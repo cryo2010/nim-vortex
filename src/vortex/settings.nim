@@ -43,7 +43,7 @@ proc initSettings*(
     bodyTimeout = 30,
     keepAliveTimeout = 60,
     shutdownGrace = 10,
-    serverHeader = "nim_http_server",
+    serverHeader = "vortex",
     certFile = "",
     keyFile = "",
     http3 = true

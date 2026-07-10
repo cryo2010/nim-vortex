@@ -1,7 +1,7 @@
 import std/[unittest, net, httpclient, httpcore, strutils, os, osproc, times]
-import nim_http_server/[settings, request, server, router]
+import vortex/[settings, request, server, router]
 import ./helper
-import nim_http_server/adapters/asyncdispatch as nhsasync
+import vortex/adapters/asyncdispatch as nhsasync
 
 proc hRoot(req: Request, params: PathParams) {.async.} =
   # No await at all: completes synchronously through the async path.

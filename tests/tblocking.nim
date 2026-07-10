@@ -1,5 +1,5 @@
 import std/[unittest, net, httpclient, httpcore, strutils, os, times]
-import nim_http_server/[settings, request, server]
+import vortex/[settings, request, server]
 import ./helper
 
 proc handler(req: Request) {.gcsafe.} =

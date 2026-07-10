@@ -13,8 +13,8 @@
 ## Ctrl-C stops the server.
 
 import std/os
-import ../src/nim_http_server
-import ../src/nim_http_server/adapters/asyncdispatch
+import ../src/vortex
+import ../src/vortex/adapters/asyncdispatch
 
 proc hRoot(req: Request, params: PathParams) {.async.} =
   req.respond(Http200, "Hello, World!\n", "text/plain")

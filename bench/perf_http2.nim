@@ -1,6 +1,6 @@
 ## HTTP/2 throughput benchmark (h2c prior knowledge).
 ##
-## No other Nim server speaks HTTP/2, so this measures nim_http_server
+## No other Nim server speaks HTTP/2, so this measures vortex
 ## against itself: HTTP/2 vs HTTP/1.1 protocol overhead on the same
 ## server, and h2 multi-thread vs single-thread scaling.
 ##
@@ -19,9 +19,9 @@
 
 import std/[os, osproc, strutils, atomics, posix, nativesockets, net,
             httpcore]
-import ../src/nim_http_server
-import ../src/nim_http_server/adapters/asyncdispatch as nhsasync
-import ../src/nim_http_server/http2/frames
+import ../src/vortex
+import ../src/vortex/adapters/asyncdispatch as nhsasync
+import ../src/vortex/http2/frames
 import ./perf_common
 
 const
@@ -31,19 +31,19 @@ const
   benchDepth {.intdefine.} = 8      # h1 pipeline depth (comparison row)
 
 proc serveOurs(port: int, threads: int) =
-  proc handler(req: nim_http_server.Request) {.gcsafe.} =
-    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
-  nim_http_server.run(handler,
-    nim_http_server.initSettings(port = net.Port(port), numThreads = threads))
+  proc handler(req: vortex.Request) {.gcsafe.} =
+    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  vortex.run(handler,
+    vortex.initSettings(port = net.Port(port), numThreads = threads))
 
 proc serveOursAsync(port: int) =
   ## Suspending async handler via the adapter: h2 streams are
   ## independent, so awaits do not pause the connection (unlike h1).
-  proc h(req: nim_http_server.Request): Future[void] {.async.} =
+  proc h(req: vortex.Request): Future[void] {.async.} =
     await sleepAsync(0)
-    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
-  nim_http_server.run(toHandler(h),
-    nim_http_server.initSettings(port = net.Port(port), numThreads = 0))
+    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  vortex.run(toHandler(h),
+    vortex.initSettings(port = net.Port(port), numThreads = 0))
 
 # --- HTTP/2 client -----------------------------------------------------------
 

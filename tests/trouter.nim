@@ -1,5 +1,5 @@
 import std/[unittest, net, httpclient, httpcore]
-import nim_http_server/[settings, request, server, router]
+import vortex/[settings, request, server, router]
 
 proc hRoot(req: Request, params: PathParams) {.gcsafe.} =
   req.respond(Http200, "root", "text/plain")

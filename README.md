@@ -1,4 +1,4 @@
-# nim_http_server
+# vortex
 
 A fast HTTP server for Nim speaking **HTTP/1.1, HTTP/2, and HTTP/3** from a
 single port and a single handler API.
@@ -24,7 +24,7 @@ single port and a single handler API.
 ## Quick start
 
 ```nim
-import nim_http_server
+import vortex
 
 proc handler(req: Request) {.gcsafe.} =
   case req.path
@@ -62,8 +62,8 @@ run(router.toHandler, initSettings(port = Port(8080)))
 Async handlers (optional adapter; asyncdispatch drivers like asyncpg):
 
 ```nim
-import nim_http_server
-import nim_http_server/adapters/asyncdispatch
+import vortex
+import vortex/adapters/asyncdispatch
 
 proc getUser(req: Request, params: PathParams) {.async.} =
   let user = await db.getUser(params.param("id"))   # loop keeps serving

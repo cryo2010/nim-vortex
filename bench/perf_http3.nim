@@ -18,8 +18,8 @@
 
 import std/[os, osproc, strutils, atomics, posix, nativesockets, net,
             httpcore]
-import ../src/nim_http_server
-import ../src/nim_http_server/http3/frames
+import ../src/vortex
+import ../src/vortex/http3/frames
 import ./perf_common
 
 const
@@ -29,10 +29,10 @@ const
   benchDepth {.intdefine.} = 8      # h1 pipeline depth (reference row)
 
 proc serveOurs(port: int, threads: int, cert, key: string) =
-  proc handler(req: nim_http_server.Request) {.gcsafe.} =
-    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
-  nim_http_server.run(handler,
-    nim_http_server.initSettings(port = net.Port(port), numThreads = threads,
+  proc handler(req: vortex.Request) {.gcsafe.} =
+    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  vortex.run(handler,
+    vortex.initSettings(port = net.Port(port), numThreads = threads,
                                  certFile = cert, keyFile = key))
 
 # --- OpenSSL QUIC client bindings -------------------------------------------

@@ -1,5 +1,5 @@
 import std/[unittest, net, httpclient, httpcore, os, osproc, strutils]
-import nim_http_server/[settings, request, server]
+import vortex/[settings, request, server]
 import ./helper
 
 let certDir = getTempDir() / "nhs_test_certs_" & $getCurrentProcessId()

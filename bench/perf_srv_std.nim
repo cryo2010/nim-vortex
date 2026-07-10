@@ -9,7 +9,7 @@ proc serveHttpbeast*(port: int) =
   ## Note: this handler returns a nil Future (not {.async.}, result never
   ## assigned), which httpbeast detects and short-circuits: its future
   ## machinery is skipped entirely. Compare with the inline
-  ## nim_http_server rows, not the -async ones.
+  ## vortex rows, not the -async ones.
   proc onRequest(req: httpbeast.Request): Future[void] =
     if req.httpMethod == some(HttpGet):
       req.send("Hello, World!")
@@ -17,7 +17,7 @@ proc serveHttpbeast*(port: int) =
 
 proc serveHttpbeastAsync*(port: int) =
   ## A real {.async.} handler: allocates and completes a future per
-  ## request. The fair peer of the nim_http_server-async row.
+  ## request. The fair peer of the vortex-async row.
   proc onRequest(req: httpbeast.Request): Future[void] {.async.} =
     if req.httpMethod == some(HttpGet):
       req.send("Hello, World!")

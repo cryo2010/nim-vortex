@@ -1,4 +1,4 @@
-## HTTP/1.1 throughput comparison: nim_http_server vs httpbeast,
+## HTTP/1.1 throughput comparison: vortex vs httpbeast,
 ## std/asynchttpserver, and chronos.
 ##
 ## One binary, two modes:
@@ -19,7 +19,7 @@
 ## sends `depth` pipelined GETs per batch, and counts complete responses
 ## by parsing Content-Length, so servers with different header sets are
 ## measured identically. asynchttpserver and chronos are single-threaded
-## by design; nim_http_server is also shown pinned to one thread for a
+## by design; vortex is also shown pinned to one thread for a
 ## like-for-like comparison.
 ##
 ## The -async row serves through the asyncdispatch adapter with a
@@ -33,8 +33,8 @@
 ## streams are independent and the cost mostly disappears.
 
 import std/[os, osproc, strutils, net, httpcore]
-import ../src/nim_http_server
-import ../src/nim_http_server/adapters/asyncdispatch as nhsasync
+import ../src/vortex
+import ../src/vortex/adapters/asyncdispatch as nhsasync
 import ./perf_common
 from ./perf_srv_std import serveHttpbeast, serveHttpbeastAsync,
                            serveAsynchttpserver
@@ -48,40 +48,40 @@ const
 # --- the servers under test -------------------------------------------------
 
 proc serveOurs(port: int, threads: int, minimal = false) =
-  proc handler(req: nim_http_server.Request) {.gcsafe.} =
-    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
-  proc minHandler(req: nim_http_server.Request) {.gcsafe.} =
-    nim_http_server.respond(req, Http200, "Hello, World!")
-  var cfg = nim_http_server.initSettings(port = net.Port(port),
+  proc handler(req: vortex.Request) {.gcsafe.} =
+    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  proc minHandler(req: vortex.Request) {.gcsafe.} =
+    vortex.respond(req, Http200, "Hello, World!")
+  var cfg = vortex.initSettings(port = net.Port(port),
                                          numThreads = threads)
   if minimal:
     cfg.serverHeader = ""       # diagnostic: byte-parity with httpbeast
-    nim_http_server.run(minHandler, cfg)
+    vortex.run(minHandler, cfg)
   else:
-    nim_http_server.run(handler, cfg)
+    vortex.run(handler, cfg)
 
 proc serveOursAsync(port: int, doAwait: bool) =
   ## Through the asyncdispatch adapter: measures the future/adapter tax
   ## against the plain inline handler (httpbeast handlers are also
   ## Future-based, making that row directly comparable).
-  proc immediate(req: nim_http_server.Request): Future[void] {.async.} =
-    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
-  proc suspending(req: nim_http_server.Request): Future[void] {.async.} =
+  proc immediate(req: vortex.Request): Future[void] {.async.} =
+    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  proc suspending(req: vortex.Request): Future[void] {.async.} =
     await sleepAsync(0)                  # force a real suspend/resume
-    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
+    vortex.respond(req, Http200, "Hello, World!", "text/plain")
   let handler = if doAwait: toHandler(suspending) else: toHandler(immediate)
-  nim_http_server.run(handler,
-    nim_http_server.initSettings(port = net.Port(port), numThreads = 0))
+  vortex.run(handler,
+    vortex.initSettings(port = net.Port(port), numThreads = 0))
 
 # --- orchestration -----------------------------------------------------------
 
 proc orchestrate() =
   let targets = [
-    (name: "nim_http_server", port: 9101),
-    (name: "nim_http_server-1thread", port: 9102),
-    (name: "nim_http_server-minimal", port: 9106),
-    (name: "nim_http_server-async", port: 9107),
-    (name: "nim_http_server-async-await", port: 9108),
+    (name: "vortex", port: 9101),
+    (name: "vortex-1thread", port: 9102),
+    (name: "vortex-minimal", port: 9106),
+    (name: "vortex-async", port: 9107),
+    (name: "vortex-async-await", port: 9108),
     (name: "httpbeast", port: 9103),
     (name: "httpbeast-async", port: 9109),
     (name: "asynchttpserver", port: 9104),
@@ -113,11 +113,11 @@ when isMainModule:
   if paramCount() >= 3 and paramStr(1) == "serve":
     let port = parseInt(paramStr(3))
     case paramStr(2)
-    of "nim_http_server": serveOurs(port, 0)
-    of "nim_http_server-1thread": serveOurs(port, 1)
-    of "nim_http_server-minimal": serveOurs(port, 0, minimal = true)
-    of "nim_http_server-async": serveOursAsync(port, doAwait = false)
-    of "nim_http_server-async-await": serveOursAsync(port, doAwait = true)
+    of "vortex": serveOurs(port, 0)
+    of "vortex-1thread": serveOurs(port, 1)
+    of "vortex-minimal": serveOurs(port, 0, minimal = true)
+    of "vortex-async": serveOursAsync(port, doAwait = false)
+    of "vortex-async-await": serveOursAsync(port, doAwait = true)
     of "httpbeast": serveHttpbeast(port)
     of "httpbeast-async": serveHttpbeastAsync(port)
     of "asynchttpserver": serveAsynchttpserver(port)

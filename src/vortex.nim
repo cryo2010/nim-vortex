@@ -1,7 +1,7 @@
-## nim_http_server: a fast HTTP/1.1 (and, coming, HTTP/2 + HTTP/3) server.
+## vortex: a fast HTTP/1.1 (and, coming, HTTP/2 + HTTP/3) server.
 ##
 ## ```nim
-## import nim_http_server
+## import vortex
 ##
 ## proc handler(req: Request) =
 ##   case req.path
@@ -14,10 +14,10 @@
 import std/httpcore
 import std/net
 
-import nim_http_server/settings
-import nim_http_server/request
-import nim_http_server/server
-import nim_http_server/router
+import vortex/settings
+import vortex/request
+import vortex/server
+import vortex/router
 
 export httpcore
 export net.Port

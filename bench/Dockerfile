@@ -22,7 +22,7 @@ RUN pacman -Syu --noconfirm --needed --disable-sandbox \
     pacman -Scc --noconfirm
 
 WORKDIR /nhs
-COPY nim_http_server.nimble ./
+COPY vortex.nimble ./
 COPY src ./src
 COPY tests ./tests
 COPY bench/*.nim bench/run.sh ./bench/

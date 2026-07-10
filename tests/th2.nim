@@ -1,5 +1,5 @@
 import std/[unittest, net, httpcore, osproc, strutils, os, tables]
-import nim_http_server/[settings, request, server]
+import vortex/[settings, request, server]
 
 const bigBody = "0123456789abcdef".repeat(16 * 1024)   # 256 KiB
 

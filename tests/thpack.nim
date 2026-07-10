@@ -1,5 +1,5 @@
 import std/[unittest, strutils]
-import nim_http_server/http2/hpack
+import vortex/http2/hpack
 
 proc fromHex(s: string): string =
   result = newString(s.len div 2)

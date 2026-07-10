@@ -4,7 +4,7 @@
 ##   ./bench/handlers [port] [certFile keyFile]
 
 import std/[os, strutils, httpcore]
-import ../src/nim_http_server
+import ../src/vortex
 
 proc handler(req: Request) {.gcsafe.} =
   case req.path

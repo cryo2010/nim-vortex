@@ -1,5 +1,5 @@
 import std/[unittest, httpcore, strutils]
-import nim_http_server/http1/parser
+import vortex/http1/parser
 
 proc limits(maxHeaderSize = 16384, maxHeaderCount = 100,
             maxBodySize = 1024 * 1024): ParserLimits =

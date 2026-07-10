@@ -1,5 +1,5 @@
 import std/[unittest, net, httpcore, osproc, strutils, os]
-import nim_http_server/[settings, request, server]
+import vortex/[settings, request, server]
 
 # HTTP/3 needs an h3-capable curl (Homebrew's links libnghttp3/ngtcp2).
 const h3curlBin = "/opt/homebrew/opt/curl/bin/curl"
