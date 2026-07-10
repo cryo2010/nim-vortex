@@ -1,0 +1,6 @@
+nimcache/
+bench/handlers
+demos/minimal
+*.exe
+.DS_Store
+.claude/settings.local.json

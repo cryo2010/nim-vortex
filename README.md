@@ -1,0 +1,93 @@
+# nim_http_server
+
+A fast HTTP server for Nim speaking **HTTP/1.1, HTTP/2, and HTTP/3** from a
+single port and a single handler API.
+
+- **Architecture**: one event loop per thread (`SO_REUSEPORT`,
+  kqueue/epoll via `std/selectors`), handlers run inline on the loop:
+  the httpbeast model, with the protocol gaps filled in.
+- **Blocking escape hatch**: `req.blocking:` moves a handler body to a
+  worker pool where synchronous DB drivers, file IO, and CPU work are
+  safe; routes that never use it pay zero overhead.
+- **Future-agnostic**: handlers are plain procs and responses may be
+  deferred: no async runtime dependency, no Future type in the core.
+  (asyncdispatch/chronos adapters are planned as optional modules.)
+- **Protocols**: HTTP/1.1 (keep-alive, pipelining, chunked bodies,
+  100-continue), HTTP/2 (TLS ALPN and h2c prior knowledge; h2spec-clean),
+  HTTP/3 over QUIC (OpenSSL >= 3.5 server API), with automatic `Alt-Svc`
+  advertisement.
+- **Dependencies**: none beyond OpenSSL >= 3.5 at runtime for TLS/h2/h3.
+  Build with `-d:plainHttp` for a zero-dependency cleartext (h1 + h2c)
+  server.
+
+## Quick start
+
+```nim
+import nim_http_server
+
+proc handler(req: Request) {.gcsafe.} =
+  case req.path
+  of "/":
+    req.respond(Http200, "Hello, World!", "text/plain")
+  of "/report":
+    req.blocking:                       # runs on the worker pool
+      let data = expensiveBlockingCall()
+      req.respond(Http200, data, "application/json")
+  else:
+    req.respond(Http404)
+
+run(handler, initSettings(port = Port(8080)))
+```
+
+TLS + HTTP/2 + HTTP/3:
+
+```nim
+run(handler, initSettings(port = Port(8443),
+                          certFile = "cert.pem", keyFile = "key.pem"))
+```
+
+Router:
+
+```nim
+proc getUser(req: Request, params: PathParams) {.gcsafe.} =
+  req.respond(Http200, "user " & params.param("id"))
+
+var router = newRouter()
+router.get("/users/:id", getUser)
+router.get("/static/*", serveFile)
+run(router.toHandler, initSettings(port = Port(8080)))
+```
+
+Embedded / test usage: `var srv = start(handler, settings)` returns
+immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
+
+## Handler rules
+
+- Handlers run **inline on the event loop**: never block in them (no sync
+  DB calls, no `sleep`). Use `req.blocking:` for anything that blocks.
+- Inside `blocking:` the request is available as `req`; the body cannot
+  capture surrounding locals (it runs on another thread); read request
+  data through `req`, which remains valid until you respond.
+- `req.respond(...)` may be called after the handler returns (deferred
+  responses); calling it through a dead connection is a safe no-op.
+
+## Build flags
+
+Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
+(`nimble bench` builds the benchmark server this way).
+
+`-d:plainHttp` removes the OpenSSL dependency (and TLS/h2-over-TLS/h3).
+
+## Verification
+
+- `nimble test`: parser/HPACK/QPACK unit tests (RFC vectors) plus
+  integration suites for h1, h2 (curl), h3 (h3-capable curl), TLS,
+  worker pool, and router.
+- HTTP/2 conformance: `h2spec -t -k -p <port>` passes 145/146 (1 skipped,
+  0 failed) against a TLS server.
+- `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
+
+## Status
+
+Pre-1.0. Deferred (planned): WebSockets, streaming request/response
+bodies, async runtime adapters, dynamic QPACK, h2c upgrade, Windows.
