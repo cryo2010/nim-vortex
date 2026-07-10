@@ -92,6 +92,10 @@ immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
   data through `req`, which remains valid until you respond.
 - `req.respond(...)` may be called after the handler returns (deferred
   responses); calling it through a dead connection is a safe no-op.
+- `req.path` is the raw request target (query string included, matching
+  httpbeast). `req.url` gives the parsed form (`req.url.path` excludes
+  the query) and `req.query` a decoded parameter Table; both are lazy
+  and cached per request, on any protocol.
 
 ## Build flags
 

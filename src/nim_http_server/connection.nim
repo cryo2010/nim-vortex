@@ -3,7 +3,7 @@
 ## worker threads or deferred handlers) can never touch a connection that
 ## has since been closed and reused.
 
-import std/locks
+import std/[locks, uri, tables]
 from std/selectors import SelectEvent, trigger, newSelectEvent, close
 import ./http1/parser
 
@@ -55,6 +55,10 @@ type
     closeRequested*: bool     ## close deferred until unpinned
     responded*: bool          ## current request has been answered
     sent100*: bool            ## 100 Continue already sent for this request
+    urlCached*: bool          ## lazy per-request caches (see request.url)
+    queryCached*: bool
+    cachedUrl*: Uri
+    cachedQuery*: Table[string, string]
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
 
@@ -176,6 +180,8 @@ proc resetForNextRequest*(c: var Connection) =
     moveMem(addr c.rbuf[0], addr c.rbuf[consumed], c.rlen - consumed)
     c.rlen -= consumed
   c.chunkBody.setLen(0)
+  c.urlCached = false
+  c.queryCached = false
   c.responded = false
   c.sent100 = false
   c.awaitingResponse = false
@@ -202,6 +208,8 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.writeArmed = false
   c.pinned = 0
   c.closeRequested = false
+  c.urlCached = false
+  c.queryCached = false
   c.responded = false
   c.sent100 = false
   c.awaitingResponse = false

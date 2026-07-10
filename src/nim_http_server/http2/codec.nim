@@ -3,7 +3,7 @@
 ## One H2Conn per connection, touched only by the owning loop thread
 ## (workers respond through the protocol-neutral outbox).
 
-import std/[tables, strutils]
+import std/[tables, strutils, uri]
 import ./frames, ./hpack
 import ../connection
 
@@ -18,6 +18,10 @@ type
     isHead*: bool
     headersDone*: bool
     contentLength*: int64            ## -1 unknown; validated vs body
+    urlCached*: bool                 ## lazy per-request caches
+    queryCached*: bool
+    cachedUrl*: Uri
+    cachedQuery*: Table[string, string]
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool

@@ -7,7 +7,7 @@
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
 ## streams are independent.
 
-import std/[httpcore, strutils]
+import std/[httpcore, strutils, uri, tables]
 import ./connection
 import ./workerpool
 import ./http1/parser as h1parser
@@ -190,6 +190,58 @@ proc contentLength*(req: Request): int =
       if st != nil: result = st.body.len
     else:
       result = if c.parser.chunked: c.chunkBody.len else: c.parser.bodyLen
+
+template lazyUrl(store: untyped, target: string): Uri =
+  if not store.urlCached:
+    store.cachedUrl = parseUri(target)
+    store.urlCached = true
+  store.cachedUrl
+
+template lazyQuery(store: untyped, rawQuery: string):
+    Table[string, string] =
+  if not store.queryCached:
+    store.cachedQuery.clear()          # storage is reused across requests
+    for (key, value) in decodeQuery(rawQuery):
+      store.cachedQuery[key] = value   # duplicate keys: last one wins
+    store.queryCached = true
+  store.cachedQuery
+
+proc url*(req: Request): Uri =
+  ## The request target parsed as a Uri (so `req.url.path` excludes the
+  ## query string). Parsed lazily on first access, cached per request.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        result = lazyUrl(st, h3FieldOf(req, ":path"))
+    return
+  withConn(req, c):
+    if req.stream != 0:
+      let st = h2Stream(c, req.stream)
+      if st != nil:
+        result = lazyUrl(st, h2Field(c, req.stream, ":path"))
+    else:
+      result = lazyUrl(c, c.rbuf.substr(int(c.parser.pathStart),
+                       int(c.parser.pathStart + c.parser.pathLen) - 1))
+
+proc query*(req: Request): Table[string, string] =
+  ## Decoded query parameters, built lazily on first access and cached
+  ## per request. Duplicate keys keep the last value; use
+  ## `decodeQuery(req.url.query)` directly if you need every occurrence.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        result = lazyQuery(st, lazyUrl(st, h3FieldOf(req, ":path")).query)
+    return
+  withConn(req, c):
+    if req.stream != 0:
+      let st = h2Stream(c, req.stream)
+      if st != nil:
+        result = lazyQuery(st,
+          lazyUrl(st, h2Field(c, req.stream, ":path")).query)
+    else:
+      result = lazyQuery(c, lazyUrl(c,
+        c.rbuf.substr(int(c.parser.pathStart),
+                      int(c.parser.pathStart + c.parser.pathLen) - 1)).query)
 
 proc httpVersion*(req: Request): int =
   ## 1 for HTTP/1.x, 2 for HTTP/2, 3 for HTTP/3.

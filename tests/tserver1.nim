@@ -1,15 +1,22 @@
-import std/[unittest, net, httpclient, httpcore, strutils]
+import std/[unittest, net, httpclient, httpcore, strutils, tables]
 import nim_http_server/[settings, request, server]
 import ./helper
 
 proc handler(req: Request) {.gcsafe.} =
-  case req.path
+  case req.url.path
   of "/":
     req.respond(Http200, "Hello, World!", "text/plain")
   of "/echo":
     req.respond(Http200, req.body, req.header("Content-Type"))
   of "/headers":
     req.respond(Http200, req.header("X-Probe"), "text/plain")
+  of "/qs":
+    var parts: seq[string]
+    parts.add "path=" & req.url.path
+    for key in ["a", "b", "sp"]:
+      if key in req.query:
+        parts.add key & "=" & req.query[key]
+    req.respond(Http200, parts.join("|"), "text/plain")
   of "/boom":
     raise newException(ValueError, "handler exploded")
   else:
@@ -46,6 +53,19 @@ suite "http/1.1 integration":
     check resp.code == Http200
     check resp.body == """{"a":1}"""
     check resp.headers["content-type"] == "application/json"
+
+  test "query string parsing (lazy, cached)":
+    var client = newHttpClient()
+    defer: client.close()
+    check client.getContent(base & "/qs?a=1&b=two&sp=hello%20world+x") ==
+      "path=/qs|a=1|b=two|sp=hello world x"
+    # repeated access + no query at all
+    check client.getContent(base & "/qs") == "path=/qs"
+    # duplicate keys: last wins
+    check client.getContent(base & "/qs?a=first&a=second") ==
+      "path=/qs|a=second"
+    # root with query still routes (url.path strips it)
+    check client.getContent(base & "/?x=1") == "Hello, World!"
 
   test "request header readable":
     var client = newHttpClient()

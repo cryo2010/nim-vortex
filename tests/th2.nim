@@ -1,12 +1,14 @@
-import std/[unittest, net, httpcore, osproc, strutils, os]
+import std/[unittest, net, httpcore, osproc, strutils, os, tables]
 import nim_http_server/[settings, request, server]
 
 const bigBody = "0123456789abcdef".repeat(16 * 1024)   # 256 KiB
 
 proc handler(req: Request) {.gcsafe.} =
-  case req.path
+  case req.url.path
   of "/":
     req.respond(Http200, "hello h2", "text/plain")
+  of "/qs":
+    req.respond(Http200, req.url.path & "|" & req.query["k"], "text/plain")
   of "/echo":
     req.respond(Http200, req.body, req.header("Content-Type"),
                 headers = [("X-Proto", $req.httpVersion)])
@@ -41,6 +43,11 @@ suite "HTTP/2 (h2c prior knowledge, via curl)":
       "-w '|%{http_version}|%{content_type}' " & base & "/echo")
     check rc == 0
     check output == "payload h2|2|text/plain"
+
+  test "query string over h2":
+    let (output, rc) = h2curl("'" & base & "/qs?k=v%20w'")
+    check rc == 0
+    check output == "/qs|v w"
 
   test "404":
     let (output, rc) = h2curl("-o /dev/null -w '%{http_code}' " & base & "/nope")

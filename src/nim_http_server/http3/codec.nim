@@ -3,7 +3,7 @@
 ## One request per client-initiated bidirectional stream: HEADERS frame
 ## (QPACK, capacity-0) then DATA frames, FIN completes the request.
 
-import std/[tables, strutils]
+import std/[tables, strutils, uri]
 import ./frames, ./qpack
 import ../connection
 import ../transport/quic
@@ -19,6 +19,10 @@ type
     headers*: seq[(string, string)]
     body*: string
     headersDone*: bool
+    urlCached*: bool                 ## lazy per-request caches
+    queryCached*: bool
+    cachedUrl*: Uri
+    cachedQuery*: Table[string, string]
     finSeen: bool
     dispatched: bool
     responded*: bool
