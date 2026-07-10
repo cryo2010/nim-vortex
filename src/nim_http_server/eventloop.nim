@@ -19,7 +19,10 @@ when not defined(plainHttp):
 when defined(macosx):
   const SO_NOSIGPIPE = cint(0x1022)
 when defined(linux):
-  const sendFlags = cint(MSG_NOSIGNAL)
+  # MSG_NOSIGNAL; std/posix exports it as an importc var on some targets,
+  # which cannot initialize a const. The value is uniform across Linux
+  # architectures.
+  const sendFlags = cint(0x4000)
 else:
   const sendFlags = cint(0)
 
