@@ -1,6 +1,9 @@
 nimcache/
 bench/handlers
+bench/perf_http1_1
 demos/minimal
 *.exe
 .DS_Store
 .claude/settings.local.json
+bench/perf_http2
+bench/perf_http3
