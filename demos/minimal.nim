@@ -1,37 +1,48 @@
-## Minimal demo server. Run it, then poke it from another terminal:
+## Minimal demo server using the asyncdispatch adapter. Run it, then
+## poke it from another terminal:
 ##
 ##   nim c -r --mm:orc --threads:on demos/minimal.nim
 ##
 ##   curl http://localhost:8080/
 ##   curl http://localhost:8080/hello/you
 ##   curl -X POST -d 'some data' http://localhost:8080/echo
+##   curl http://localhost:8080/slow      # awaits without blocking the loop
+##   curl http://localhost:8080/report    # sync work on the worker pool
 ##   curl -s --http2-prior-knowledge http://localhost:8080/   # HTTP/2
 ##
 ## Ctrl-C stops the server.
 
 import std/os
 import ../src/nim_http_server
+import ../src/nim_http_server/adapters/asyncdispatch
 
-proc hRoot(req: Request, params: PathParams) {.gcsafe.} =
+proc hRoot(req: Request, params: PathParams) {.async.} =
   req.respond(Http200, "Hello, World!\n", "text/plain")
 
-proc hHello(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http200, "Hello, " & params.param("name") & "!\n", "text/plain")
+proc hHello(req: Request, params: PathParams) {.async.} =
+  let name = params.param("name")        # captures are fine in async bodies
+  await sleepAsync(10)
+  req.respond(Http200, "Hello, " & name & "!\n", "text/plain")
 
-proc hEcho(req: Request, params: PathParams) {.gcsafe.} =
+proc hEcho(req: Request, params: PathParams) {.async.} =
   req.respond(Http200, "you sent (" & $req.method & "): " & req.body & "\n",
               "text/plain")
 
-proc hSlow(req: Request, params: PathParams) {.gcsafe.} =
-  req.blocking:                     # runs on the worker pool
-    sleep(1000)                     # blocking calls are safe here
-    req.respond(Http200, "that took a second\n", "text/plain")
+proc hSlow(req: Request, params: PathParams) {.async.} =
+  await sleepAsync(1000)                 # loop keeps serving other requests
+  req.respond(Http200, "that took a second\n", "text/plain")
+
+proc hReport(req: Request, params: PathParams) {.async.} =
+  req.blocking:                          # synchronous escape: worker pool
+    sleep(500)                           # stands in for a sync DB/file call
+    req.respond(Http200, "report built on a worker thread\n", "text/plain")
 
 var router = newRouter()
 router.get("/", hRoot)
 router.get("/hello/:name", hHello)
 router.post("/echo", hEcho)
 router.get("/slow", hSlow)
+router.get("/report", hReport)
 
 echo "listening on http://localhost:8080  (Ctrl-C to stop)"
 run(router.toHandler, initSettings(port = Port(8080)))
