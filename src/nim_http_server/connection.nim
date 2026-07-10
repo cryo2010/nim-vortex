@@ -79,6 +79,16 @@ type
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox
+    # Async-adapter integration (see adapters/). All loop-thread only.
+    loopPtr*: pointer         ## the owning Loop, for kick
+    pumpHook*: proc (): int {.nimcall, gcsafe.}
+      ## Registered by an adapter; called once per loop iteration to run
+      ## ready async callbacks. Returns a max selector timeout in ms, or
+      ## -1 for no constraint.
+    kick*: proc (loopPtr: pointer, fd: int32, gen: uint32,
+                 stream: uint32) {.nimcall, gcsafe.}
+      ## Flush/resume after a deferred same-thread respond (async
+      ## completion). Set by the event loop; safe to call redundantly.
 
 proc newOutbox*(): ptr Outbox =
   result = createShared(Outbox)

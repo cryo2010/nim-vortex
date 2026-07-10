@@ -11,7 +11,8 @@ single port and a single handler API.
   safe; routes that never use it pay zero overhead.
 - **Future-agnostic**: handlers are plain procs and responses may be
   deferred: no async runtime dependency, no Future type in the core.
-  (asyncdispatch/chronos adapters are planned as optional modules.)
+  An optional asyncdispatch adapter layers `await` support on top
+  (a chronos adapter can follow the same hook).
 - **Protocols**: HTTP/1.1 (keep-alive, pipelining, chunked bodies,
   100-continue), HTTP/2 (TLS ALPN and h2c prior knowledge; h2spec-clean),
   HTTP/3 over QUIC (OpenSSL >= 3.5 server API), with automatic `Alt-Svc`
@@ -58,6 +59,27 @@ router.get("/static/*", serveFile)
 run(router.toHandler, initSettings(port = Port(8080)))
 ```
 
+Async handlers (optional adapter; asyncdispatch drivers like asyncpg):
+
+```nim
+import nim_http_server
+import nim_http_server/adapters/asyncdispatch
+
+proc getUser(req: Request, params: PathParams) {.async.} =
+  let user = await db.getUser(params.param("id"))   # loop keeps serving
+  req.respond(Http200, user.toJson)
+
+var router = newRouter()
+router.get("/users/:id", getUser)    # async handlers register directly
+run(router.toHandler, initSettings(port = Port(8080)))
+```
+
+Inside an async handler `req.blocking:` still works for synchronous
+libraries, and unlike `blocking:` the async body may capture locals
+(it never leaves the loop thread). Without a router, wrap a
+`proc (req: Request) {.async.}` with the adapter's `toHandler`, or use
+`req.doAsync:` inside a plain handler.
+
 Embedded / test usage: `var srv = start(handler, settings)` returns
 immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 
@@ -90,7 +112,7 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 ## Status
 
 Pre-1.0. Deferred (planned): WebSockets, streaming request/response
-bodies, async runtime adapters, dynamic QPACK, h2c upgrade, Windows.
+bodies, a chronos adapter, dynamic QPACK, h2c upgrade, Windows.
 
 ## Thanks
 

@@ -132,6 +132,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox
+  result.core.loopPtr = cast[pointer](result)
   result.refreshDate()
   result.selector.registerHandle(listenFd, {Event.Read}, fkListen)
   if outbox != nil:
@@ -328,6 +329,44 @@ proc processInput(loop: Loop, c: ptr Connection) =
         return
       # Loop again: pipelined request already buffered.
 
+proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
+  ## Flush a response that was produced outside the dispatch call
+  ## (worker outbox or same-thread async completion) and, for HTTP/1,
+  ## resume the paused pipeline.
+  if stream != 0:
+    loop.flushOut(c)
+    if c.state != csFree and c.pinned == 0:
+      loop.processInput(c)       # resume input paused during pinning
+      if c.state != csFree and c.pendingOut > 0:
+        loop.flushOut(c)
+  elif c.closeAfterFlush:
+    c.state = csClosing
+    loop.flushOut(c)
+  else:
+    c[].resetForNextRequest()
+    loop.flushOut(c)
+    if c.state == csFree: return
+    loop.processInput(c)         # pipelined requests may be buffered
+    if c.state == csFree: return
+    if c.pendingOut > 0:
+      loop.flushOut(c)
+    if c.state == csActive and c.rlen == 0 and not c.awaitingResponse:
+      c.setDeadline(loop, dkIdle)
+
+proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
+              stream: uint32) {.nimcall, gcsafe.} =
+  ## LoopCore.kick: adapters call this on the loop thread after a
+  ## deferred respond. Redundant calls are harmless.
+  {.gcsafe.}:
+    let loop = cast[Loop](loopPtr)
+    if fd < 0:
+      return                     # h3 responses flush inside h3Respond
+    let c = conn(addr loop.core, fd, gen)
+    if c == nil: return
+    if stream == 0 and not (c.awaitingResponse and c.responded):
+      return                     # nothing deferred is pending
+    loop.resumeAfterRespond(c, stream)
+
 proc handleRead(loop: Loop, c: ptr Connection) =
   while true:
     if c.rlen == c.rbuf.len:
@@ -510,25 +549,7 @@ proc processOutbox(loop: Loop) =
     let (contentType, headers, bodyStart) = unpackResponse(m.data)
     applyResponse(addr loop.core, c, m.stream, int(m.code), contentType,
                   headers, m.data.toOpenArray(bodyStart, m.data.len - 1))
-    if m.stream != 0:
-      loop.flushOut(c)
-      if c.state != csFree and c.pinned == 0:
-        loop.processInput(c)     # resume input paused during pinning
-        if c.state != csFree and c.pendingOut > 0:
-          loop.flushOut(c)
-    elif c.closeAfterFlush:
-      c.state = csClosing
-      loop.flushOut(c)
-    else:
-      c[].resetForNextRequest()
-      loop.flushOut(c)
-      if c.state == csFree: continue
-      loop.processInput(c)       # pipelined requests may be buffered
-      if c.state == csFree: continue
-      if c.pendingOut > 0:
-        loop.flushOut(c)
-      if c.state == csActive and c.rlen == 0 and not c.awaitingResponse:
-        c.setDeadline(loop, dkIdle)
+    loop.resumeAfterRespond(c, m.stream)
   when not defined(plainHttp):
     if h3Touched and loop.quicListener != nil:
       loop.h3Drive()             # flush unpinned conns, dispatch new work
@@ -549,9 +570,16 @@ proc tick(loop: Loop) =
 
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
+  loop.core.kick = kickImpl
   var keys: array[256, ReadyKey]
   while not loop.stopFlag[].load(moRelaxed):
     var timeoutMs = 1000
+    if loop.core.pumpHook != nil:
+      # Adapter (asyncdispatch etc.): run ready callbacks and cap the
+      # selector timeout while async operations are pending.
+      let cap = loop.core.pumpHook()
+      if cap >= 0:
+        timeoutMs = min(timeoutMs, max(1, cap))
     when not defined(plainHttp):
       if loop.quicListener != nil:
         let qt = quicEventTimeoutMs(loop.quicListener)
