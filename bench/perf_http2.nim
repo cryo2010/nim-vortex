@@ -20,6 +20,7 @@
 import std/[os, osproc, strutils, atomics, posix, nativesockets, net,
             httpcore]
 import ../src/nim_http_server
+import ../src/nim_http_server/adapters/asyncdispatch as nhsasync
 import ../src/nim_http_server/http2/frames
 import ./perf_common
 
@@ -34,6 +35,15 @@ proc serveOurs(port: int, threads: int) =
     nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
   nim_http_server.run(handler,
     nim_http_server.initSettings(port = net.Port(port), numThreads = threads))
+
+proc serveOursAsync(port: int) =
+  ## Suspending async handler via the adapter: h2 streams are
+  ## independent, so awaits do not pause the connection (unlike h1).
+  proc h(req: nim_http_server.Request): Future[void] {.async.} =
+    await sleepAsync(0)
+    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
+  nim_http_server.run(toHandler(h),
+    nim_http_server.initSettings(port = net.Port(port), numThreads = 0))
 
 # --- HTTP/2 client -----------------------------------------------------------
 
@@ -165,6 +175,7 @@ proc orchestrate() =
 
   bench("h2", "nhs", 9201, h2ClientLoop, benchStreams)
   bench("h2-1thread", "nhs-1t", 9202, h2ClientLoop, benchStreams)
+  bench("h2-async-await", "nhs-async", 9204, h2ClientLoop, benchStreams)
   bench("h1 (same server)", "nhs", 9203, h1ClientLoop, benchDepth)
   report(results)
 
@@ -174,6 +185,7 @@ when isMainModule:
     case paramStr(2)
     of "nhs": serveOurs(port, 0)
     of "nhs-1t": serveOurs(port, 1)
+    of "nhs-async": serveOursAsync(port)
     else: quit "unknown server: " & paramStr(2)
   else:
     orchestrate()

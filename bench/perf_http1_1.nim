@@ -21,11 +21,23 @@
 ## measured identically. asynchttpserver and chronos are single-threaded
 ## by design; nim_http_server is also shown pinned to one thread for a
 ## like-for-like comparison.
+##
+## The -async row serves through the asyncdispatch adapter with a
+## handler that responds without suspending (the adapter tax; the fair
+## peer is httpbeast-async, a real {.async.} httpbeast handler, since
+## plain httpbeast handlers return nil futures and skip its future
+## machinery entirely). The
+## -async-await row forces a suspend per request, which on pipelined
+## HTTP/1.1 is the worst case: ordering pauses the pipeline at each
+## deferred response. See perf_http2 for the same handler on h2, where
+## streams are independent and the cost mostly disappears.
 
 import std/[os, osproc, strutils, net, httpcore]
 import ../src/nim_http_server
+import ../src/nim_http_server/adapters/asyncdispatch as nhsasync
 import ./perf_common
-from ./perf_srv_std import serveHttpbeast, serveAsynchttpserver
+from ./perf_srv_std import serveHttpbeast, serveHttpbeastAsync,
+                           serveAsynchttpserver
 from ./perf_srv_chronos import serveChronos
 
 const
@@ -48,6 +60,19 @@ proc serveOurs(port: int, threads: int, minimal = false) =
   else:
     nim_http_server.run(handler, cfg)
 
+proc serveOursAsync(port: int, doAwait: bool) =
+  ## Through the asyncdispatch adapter: measures the future/adapter tax
+  ## against the plain inline handler (httpbeast handlers are also
+  ## Future-based, making that row directly comparable).
+  proc immediate(req: nim_http_server.Request): Future[void] {.async.} =
+    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
+  proc suspending(req: nim_http_server.Request): Future[void] {.async.} =
+    await sleepAsync(0)                  # force a real suspend/resume
+    nim_http_server.respond(req, Http200, "Hello, World!", "text/plain")
+  let handler = if doAwait: toHandler(suspending) else: toHandler(immediate)
+  nim_http_server.run(handler,
+    nim_http_server.initSettings(port = net.Port(port), numThreads = 0))
+
 # --- orchestration -----------------------------------------------------------
 
 proc orchestrate() =
@@ -55,7 +80,10 @@ proc orchestrate() =
     (name: "nim_http_server", port: 9101),
     (name: "nim_http_server-1thread", port: 9102),
     (name: "nim_http_server-minimal", port: 9106),
+    (name: "nim_http_server-async", port: 9107),
+    (name: "nim_http_server-async-await", port: 9108),
     (name: "httpbeast", port: 9103),
+    (name: "httpbeast-async", port: 9109),
     (name: "asynchttpserver", port: 9104),
     (name: "chronos", port: 9105),
   ]
@@ -88,7 +116,10 @@ when isMainModule:
     of "nim_http_server": serveOurs(port, 0)
     of "nim_http_server-1thread": serveOurs(port, 1)
     of "nim_http_server-minimal": serveOurs(port, 0, minimal = true)
+    of "nim_http_server-async": serveOursAsync(port, doAwait = false)
+    of "nim_http_server-async-await": serveOursAsync(port, doAwait = true)
     of "httpbeast": serveHttpbeast(port)
+    of "httpbeast-async": serveHttpbeastAsync(port)
     of "asynchttpserver": serveAsynchttpserver(port)
     of "chronos": serveChronos(port)
     else: quit "unknown server: " & paramStr(2)
