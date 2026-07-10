@@ -35,6 +35,7 @@
 ## uncaught exception in the body responds 500.
 
 import std/[asyncdispatch, httpcore]
+from std/deques import len          # for the dispatcher's callback queue
 import ../connection
 import ../request
 import ../router
@@ -43,8 +44,14 @@ export asyncdispatch
 
 proc pump(): int {.nimcall, gcsafe.} =
   {.gcsafe.}:
-    if hasPendingOperations():
+    # Bounded spin: completing one future can resume work that
+    # immediately suspends again (pipelined requests, chained awaits);
+    # each such link needs another poll pass. Real IO waits are not
+    # completed by poll(0) and fall through to the timeout cap below.
+    var spins = 0
+    while hasPendingOperations() and spins < 8:
       poll(0)                    # run completed futures; never block
+      inc spins
     if hasPendingOperations(): 5 else: -1
 
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
@@ -55,7 +62,14 @@ proc ensurePump*(core: ptr LoopCore) {.inline.} =
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling: 500 on failure, then flush/resume the
   ## connection (respond is a no-op if the body already answered).
-  ensurePump(req.core)
+  if fut.finished:
+    # Completed without suspending (httpbeast's nil-future case): any
+    # respond already ran inline during dispatch, so skip the callback
+    # queue, the pump, and the kick entirely.
+    if fut.failed:
+      req.respond(Http500, "500 Internal Server Error", "text/plain")
+    return
+  ensurePump(req.core)               # pump only once something suspends
   fut.addCallback proc () {.gcsafe.} =
     if fut.failed:
       req.respond(Http500, "500 Internal Server Error", "text/plain")

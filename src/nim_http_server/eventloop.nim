@@ -38,6 +38,7 @@ type
     handler: RequestHandler
     stopFlag: ptr Atomic[bool]
     lastWallSec: int64
+    pumpCap: int                 # adapter-suggested selector timeout cap
     outboxScratch: seq[OutMsg]   # reused drain buffer
     readyStreams: seq[uint32]    # reused h2 dispatch buffer
     tls: pointer                 # ptr TlsConfig; nil = plaintext
@@ -571,15 +572,14 @@ proc tick(loop: Loop) =
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.kick = kickImpl
+  loop.pumpCap = -1
   var keys: array[256, ReadyKey]
   while not loop.stopFlag[].load(moRelaxed):
     var timeoutMs = 1000
-    if loop.core.pumpHook != nil:
-      # Adapter (asyncdispatch etc.): run ready callbacks and cap the
-      # selector timeout while async operations are pending.
-      let cap = loop.core.pumpHook()
-      if cap >= 0:
-        timeoutMs = min(timeoutMs, max(1, cap))
+    if loop.pumpCap >= 0:
+      # An adapter has pending async operations: bound the wait so
+      # timer/IO completions from its dispatcher aren't starved.
+      timeoutMs = min(timeoutMs, max(1, loop.pumpCap))
     when not defined(plainHttp):
       if loop.quicListener != nil:
         let qt = quicEventTimeoutMs(loop.quicListener)
@@ -634,6 +634,11 @@ proc run*(loop: Loop) =
           loop.h3Drive()
         except Exception:
           discard
+    if loop.core.pumpHook != nil:
+      # Pump at the end of the iteration so callbacks scheduled while
+      # handling this batch (e.g. an await that completed immediately)
+      # finish in the same pass instead of after a selector timeout.
+      loop.pumpCap = loop.core.pumpHook()
     loop.tick()
   when not defined(plainHttp):
     if loop.quicListener != nil:

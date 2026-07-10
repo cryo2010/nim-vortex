@@ -28,6 +28,11 @@ proc hBoom(req: Request, params: PathParams) {.async.} =
   await sleepAsync(10)
   raise newException(ValueError, "async exploded")
 
+proc hBoomSync(req: Request, params: PathParams) {.async.} =
+  # Fails before any await: the future completes (failed) synchronously,
+  # exercising the finished-future fast path in the adapter.
+  raise newException(ValueError, "sync exploded")
+
 proc hBlockingInside(req: Request, params: PathParams) {.async.} =
   await sleepAsync(10)
   req.blocking:                          # sync escape inside async
@@ -40,6 +45,7 @@ appRouter.get("/delay", hDelay)
 appRouter.get("/hello/:name", hCapture)
 appRouter.get("/fan", hFanIn)
 appRouter.get("/boom", hBoom)
+appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
 
 var srv = start(appRouter.toHandler,
@@ -93,6 +99,11 @@ suite "asyncdispatch adapter":
     var client = newHttpClient()
     defer: client.close()
     check client.get(base & "/boom").code == Http500
+
+  test "exception before first await gives 500 (fast path)":
+    var client = newHttpClient()
+    defer: client.close()
+    check client.get(base & "/boomsync").code == Http500
 
   test "blocking: works inside an async handler":
     check fetch("/worker") == "worker done"
