@@ -58,6 +58,15 @@ template withConn(req: Request, c, body: untyped) =
 proc lowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
 
+var cachedThreadId {.threadvar.}: int
+
+proc currentThreadId(): int {.inline.} =
+  ## getThreadId() is a syscall on Linux; caching it matters on the
+  ## per-request fast path.
+  if cachedThreadId == 0:
+    cachedThreadId = getThreadId()
+  cachedThreadId
+
 # --- accessors --------------------------------------------------------------
 
 proc parseMethodStr(s: string): HttpMethod =
@@ -227,7 +236,7 @@ proc respond*(req: Request, code: HttpCode, body: openArray[char],
   ## Queue a response. Safe to call once per request, from the handler,
   ## later (deferred), or from a worker thread inside `blocking:`; no-op
   ## if the connection is already gone.
-  if getThreadId() != req.core.threadId:
+  if currentThreadId() != req.core.threadId:
     # Worker thread: pack protocol-neutrally; the loop serializes.
     push(req.core.outbox, OutMsg(
       fd: req.fd, gen: req.gen, stream: req.stream, code: int32(code),
