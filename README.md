@@ -91,3 +91,14 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 
 Pre-1.0. Deferred (planned): WebSockets, streaming request/response
 bodies, async runtime adapters, dynamic QPACK, h2c upgrade, Windows.
+
+## Thanks
+
+- [httpbeast](https://github.com/dom96/httpbeast) proved the
+  architecture this server is built on: one event loop per thread over
+  `SO_REUSEPORT` listeners with handlers running inline. This package is
+  in many ways a from-scratch continuation of that design with the
+  protocol gaps (chunked bodies, HTTP/2, HTTP/3) filled in.
+- [mummy](https://github.com/guzba/mummy) made the case that blocking
+  handler code deserves first-class support instead of async coloring;
+  its worker-pool design directly shaped `blocking:`.
