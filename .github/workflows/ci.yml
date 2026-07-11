@@ -39,3 +39,29 @@ jobs:
         run: >-
           nim c --mm:orc --threads:on -d:plainHttp
           -o:/tmp/vortex_plain src/vortex.nim
+
+  # The REDbot and fuzz checks ship as Docker images (bundling REDbot and
+  # the libFuzzer runtime). These jobs run on the plain runner, where
+  # Docker is available, so they exercise the images themselves. The image
+  # base defaults to arm64, so override it for the x86_64 runners. Each
+  # tool exits non-zero on a finding, which fails the job.
+  redbot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: HTTP/1.1 conformance (REDbot)
+        run: |
+          docker build -f conformance/Dockerfile -t vortex-redbot \
+            --build-arg BASE=archlinux:latest .
+          docker run --rm vortex-redbot
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fuzz the parser/HPACK/QPACK decoders
+        # 30s per target; a crash writes a reproducer and exits non-zero.
+        run: |
+          docker build -f fuzz/Dockerfile -t vortex-fuzz \
+            --build-arg BASE=archlinux:latest .
+          docker run --rm -e DUR=30 vortex-fuzz
