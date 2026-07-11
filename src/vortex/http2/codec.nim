@@ -43,28 +43,39 @@ type
     maxBody*: int
     maxHeaderList*: int
     activeStreams*: int
+    # DoS budgets (0 disables). rstStreamCount / controlFrameCount are
+    # per-connection cumulative; controlFrameCount resets on stream progress.
+    maxConcurrentStreams*: int
+    maxResetStreams*: int
+    maxControlFrames*: int
+    rstStreamCount*: int
+    controlFrameCount*: int
 
 const
   ourMaxFrameSize = defaultMaxFrameSize
-  ourMaxConcurrentStreams = 256'u32
 
 proc h2Conn*(c: ptr Connection): H2Conn {.inline.} =
   H2Conn(c.h2)
 
-proc newH2Conn*(maxBody, maxHeaderList: int): H2Conn =
+proc newH2Conn*(maxBody, maxHeaderList, maxConcurrentStreams,
+                maxResetStreams, maxControlFrames: int): H2Conn =
   H2Conn(
-    decoder: initHpackDecoder(4096),
+    decoder: initHpackDecoder(4096, maxDecoded = maxHeaderList),
     connSendWindow: defaultInitialWindow,
     peerMaxFrame: defaultMaxFrameSize,
     peerInitialWindow: defaultInitialWindow,
     maxBody: maxBody,
-    maxHeaderList: maxHeaderList)
+    maxHeaderList: maxHeaderList,
+    maxConcurrentStreams: maxConcurrentStreams,
+    maxResetStreams: maxResetStreams,
+    maxControlFrames: maxControlFrames)
 
 proc sendOurSettings(c: ptr Connection) =
   var payload = ""
   payload.addSetting(setHeaderTableSize, 4096)
   payload.addSetting(setEnablePush, 0)
-  payload.addSetting(setMaxConcurrentStreams, ourMaxConcurrentStreams)
+  payload.addSetting(setMaxConcurrentStreams,
+                     uint32(h2Conn(c).maxConcurrentStreams))
   payload.addSetting(setMaxFrameSize, uint32(ourMaxFrameSize))
   c.wbuf.addFrameHeader(payload.len, ftSettings, 0, 0)
   c.wbuf.add payload
@@ -79,6 +90,14 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
   if sid in h2.streams:
     h2.streams.del(sid)
     dec h2.activeStreams
+
+proc noteControlFrame(h2: H2Conn, c: ptr Connection) =
+  ## Budget PING/SETTINGS/PRIORITY floods (each queues an ACK or is pure
+  ## overhead). The counter resets when a real request arrives, so only
+  ## floods with no intervening stream progress trip it.
+  inc h2.controlFrameCount
+  if h2.maxControlFrames > 0 and h2.controlFrameCount > h2.maxControlFrames:
+    h2.connError(c, errEnhanceYourCalm)
 
 # --- response serialization ------------------------------------------------
 
@@ -331,12 +350,14 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.connError(c, errStreamClosed); return  # closed stream reuse
       if h2.goingAway:
         h2.streamError(c, sid, errRefusedStream); return
-      if uint32(h2.activeStreams) >= ourMaxConcurrentStreams:
+      if h2.maxConcurrentStreams > 0 and
+          h2.activeStreams >= h2.maxConcurrentStreams:
         h2.streamError(c, sid, errRefusedStream); return
       h2.lastStreamId = sid
       h2.streams[sid] = H2Stream(
         sendWindow: h2.peerInitialWindow, contentLength: -1)
       inc h2.activeStreams
+      h2.controlFrameCount = 0       # a real request: reset the flood budget
     h2.headerBlock.setLen(0)
     for i in 0 ..< fragLen:
       h2.headerBlock.add c.rbuf[fragStart + i]
@@ -366,6 +387,8 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       if fh.length != 0: h2.connError(c, errFrameSize)
       return
     if fh.length mod 6 != 0: h2.connError(c, errFrameSize); return
+    h2.noteControlFrame(c)
+    if c.state == csClosing: return
     var i = 0
     while i < fh.length:
       let id = get16(c.rbuf, payloadPos + i)
@@ -392,6 +415,8 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.streamId != 0: h2.connError(c, errProtocol); return
     if fh.length != 8: h2.connError(c, errFrameSize); return
     if (fh.flags and flagAck) == 0:
+      h2.noteControlFrame(c)
+      if c.state == csClosing: return
       c.wbuf.addPingAck(c.rbuf.toOpenArray(payloadPos, payloadPos + 7))
 
   of ftWindowUpdate:
@@ -427,12 +452,19 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.streamId in h2.streams:
       h2.streams.del(fh.streamId)
       dec h2.activeStreams
+    # Rapid Reset (CVE-2023-44487): a peer that opens then immediately
+    # resets streams costs handler work while never holding concurrency.
+    # Cap cumulative resets per connection.
+    inc h2.rstStreamCount
+    if h2.maxResetStreams > 0 and h2.rstStreamCount > h2.maxResetStreams:
+      h2.connError(c, errEnhanceYourCalm)
 
   of ftPriority:
     if fh.streamId == 0: h2.connError(c, errProtocol); return
     if fh.length != 5: h2.connError(c, errFrameSize); return
     if (get32(c.rbuf, payloadPos) and 0x7fffffff'u32) == fh.streamId:
-      h2.connError(c, errProtocol)   # self-dependency
+      h2.connError(c, errProtocol); return   # self-dependency
+    h2.noteControlFrame(c)         # PRIORITY has no productive use here
     # Otherwise ignored (RFC 9113 deprecates the priority tree).
 
   of ftGoaway:

@@ -1,0 +1,31 @@
+# Security posture
+
+Threats defended against, with the test that proves it. Thresholds are
+configurable in initSettings (maxConnections, maxConcurrentStreams,
+maxResetStreams, maxControlFrames, maxHeaderSize, maxBodySize, *Timeout).
+
+- HTTP/2 rapid reset (CVE-2023-44487)   maxResetStreams -> GOAWAY; reset
+    streams skip handler dispatch. test_security_dos
+- HTTP/2 framing floods (PING/SETTINGS/PRIORITY)   maxControlFrames budget,
+    reset on stream progress -> GOAWAY. test_security_dos
+    (WINDOW_UPDATE floods self-limit via the flow-control overflow check.)
+- HPACK decompression bomb   decode aborts past maxDecoded (= maxHeaderList).
+    QPACK is capacity-0, so no dynamic-table amplification. test_security_parsing
+- Request smuggling (CL/TE)   CL+TE reject, dup-CL reject, space-in-name,
+    TE-must-be-chunked, CRLF required. test_security_parsing
+- Slowloris / slow-body   header/body/idle timeout wheel. test_security_dos
+- Oversized header/body   431 / 413 via maxHeaderSize / maxBodySize.
+    test_http1_parser (status), test_security_dos (rejected-not-served)
+- Integer overflow   Content-Length and chunk-size guards. test_security_parsing
+- Memory (many conns / streams)   maxConnections accept-and-drop;
+    maxConcurrentStreams per h2/h3 connection. test_security_dos
+
+## Follow-ups (not yet addressed)
+- Reliable error-response delivery: an error + close while request bytes
+  remain unread can RST-truncate the 4xx (a courtesy, not a defense gap;
+  the request is still rejected). A bounded drain / half-close would fix it.
+- h2 read-buffer sizing: the h1 flood guard (maxHeaderSize + maxBodySize)
+  also bounds the h2 receive buffer; large h2 frame bursts want a dedicated
+  cap so tight h1 limits don't cap h2 buffering.
+- Fuzzing: libFuzzer harness over parser.parse / HPACK / QPACK decoders.
+- Per-IP connection limits (needs peer-addr plumbing); h3spec conformance.

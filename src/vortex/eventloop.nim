@@ -45,6 +45,7 @@ type
     udpFd: int                   # -1 = no HTTP/3
     quicListener: pointer        # SSL* listener
     h3Ready: seq[uint64]         # reused h3 dispatch buffer
+    connCount: int               # live TCP connections (maxConnections cap)
 
 proc monoSec(): int64 {.inline.} =
   getMonoTime().ticks div 1_000_000_000
@@ -180,6 +181,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   inc c.gen
   c.state = csFree
   c.closeRequested = false
+  dec loop.connCount
 
 proc armWrite(loop: Loop, c: ptr Connection) =
   if not c.writeArmed:
@@ -246,6 +248,10 @@ proc h2Input(loop: Loop, c: ptr Connection) =
   h2Feed(c, loop.readyStreams)
   for sid in loop.readyStreams:
     if c.state == csClosing: break
+    # Rapid Reset: a stream can be RST in the same read batch after it was
+    # queued as ready. Skip it so the handler (and any blocking: worker
+    # task) never runs for an already-cancelled request.
+    if not h2StreamAlive(c, sid): continue
     let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen,
                       stream: sid)
     try:
@@ -263,7 +269,10 @@ proc h2Input(loop: Loop, c: ptr Connection) =
       c.dlKind = dkNone
 
 proc initH2(loop: Loop, c: ptr Connection) =
-  c.h2 = newH2Conn(loop.settings.maxBodySize, loop.settings.maxHeaderSize)
+  c.h2 = newH2Conn(loop.settings.maxBodySize, loop.settings.maxHeaderSize,
+                   loop.settings.maxConcurrentStreams,
+                   loop.settings.maxResetStreams,
+                   loop.settings.maxControlFrames)
 
 proc processInput(loop: Loop, c: ptr Connection) =
   ## Parse and dispatch as many complete pipelined requests as the buffer
@@ -447,11 +456,18 @@ proc handleAccept(loop: Loop) =
       discard setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE,
                          addr one, SockLen(sizeof(one)))
     let fd = int(client)
+    # Connection cap: accept then immediately drop beyond the limit, which
+    # keeps the accept queue clear rather than letting it back up.
+    if loop.settings.maxConnections > 0 and
+        loop.connCount >= loop.settings.maxConnections:
+      discard posix.close(client)
+      continue
     if fd >= loop.core.conns.len:
       loop.core.conns.setLen(fd + 64)
     let c = addr loop.core.conns[fd]
     c.fd = int32(fd)
     c[].clear(loop.settings.initialBufferSize)
+    inc loop.connCount
     when not defined(plainHttp):
       if loop.tls != nil:
         c.ssl = newTlsSession(cast[ptr TlsConfig](loop.tls), cint(fd))
@@ -459,6 +475,7 @@ proc handleAccept(loop: Loop) =
           discard posix.close(client)
           inc c.gen
           c.state = csFree
+          dec loop.connCount
           continue
         c.handshaking = true
     c.setDeadline(loop, dkHeader)   # handshake counts toward header timeout
@@ -494,7 +511,8 @@ when not defined(plainHttp):
         loop.core.h3slots.add H3SlotEntry()
         idx = loop.core.h3slots.len - 1
       loop.core.h3slots[idx].conn =
-        newH3Conn(connSsl, idx, loop.settings.maxBodySize)
+        newH3Conn(connSsl, idx, loop.settings.maxBodySize,
+                  loop.settings.maxConcurrentStreams)
     for idx in 0 ..< loop.core.h3slots.len:
       let slot = addr loop.core.h3slots[idx]
       if slot.conn == nil: continue

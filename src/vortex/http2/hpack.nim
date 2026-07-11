@@ -17,9 +17,11 @@ type
     size: int                 ## RFC size: sum(name+value+32)
     maxSize*: int             ## current limit (after size-update instr.)
     settingsMax*: int         ## cap we advertised via SETTINGS
+    maxDecoded*: int          ## cap on total decoded field-list size (bomb guard)
 
-proc initHpackDecoder*(settingsMax = 4096): HpackDecoder =
-  HpackDecoder(maxSize: settingsMax, settingsMax: settingsMax)
+proc initHpackDecoder*(settingsMax = 4096, maxDecoded = 64 * 1024): HpackDecoder =
+  HpackDecoder(maxSize: settingsMax, settingsMax: settingsMax,
+               maxDecoded: maxDecoded)
 
 # --- Huffman decode tree, built at compile time --------------------------
 
@@ -144,13 +146,20 @@ proc decodeHeaderBlock*(d: var HpackDecoder, buf: openArray[char],
   ## Decode a complete header block (caller assembles CONTINUATIONs first).
   var pos = start
   var seenHeader = false
+  var decoded = 0                # accumulated field-list size (bomb guard)
+  template accrue(n, v: string) =
+    decoded += n.len + v.len + 32
+    if d.maxDecoded > 0 and decoded > d.maxDecoded:
+      raise newException(HpackError, "decoded header list too large")
   while pos < endPos:
     let b = uint8(buf[pos])
     if (b and 0x80) != 0:
       # Indexed header field.
       let idx = decodeInt(buf, pos, endPos, 7)
       if idx == 0: raise newException(HpackError, "index 0")
-      headers.add d.lookup(idx)
+      let (n, v) = d.lookup(idx)
+      accrue(n, v)
+      headers.add (n, v)
       seenHeader = true
     elif (b and 0xc0) == 0x40:
       # Literal with incremental indexing.
@@ -161,6 +170,7 @@ proc decodeHeaderBlock*(d: var HpackDecoder, buf: openArray[char],
       else:
         name = d.lookup(nameIdx)[0]
       decodeString(buf, pos, endPos, value)
+      accrue(name, value)
       d.addEntry(name, value)
       headers.add (name, value)
       seenHeader = true
@@ -182,6 +192,7 @@ proc decodeHeaderBlock*(d: var HpackDecoder, buf: openArray[char],
       else:
         name = d.lookup(nameIdx)[0]
       decodeString(buf, pos, endPos, value)
+      accrue(name, value)
       headers.add (name, value)
       seenHeader = true
 

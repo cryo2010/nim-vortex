@@ -42,6 +42,7 @@ type
     ctrlBuf: string
     ctrlPos: int
     maxBody: int
+    maxConcurrentStreams: int
     scratch: string
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
@@ -52,8 +53,10 @@ proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
     return nil
   H3Conn(core.h3slots[idx].conn)
 
-proc newH3Conn*(ssl: SslPtr, slot: int, maxBody: int): H3Conn =
-  result = H3Conn(ssl: ssl, slot: slot, maxBody: maxBody)
+proc newH3Conn*(ssl: SslPtr, slot: int, maxBody,
+                maxConcurrentStreams: int): H3Conn =
+  result = H3Conn(ssl: ssl, slot: slot, maxBody: maxBody,
+                  maxConcurrentStreams: maxConcurrentStreams)
   result.scratch = newString(4096)
   # Our control stream: stream type + SETTINGS (QPACK capacity 0).
   result.ctrl = quicNewUniStream(ssl)
@@ -246,7 +249,14 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
     let s = quicAcceptStream(conn.ssl)
     if s == nil: break
     if quicStreamIsBidi(s):
-      conn.streams[quicStreamId(s)] = H3Stream(ssl: s, id: quicStreamId(s))
+      # Concurrent-stream cap: refuse (conclude + free) rather than admit
+      # unbounded request streams on one QUIC connection.
+      if conn.maxConcurrentStreams > 0 and
+          conn.streams.len >= conn.maxConcurrentStreams:
+        quicConclude(s)
+        quicFree(s)
+      else:
+        conn.streams[quicStreamId(s)] = H3Stream(ssl: s, id: quicStreamId(s))
     else:
       conn.unis.add s
   # Drain peer uni streams (control/QPACK); contents are ignored in
