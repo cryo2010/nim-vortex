@@ -146,5 +146,31 @@ suite "http/1.1 integration":
     s.connect("127.0.0.1", port)
     check s.waitForClose()
 
+var capSrv = start(RequestHandler(handler),
+                   initSettings(port = Port(0), numThreads = 1,
+                                maxRequestsPerSocket = 3))
+
+suite "maxRequestsPerSocket":
+  test "connection is closed after the request cap":
+    # Five pipelined keep-alive requests, but only three are served; the
+    # third carries Connection: close and the socket closes after it.
+    var req = ""
+    for i in 0 ..< 5:
+      req.add "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    let resp = rawExchange(capSrv.port, req)
+    check resp.count("HTTP/1.1 200") == 3
+    check "Connection: close" in resp
+
+  test "requests below the cap keep the connection alive":
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", capSrv.port)
+    for i in 0 ..< 2:                 # under the cap of 3
+      s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      check "200" in s.recvAvailable(1000)
+    # Connection is still open (not closed by the cap).
+    check not s.waitForClose(tries = 2, stepMs = 200)
+
+capSrv.close()
 srv.close()
 echo "server shut down cleanly"

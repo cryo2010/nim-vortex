@@ -24,6 +24,7 @@ type
     maxConcurrentStreams*: int    ## open h2/h3 streams per connection
     maxResetStreams*: int         ## h2 peer resets before GOAWAY (rapid reset)
     maxControlFrames*: int        ## h2 PING/SETTINGS/etc. between stream progress
+    maxRequestsPerSocket*: int    ## HTTP/1 keep-alive requests before close
 
     # Timeouts (seconds, coarse; 0 disables)
     headerTimeout*: int       ## from first byte of a request to end of headers
@@ -56,6 +57,7 @@ proc initSettings*(
     maxConcurrentStreams = 256,
     maxResetStreams = 512,
     maxControlFrames = 1000,
+    maxRequestsPerSocket = 0,
     headerTimeout = 10,
     bodyTimeout = 30,
     keepAliveTimeout = 60,
@@ -77,6 +79,7 @@ proc initSettings*(
     maxConnections: maxConnections,
     maxConcurrentStreams: maxConcurrentStreams,
     maxResetStreams: maxResetStreams, maxControlFrames: maxControlFrames,
+    maxRequestsPerSocket: maxRequestsPerSocket,
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
