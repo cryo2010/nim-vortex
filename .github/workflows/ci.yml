@@ -1,8 +1,15 @@
 name: CI
 
+# pull_request gates PRs; push only fires for main (a PR merge is a push
+# to main), giving a post-merge run without duplicating the PR check.
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
