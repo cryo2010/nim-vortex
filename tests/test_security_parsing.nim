@@ -22,19 +22,19 @@ proc parseAll(data: string, lim = limits()): (ParseResult, HttpCode) =
 suite "request smuggling should be rejected":
   test "Content-Length with Transfer-Encoding should be rejected":
     let (res, _) = parseAll(
-      "POST / HTTP/1.1\r\nContent-Length: 5\r\n" &
+      "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n" &
       "Transfer-Encoding: chunked\r\n\r\n")
     check res == prError
 
   test "Transfer-Encoding then Content-Length should be rejected":
     let (res, _) = parseAll(
-      "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n" &
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n" &
       "Content-Length: 5\r\n\r\n")
     check res == prError
 
   test "duplicate Content-Length should be rejected":
     let (res, _) = parseAll(
-      "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n")
+      "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n")
     check res == prError
 
   test "bare LF line ending should be rejected":
@@ -43,41 +43,41 @@ suite "request smuggling should be rejected":
 
   test "non-chunked Transfer-Encoding should be rejected":
     let (res, status) = parseAll(
-      "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n")
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
     check res == prError
     check status == Http501
 
   test "space in field name should be rejected":
-    let (res, _) = parseAll("GET / HTTP/1.1\r\nBad Header: x\r\n\r\n")
+    let (res, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nBad Header: x\r\n\r\n")
     check res == prError
 
   test "obs-fold continuation line should be rejected":
     let (res, _) = parseAll(
-      "GET / HTTP/1.1\r\nX-A: value\r\n folded: c\r\n\r\n")
+      "GET / HTTP/1.1\r\nHost: x\r\nX-A: value\r\n folded: c\r\n\r\n")
     check res == prError
 
   test "chunk extensions should be tolerated":
     let (res, _) = parseAll(
-      "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" &
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
       "5;name=value\r\nhello\r\n0\r\n\r\n")
     check res == prComplete
 
 suite "integer overflow should not wrap":
   test "oversized Content-Length should give 413 not wraparound":
     let (res, status) = parseAll(
-      "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n")
+      "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999999999999\r\n\r\n")
     check res == prError
     check status == Http413
 
   test "oversized chunk size should give 413 not wraparound":
     let (res, status) = parseAll(
-      "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" &
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
       "FFFFFFFFFFFFFFFF\r\n")
     check res == prError
     check status == Http413
 
   test "non-numeric Content-Length should be rejected":
-    let (res, _) = parseAll("POST / HTTP/1.1\r\nContent-Length: 1e9\r\n\r\n")
+    let (res, _) = parseAll("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1e9\r\n\r\n")
     check res == prError
 
 proc encodeInt7(buf: var string, value: int, firstByte: uint8) =

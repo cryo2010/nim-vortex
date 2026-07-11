@@ -36,7 +36,7 @@ proc headerOf(p: RequestParser, data: string, i: int): (string, string) =
 
 suite "request line":
   test "simple GET":
-    let (res, p, _) = parseAll("GET /foo/bar?q=1 HTTP/1.1\r\n\r\n")
+    let (res, p, _) = parseAll("GET /foo/bar?q=1 HTTP/1.1\r\nHost: x\r\n\r\n")
     check res == prComplete
     check p.httpMethod == HttpGet
     check p.pathOf("GET /foo/bar?q=1 HTTP/1.1\r\n\r\n") == "/foo/bar?q=1"
@@ -49,7 +49,7 @@ suite "request line":
     check not p.keepAlive
 
   test "leading CRLF tolerated":
-    let (res, p, _) = parseAll("\r\nGET / HTTP/1.1\r\n\r\n")
+    let (res, p, _) = parseAll("\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n")
     check res == prComplete
     check p.httpMethod == HttpGet
 
@@ -58,12 +58,12 @@ suite "request line":
                    ("PUT", HttpPut), ("DELETE", HttpDelete),
                    ("OPTIONS", HttpOptions), ("PATCH", HttpPatch),
                    ("TRACE", HttpTrace), ("CONNECT", HttpConnect)]:
-      let (res, p, _) = parseAll(m & " / HTTP/1.1\r\n\r\n")
+      let (res, p, _) = parseAll(m & " / HTTP/1.1\r\nHost: x\r\n\r\n")
       check res == prComplete
       check p.httpMethod == e
 
   test "unknown method rejected":
-    let (res, p, _) = parseAll("BREW / HTTP/1.1\r\n\r\n")
+    let (res, p, _) = parseAll("BREW / HTTP/1.1\r\nHost: x\r\n\r\n")
     check res == prError
     check p.errorStatus == Http501
 
@@ -91,7 +91,7 @@ suite "headers":
     check p.headerOf(data, 1) == ("X-Pad", "spaced")
 
   test "connection close":
-    let (res, p, _) = parseAll("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")
+    let (res, p, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
     check res == prComplete
     check not p.keepAlive
 
@@ -103,16 +103,36 @@ suite "headers":
 
   test "expect 100-continue":
     let (res, p, _) = parseByByte(
-      "POST / HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
+      "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
     check res == prComplete
     check p.expectContinue
 
+suite "Host header (RFC 9112 3.2)":
+  test "HTTP/1.1 without Host is rejected":
+    let (res, p, _) = parseAll("GET / HTTP/1.1\r\n\r\n")
+    check res == prError
+    check p.errorStatus == Http400
+
+  test "HTTP/1.1 with Host is accepted":
+    let (res, _, _) = parseAll("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    check res == prComplete
+
+  test "HTTP/1.1 with duplicate Host is rejected":
+    let (res, p, _) = parseAll(
+      "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")
+    check res == prError
+    check p.errorStatus == Http400
+
+  test "HTTP/1.0 without Host is accepted":
+    let (res, _, _) = parseAll("GET / HTTP/1.0\r\n\r\n")
+    check res == prComplete
+
   test "space in field name rejected":
-    let (res, _, _) = parseAll("GET / HTTP/1.1\r\nBad Header: x\r\n\r\n")
+    let (res, _, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nBad Header: x\r\n\r\n")
     check res == prError
 
   test "too many headers":
-    var data = "GET / HTTP/1.1\r\n"
+    var data = "GET / HTTP/1.1\r\nHost: x\r\n"
     for i in 0 ..< 6: data.add "H" & $i & ": v\r\n"
     data.add "\r\n"
     let (res, p, _) = parseAll(data, limits(maxHeaderCount = 5))
@@ -120,54 +140,54 @@ suite "headers":
     check p.errorStatus == Http431
 
   test "oversized headers":
-    var data = "GET / HTTP/1.1\r\nX-Big: " & repeat('a', 300) & "\r\n\r\n"
+    var data = "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 300) & "\r\n\r\n"
     let (res, p, _) = parseAll(data, limits(maxHeaderSize = 128))
     check res == prError
     check p.errorStatus == Http431
 
 suite "bodies":
   test "content-length body":
-    let data = "POST /e HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
+    let data = "POST /e HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
     let (res, p, _) = parseAll(data)
     check res == prComplete
     check p.contentLength == 11
     check data.substr(p.bodyStart, p.bodyStart + p.bodyLen - 1) == "hello world"
 
   test "content-length body split across reads":
-    let data = "POST /e HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
+    let data = "POST /e HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
     let (res, p, _) = parseByByte(data)
     check res == prComplete
     check data.substr(p.bodyStart, p.bodyStart + p.bodyLen - 1) == "hello world"
 
   test "invalid content-length":
-    let (res, p, _) = parseAll("POST / HTTP/1.1\r\nContent-Length: 1x\r\n\r\n")
+    let (res, p, _) = parseAll("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1x\r\n\r\n")
     check res == prError
     check p.errorStatus == Http400
 
   test "duplicate content-length":
     let (res, _, _) = parseAll(
-      "POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab")
+      "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab")
     check res == prError
 
   test "content-length plus transfer-encoding rejected":
-    let (res, _, _) = parseAll("POST / HTTP/1.1\r\nContent-Length: 2\r\n" &
+    let (res, _, _) = parseAll("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n" &
       "Transfer-Encoding: chunked\r\n\r\n")
     check res == prError
 
   test "body over limit":
     let (res, p, _) = parseAll(
-      "POST / HTTP/1.1\r\nContent-Length: 2000000\r\n\r\n")
+      "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n")
     check res == prError
     check p.errorStatus == Http413
 
   test "unknown transfer-encoding":
     let (res, p, _) = parseAll(
-      "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n")
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
     check res == prError
     check p.errorStatus == Http501
 
 suite "chunked":
-  const chunked = "POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" &
+  const chunked = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
                   "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n"
 
   test "chunked body decoded":
@@ -182,33 +202,33 @@ suite "chunked":
     check body == "hello world"
 
   test "chunked with trailers":
-    let data = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" &
+    let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
                "3\r\nabc\r\n0\r\nX-Trailer: v\r\n\r\n"
     let (res, _, body) = parseAll(data)
     check res == prComplete
     check body == "abc"
 
   test "chunked over limit":
-    let data = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" &
+    let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
                "FFFFF\r\n"
     let (res, p, _) = parseAll(data, limits(maxBodySize = 1024))
     check res == prError
     check p.errorStatus == Http413
 
   test "bad chunk size":
-    let data = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
+    let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
     let (res, _, _) = parseAll(data)
     check res == prError
 
   test "missing chunk CRLF":
-    let data = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" &
+    let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
                "3\r\nabcXX"
     let (res, _, _) = parseAll(data)
     check res == prError
 
 suite "pipelining":
   test "two requests back to back":
-    let data = "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n"
+    let data = "GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"
     var p: RequestParser
     p.reset(0)
     var body = ""
