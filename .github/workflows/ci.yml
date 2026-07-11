@@ -19,6 +19,12 @@ jobs:
     # HTTP/3 integration tests skip themselves when no HTTP/3-capable curl
     # is present, so they are effectively h1 + h2 + TLS here.
     container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]         # memory managers; orc is the recommended one
+    env:
+      NIM_MM: ${{ matrix.mm }}   # tests/config.nims reads this
     steps:
       - name: Install toolchain
         # --disable-sandbox: pacman's Landlock sandbox cannot apply in a
@@ -37,8 +43,22 @@ jobs:
 
       - name: Build zero-dependency variant
         run: >-
-          nim c --mm:orc --threads:on -d:plainHttp
+          nim c --mm:${{ matrix.mm }} --threads:on -d:plainHttp
           -o:/tmp/vortex_plain src/vortex.nim
+
+  testchronos:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git curl openssl
+      - uses: actions/checkout@v7
+      - name: Test the chronos adapter
+        # chronos is an opt-in dependency kept out of the default nimble
+        # test; this installs it and runs the adapter's own suite (orc).
+        run: nimble testchronos -y
 
   # The REDbot and fuzz checks ship as Docker images (bundling REDbot and
   # the libFuzzer runtime). These jobs run on the plain runner, where
