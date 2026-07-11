@@ -229,8 +229,9 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 - `nimble test`: parser/HPACK/QPACK unit tests (RFC vectors) plus
   integration suites for h1, h2 (curl), h3 (h3-capable curl), TLS,
   worker pool, and router.
-- HTTP/2 conformance: `h2spec -t -k -p <port>` passes 145/146 (1 skipped,
-  0 failed) against a TLS server.
+- HTTP/2 conformance: `nimble h2spec` runs
+  [h2spec](https://github.com/summerwind/h2spec) over TLS in Docker and
+  fails on any failed test. See [conformance/h2spec/](conformance/h2spec/).
 - HTTP/1.1 conformance: `nimble redbot` runs [REDbot](https://redbot.org)
   against a live server in Docker and fails on any BAD-level finding (or
   `sh conformance/run.sh` with a host REDbot). See
