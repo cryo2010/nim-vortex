@@ -121,6 +121,12 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
   0 failed) against a TLS server.
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
 
+## Security
+
+Rapid Reset, framing floods, decompression bombs, request smuggling,
+slowloris, and resource exhaustion are defended with configurable limits
+and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
+
 ## Status
 
 Pre-1.0. Deferred (planned): WebSockets, streaming request/response
