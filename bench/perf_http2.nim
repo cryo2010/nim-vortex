@@ -2,7 +2,10 @@
 ##
 ## No other Nim server speaks HTTP/2, so this measures vortex
 ## against itself: HTTP/2 vs HTTP/1.1 protocol overhead on the same
-## server, and h2 multi-thread vs single-thread scaling.
+## server, and h2 multi-thread vs single-thread scaling. The
+## h2-async-await and h2-chronos-await rows run a suspending handler
+## through each async adapter: on h2 the streams are independent, so the
+## per-request suspend cost that dominates pipelined h1 largely hides.
 ##
 ##   perf_http2                    orchestrator (spawns itself as servers)
 ##   perf_http2 serve <name> <port>
@@ -23,6 +26,7 @@ import ../src/vortex
 import ../src/vortex/adapters/asyncdispatch as nhsasync
 import ../src/vortex/http2/frames
 import ./perf_common
+from ./perf_srv_vortex_chronos import serveOursChronos
 
 const
   benchSeconds {.intdefine.} = 5
@@ -176,6 +180,7 @@ proc orchestrate() =
   bench("h2", "nhs", 9201, h2ClientLoop, benchStreams)
   bench("h2-1thread", "nhs-1t", 9202, h2ClientLoop, benchStreams)
   bench("h2-async-await", "nhs-async", 9204, h2ClientLoop, benchStreams)
+  bench("h2-chronos-await", "nhs-chronos", 9205, h2ClientLoop, benchStreams)
   bench("h1 (same server)", "nhs", 9203, h1ClientLoop, benchDepth)
   report(results)
 
@@ -186,6 +191,7 @@ when isMainModule:
     of "nhs": serveOurs(port, 0)
     of "nhs-1t": serveOurs(port, 1)
     of "nhs-async": serveOursAsync(port)
+    of "nhs-chronos": serveOursChronos(port, doAwait = true)
     else: quit "unknown server: " & paramStr(2)
   else:
     orchestrate()
