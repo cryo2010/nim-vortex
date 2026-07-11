@@ -42,7 +42,9 @@ type
     csDraining   ## half-closed; read and discard peer bytes, then close
 
   DeadlineKind* = enum
-    dkNone, dkHeader, dkBody, dkIdle, dkDrain
+    dkNone, dkHeader, dkBody, dkIdle, dkDrain,
+    dkWsPing,   ## WebSocket idle: send a keepalive ping when it expires
+    dkWsPong    ## ping sent: close the connection if it expires with no reply
 
   Connection* = object
     fd*: int32
@@ -96,6 +98,7 @@ type
     serverHeader*: string
     nowSec*: int64            ## coarse monotonic seconds, updated per tick
     maxWsMessage*: int        ## largest inbound WebSocket message (bytes)
+    wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox

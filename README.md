@@ -156,8 +156,12 @@ ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
 
 Works over `ws://` and, with a cert, `wss://`. Fragmented messages are
 reassembled (bounded by `maxWsMessageSize`), ping/pong and the close
-handshake are handled for you, and text is validated as UTF-8. HTTP/1.1
-only for now (HTTP/2 per RFC 8441 is not yet supported).
+handshake are handled for you, and text is validated as UTF-8. Idle
+connections are kept alive and half-open ones reaped automatically: after
+`wsPingInterval` seconds without a frame the server sends a ping, and if no
+reply arrives within `wsPongTimeout` it closes the connection (set
+`wsPingInterval = 0` to disable). HTTP/1.1 only for now (HTTP/2 per RFC
+8441 is not yet supported).
 
 ## Handler rules
 
