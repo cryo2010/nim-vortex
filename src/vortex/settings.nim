@@ -15,6 +15,12 @@ type
     maxBodySize*: int         ## 413 when exceeded
     initialBufferSize*: int   ## per-connection read/write buffer starting size
 
+    # DoS budgets (0 disables the check)
+    maxConnections*: int          ## live connections per loop thread
+    maxConcurrentStreams*: int    ## open h2/h3 streams per connection
+    maxResetStreams*: int         ## h2 peer resets before GOAWAY (rapid reset)
+    maxControlFrames*: int        ## h2 PING/SETTINGS/etc. between stream progress
+
     # Timeouts (seconds, coarse; 0 disables)
     headerTimeout*: int       ## from first byte of a request to end of headers
     bodyTimeout*: int         ## from end of headers to end of body
@@ -39,6 +45,10 @@ proc initSettings*(
     maxHeaderCount = 100,
     maxBodySize = 8 * 1024 * 1024,
     initialBufferSize = 8 * 1024,
+    maxConnections = 65536,
+    maxConcurrentStreams = 256,
+    maxResetStreams = 512,
+    maxControlFrames = 1000,
     headerTimeout = 10,
     bodyTimeout = 30,
     keepAliveTimeout = 60,
@@ -53,7 +63,11 @@ proc initSettings*(
     workerThreads: workerThreads, listenBacklog: listenBacklog,
     reusePort: reusePort, maxHeaderSize: maxHeaderSize,
     maxHeaderCount: maxHeaderCount, maxBodySize: maxBodySize,
-    initialBufferSize: initialBufferSize, headerTimeout: headerTimeout,
+    initialBufferSize: initialBufferSize,
+    maxConnections: maxConnections,
+    maxConcurrentStreams: maxConcurrentStreams,
+    maxResetStreams: maxResetStreams, maxControlFrames: maxControlFrames,
+    headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
     certFile: certFile, keyFile: keyFile, http3: http3
