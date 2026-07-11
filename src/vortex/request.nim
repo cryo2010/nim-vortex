@@ -397,27 +397,36 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   except CatchableError:
     res.send(Http500, "500 Internal Server Error", "text/plain")
 
-proc dispatchBlocking*(req: Request, fn: BlockingProc) =
+proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   ## Pin the connection and hand `fn` to the worker pool. Must be called
   ## from the owning loop thread (i.e. inside a handler). Prefer the
   ## `blocking:` template.
-  if req.core.pool == nil:
-    blockingTrampoline(cast[pointer](fn), cast[pointer](req.core),
-                       req.fd, req.gen, req.stream)    # no pool: run inline
-    return
-  if req.fd < 0:
-    let idx = int(-req.fd) - 2
-    if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+  ##
+  ## Declared `{.raises: [].}` so it composes inside strict-effect async
+  ## bodies (chronos `{.async.}` tracks raises and only permits
+  ## CatchableError). Handler exceptions are already contained: in the
+  ## pool this is a pure enqueue, and the no-pool inline path runs the
+  ## trampoline, which turns a failing body into a 500.
+  try:
+    if req.core.pool == nil:
+      blockingTrampoline(cast[pointer](fn), cast[pointer](req.core),
+                         req.fd, req.gen, req.stream)  # no pool: run inline
       return
-    inc req.core.h3slots[idx].pinned
-  else:
-    let c = conn(req.core, req.fd, req.gen)
-    if c == nil: return
-    inc c.pinned
-  enqueue(cast[ptr WorkerPool](req.core.pool),
-          WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
-                     core: cast[pointer](req.core), fd: req.fd,
-                     gen: req.gen, stream: req.stream))
+    if req.fd < 0:
+      let idx = int(-req.fd) - 2
+      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+        return
+      inc req.core.h3slots[idx].pinned
+    else:
+      let c = conn(req.core, req.fd, req.gen)
+      if c == nil: return
+      inc c.pinned
+    enqueue(cast[ptr WorkerPool](req.core.pool),
+            WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
+                       core: cast[pointer](req.core), fd: req.fd,
+                       gen: req.gen, stream: req.stream))
+  except Exception:
+    discard
 
 template blocking*(request: Request, body: untyped) =
   ## Run `body` on the worker pool, where blocking calls (sync DB drivers,
