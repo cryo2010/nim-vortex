@@ -34,3 +34,11 @@ task testchronos, "Test the chronos async adapter (needs chronos)":
 
 task fuzz, "Fuzz the parser/HPACK/QPACK decoders (needs clang + libFuzzer)":
   exec "sh fuzz/run.sh"
+
+task redbot, "HTTP conformance check with REDbot in Docker (needs docker)":
+  # The Dockerfile bundles Nim + REDbot; the image's default base is
+  # arm64, so override it on x86_64 hosts. Exits non-zero on a BAD finding.
+  let base =
+    if hostCPU == "amd64": " --build-arg BASE=archlinux:latest" else: ""
+  exec "docker build -f conformance/Dockerfile -t vortex-redbot" & base & " ."
+  exec "docker run --rm vortex-redbot"

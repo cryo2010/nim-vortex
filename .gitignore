@@ -16,3 +16,5 @@ fuzz/fuzz_hpack
 fuzz/fuzz_qpack
 fuzz/corpus/
 crash-*
+conformance/redbot_server
+conformance/reports/
