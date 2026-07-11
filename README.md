@@ -1,5 +1,9 @@
 # vortex
 
+
+[![CI](https://github.com/cryo2010/nim-vortex/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-vortex/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A fast HTTP server for Nim speaking **HTTP/1.1, HTTP/2, and HTTP/3** from a
 single port and a single handler API.
 
