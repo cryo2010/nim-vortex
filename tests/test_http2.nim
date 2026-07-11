@@ -18,6 +18,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     req.blocking:
       sleep(100)
       res.send(Http200, "slow h2 done", "text/plain")
+  of "/nm":
+    res.send(Http304, "", "text/plain", headers = [("etag", "\"v1\"")])
   else:
     res.send(Http404, "nope", "text/plain")
 
@@ -79,6 +81,14 @@ suite "HTTP/2 (h2c prior knowledge, via curl)":
     check rc == 0
     check "hello h2" in output
     check "slow h2 done" in output
+
+  test "304 omits content-length/content-type but keeps validator":
+    let (output, rc) = h2curl("-D - -o /dev/null " & base & "/nm")
+    check rc == 0
+    check "HTTP/2 304" in output
+    check "content-length" notin output.toLowerAscii
+    check "content-type" notin output.toLowerAscii
+    check "etag: \"v1\"" in output.toLowerAscii
 
   test "HTTP/1.1 still served on the same port":
     var (output, rc) = execCmdEx(

@@ -137,19 +137,24 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
   if h2.streams[sid].responded: return
   h2.streams[sid].responded = true
   let skipBody = h2.streams[sid].isHead
+  # RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
+  # they must not advertise content-length (or content-type). Distinct
+  # from HEAD (skipBody), which keeps the length a GET would have sent.
+  let bodiless = code in 100 .. 199 or code == 204 or code == 304
   var hb = ""
   encodeStatus(hb, code)
   if serverHeader.len > 0:
     encodeHeader(hb, "server", serverHeader)
   encodeHeader(hb, "date", dateStr)
-  if contentType.len > 0:
+  if contentType.len > 0 and not bodiless:
     encodeHeader(hb, "content-type", contentType)
-  encodeHeader(hb, "content-length", $body.len)
+  if not bodiless:
+    encodeHeader(hb, "content-length", $body.len)
   if altSvc.len > 0:
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
     encodeHeader(hb, name.toLowerAscii, val)
-  let noBody = body.len == 0 or skipBody
+  let noBody = body.len == 0 or skipBody or bodiless
   # Header block fits one frame in practice; chunk defensively anyway.
   var off = 0
   var first = true

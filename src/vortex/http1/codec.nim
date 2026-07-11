@@ -66,6 +66,11 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
   ## Serialize a full response. `skipBody` (HEAD) writes the head with the
   ## real Content-Length but omits the body bytes.
   let codeInt = int(code)
+  # RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
+  # they must not advertise Content-Length (or Content-Type). This is
+  # distinct from HEAD (skipBody), which keeps the Content-Length a GET
+  # would have sent.
+  let bodiless = codeInt in 100 .. 199 or codeInt == 204 or codeInt == 304
   if codeInt in 100 .. 599:
     wbuf.add statusLines[codeInt]
   else:
@@ -79,13 +84,14 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
   wbuf.add "Date: "
   wbuf.add dateStr
   wbuf.add "\r\n"
-  if contentType.len > 0:
+  if contentType.len > 0 and not bodiless:
     wbuf.add "Content-Type: "
     wbuf.add contentType
     wbuf.add "\r\n"
-  wbuf.add "Content-Length: "
-  wbuf.addInt body.len
-  wbuf.add "\r\n"
+  if not bodiless:
+    wbuf.add "Content-Length: "
+    wbuf.addInt body.len
+    wbuf.add "\r\n"
   if not keepAlive:
     wbuf.add "Connection: close\r\n"
   elif announceKeepAlive:
@@ -101,7 +107,7 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
     wbuf.add val
     wbuf.add "\r\n"
   wbuf.add "\r\n"
-  if body.len > 0 and not skipBody:
+  if body.len > 0 and not skipBody and not bodiless:
     let oldLen = wbuf.len
     wbuf.setLen(oldLen + body.len)
     copyMem(addr wbuf[oldLen], unsafeAddr body[0], body.len)
