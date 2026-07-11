@@ -15,8 +15,8 @@ single port and a single handler API.
   safe; routes that never use it pay zero overhead.
 - **Future-agnostic**: handlers are plain procs and responses may be
   deferred: no async runtime dependency, no Future type in the core.
-  An optional asyncdispatch adapter layers `await` support on top
-  (a chronos adapter can follow the same hook).
+  Optional asyncdispatch and chronos adapters layer `await` support on
+  top through the same loop hook.
 - **Protocols**: HTTP/1.1 (keep-alive, pipelining, chunked bodies,
   100-continue), HTTP/2 (TLS ALPN and h2c prior knowledge; h2spec-clean),
   HTTP/3 over QUIC (OpenSSL >= 3.5 server API), with automatic `Alt-Svc`
@@ -84,6 +84,25 @@ libraries, and unlike `blocking:` the async body may capture locals
 `proc (req: Request, res: Response) {.async.}` with the adapter's `toHandler`, or use
 `req.doAsync:` inside a plain handler.
 
+For chronos-based drivers, import `vortex/adapters/chronos` instead: it
+exposes the identical API (`{.async.}` handlers, `toHandler`,
+`req.doAsync:`) over chronos's `Future`. Import only one async adapter
+per program.
+
+chronos is **not** a vortex dependency (a bare `import vortex` never
+needs it), so using this adapter means adding chronos to your own
+project alongside vortex:
+
+```
+requires "chronos >= 4.0.0"
+```
+
+Without it the adapter import fails to compile (`cannot open file:
+chronos`). The asyncdispatch adapter has no such step because
+asyncdispatch ships in Nim's stdlib. For the same reason chronos stays
+out of the default `nimble test`; its suite runs via `nimble
+testchronos`.
+
 Embedded / test usage: `var srv = start(handler, settings)` returns
 immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 
@@ -134,7 +153,7 @@ and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 ## Status
 
 Pre-1.0. Deferred (planned): WebSockets, streaming request/response
-bodies, a chronos adapter, dynamic QPACK, h2c upgrade, Windows.
+bodies, dynamic QPACK, h2c upgrade, Windows.
 
 ## Thanks
 

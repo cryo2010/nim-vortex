@@ -9,6 +9,8 @@ bench/perf_http2
 bench/perf_http3
 tests/t*
 !tests/t*.nim
+tests/chronos_adapter
+!tests/chronos_adapter.nim
 fuzz/fuzz_http1
 fuzz/fuzz_hpack
 fuzz/fuzz_qpack

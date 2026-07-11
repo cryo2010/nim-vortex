@@ -31,6 +31,11 @@
 ## HTTP/1.1 is the worst case: ordering pauses the pipeline at each
 ## deferred response. See perf_http2 for the same handler on h2, where
 ## streams are independent and the cost mostly disappears.
+##
+## The -chronos / -chronos-await rows are the same two handlers through
+## the chronos adapter instead of asyncdispatch, so the two adapters can
+## be compared directly (the pure `chronos` row below is chronos's own
+## HTTP server, a different codebase, for reference).
 
 import std/[os, osproc, strutils, net, httpcore]
 import ../src/vortex
@@ -39,6 +44,7 @@ import ./perf_common
 from ./perf_srv_std import serveHttpbeast, serveHttpbeastAsync,
                            serveAsynchttpserver
 from ./perf_srv_chronos import serveChronos
+from ./perf_srv_vortex_chronos import serveOursChronos
 
 const
   benchSeconds {.intdefine.} = 5
@@ -82,6 +88,8 @@ proc orchestrate() =
     (name: "vortex-minimal", port: 9106),
     (name: "vortex-async", port: 9107),
     (name: "vortex-async-await", port: 9108),
+    (name: "vortex-chronos", port: 9110),
+    (name: "vortex-chronos-await", port: 9111),
     (name: "httpbeast", port: 9103),
     (name: "httpbeast-async", port: 9109),
     (name: "asynchttpserver", port: 9104),
@@ -118,6 +126,8 @@ when isMainModule:
     of "vortex-minimal": serveOurs(port, 0, minimal = true)
     of "vortex-async": serveOursAsync(port, doAwait = false)
     of "vortex-async-await": serveOursAsync(port, doAwait = true)
+    of "vortex-chronos": serveOursChronos(port, doAwait = false)
+    of "vortex-chronos-await": serveOursChronos(port, doAwait = true)
     of "httpbeast": serveHttpbeast(port)
     of "httpbeast-async": serveHttpbeastAsync(port)
     of "asynchttpserver": serveAsynchttpserver(port)
