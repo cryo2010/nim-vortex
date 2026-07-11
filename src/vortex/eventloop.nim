@@ -465,8 +465,15 @@ proc handleRead(loop: Loop, c: ptr Connection) =
             return
           c.rbuf.setLen(c.rbuf.len * 2)
       else:
-        # HTTP/1 flood guard: never buffer more than one request head+body.
-        if c.rlen > loop.settings.maxHeaderSize + loop.settings.maxBodySize:
+        # Flood guard on the receive buffer. A WebSocket frame can be as
+        # large as one whole message; HTTP/1 never buffers more than a
+        # single request head plus body. parseFrame rejects an oversized
+        # frame from its length header before this cap is reached, so for
+        # a WebSocket this is only a backstop.
+        let cap =
+          if c.ws != nil: loop.settings.maxWsMessageSize + 1024
+          else: loop.settings.maxHeaderSize + loop.settings.maxBodySize
+        if c.rlen > cap:
           loop.closeConn(c)
           return
         c.rbuf.setLen(c.rbuf.len * 2)
