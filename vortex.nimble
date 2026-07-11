@@ -32,8 +32,14 @@ task testchronos, "Test the chronos async adapter (needs chronos)":
   exec "nim c -r --mm:orc --threads:on -d:ssl -p:src " &
        "-o:tests/chronos_adapter tests/chronos_adapter.nim"
 
-task fuzz, "Fuzz the parser/HPACK/QPACK decoders (needs clang + libFuzzer)":
-  exec "sh fuzz/run.sh"
+task fuzz, "Fuzz the parser/HPACK/QPACK decoders in Docker (needs docker)":
+  # The Dockerfile bundles clang + the libFuzzer runtime; the image's
+  # default base is arm64, so override it on x86_64 hosts. Fuzzes each
+  # target for 30s (override with `-e DUR=<seconds>` on the docker run).
+  let base =
+    if hostCPU == "amd64": " --build-arg BASE=archlinux:latest" else: ""
+  exec "docker build -f fuzz/Dockerfile -t vortex-fuzz" & base & " ."
+  exec "docker run --rm vortex-fuzz"
 
 task redbot, "HTTP conformance check with REDbot in Docker (needs docker)":
   # The Dockerfile bundles Nim + REDbot; the image's default base is

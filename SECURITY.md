@@ -171,14 +171,19 @@ overflow checks left on and `-d:useMalloc` so AddressSanitizer sees Nim
 allocations. A small seed corpus under `fuzz/seeds/` bootstraps coverage. All
 three run clean over millions of inputs with no crashes or leaks.
 
-Run with `nimble fuzz` or `fuzz/run.sh` (needs clang with the libFuzzer
-runtime; Apple clang lacks it, so use the Arch container in `bench/Dockerfile`,
-which installs `clang` and `compiler-rt`):
+Run with `nimble fuzz`, which builds `fuzz/Dockerfile` (bundling clang and
+the libFuzzer runtime, which Apple clang lacks) and fuzzes each target for
+30s, exiting non-zero on a crash:
 
 ```
-docker build -f bench/Dockerfile -t vortex-bench .
-docker run --rm vortex-bench sh fuzz/run.sh
+nimble fuzz
+# override duration or narrow to one target:
+docker run --rm -e DUR=120 vortex-fuzz
+docker run --rm vortex-fuzz hpack
 ```
+
+On a host that already has clang and `compiler-rt`, `fuzz/run.sh` runs the
+same harnesses without Docker.
 
 ## Reporting a vulnerability
 
