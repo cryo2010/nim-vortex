@@ -18,6 +18,10 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       if key in req.query:
         parts.add key & "=" & req.query[key]
     res.send(Http200, parts.join("|"), "text/plain")
+  of "/nm":
+    # Bodiless status: must go out with no Content-Length/Content-Type
+    # and no body, but keep the validator (RFC 9110 8.6).
+    res.send(Http304, "", "text/plain", @{"ETag": "\"v1\""})
   of "/boom":
     raise newException(ValueError, "handler exploded")
   else:
@@ -135,6 +139,26 @@ suite "http/1.1 integration":
     let resp = rawExchange(port,
       "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 20000) & "\r\n\r\n")
     check "431" in resp
+
+  test "304 has no Content-Length/Content-Type/body but keeps validator":
+    let resp = rawExchange(port,
+      "GET /nm HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    check "HTTP/1.1 304" in resp
+    check "Content-Length" notin resp
+    check "Content-Type" notin resp
+    check "ETag: \"v1\"" in resp
+    check resp.endsWith("\r\n\r\n")         # nothing after the headers
+
+  test "304 on a keep-alive connection does not desync the stream":
+    # No Content-Length must not mean "read body until close": a second
+    # request on the same socket must still get its own answer.
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.send("GET /nm HTTP/1.1\r\nHost: x\r\n\r\n")
+    check "304" in s.recvAvailable(1000)
+    s.send("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    check s.recvUntilClose(1000).endsWith("Hello, World!")
 
   test "handler exception gives 500":
     let resp = rawExchange(port, "GET /boom HTTP/1.1\r\nHost: x\r\n\r\n")

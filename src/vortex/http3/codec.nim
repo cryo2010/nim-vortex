@@ -105,20 +105,25 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   if conn.streams[sid].responded: return
   conn.streams[sid].responded = true
   let skipBody = conn.streams[sid].isHead
+  # RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
+  # they must not advertise content-length (or content-type). Distinct
+  # from HEAD (skipBody), which keeps the length a GET would have sent.
+  let bodiless = code in 100 .. 199 or code == 204 or code == 304
   var fs = ""
   addPrefix(fs)
   qpack.encodeStatus(fs, code)
   if core.serverHeader.len > 0:
     qpack.encodeHeader(fs, "server", core.serverHeader)
   qpack.encodeHeader(fs, "date", core.dateStr)
-  if contentType.len > 0:
+  if contentType.len > 0 and not bodiless:
     qpack.encodeHeader(fs, "content-type", contentType)
-  qpack.encodeHeader(fs, "content-length", $body.len)
+  if not bodiless:
+    qpack.encodeHeader(fs, "content-length", $body.len)
   for (name, val) in extraHeaders:
     qpack.encodeHeader(fs, name.toLowerAscii, val)
   template st: H3Stream = conn.streams[sid]
   st.outBuf.addFrame(h3fHeaders, fs)
-  if body.len > 0 and not skipBody:
+  if body.len > 0 and not skipBody and not bodiless:
     st.outBuf.addFrame(h3fData, body)
   st.concludeAfterFlush = true
   discard conn.flushStream(sid)

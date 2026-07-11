@@ -142,7 +142,14 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
   worker pool, and router.
 - HTTP/2 conformance: `h2spec -t -k -p <port>` passes 145/146 (1 skipped,
   0 failed) against a TLS server.
+- HTTP/1.1 conformance: `nimble redbot` runs [REDbot](https://redbot.org)
+  against a live server in Docker and fails on any BAD-level finding (or
+  `sh conformance/run.sh` with a host REDbot). See
+  [conformance/](conformance/).
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
+
+The chronos adapter is covered by `nimble testchronos` (its dependency is
+opt-in, so it is kept out of the default `nimble test`).
 
 ## Security
 
