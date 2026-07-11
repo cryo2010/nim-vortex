@@ -1,0 +1,41 @@
+name: CI
+
+# pull_request gates PRs; push only fires for main (a PR merge is a push
+# to main), giving a post-merge run without duplicating the PR check.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Arch Linux ships OpenSSL 3.6; the TLS/HTTP2/HTTP3 tests need OpenSSL
+    # >= 3.5 for the QUIC server API, which stock Ubuntu runners lack. The
+    # HTTP/3 integration tests skip themselves when no HTTP/3-capable curl
+    # is present, so they are effectively h1 + h2 + TLS here.
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        # --disable-sandbox: pacman's Landlock sandbox cannot apply in a
+        # container.
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git curl openssl
+
+      - uses: actions/checkout@v4
+
+      - name: Nim version
+        run: nim --version
+
+      - name: Run unit tests
+        run: nimble test -y
+
+      - name: Build zero-dependency variant
+        run: >-
+          nim c --mm:orc --threads:on -d:plainHttp
+          -o:/tmp/vortex_plain src/vortex.nim

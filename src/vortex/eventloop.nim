@@ -355,6 +355,12 @@ proc processInput(loop: Loop, c: ptr Connection) =
     of prComplete:
       c.deadline = 0
       c.dlKind = dkNone
+      inc c.requestCount
+      # Bound keep-alive request count: the last allowed request is answered
+      # with Connection: close (respond reads keepAlive).
+      if loop.settings.maxRequestsPerSocket > 0 and
+          c.requestCount >= loop.settings.maxRequestsPerSocket:
+        c.parser.keepAlive = false
       let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
       try:
         {.gcsafe.}:

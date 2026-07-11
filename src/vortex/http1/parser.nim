@@ -47,6 +47,7 @@ type
     bodyLen*: int             ## non-chunked body length
     chunkRemaining: int64
     seenContentLength: bool
+    seenHost: bool
     errorStatus*: HttpCode
 
 proc c_memchr(s: pointer, c: cint, n: csize_t): pointer
@@ -106,6 +107,7 @@ proc reset*(p: var RequestParser, reqStart: int) =
   p.bodyLen = 0
   p.chunkRemaining = 0
   p.seenContentLength = false
+  p.seenHost = false
 
 proc fail(p: var RequestParser, status: HttpCode): ParseResult =
   p.phase = ppError
@@ -192,6 +194,10 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
   elif ieqLit(buf, h.nameStart, h.nameLen, "expect"):
     if ieqLit(buf, h.valStart, h.valLen, "100-continue"):
       p.expectContinue = true
+  elif ieqLit(buf, h.nameStart, h.nameLen, "host"):
+    # RFC 9112 3.2: reject more than one Host field (smuggling guard).
+    if p.seenHost: return p.fail(Http400)
+    p.seenHost = true
   prNeedMore
 
 proc parseHeaderLine(p: var RequestParser, buf: openArray[char],
@@ -238,6 +244,9 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
       else:
         if lineEnd == p.pos:
           # Blank line: headers finished.
+          # RFC 9112 3.2: an HTTP/1.1 request MUST carry a Host field.
+          if p.minor == 1 and not p.seenHost:
+            return p.fail(Http400)
           p.pos = nl + 1
           if p.chunked:
             p.phase = ppChunkSize

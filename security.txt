@@ -12,7 +12,11 @@ maxResetStreams, maxControlFrames, maxHeaderSize, maxBodySize, *Timeout).
 - HPACK decompression bomb   decode aborts past maxDecoded (= maxHeaderList).
     QPACK is capacity-0, so no dynamic-table amplification. test_security_parsing
 - Request smuggling (CL/TE)   CL+TE reject, dup-CL reject, space-in-name,
-    TE-must-be-chunked, CRLF required. test_security_parsing
+    TE-must-be-chunked, CRLF required; HTTP/1.1 Host required and
+    single (RFC 9112 3.2, host-confusion guard). test_security_parsing,
+    test_http1_parser
+- Keep-alive amortization   maxRequestsPerSocket caps HTTP/1 requests per
+    connection (last one gets Connection: close). test_http1_server
 - Slowloris / slow-body   header/body/idle timeout wheel. test_security_dos
 - Oversized header/body   431 / 413 via maxHeaderSize / maxBodySize;
     lingering close (half-close + drain) delivers the error before closing

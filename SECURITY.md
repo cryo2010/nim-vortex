@@ -33,6 +33,7 @@ disables the corresponding check where noted.
 | `maxConcurrentStreams` | 256 | Open HTTP/2 and HTTP/3 streams per connection |
 | `maxResetStreams` | 512 | HTTP/2 peer resets before GOAWAY (rapid reset) |
 | `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/PRIORITY between stream progress |
+| `maxRequestsPerSocket` | 0 (off) | HTTP/1 keep-alive requests before the connection is closed |
 | `maxHeaderSize` | 16 KiB | Request line + headers (431); also caps HPACK decoded size |
 | `maxHeaderCount` | 100 | Header fields per request |
 | `maxBodySize` | 8 MiB | Request body (413); per-stream for HTTP/2 and HTTP/3 |
@@ -86,6 +87,12 @@ overflow vectors before dispatch:
 - Content-Length and chunk-size values are parsed with explicit overflow
   guards, returning 413 rather than wrapping.
 - Chunk extensions are tolerated and ignored.
+- An HTTP/1.1 request without a `Host` field, or with more than one, is
+  rejected with 400 (RFC 9112 3.2), closing a host-confusion vector.
+
+Keep-alive connections can additionally be capped with `maxRequestsPerSocket`
+(off by default): the last allowed request is answered with `Connection:
+close`, bounding how long one connection is amortized across requests.
 
 ### Resource exhaustion
 

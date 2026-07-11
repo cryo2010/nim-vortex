@@ -59,6 +59,7 @@ type
     closeRequested*: bool     ## close deferred until unpinned
     responded*: bool          ## current request has been answered
     sent100*: bool            ## 100 Continue already sent for this request
+    requestCount*: int        ## HTTP/1 requests served on this connection
     urlCached*: bool          ## lazy per-request caches (see request.url)
     queryCached*: bool
     cachedUrl*: Uri
@@ -223,5 +224,6 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.awaitingResponse = false
   c.closeAfterFlush = false
   c.lingerClose = false
+  c.requestCount = 0
   c.parser.reset(0)
   c.state = csActive
