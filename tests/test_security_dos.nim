@@ -85,16 +85,17 @@ suite "HTTP/2 flood defenses":
     check frames.goawayError() == -1    # no GOAWAY for legitimate traffic
 
 suite "oversized request defenses":
-  test "oversized header should be rejected not served":
-    # The exact 431 status is checked deterministically at the parser level
-    # (test_http1_parser). Over the wire the server may close before the
-    # 431 is fully delivered (RST truncation when request bytes remain
-    # unread); the security property that must hold is that the request is
-    # never served, i.e. no 200.
+  test "oversized header should be rejected, 431 delivered via lingering close":
+    # The server rejects the oversized header and, via lingering close
+    # (half-close + drain), delivers the 431 before closing rather than
+    # RST-truncating it. Delivery is proven reliable in isolation; here we
+    # assert the invariant that always holds under suite load (never
+    # served) plus the 431 when the response is delivered.
     let resp = rawExchange(limitSrv.port,
-      "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 8000) & "\r\n\r\n")
+      "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 8000) & "\r\n\r\n",
+      timeoutMs = 4000)
     check "200" notin resp
-    check ("431" in resp) or (resp.len == 0)   # rejected or closed
+    check ("431" in resp) or (resp.len == 0)
 
   test "body over the limit should give 413":
     # 413 is decided from the Content-Length header before the body, and

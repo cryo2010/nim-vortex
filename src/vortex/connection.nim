@@ -31,10 +31,11 @@ type
   ConnState* = enum
     csFree,      ## slot unused
     csActive,    ## reading/handling requests
-    csClosing    ## flush pending output, then close
+    csClosing,   ## flush pending output, then close
+    csDraining   ## half-closed; read and discard peer bytes, then close
 
   DeadlineKind* = enum
-    dkNone, dkHeader, dkBody, dkIdle
+    dkNone, dkHeader, dkBody, dkIdle, dkDrain
 
   Connection* = object
     fd*: int32
@@ -65,6 +66,7 @@ type
     pathParams*: PathParams   ## written by the router at match time
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
+    lingerClose*: bool        ## drain peer before close (reliable error delivery)
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
@@ -220,5 +222,6 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.sent100 = false
   c.awaitingResponse = false
   c.closeAfterFlush = false
+  c.lingerClose = false
   c.parser.reset(0)
   c.state = csActive

@@ -148,6 +148,8 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
         result.selector.registerHandle(udpFd, {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
 
+const drainTimeoutSec = 5    # bound on how long a lingering close waits
+
 proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
   c.dlKind = kind
   let secs =
@@ -155,6 +157,7 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
     of dkHeader: loop.settings.headerTimeout
     of dkBody: loop.settings.bodyTimeout
     of dkIdle: loop.settings.keepAliveTimeout
+    of dkDrain: drainTimeoutSec
     of dkNone: 0
   c.deadline = if secs > 0: loop.core.nowSec + int64(secs) else: 0
 
@@ -193,6 +196,36 @@ proc disarmWrite(loop: Loop, c: ptr Connection) =
     c.writeArmed = false
     loop.selector.updateHandle(int(c.fd), {Event.Read})
 
+proc beginLingerClose(loop: Loop, c: ptr Connection) =
+  ## Half-close after flushing an error response, then drain the peer's
+  ## remaining bytes so close() sends a clean FIN instead of a RST that
+  ## would truncate the error the client hasn't read yet. Bounded by the
+  ## drain deadline and the connection cap.
+  when not defined(plainHttp):
+    if c.ssl != nil:
+      loop.closeConn(c)          # TLS has its own close_notify; skip drain
+      return
+  discard shutdown(SocketHandle(c.fd), cint(SHUT_WR))
+  c.state = csDraining
+  c.setDeadline(loop, dkDrain)
+
+proc handleDrain(loop: Loop, c: ptr Connection) =
+  ## Read and discard peer bytes until EOF (clean close) or the drain
+  ## deadline; never processed as HTTP.
+  var scratch: array[8192, char]
+  while true:
+    let n = recv(SocketHandle(c.fd), addr scratch[0], scratch.len, cint(0))
+    if n > 0: continue
+    elif n == 0:
+      loop.closeConn(c)          # peer FIN: recv buffer empty, no RST
+      return
+    else:
+      let err = cint(osLastError())
+      if err == EINTR: continue
+      if err == EAGAIN or err == EWOULDBLOCK: return
+      loop.closeConn(c)
+      return
+
 proc flushOut(loop: Loop, c: ptr Connection) =
   ## Write as much pending output as the socket accepts; arm write
   ## interest only when the kernel buffer is full.
@@ -228,7 +261,10 @@ proc flushOut(loop: Loop, c: ptr Connection) =
   c.wpos = 0
   loop.disarmWrite(c)
   if c.closeAfterFlush:
-    loop.closeConn(c)
+    if c.lingerClose:
+      loop.beginLingerClose(c)   # drain peer so the error is delivered
+    else:
+      loop.closeConn(c)
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code
@@ -627,6 +663,9 @@ proc run*(loop: Loop) =
         continue
       if Event.Error in key.events:
         loop.closeConn(c)
+        continue
+      if c.state == csDraining:
+        loop.handleDrain(c)      # read-discard until EOF/deadline, then close
         continue
       try:
         when not defined(plainHttp):
