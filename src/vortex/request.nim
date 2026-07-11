@@ -23,7 +23,22 @@ type
     gen*: uint32
     stream*: uint32           ## HTTP/2 stream id, 0 for HTTP/1
 
-  RequestHandler* = proc (req: Request) {.gcsafe.}
+  Response* = object
+    ## The write half of a request/response pair: the same four handle
+    ## words as Request, carrying only the capability to send. Copying
+    ## it anywhere (workers, async callbacks) is free; sending through a
+    ## dead connection is a safe no-op.
+    core*: ptr LoopCore
+    fd*: int32
+    gen*: uint32
+    stream*: uint32
+
+  RequestHandler* = proc (req: Request, res: Response) {.gcsafe.}
+
+proc response*(req: Request): Response =
+  ## The Response paired with a Request. Dispatch hands handlers both;
+  ## this exists for code that stored only the read half.
+  Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream)
 
 proc isAlive*(req: Request): bool =
   if req.fd < 0:
@@ -283,49 +298,51 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
     if h3c != nil:
       h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
 
-proc respond*(req: Request, code: HttpCode, body: openArray[char],
-              contentType = "", headers: openArray[(string, string)] = []) =
-  ## Queue a response. Safe to call once per request, from the handler,
+proc send*(res: Response, code: HttpCode, body: openArray[char],
+           contentType = "", headers: openArray[(string, string)] = []) =
+  ## Queue the response. Safe to call once per request, from the handler,
   ## later (deferred), or from a worker thread inside `blocking:`; no-op
   ## if the connection is already gone.
-  if currentThreadId() != req.core.threadId:
+  if currentThreadId() != res.core.threadId:
     # Worker thread: pack protocol-neutrally; the loop serializes.
-    push(req.core.outbox, OutMsg(
-      fd: req.fd, gen: req.gen, stream: req.stream, code: int32(code),
+    push(res.core.outbox, OutMsg(
+      fd: res.fd, gen: res.gen, stream: res.stream, code: int32(code),
       data: packResponse(contentType, headers, body)))
     return
-  if req.fd < 0:
-    h3Apply(req.core, req.fd, req.gen, req.stream, int(code), contentType,
+  if res.fd < 0:
+    h3Apply(res.core, res.fd, res.gen, res.stream, int(code), contentType,
             headers, body)
     return
-  withConn(req, c):
-    applyResponse(req.core, c, req.stream, int(code), contentType,
+  let c = conn(res.core, res.fd, res.gen)
+  if c != nil:
+    applyResponse(res.core, c, res.stream, int(code), contentType,
                   headers, body)
 
-proc respond*(req: Request, code: HttpCode) =
-  respond(req, code, "", "")
+proc send*(res: Response, code: HttpCode) =
+  send(res, code, "", "")
 
-proc respond*(req: Request, code: int, body: openArray[char],
-              contentType = "", headers: openArray[(string, string)] = []) =
-  respond(req, HttpCode(code), body, contentType, headers)
+proc send*(res: Response, code: int, body: openArray[char],
+           contentType = "", headers: openArray[(string, string)] = []) =
+  send(res, HttpCode(code), body, contentType, headers)
 
 # --- blocking dispatch ------------------------------------------------------
 
 type
-  BlockingProc* = proc (req: Request) {.nimcall, gcsafe.}
+  BlockingProc* = proc (req: Request, res: Response) {.nimcall, gcsafe.}
     ## A `blocking:` body. Must be capture-free (nimcall): closures cannot
     ## cross threads under ORC. Request data is read through `req`, which
-    ## stays valid (the connection is pinned) until the body responds.
+    ## stays valid (the connection is pinned) until the body sends.
 
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32) {.nimcall, gcsafe.} =
   let fn = cast[BlockingProc](user)
   let req = Request(core: cast[ptr LoopCore](core), fd: fd, gen: gen,
                     stream: stream)
+  let res = response(req)
   try:
-    fn(req)
+    fn(req, res)
   except CatchableError:
-    req.respond(Http500, "500 Internal Server Error", "text/plain")
+    res.send(Http500, "500 Internal Server Error", "text/plain")
 
 proc dispatchBlocking*(req: Request, fn: BlockingProc) =
   ## Pin the connection and hand `fn` to the worker pool. Must be called
@@ -351,17 +368,18 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) =
 
 template blocking*(request: Request, body: untyped) =
   ## Run `body` on the worker pool, where blocking calls (sync DB drivers,
-  ## file IO, CPU work) are safe. Inside `body` the request is available
-  ## as `req`; `body` must eventually call `req.respond` (an uncaught
-  ## exception responds 500). `body` cannot capture surrounding locals;
-  ## read what you need via `req` inside the body, or use globals.
+  ## file IO, CPU work) are safe. Inside `body` the request and response
+  ## are available as `req` and `res`; `body` must eventually call
+  ## `res.send` (an uncaught exception sends 500). `body` cannot capture
+  ## surrounding locals; read what you need via `req` inside the body.
   ##
   ## ```nim
-  ## proc handler(req: Request) =
+  ## proc handler(req: Request, res: Response) =
   ##   req.blocking:
   ##     let rows = db.getAllRows(sql"...")   # blocking is fine here
-  ##     req.respond(Http200, $rows)
+  ##     res.send(Http200, $rows)
   ## ```
   dispatchBlocking(request,
-    proc (req {.inject.}: Request) {.nimcall, gcsafe.} =
+    proc (req {.inject.}: Request, res {.inject.}: Response)
+        {.nimcall, gcsafe.} =
       body)

@@ -48,10 +48,10 @@ const
 # --- the servers under test -------------------------------------------------
 
 proc serveOurs(port: int, threads: int, minimal = false) =
-  proc handler(req: vortex.Request) {.gcsafe.} =
-    vortex.respond(req, Http200, "Hello, World!", "text/plain")
-  proc minHandler(req: vortex.Request) {.gcsafe.} =
-    vortex.respond(req, Http200, "Hello, World!")
+  proc handler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
+  proc minHandler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
+    vortex.send(res, Http200, "Hello, World!")
   var cfg = vortex.initSettings(port = net.Port(port),
                                          numThreads = threads)
   if minimal:
@@ -64,11 +64,11 @@ proc serveOursAsync(port: int, doAwait: bool) =
   ## Through the asyncdispatch adapter: measures the future/adapter tax
   ## against the plain inline handler (httpbeast handlers are also
   ## Future-based, making that row directly comparable).
-  proc immediate(req: vortex.Request): Future[void] {.async.} =
-    vortex.respond(req, Http200, "Hello, World!", "text/plain")
-  proc suspending(req: vortex.Request): Future[void] {.async.} =
+  proc immediate(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
+  proc suspending(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
     await sleepAsync(0)                  # force a real suspend/resume
-    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
   let handler = if doAwait: toHandler(suspending) else: toHandler(immediate)
   vortex.run(handler,
     vortex.initSettings(port = net.Port(port), numThreads = 0))

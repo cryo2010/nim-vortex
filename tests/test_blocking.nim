@@ -1,15 +1,16 @@
-import std/[unittest, net, httpclient, httpcore, strutils, os, times]
+import std/[unittest, net, httpcore, strutils, os, times]
+import std/httpclient except Response
 import vortex/[settings, request, server]
 import ./helper
 
-proc handler(req: Request) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
-    req.respond(Http200, "fast", "text/plain")
+    res.send(Http200, "fast", "text/plain")
   of "/slow":
     req.blocking:
       sleep(300)                       # blocking is legal here
-      req.respond(Http200, "slow done", "text/plain")
+      res.send(Http200, "slow done", "text/plain")
   of "/slowboom":
     req.blocking:
       sleep(50)
@@ -17,9 +18,9 @@ proc handler(req: Request) {.gcsafe.} =
   of "/echo-slow":
     req.blocking:
       sleep(50)
-      req.respond(Http200, req.body, req.header("Content-Type"))
+      res.send(Http200, req.body, req.header("Content-Type"))
   else:
-    req.respond(Http404)
+    res.send(Http404)
 
 var srv = start(RequestHandler(handler),
                 initSettings(port = Port(0), numThreads = 2,

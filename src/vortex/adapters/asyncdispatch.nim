@@ -4,19 +4,20 @@
 ## - register `{.async.}` handlers directly on the router:
 ##
 ##   ```nim
-##   proc getUser(req: Request, params: PathParams) {.async.} =
+##   proc getUser(req: Request, res: Response,
+##                params: PathParams) {.async.} =
 ##     let user = await db.getUser(params.param("id"))
-##     req.respond(Http200, user.toJson)
+##     res.send(Http200, user.toJson)
 ##   router.get("/users/:id", getUser)
 ##   ```
 ##
 ## - or use the block form inside a plain handler:
 ##
 ##   ```nim
-##   proc handler(req: Request) {.gcsafe.} =
+##   proc handler(req: Request, res: Response) {.gcsafe.} =
 ##     req.doAsync:
 ##       let rows = await db.query(...)
-##       req.respond(Http200, $rows)
+##       res.send(Http200, $rows)
 ##   ```
 ##
 ## (The block form is `doAsync`, not `async`: a template named `async`
@@ -61,44 +62,46 @@ proc ensurePump*(core: ptr LoopCore) {.inline.} =
 
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling: 500 on failure, then flush/resume the
-  ## connection (respond is a no-op if the body already answered).
+  ## connection (send is a no-op if the body already answered).
   if fut.finished:
     # Completed without suspending (httpbeast's nil-future case): any
-    # respond already ran inline during dispatch, so skip the callback
+    # send already ran inline during dispatch, so skip the callback
     # queue, the pump, and the kick entirely.
     if fut.failed:
-      req.respond(Http500, "500 Internal Server Error", "text/plain")
+      response(req).send(Http500, "500 Internal Server Error", "text/plain")
     return
   ensurePump(req.core)               # pump only once something suspends
   fut.addCallback proc () {.gcsafe.} =
     if fut.failed:
-      req.respond(Http500, "500 Internal Server Error", "text/plain")
+      response(req).send(Http500, "500 Internal Server Error", "text/plain")
     if req.core.kick != nil:
       req.core.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
 
 template doAsync*(req: Request, body: untyped) =
   ## Run `body` asynchronously on the loop thread; it must eventually
-  ## call `req.respond`. Captures are allowed.
+  ## call `res.send`. Captures are allowed.
   watch(req, (proc () {.closure, async.} = body)())
 
 type
-  AsyncRequestHandler* = proc (req: Request): Future[void] {.gcsafe.}
+  AsyncRequestHandler* =
+    proc (req: Request, res: Response): Future[void] {.gcsafe.}
   AsyncRouteHandler* =
-    proc (req: Request, params: PathParams): Future[void] {.gcsafe.}
+    proc (req: Request, res: Response,
+          params: PathParams): Future[void] {.gcsafe.}
 
 proc toHandler*(h: AsyncRequestHandler): RequestHandler =
   ## Adapt a routerless async handler for `run`/`start`.
   let inner = h
-  proc (req: Request) {.gcsafe.} =
+  proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
-      watch(req, inner(req))
+      watch(req, inner(req, res))
 
 proc route(r: Router, meth: HttpMethod, path: string, h: AsyncRouteHandler) =
   let inner = h
   r.addRoute(meth, path,
-    proc (req: Request, params: PathParams) {.gcsafe.} =
+    proc (req: Request, res: Response, params: PathParams) {.gcsafe.} =
       {.gcsafe.}:
-        watch(req, inner(req, params)))
+        watch(req, inner(req, res, params)))
 
 proc get*(r: Router, path: string, h: AsyncRouteHandler) =
   r.route(HttpGet, path, h)

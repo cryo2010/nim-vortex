@@ -1,22 +1,23 @@
-import std/[unittest, net, httpclient, httpcore]
+import std/[unittest, net, httpcore]
+import std/httpclient except Response
 import vortex/[settings, request, server, router]
 
-proc hRoot(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http200, "root", "text/plain")
+proc hRoot(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+  res.send(Http200, "root", "text/plain")
 
-proc hUsers(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http200, "user=" & params.param("id"), "text/plain")
+proc hUsers(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+  res.send(Http200, "user=" & params.param("id"), "text/plain")
 
-proc hUserPosts(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http200,
+proc hUserPosts(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+  res.send(Http200,
     "user=" & params.param("id") & " post=" & params.param("post"),
     "text/plain")
 
-proc hStatic(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http200, "file=" & params.param("*"), "text/plain")
+proc hStatic(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+  res.send(Http200, "file=" & params.param("*"), "text/plain")
 
-proc hCreate(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http201, "created:" & req.body, "text/plain")
+proc hCreate(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+  res.send(Http201, "created:" & req.body, "text/plain")
 
 var appRouter = newRouter()
 appRouter.get("/", hRoot)

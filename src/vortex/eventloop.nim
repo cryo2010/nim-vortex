@@ -250,7 +250,7 @@ proc h2Input(loop: Loop, c: ptr Connection) =
                       stream: sid)
     try:
       {.gcsafe.}:
-        loop.handler(req)
+        loop.handler(req, response(req))
     except CatchableError:
       applyResponse(addr loop.core, c, sid, 500, "text/plain", [],
                     "500 Internal Server Error")
@@ -312,7 +312,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
       let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
       try:
         {.gcsafe.}:
-          loop.handler(req)
+          loop.handler(req, response(req))
       except CatchableError:
         if not c.responded:
           loop.respondError(c, Http500)
@@ -513,7 +513,7 @@ when not defined(plainHttp):
                           gen: slot.gen, stream: uint32(sid))
         try:
           {.gcsafe.}:
-            loop.handler(req)
+            loop.handler(req, response(req))
         except CatchableError:
           h3Apply(addr loop.core, int32(-(idx + 2)), slot.gen, uint32(sid),
                   500, "text/plain", [], "500 Internal Server Error")

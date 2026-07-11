@@ -1,43 +1,44 @@
-import std/[unittest, net, httpclient, httpcore, strutils, os, osproc, times]
+import std/[unittest, net, httpcore, strutils, os, osproc, times]
+import std/httpclient except Response
 import vortex/[settings, request, server, router]
 import ./helper
 import vortex/adapters/asyncdispatch as nhsasync
 
-proc hRoot(req: Request, params: PathParams) {.async.} =
+proc hRoot(req: Request, res: Response, params: PathParams) {.async.} =
   # No await at all: completes synchronously through the async path.
-  req.respond(Http200, "sync-in-async", "text/plain")
+  res.send(Http200, "sync-in-async", "text/plain")
 
-proc hDelay(req: Request, params: PathParams) {.async.} =
+proc hDelay(req: Request, res: Response, params: PathParams) {.async.} =
   await sleepAsync(150)                 # loop keeps serving meanwhile
-  req.respond(Http200, "slept", "text/plain")
+  res.send(Http200, "slept", "text/plain")
 
-proc hCapture(req: Request, params: PathParams) {.async.} =
+proc hCapture(req: Request, res: Response, params: PathParams) {.async.} =
   # Captures work: the future never leaves the loop thread.
   let who = params.param("name")
   await sleepAsync(20)
-  req.respond(Http200, "hello " & who, "text/plain")
+  res.send(Http200, "hello " & who, "text/plain")
 
-proc hFanIn(req: Request, params: PathParams) {.async.} =
+proc hFanIn(req: Request, res: Response, params: PathParams) {.async.} =
   var total = 0
   for i in 1 .. 3:
     await sleepAsync(10)
     total += i
-  req.respond(Http200, $total, "text/plain")
+  res.send(Http200, $total, "text/plain")
 
-proc hBoom(req: Request, params: PathParams) {.async.} =
+proc hBoom(req: Request, res: Response, params: PathParams) {.async.} =
   await sleepAsync(10)
   raise newException(ValueError, "async exploded")
 
-proc hBoomSync(req: Request, params: PathParams) {.async.} =
+proc hBoomSync(req: Request, res: Response, params: PathParams) {.async.} =
   # Fails before any await: the future completes (failed) synchronously,
   # exercising the finished-future fast path in the adapter.
   raise newException(ValueError, "sync exploded")
 
-proc hBlockingInside(req: Request, params: PathParams) {.async.} =
+proc hBlockingInside(req: Request, res: Response, params: PathParams) {.async.} =
   await sleepAsync(10)
   req.blocking:                          # sync escape inside async
     sleep(50)
-    req.respond(Http200, "worker done", "text/plain")
+    res.send(Http200, "worker done", "text/plain")
 
 var appRouter = newRouter()
 appRouter.get("/", hRoot)

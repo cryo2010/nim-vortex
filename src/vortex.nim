@@ -3,10 +3,10 @@
 ## ```nim
 ## import vortex
 ##
-## proc handler(req: Request) =
+## proc handler(req: Request, res: Response) =
 ##   case req.path
-##   of "/": req.respond(Http200, "Hello, World!", "text/plain")
-##   else: req.respond(Http404)
+##   of "/": res.send(Http200, "Hello, World!", "text/plain")
+##   else: res.send(Http404)
 ##
 ## run(handler, initSettings(port = Port(8080)))
 ## ```

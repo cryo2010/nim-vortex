@@ -16,26 +16,26 @@ import std/os
 import ../src/vortex
 import ../src/vortex/adapters/asyncdispatch
 
-proc hRoot(req: Request, params: PathParams) {.async.} =
-  req.respond(Http200, "Hello, World!\n", "text/plain")
+proc hRoot(req: Request, res: Response, params: PathParams) {.async.} =
+  res.send(Http200, "Hello, World!\n", "text/plain")
 
-proc hHello(req: Request, params: PathParams) {.async.} =
+proc hHello(req: Request, res: Response, params: PathParams) {.async.} =
   let name = params.param("name")        # captures are fine in async bodies
   await sleepAsync(10)
-  req.respond(Http200, "Hello, " & name & "!\n", "text/plain")
+  res.send(Http200, "Hello, " & name & "!\n", "text/plain")
 
-proc hEcho(req: Request, params: PathParams) {.async.} =
-  req.respond(Http200, "you sent (" & $req.method & "): " & req.body & "\n",
+proc hEcho(req: Request, res: Response, params: PathParams) {.async.} =
+  res.send(Http200, "you sent (" & $req.method & "): " & req.body & "\n",
               "text/plain")
 
-proc hSlow(req: Request, params: PathParams) {.async.} =
+proc hSlow(req: Request, res: Response, params: PathParams) {.async.} =
   await sleepAsync(1000)                 # loop keeps serving other requests
-  req.respond(Http200, "that took a second\n", "text/plain")
+  res.send(Http200, "that took a second\n", "text/plain")
 
-proc hReport(req: Request, params: PathParams) {.async.} =
+proc hReport(req: Request, res: Response, params: PathParams) {.async.} =
   req.blocking:                          # synchronous escape: worker pool
     sleep(500)                           # stands in for a sync DB/file call
-    req.respond(Http200, "report built on a worker thread\n", "text/plain")
+    res.send(Http200, "report built on a worker thread\n", "text/plain")
 
 var router = newRouter()
 router.get("/", hRoot)

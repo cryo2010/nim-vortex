@@ -29,8 +29,8 @@ const
   benchDepth {.intdefine.} = 8      # h1 pipeline depth (reference row)
 
 proc serveOurs(port: int, threads: int, cert, key: string) =
-  proc handler(req: vortex.Request) {.gcsafe.} =
-    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  proc handler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
   vortex.run(handler,
     vortex.initSettings(port = net.Port(port), numThreads = threads,
                                  certFile = cert, keyFile = key))

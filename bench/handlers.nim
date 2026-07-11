@@ -6,14 +6,14 @@
 import std/[os, strutils, httpcore]
 import ../src/vortex
 
-proc handler(req: Request) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/plaintext":
-    req.respond(Http200, "Hello, World!", "text/plain")
+    res.send(Http200, "Hello, World!", "text/plain")
   of "/json":
-    req.respond(Http200, """{"message":"Hello, World!"}""", "application/json")
+    res.send(Http200, """{"message":"Hello, World!"}""", "application/json")
   else:
-    req.respond(Http404)
+    res.send(Http404)
 
 when isMainModule:
   let port = if paramCount() >= 1: Port(parseInt(paramStr(1))) else: Port(8080)

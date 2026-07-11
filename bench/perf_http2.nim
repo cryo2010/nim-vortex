@@ -31,17 +31,17 @@ const
   benchDepth {.intdefine.} = 8      # h1 pipeline depth (comparison row)
 
 proc serveOurs(port: int, threads: int) =
-  proc handler(req: vortex.Request) {.gcsafe.} =
-    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+  proc handler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
   vortex.run(handler,
     vortex.initSettings(port = net.Port(port), numThreads = threads))
 
 proc serveOursAsync(port: int) =
   ## Suspending async handler via the adapter: h2 streams are
   ## independent, so awaits do not pause the connection (unlike h1).
-  proc h(req: vortex.Request): Future[void] {.async.} =
+  proc h(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
     await sleepAsync(0)
-    vortex.respond(req, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
   vortex.run(toHandler(h),
     vortex.initSettings(port = net.Port(port), numThreads = 0))
 

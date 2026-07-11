@@ -8,7 +8,8 @@ import ./request
 type
   PathParams* = seq[(string, string)]
 
-  RouteHandler* = proc (req: Request, params: PathParams) {.gcsafe.}
+  RouteHandler* = proc (req: Request, res: Response,
+                        params: PathParams) {.gcsafe.}
 
   RouteNode = ref object
     segment: string           ## literal, or param name when isParam
@@ -26,8 +27,9 @@ proc param*(params: PathParams, name: string): string =
   for (n, v) in params:
     if n == name: return v
 
-proc defaultNotFound(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http404, "404 Not Found", "text/plain")
+proc defaultNotFound(req: Request, res: Response,
+                     params: PathParams) {.gcsafe.} =
+  res.send(Http404, "404 Not Found", "text/plain")
 
 proc newRouter*(): Router =
   Router(root: RouteNode(), notFound: defaultNotFound)
@@ -103,7 +105,7 @@ proc match(node: RouteNode, path: string, start: int,
       return child
   nil
 
-proc route*(router: Router, req: Request) {.gcsafe.} =
+proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
   ## Look up and invoke the handler for a request.
   var path = req.path
   let q = path.find('?')
@@ -111,7 +113,7 @@ proc route*(router: Router, req: Request) {.gcsafe.} =
   var params: PathParams
   let node = router.root.match(path, 0, params)
   if node == nil:
-    router.notFound(req, params)
+    router.notFound(req, res, params)
     return
   let h = node.handlers[req.method]
   if h == nil:
@@ -122,11 +124,11 @@ proc route*(router: Router, req: Request) {.gcsafe.} =
         any = true
         break
     if any:
-      req.respond(HttpCode(405), "405 Method Not Allowed", "text/plain")
+      res.send(HttpCode(405), "405 Method Not Allowed", "text/plain")
     else:
-      router.notFound(req, params)
+      router.notFound(req, res, params)
     return
-  h(req, params)
+  h(req, res, params)
 
 proc toHandler*(router: Router): RequestHandler =
   ## Adapt a router into the server's RequestHandler. The router is
@@ -134,6 +136,6 @@ proc toHandler*(router: Router): RequestHandler =
   ## process lifetime.
   GC_ref(router)
   let r = router
-  proc (req: Request) {.gcsafe.} =
+  proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
-      r.route(req)
+      r.route(req, res)

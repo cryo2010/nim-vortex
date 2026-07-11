@@ -1,4 +1,5 @@
-import std/[unittest, net, httpclient, httpcore, os, osproc, strutils]
+import std/[unittest, net, httpcore, os, osproc, strutils]
+import std/httpclient except Response
 import vortex/[settings, request, server]
 import ./helper
 
@@ -11,14 +12,14 @@ let (genOut, genRc) = execCmdEx(
   " -out " & certFile & " -days 2 -subj /CN=localhost")
 doAssert genRc == 0, "cert generation failed: " & genOut
 
-proc handler(req: Request) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
-    req.respond(Http200, "hello over TLS", "text/plain")
+    res.send(Http200, "hello over TLS", "text/plain")
   of "/echo":
-    req.respond(Http200, req.body, req.header("Content-Type"))
+    res.send(Http200, req.body, req.header("Content-Type"))
   else:
-    req.respond(Http404)
+    res.send(Http404)
 
 var srv = start(RequestHandler(handler),
                 initSettings(port = Port(0), numThreads = 2,

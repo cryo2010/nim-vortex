@@ -3,23 +3,23 @@ import vortex/[settings, request, server]
 
 const bigBody = "0123456789abcdef".repeat(16 * 1024)   # 256 KiB
 
-proc handler(req: Request) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.url.path
   of "/":
-    req.respond(Http200, "hello h2", "text/plain")
+    res.send(Http200, "hello h2", "text/plain")
   of "/qs":
-    req.respond(Http200, req.url.path & "|" & req.query["k"], "text/plain")
+    res.send(Http200, req.url.path & "|" & req.query["k"], "text/plain")
   of "/echo":
-    req.respond(Http200, req.body, req.header("Content-Type"),
+    res.send(Http200, req.body, req.header("Content-Type"),
                 headers = [("X-Proto", $req.httpVersion)])
   of "/big":
-    req.respond(Http200, bigBody, "application/octet-stream")
+    res.send(Http200, bigBody, "application/octet-stream")
   of "/slow":
     req.blocking:
       sleep(100)
-      req.respond(Http200, "slow h2 done", "text/plain")
+      res.send(Http200, "slow h2 done", "text/plain")
   else:
-    req.respond(Http404, "nope", "text/plain")
+    res.send(Http404, "nope", "text/plain")
 
 var srv = start(RequestHandler(handler),
                 initSettings(port = Port(0), numThreads = 2,

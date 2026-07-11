@@ -1,26 +1,27 @@
-import std/[unittest, net, httpclient, httpcore, strutils, tables]
+import std/[unittest, net, httpcore, strutils, tables]
+import std/httpclient except Response
 import vortex/[settings, request, server]
 import ./helper
 
-proc handler(req: Request) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.url.path
   of "/":
-    req.respond(Http200, "Hello, World!", "text/plain")
+    res.send(Http200, "Hello, World!", "text/plain")
   of "/echo":
-    req.respond(Http200, req.body, req.header("Content-Type"))
+    res.send(Http200, req.body, req.header("Content-Type"))
   of "/headers":
-    req.respond(Http200, req.header("X-Probe"), "text/plain")
+    res.send(Http200, req.header("X-Probe"), "text/plain")
   of "/qs":
     var parts: seq[string]
     parts.add "path=" & req.url.path
     for key in ["a", "b", "sp"]:
       if key in req.query:
         parts.add key & "=" & req.query[key]
-    req.respond(Http200, parts.join("|"), "text/plain")
+    res.send(Http200, parts.join("|"), "text/plain")
   of "/boom":
     raise newException(ValueError, "handler exploded")
   else:
-    req.respond(Http404, "not found", "text/plain")
+    res.send(Http404, "not found", "text/plain")
 
 var srv = start(RequestHandler(handler),
                 initSettings(port = Port(0), numThreads = 2,

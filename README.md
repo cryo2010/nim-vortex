@@ -26,16 +26,16 @@ single port and a single handler API.
 ```nim
 import vortex
 
-proc handler(req: Request) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
-    req.respond(Http200, "Hello, World!", "text/plain")
+    res.send(Http200, "Hello, World!", "text/plain")
   of "/report":
     req.blocking:                       # runs on the worker pool
       let data = expensiveBlockingCall()
-      req.respond(Http200, data, "application/json")
+      res.send(Http200, data, "application/json")
   else:
-    req.respond(Http404)
+    res.send(Http404)
 
 run(handler, initSettings(port = Port(8080)))
 ```
@@ -50,8 +50,8 @@ run(handler, initSettings(port = Port(8443),
 Router:
 
 ```nim
-proc getUser(req: Request, params: PathParams) {.gcsafe.} =
-  req.respond(Http200, "user " & params.param("id"))
+proc getUser(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+  res.send(Http200, "user " & params.param("id"))
 
 var router = newRouter()
 router.get("/users/:id", getUser)
@@ -65,9 +65,9 @@ Async handlers (optional adapter; asyncdispatch drivers like asyncpg):
 import vortex
 import vortex/adapters/asyncdispatch
 
-proc getUser(req: Request, params: PathParams) {.async.} =
+proc getUser(req: Request, res: Response, params: PathParams) {.async.} =
   let user = await db.getUser(params.param("id"))   # loop keeps serving
-  req.respond(Http200, user.toJson)
+  res.send(Http200, user.toJson)
 
 var router = newRouter()
 router.get("/users/:id", getUser)    # async handlers register directly
@@ -77,7 +77,7 @@ run(router.toHandler, initSettings(port = Port(8080)))
 Inside an async handler `req.blocking:` still works for synchronous
 libraries, and unlike `blocking:` the async body may capture locals
 (it never leaves the loop thread). Without a router, wrap a
-`proc (req: Request) {.async.}` with the adapter's `toHandler`, or use
+`proc (req: Request, res: Response) {.async.}` with the adapter's `toHandler`, or use
 `req.doAsync:` inside a plain handler.
 
 Embedded / test usage: `var srv = start(handler, settings)` returns
@@ -90,8 +90,11 @@ immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 - Inside `blocking:` the request is available as `req`; the body cannot
   capture surrounding locals (it runs on another thread); read request
   data through `req`, which remains valid until you respond.
-- `req.respond(...)` may be called after the handler returns (deferred
-  responses); calling it through a dead connection is a safe no-op.
+- Handlers receive the read half (`req`) and the write half (`res`);
+  `res.send(...)` may be called after the handler returns (deferred
+  responses), and sending through a dead connection is a safe no-op.
+  (`std/httpclient` also exports a `Response` type; in modules using
+  both, `import std/httpclient except Response`.)
 - `req.path` is the raw request target (query string included, matching
   httpbeast). `req.url` gives the parsed form (`req.url.path` excludes
   the query) and `req.query` a decoded parameter Table; both are lazy
