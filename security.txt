@@ -24,6 +24,13 @@ maxResetStreams, maxControlFrames, maxHeaderSize, maxBodySize, *Timeout).
     compacted as frames are consumed (bounded, not tied to the h1 body
     limit), so tight h1 limits don't clip large h2 bursts. test_security_dos
 
+## Fuzzing
+libFuzzer harnesses over the untrusted-input decoders live in fuzz/
+(fuzz/run.sh, or `nimble fuzz`; needs clang + libFuzzer, e.g. the Arch
+container). ASAN + Nim checks on, -d:useMalloc so ASAN sees allocations.
+Clean over millions of runs each: parser.parse (whole + split feed), the
+HPACK decoder (dynamic-table state across blocks), the QPACK decoder.
+
 ## Follow-ups (not yet addressed)
-- Fuzzing: libFuzzer harness over parser.parse / HPACK / QPACK decoders.
 - Per-IP connection limits (needs peer-addr plumbing); h3spec conformance.
+- Wire the fuzzers into CI (OSS-Fuzz-style) with a persisted corpus.

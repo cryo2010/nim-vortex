@@ -25,3 +25,6 @@ task perf2, "Run the HTTP/2 throughput benchmark":
 
 task perf3, "Run the HTTP/3 throughput benchmark":
   exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http3 bench/perf_http3.nim"
+
+task fuzz, "Fuzz the parser/HPACK/QPACK decoders (needs clang + libFuzzer)":
+  exec "sh fuzz/run.sh"

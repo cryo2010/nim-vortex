@@ -12,19 +12,22 @@
 #   docker run --rm nhs-bench ./bench/perf_http2   # HTTP/2 benchmark
 #   docker run --rm nhs-bench ./bench/perf_http3   # HTTP/3 benchmark
 #   docker run --rm nhs-bench nimble test          # test suite on epoll
+#   docker run --rm nhs-bench sh fuzz/run.sh        # fuzz the decoders
 
 ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
 
+# clang + compiler-rt provide the libFuzzer runtime for fuzz/run.sh.
 # --disable-sandbox: pacman's Landlock sandbox cannot apply in a container.
 RUN pacman -Syu --noconfirm --needed --disable-sandbox \
-      nim gcc git curl openssl && \
+      nim gcc git curl openssl clang compiler-rt && \
     pacman -Scc --noconfirm
 
 WORKDIR /nhs
 COPY vortex.nimble ./
 COPY src ./src
 COPY tests ./tests
+COPY fuzz ./fuzz
 COPY bench/*.nim bench/run.sh ./bench/
 
 RUN nimble install httpbeast chronos -y
