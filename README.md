@@ -20,7 +20,7 @@ single port and a single handler API.
 - **Protocols**: HTTP/1.1 (keep-alive, pipelining, chunked bodies,
   100-continue), HTTP/2 (TLS ALPN and h2c prior knowledge; h2spec-clean),
   HTTP/3 over QUIC (OpenSSL >= 3.5 server API), with automatic `Alt-Svc`
-  advertisement.
+  advertisement, plus **WebSockets** (RFC 6455) over `ws://` and `wss://`.
 - **Dependencies**: none beyond OpenSSL >= 3.5 at runtime for TLS/h2/h3.
   Build with `-d:plainHttp` for a zero-dependency cleartext (h1 + h2c)
   server.
@@ -106,6 +106,59 @@ testchronos`.
 Embedded / test usage: `var srv = start(handler, settings)` returns
 immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 
+## WebSockets
+
+A handler detects the upgrade and calls `req.acceptWebSocket()`; set
+`onMessage` / `onClose` callbacks that run on the loop thread (they may
+capture locals). `ws.send` / `ws.close` are non-blocking and safe to call
+from any thread, so you can push to a socket from a worker or a timer.
+
+```nim
+proc handler(req: Request, res: Response) {.gcsafe.} =
+  if req.isWebSocketUpgrade:
+    let ws = req.acceptWebSocket()
+    ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+      ws.send(data, kind)                 # echo
+    ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) {.gcsafe.} =
+      discard
+  else:
+    res.send(Http200, "…", "text/html")
+
+run(handler, initSettings(port = Port(8080)))
+```
+
+`onMessage` runs on the loop thread, so it must not block. For blocking
+work in response to a message (a sync DB query, file IO), use
+`ws.blocking:` to run it on the same worker pool that backs the HTTP
+`blocking:`, no thread of your own required. The message is passed in as
+`msg` (the body cannot capture locals, like the HTTP form); reply with
+`ws.send`:
+
+```nim
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+  ws.blocking(data):
+    let rows = db.getAllRows(sql"…")    # blocking is safe here
+    ws.send($rows)
+```
+
+For genuinely async drivers (asyncdispatch/chronos `Future`s), import an
+async adapter and use `ws.doAsync:` to `await` on the loop thread. Captures
+are allowed; an uncaught exception closes the socket with 1011:
+
+```nim
+import vortex/adapters/asyncdispatch   # or vortex/adapters/chronos
+
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+  ws.doAsync:
+    let user = await db.getUser(data)   # loop keeps serving during the await
+    ws.send(user.toJson)
+```
+
+Works over `ws://` and, with a cert, `wss://`. Fragmented messages are
+reassembled (bounded by `maxWsMessageSize`), ping/pong and the close
+handshake are handled for you, and text is validated as UTF-8. HTTP/1.1
+only for now (HTTP/2 per RFC 8441 is not yet supported).
+
 ## Handler rules
 
 - Handlers run **inline on the event loop**: never block in them (no sync
@@ -159,7 +212,7 @@ and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 
 ## Status
 
-Pre-1.0. Deferred (planned): WebSockets, streaming request/response
+Pre-1.0. Deferred (planned): streaming request/response
 bodies, dynamic QPACK, h2c upgrade, Windows.
 
 ## Thanks

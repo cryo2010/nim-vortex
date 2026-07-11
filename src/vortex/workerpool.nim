@@ -13,14 +13,15 @@ import std/[locks, deques]
 type
   WorkerTask* = object
     ## `fn` is a trampoline (see request.dispatchBlocking) that rebuilds
-    ## the Request from the handle words and runs the user's body.
-    fn*: proc (user, core: pointer, fd: int32, gen: uint32, stream: uint32)
-        {.nimcall, gcsafe.}
+    ## the Request/WebSocket from the handle words and runs the user's body.
+    fn*: proc (user, core: pointer, fd: int32, gen: uint32, stream: uint32,
+               data: string) {.nimcall, gcsafe.}
     user*: pointer            ## the user body proc pointer
     core*: pointer            ## ptr LoopCore
     fd*: int32
     gen*: uint32
     stream*: uint32           ## HTTP/2 stream id, 0 for HTTP/1
+    data*: string             ## moved-in payload (a WebSocket message); "" for HTTP
 
   WorkerPool* = object
     lock: Lock
@@ -37,11 +38,12 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
     if pool.tasks.len == 0:
       release pool.lock
       return                       # stopping and drained
-    let task = pool.tasks.popFirst()
+    var task = pool.tasks.popFirst()
     release pool.lock
     {.gcsafe.}:
       try:
-        task.fn(task.user, task.core, task.fd, task.gen, task.stream)
+        task.fn(task.user, task.core, task.fd, task.gen, task.stream,
+                move task.data)
       except CatchableError:
         discard                    # trampoline already responded 500
 
