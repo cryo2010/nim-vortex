@@ -54,3 +54,8 @@ task autobahn, "WebSocket conformance via the Autobahn testsuite (Docker)":
   # crossbario/autobahn-testsuite fuzzingclient against it; it picks the
   # image base by host arch and exits non-zero on any failing case.
   exec "sh conformance/autobahn/run.sh"
+
+task h2spec, "HTTP/2 conformance via h2spec over TLS (Docker)":
+  # run.sh builds a vortex HTTP/2-over-TLS server image and runs the
+  # summerwind/h2spec image against it; h2spec exits non-zero on failures.
+  exec "sh conformance/h2spec/run.sh"

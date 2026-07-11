@@ -76,3 +76,13 @@ jobs:
         # non-zero on any failing case. It picks the x86_64 image base
         # itself; python3 (for the report) is preinstalled on the runner.
         run: sh conformance/autobahn/run.sh
+
+  h2spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: HTTP/2 conformance (h2spec over TLS)
+        # run.sh builds a vortex HTTP/2-over-TLS server image and runs the
+        # summerwind/h2spec image against it; h2spec exits non-zero on any
+        # failed test.
+        run: sh conformance/h2spec/run.sh
