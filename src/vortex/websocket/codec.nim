@@ -7,7 +7,7 @@
 ## through the loop's outbox (as `res.send` does for HTTP responses), so a
 ## worker or timer holding a `WebSocket` handle can push safely.
 
-import std/[base64, unicode]
+import std/base64
 import ../connection
 import ./frames
 import ./sha1
@@ -110,11 +110,55 @@ proc failClose(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   notifyClose(core, c, w, code, "")
   c.closeAfterFlush = true
 
+proc validUtf8(s: openArray[char]): bool =
+  ## Strict UTF-8 per RFC 3629: rejects overlong forms, surrogate code
+  ## points (U+D800..U+DFFF), values above U+10FFFF, and truncated
+  ## sequences. std/unicode.validateUtf8 accepts several of these, which
+  ## fails the Autobahn UTF-8 cases.
+  var i = 0
+  let n = s.len
+  while i < n:
+    let b0 = uint8(s[i])
+    if b0 < 0x80:
+      inc i
+    elif b0 shr 5 == 0b110:                       # 2-byte
+      if i + 1 >= n or (uint8(s[i+1]) and 0xC0) != 0x80: return false
+      let cp = (uint32(b0 and 0x1F) shl 6) or uint32(uint8(s[i+1]) and 0x3F)
+      if cp < 0x80: return false                  # overlong
+      i += 2
+    elif b0 shr 4 == 0b1110:                      # 3-byte
+      if i + 2 >= n or (uint8(s[i+1]) and 0xC0) != 0x80 or
+         (uint8(s[i+2]) and 0xC0) != 0x80: return false
+      let cp = (uint32(b0 and 0x0F) shl 12) or
+               (uint32(uint8(s[i+1]) and 0x3F) shl 6) or
+               uint32(uint8(s[i+2]) and 0x3F)
+      if cp < 0x800 or (cp >= 0xD800 and cp <= 0xDFFF): return false
+      i += 3
+    elif b0 shr 3 == 0b11110:                     # 4-byte
+      if i + 3 >= n or (uint8(s[i+1]) and 0xC0) != 0x80 or
+         (uint8(s[i+2]) and 0xC0) != 0x80 or
+         (uint8(s[i+3]) and 0xC0) != 0x80: return false
+      let cp = (uint32(b0 and 0x07) shl 18) or
+               (uint32(uint8(s[i+1]) and 0x3F) shl 12) or
+               (uint32(uint8(s[i+2]) and 0x3F) shl 6) or
+               uint32(uint8(s[i+3]) and 0x3F)
+      if cp < 0x10000 or cp > 0x10FFFF: return false
+      i += 4
+    else:
+      return false                                # stray continuation / F8+
+  true
+
+proc validCloseCode(code: uint16): bool =
+  ## RFC 6455 7.4: application-usable close codes. Excludes the reserved
+  ## 1004/1005/1006/1015, the unassigned 1016..2999, and 0..999.
+  code in {1000'u16, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011} or
+  (code >= 3000 and code <= 4999)
+
 proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
                      op: WsOpcode, data: string): bool =
   ## Deliver a complete message. Returns false if the connection is now
   ## closing (invalid UTF-8 in a text message).
-  if op == opText and validateUtf8(data) != -1:
+  if op == opText and not validUtf8(data):
     failClose(core, c, w, 1007)          # not valid UTF-8
     return false
   if w.onMessage != nil:
@@ -133,14 +177,25 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   of opPong:
     true                                   # unsolicited pong: ignore
   of opClose:
+    # A close payload is either empty or at least a 2-byte code; a lone
+    # byte is a protocol error (RFC 6455 5.5.1).
+    if fr.payload.len == 1:
+      failClose(core, c, w, 1002)
+      return false
     var code = 1000'u16
     var reason = ""
     if fr.payload.len >= 2:
       code = (uint16(uint8(fr.payload[0])) shl 8) or uint16(uint8(fr.payload[1]))
       if fr.payload.len > 2: reason = fr.payload[2 .. ^1]
+      if not validCloseCode(code):
+        failClose(core, c, w, 1002)        # reserved/invalid close code
+        return false
+      if not validUtf8(reason):
+        failClose(core, c, w, 1007)        # reason must be valid UTF-8
+        return false
     if not w.closeSent:
       w.closeSent = true
-      c.wbuf.appendClose(code, reason)     # echo the close
+      c.wbuf.appendClose(code)             # echo the (valid) code back
     notifyClose(core, c, w, code, reason)
     c.closeAfterFlush = true
     false
