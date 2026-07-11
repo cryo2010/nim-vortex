@@ -18,3 +18,5 @@ fuzz/corpus/
 crash-*
 conformance/redbot_server
 conformance/reports/
+conformance/autobahn/reports/
+conformance/autobahn/echo_server

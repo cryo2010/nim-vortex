@@ -48,3 +48,9 @@ task redbot, "HTTP conformance check with REDbot in Docker (needs docker)":
     if hostCPU == "amd64": " --build-arg BASE=archlinux:latest" else: ""
   exec "docker build -f conformance/Dockerfile -t vortex-redbot" & base & " ."
   exec "docker run --rm vortex-redbot"
+
+task autobahn, "WebSocket conformance via the Autobahn testsuite (Docker)":
+  # run.sh builds a vortex echo server image and runs the
+  # crossbario/autobahn-testsuite fuzzingclient against it; it picks the
+  # image base by host arch and exits non-zero on any failing case.
+  exec "sh conformance/autobahn/run.sh"

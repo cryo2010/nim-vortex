@@ -1,0 +1,9 @@
+{
+   "outdir": "/reports",
+   "servers": [
+      { "agent": "vortex", "url": "ws://server:9001" }
+   ],
+   "cases": ["*"],
+   "exclude-cases": ["12.*", "13.*"],
+   "exclude-agent-cases": {}
+}

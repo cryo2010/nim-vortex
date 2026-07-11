@@ -159,6 +159,38 @@ reassembled (bounded by `maxWsMessageSize`), ping/pong and the close
 handshake are handled for you, and text is validated as UTF-8. HTTP/1.1
 only for now (HTTP/2 per RFC 8441 is not yet supported).
 
+### Roadmap and Autobahn conformance
+
+WebSocket support is validated against the
+[Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite),
+the reference conformance suite for RFC 6455 (the WebSocket equivalent of
+the `h2spec` check used for HTTP/2). `nimble autobahn` runs it in Docker.
+The gaps below are tracked as TODO; where a gap is a known difference from
+Node's `ws` (the de facto reference implementation), it is noted.
+
+- [x] **Autobahn conformance**: `nimble autobahn` (see
+  [conformance/autobahn/](conformance/autobahn/)) runs the suite against a
+  vortex echo server. All 301 non-compression cases pass (framing,
+  pings/pongs, reserved bits, opcodes, fragmentation, UTF-8, close
+  handling, limits: groups 1-7 and 9-10).
+- [ ] **permessage-deflate** (RFC 7692) message compression. Not
+  implemented, so the Autobahn run excludes the compression cases (12-13).
+  This is the last protocol gap for a full Autobahn pass, and the main
+  difference versus `ws`.
+- [ ] **Subprotocol negotiation**: honor the client's
+  `Sec-WebSocket-Protocol` offer and echo the server-selected subprotocol
+  in the handshake (`ws` supports this via `handleProtocols`).
+- [ ] **Backpressure introspection**: a `bufferedAmount`-style accessor
+  (and a drained signal) so an application can throttle a slow consumer.
+  Today `ws.send` buffers into the connection write buffer without
+  exposing its depth; `ws` exposes `bufferedAmount` and a send callback.
+- [ ] **Per-connection backpressure for `ws.blocking:`**: pin the
+  connection so one message is processed at a time, matching the HTTP
+  `blocking:` semantics (WebSocket handlers currently run concurrently).
+- [ ] **HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)** WebSockets via Extended
+  CONNECT. Optional: browsers use HTTP/1.1 for WebSockets regardless, so
+  this is a multiplexing optimization, not a compatibility requirement.
+
 ## Handler rules
 
 - Handlers run **inline on the event loop**: never block in them (no sync
@@ -199,6 +231,10 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
   against a live server in Docker and fails on any BAD-level finding (or
   `sh conformance/run.sh` with a host REDbot). See
   [conformance/](conformance/).
+- WebSocket conformance: `nimble autobahn` runs the
+  [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
+  in Docker (301/301 non-compression cases pass). See
+  [conformance/autobahn/](conformance/autobahn/).
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
 
 The chronos adapter is covered by `nimble testchronos` (its dependency is
