@@ -133,6 +133,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
     udpFd: -1)
   result.core.serverHeader = settings.serverHeader
   result.core.maxWsMessage = settings.maxWsMessageSize
+  result.core.wsPingInterval = settings.wsPingInterval
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox
@@ -160,6 +161,8 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
     of dkBody: loop.settings.bodyTimeout
     of dkIdle: loop.settings.keepAliveTimeout
     of dkDrain: drainTimeoutSec
+    of dkWsPing: loop.settings.wsPingInterval
+    of dkWsPong: loop.settings.wsPongTimeout
     of dkNone: 0
   c.deadline = if secs > 0: loop.core.nowSec + int64(secs) else: 0
 
@@ -662,12 +665,26 @@ proc processOutbox(loop: Loop) =
     if h3Touched and loop.quicListener != nil:
       loop.h3Drive()             # flush unpinned conns, dispatch new work
 
+proc sweepWsPing(loop: Loop, c: ptr Connection) =
+  ## A WebSocket has been idle: send a keepalive ping and wait for any
+  ## frame (pong or data) until the pong deadline, after which the peer is
+  ## treated as gone.
+  if c.ws == nil:
+    loop.closeConn(c)
+    return
+  wsAppendPing(c)
+  c.setDeadline(loop, dkWsPong)
+  loop.flushOut(c)
+
 proc sweepTimeouts(loop: Loop) =
   for i in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[i]
-    if c.state != csFree and c.deadline != 0 and
-        c.deadline <= loop.core.nowSec:
-      loop.closeConn(c)
+    if c.state == csFree or c.deadline == 0 or c.deadline > loop.core.nowSec:
+      continue
+    if c.dlKind == dkWsPing:
+      loop.sweepWsPing(c)          # idle: ping, then wait for the pong
+    else:
+      loop.closeConn(c)            # includes dkWsPong: no reply, peer is gone
 
 proc tick(loop: Loop) =
   let now = monoSec()

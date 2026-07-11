@@ -56,6 +56,21 @@ proc currentThreadId(): int {.inline.} =
 proc acceptKey(clientKey: string): string =
   encode(sha1(clientKey & wsMagic))
 
+proc armWsPing*(core: ptr LoopCore, c: ptr Connection) =
+  ## (Re)start the WebSocket idle timer: after wsPingInterval seconds with
+  ## no inbound frame the loop sends a keepalive ping (see the event loop's
+  ## sweep). 0 disables it, leaving the connection without a read deadline.
+  if core.wsPingInterval > 0:
+    c.dlKind = dkWsPing
+    c.deadline = core.nowSec + int64(core.wsPingInterval)
+  else:
+    c.dlKind = dkNone
+    c.deadline = 0
+
+proc wsAppendPing*(c: ptr Connection) =
+  ## Queue a keepalive ping frame (empty payload). Loop thread only.
+  c.wbuf.appendFrame(opPing, "")
+
 # --- handshake --------------------------------------------------------------
 
 proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
@@ -86,9 +101,8 @@ proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
   elif consumed > 0:
     moveMem(addr c.rbuf[0], addr c.rbuf[consumed], c.rlen - consumed)
     c.rlen -= consumed
-  # Long-lived: no HTTP read deadline.
-  c.deadline = 0
-  c.dlKind = dkNone
+  # Long-lived: replace the HTTP read deadline with the WebSocket keepalive.
+  armWsPing(core, c)
   w
 
 # --- output helpers (loop thread) -------------------------------------------
@@ -196,6 +210,10 @@ proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
     else:
       moveMem(addr c.rbuf[0], addr c.rbuf[pos], c.rlen - pos)
       c.rlen -= pos
+    # An inbound frame (pong or data) means the peer is alive: restart the
+    # idle timer, which also cancels a pending pong deadline.
+    if c.ws != nil and not c.closeAfterFlush:
+      armWsPing(core, c)
 
 proc wsClosed*(core: ptr LoopCore, c: ptr Connection) =
   ## Called by the loop when the connection is torn down: deliver onClose

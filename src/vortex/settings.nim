@@ -31,6 +31,8 @@ type
     headerTimeout*: int       ## from first byte of a request to end of headers
     bodyTimeout*: int         ## from end of headers to end of body
     keepAliveTimeout*: int    ## idle time between requests
+    wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
+    wsPongTimeout*: int       ## close a WebSocket if no frame arrives this long after a ping
     shutdownGrace*: int       ## drain window on graceful shutdown
 
     serverHeader*: string     ## "" disables the Server header
@@ -63,6 +65,8 @@ proc initSettings*(
     headerTimeout = 10,
     bodyTimeout = 30,
     keepAliveTimeout = 60,
+    wsPingInterval = 30,
+    wsPongTimeout = 10,
     shutdownGrace = 10,
     serverHeader = "vortex",
     certFile = "",
@@ -85,6 +89,7 @@ proc initSettings*(
     maxRequestsPerSocket: maxRequestsPerSocket,
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
+    wsPingInterval: wsPingInterval, wsPongTimeout: wsPongTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
     certFile: certFile, keyFile: keyFile, http3: http3,
     minTlsVersion: minTlsVersion, tlsCipherList: tlsCipherList,
