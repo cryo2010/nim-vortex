@@ -42,6 +42,15 @@ var capSrv = start(RequestHandler(handler),
                    initSettings(port = Port(0), numThreads = 1,
                                 maxConnections = connCap))
 
+# Tight h1 limits + small initial buffer, but a high stream cap: a large
+# h2 request burst must be processed via receive-buffer compaction rather
+# than clipped by the h1 body limit.
+var tightSrv = start(RequestHandler(handler),
+                     initSettings(port = Port(0), numThreads = 1,
+                                  initialBufferSize = 2048,
+                                  maxHeaderSize = 2048, maxBodySize = 2048,
+                                  maxConcurrentStreams = 4000))
+
 suite "HTTP/2 flood defenses":
   test "rapid reset flood should GOAWAY and bound handler work":
     handlerHits.store(0)
@@ -84,16 +93,33 @@ suite "HTTP/2 flood defenses":
     check frames.count(ftHeaders) >= 1  # a response HEADERS came back
     check frames.goawayError() == -1    # no GOAWAY for legitimate traffic
 
+  test "large h2 request burst is not clipped by tight h1 limits":
+    # 1000 GETs (~12 KB) exceed both the doubled receive buffer and
+    # maxHeaderSize+maxBodySize (4 KB); compaction must process them all
+    # instead of closing the connection when the buffer fills.
+    const n = 1000
+    var c = newH2TestConn(tightSrv.port)
+    var burst = ""
+    var sid = 1'u32
+    for i in 0 ..< n:
+      burst.addHeaders(sid, endStream = true)
+      sid += 2
+    c.sendRaw(burst)
+    let frames = c.readFrames(3000)
+    c.close()
+    check frames.goawayError() == -1
+    check frames.count(ftHeaders) == n  # every request got a response
+
 suite "oversized request defenses":
-  test "oversized header should be rejected, 431 delivered via lingering close":
+  test "oversized header should be rejected via lingering close":
     # The server rejects the oversized header and, via lingering close
     # (half-close + drain), delivers the 431 before closing rather than
-    # RST-truncating it. Delivery is proven reliable in isolation; here we
-    # assert the invariant that always holds under suite load (never
-    # served) plus the 431 when the response is delivered.
+    # RST-truncating it. The invariant asserted here (never served) is
+    # stable; under the CPU load of the preceding flood tests the response
+    # can occasionally arrive empty (the request isn't scheduled in time),
+    # so 431-delivery is verified separately, not asserted under load.
     let resp = rawExchange(limitSrv.port,
-      "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 8000) & "\r\n\r\n",
-      timeoutMs = 4000)
+      "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 8000) & "\r\n\r\n")
     check "200" notin resp
     check ("431" in resp) or (resp.len == 0)
 
@@ -151,4 +177,5 @@ suite "connection cap":
 floodSrv.close()
 limitSrv.close()
 capSrv.close()
+tightSrv.close()
 echo "server shut down cleanly"

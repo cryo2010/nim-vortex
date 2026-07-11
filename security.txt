@@ -16,14 +16,14 @@ maxResetStreams, maxControlFrames, maxHeaderSize, maxBodySize, *Timeout).
 - Slowloris / slow-body   header/body/idle timeout wheel. test_security_dos
 - Oversized header/body   431 / 413 via maxHeaderSize / maxBodySize;
     lingering close (half-close + drain) delivers the error before closing
-    instead of RST-truncating it. test_http1_parser, test_security_dos
+    instead of RST-truncating it. test_http1_parser, test_http1_server,
+    test_security_dos
 - Integer overflow   Content-Length and chunk-size guards. test_security_parsing
 - Memory (many conns / streams)   maxConnections accept-and-drop;
-    maxConcurrentStreams per h2/h3 connection. test_security_dos
+    maxConcurrentStreams per h2/h3 connection. The h2 receive buffer is
+    compacted as frames are consumed (bounded, not tied to the h1 body
+    limit), so tight h1 limits don't clip large h2 bursts. test_security_dos
 
 ## Follow-ups (not yet addressed)
-- h2 read-buffer sizing: the h1 flood guard (maxHeaderSize + maxBodySize)
-  also bounds the h2 receive buffer; large h2 frame bursts want a dedicated
-  cap so tight h1 limits don't cap h2 buffering.
 - Fuzzing: libFuzzer harness over parser.parse / HPACK / QPACK decoders.
 - Per-IP connection limits (needs peer-addr plumbing); h3spec conformance.

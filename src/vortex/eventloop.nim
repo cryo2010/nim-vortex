@@ -272,6 +272,7 @@ proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
                  "text/plain", msg, [], keepAlive = false, skipBody = false)
   c.responded = true
   c.closeAfterFlush = true
+  c.lingerClose = true       # drain the peer so the error is delivered, no RST
   c.state = csClosing
 
 proc h2Input(loop: Loop, c: ptr Connection) =
@@ -413,14 +414,33 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
       return                     # nothing deferred is pending
     loop.resumeAfterRespond(c, stream)
 
+const h2RecvBufferCap = 1024 * 1024
+  ## Hard ceiling on an HTTP/2 connection's receive buffer. With
+  ## process-and-compact it is never approached in practice (a single
+  ## frame is <= max frame size); it only bounds backpressure while a
+  ## `blocking:` worker has the connection pinned.
+
 proc handleRead(loop: Loop, c: ptr Connection) =
   while true:
     if c.rlen == c.rbuf.len:
-      # Flood guard: never buffer more than one max-size request head+body.
-      if c.rlen > loop.settings.maxHeaderSize + loop.settings.maxBodySize:
-        loop.closeConn(c)
-        return
-      c.rbuf.setLen(c.rbuf.len * 2)
+      if c.h2 != nil:
+        # HTTP/2: process buffered frames to compact consumed bytes, so the
+        # receive buffer stays small regardless of total upload size and is
+        # not clipped by a tight h1 body limit. Grow only if nothing could
+        # be compacted (e.g. pinned by a worker), up to a hard ceiling.
+        loop.processInput(c)
+        if c.state != csActive: return
+        if c.rlen == c.rbuf.len:
+          if c.rbuf.len >= h2RecvBufferCap:
+            loop.closeConn(c)
+            return
+          c.rbuf.setLen(c.rbuf.len * 2)
+      else:
+        # HTTP/1 flood guard: never buffer more than one request head+body.
+        if c.rlen > loop.settings.maxHeaderSize + loop.settings.maxBodySize:
+          loop.closeConn(c)
+          return
+        c.rbuf.setLen(c.rbuf.len * 2)
     let wanted = c.rbuf.len - c.rlen
     when not defined(plainHttp):
       if c.ssl != nil:

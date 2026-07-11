@@ -127,6 +127,15 @@ suite "http/1.1 integration":
       "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999\r\n\r\n")
     check "413" in resp
 
+  test "oversized header delivers 431 before close (lingering close)":
+    # The header exceeds the limit while its bytes are still unread; the
+    # lingering close drains the peer so the 431 reaches the client
+    # instead of being RST-truncated. (No competing load here, so the
+    # delivery is deterministic.)
+    let resp = rawExchange(port,
+      "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " & repeat('a', 20000) & "\r\n\r\n")
+    check "431" in resp
+
   test "handler exception gives 500":
     let resp = rawExchange(port, "GET /boom HTTP/1.1\r\nHost: x\r\n\r\n")
     check "HTTP/1.1 500" in resp
