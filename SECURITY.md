@@ -180,12 +180,36 @@ maintainer (Craig Younker, cryo2010@gmail.com) or via a private security
 advisory on the repository, rather than opening a public issue. A short
 description and a reproducing input are enough to start.
 
+## Deployment boundary
+
+vortex defends against the abuse classes that a reverse proxy or CDN cannot
+handle for it, because they are inherent to terminating the protocol:
+HTTP/2 frame abuse, request smuggling, header-compression bombs, malformed
+input, and per-connection resource exhaustion. Those must be handled by
+whatever parses the bytes, so they live here.
+
+Per-source-IP connection and request rate limiting is deliberately **not** in
+the server core. It belongs at the fronting layer (reverse proxy, load
+balancer, or CDN), for two reasons:
+
+- Behind a proxy every connection arrives from the proxy's address, so a
+  socket-peer limiter would throttle all clients as one. Doing it correctly
+  requires trusted-proxy configuration and `X-Forwarded-For` / PROXY-protocol
+  real-IP resolution, which is a routing concern, not a parsing one.
+- It is the consensus of the mainstream server ecosystem. Node's `http` core
+  offers a global `maxConnections` but no per-IP; Go's `net/http` offers only
+  timeouts and a global `netutil.LimitListener`; Python's Falcon delegates
+  connection handling entirely to the WSGI/ASGI server, none of which limit
+  per IP. All treat per-IP as infrastructure's job.
+
+If vortex is deployed directly on the internet with no fronting layer, put a
+proxy in front for per-IP limiting, or track the opt-in per-IP feature noted
+in `security.txt`.
+
 ## Known limitations and roadmap
 
 These are tracked in `security.txt` and are future work, not open holes:
 
-- **Per-IP connection limits** are not yet implemented (the connection cap is
-  per loop thread, not per source address); this needs peer-address plumbing.
 - **HTTP/3 conformance** is smoke-tested against real clients but not yet run
   against an h3spec-style suite.
 - **CI fuzzing** with a persisted, growing corpus (OSS-Fuzz style) is not yet

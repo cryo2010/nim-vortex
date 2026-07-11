@@ -33,6 +33,12 @@ container). ASAN + Nim checks on, -d:useMalloc so ASAN sees allocations.
 Clean over millions of runs each: parser.parse (whole + split feed), the
 HPACK decoder (dynamic-table state across blocks), the QPACK decoder.
 
+## Deliberately out of scope
+- Per-IP connection / rate limiting: a fronting-proxy concern (see
+  SECURITY.md "Deployment boundary"), matching Node/Go/Falcon. Could be
+  added as an opt-in, default-off, per-thread counter for the proxyless
+  edge case, but is not core work.
+
 ## Follow-ups (not yet addressed)
-- Per-IP connection limits (needs peer-addr plumbing); h3spec conformance.
+- h3spec conformance.
 - Wire the fuzzers into CI (OSS-Fuzz-style) with a persisted corpus.
