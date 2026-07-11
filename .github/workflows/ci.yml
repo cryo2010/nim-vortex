@@ -27,7 +27,7 @@ jobs:
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git curl openssl
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Nim version
         run: nim --version
@@ -48,7 +48,7 @@ jobs:
   redbot:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: HTTP/1.1 conformance (REDbot)
         run: |
           docker build -f conformance/Dockerfile -t vortex-redbot \
@@ -58,7 +58,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Fuzz the parser/HPACK/QPACK decoders
         # 30s per target; a crash writes a reproducer and exits non-zero.
         run: |
