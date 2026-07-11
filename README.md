@@ -87,8 +87,21 @@ libraries, and unlike `blocking:` the async body may capture locals
 For chronos-based drivers, import `vortex/adapters/chronos` instead: it
 exposes the identical API (`{.async.}` handlers, `toHandler`,
 `req.doAsync:`) over chronos's `Future`. Import only one async adapter
-per program. (`nimble testchronos` runs its test suite; chronos is an
-opt-in dependency, so it is kept out of the default `nimble test`.)
+per program.
+
+chronos is **not** a vortex dependency (a bare `import vortex` never
+needs it), so using this adapter means adding chronos to your own
+project alongside vortex:
+
+```
+requires "chronos >= 4.0.0"
+```
+
+Without it the adapter import fails to compile (`cannot open file:
+chronos`). The asyncdispatch adapter has no such step because
+asyncdispatch ships in Nim's stdlib. For the same reason chronos stays
+out of the default `nimble test`; its suite runs via `nimble
+testchronos`.
 
 Embedded / test usage: `var srv = start(handler, settings)` returns
 immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
