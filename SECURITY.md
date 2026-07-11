@@ -39,6 +39,9 @@ disables the corresponding check where noted.
 | `headerTimeout` | 10 s | First byte to end of headers |
 | `bodyTimeout` | 30 s | End of headers to end of body |
 | `keepAliveTimeout` | 60 s | Idle time between requests |
+| `minTlsVersion` | `tlsV12` | Lowest accepted TLS version (`tlsV12` or `tlsV13`); QUIC is always 1.3 |
+| `tlsCipherList` | "" | OpenSSL cipher list for TLS 1.2 ("" keeps OpenSSL's default) |
+| `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default) |
 
 ## Defenses in detail
 
@@ -95,6 +98,21 @@ overflow vectors before dispatch:
   while a `blocking:` worker holds a connection pinned.
 - **Bodies and headers** are bounded by `maxBodySize`, `maxHeaderSize`, and
   `maxHeaderCount`; HTTP/2 and HTTP/3 bodies are capped per stream.
+
+### Transport security (TLS)
+
+TLS, ALPN, and QUIC are handled by OpenSSL (>= 3.5), so the transport
+cryptography is OpenSSL's. vortex adds a small policy surface on top:
+
+- **Minimum version.** `minTlsVersion` defaults to `tlsV12`, which is set
+  explicitly on the context so the insecure TLS 1.0 and 1.1 are refused
+  regardless of the system OpenSSL default. `tlsV13` restricts the server to
+  TLS 1.3. QUIC (HTTP/3) always uses TLS 1.3 by protocol.
+- **Cipher selection.** `tlsCipherList` (TLS 1.2) and `tlsCipherSuites`
+  (TLS 1.3) override OpenSSL's defaults when set; an invalid value fails fast
+  at startup rather than silently falling back.
+- Build with `-d:plainHttp` to exclude TLS and the OpenSSL dependency
+  entirely (cleartext HTTP/1.1 and h2c only).
 
 ### Connection lifecycle
 
@@ -172,6 +190,6 @@ These are tracked in `security.txt` and are future work, not open holes:
   against an h3spec-style suite.
 - **CI fuzzing** with a persisted, growing corpus (OSS-Fuzz style) is not yet
   wired up; the harnesses currently run on demand.
-- **TLS** relies on OpenSSL (>= 3.5) for the transport, ALPN, and QUIC; its
-  security posture is inherited from OpenSSL. Build with `-d:plainHttp` to
-  exclude TLS and its dependency entirely.
+- **TLS transport crypto** is OpenSSL's (see the Transport security section
+  for the policy vortex layers on top). Certificate rotation, OCSP stapling,
+  and session-ticket key management are not exposed yet.

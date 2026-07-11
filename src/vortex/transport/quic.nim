@@ -46,9 +46,12 @@ proc SSL_get_shutdown(ssl: SslPtr): cint
 proc SSL_free_q(ssl: SslPtr)
   {.importc: "SSL_free", cdecl, dynlib: sslLibName.}
 
-proc newQuicConfig*(certFile, keyFile: string): ptr TlsConfig =
-  ## SSL_CTX for the QUIC server; ALPN offers h3 only.
-  newTlsConfigWith(OSSL_QUIC_server_method(), certFile, keyFile, "\x02h3")
+proc newQuicConfig*(certFile, keyFile: string,
+                    cipherSuites = ""): ptr TlsConfig =
+  ## SSL_CTX for the QUIC server; ALPN offers h3 only. QUIC mandates
+  ## TLS 1.3, so only the 1.3 cipher suites are configurable.
+  newTlsConfigWith(OSSL_QUIC_server_method(), certFile, keyFile, "\x02h3",
+                   cipherSuites = cipherSuites)
 
 proc newQuicListener*(cfg: ptr TlsConfig, udpFd: cint): SslPtr =
   result = SSL_new_listener(cfg.ctx, 0)

@@ -67,6 +67,64 @@ suite "TLS":
     check rc == 0
     check output.strip() == "hello over TLS|200"
 
+# --- minimum TLS version -----------------------------------------------------
+
+proc handshakeOk(port: Port, tlsFlag: string): bool =
+  ## openssl s_client exits 0 on a completed handshake, non-zero on a
+  ## version/handshake rejection. (System curl here is LibreSSL and is
+  ## unreliable for --tlsv1.3, so drive OpenSSL directly.)
+  execCmdEx("echo | openssl s_client -connect localhost:" & $port & " " &
+            tlsFlag & " >/dev/null 2>&1")[1] == 0
+
+var srv12 = start(RequestHandler(handler),
+                  initSettings(port = Port(0), numThreads = 1, http3 = false,
+                               certFile = certFile, keyFile = keyFile))
+                               # default minTlsVersion = tlsV12
+var srv13 = start(RequestHandler(handler),
+                  initSettings(port = Port(0), numThreads = 1, http3 = false,
+                               certFile = certFile, keyFile = keyFile,
+                               minTlsVersion = tlsV13))
+
+suite "minimum TLS version":
+  test "default (tlsV12) accepts TLS 1.2":
+    check handshakeOk(srv12.port, "-tls1_2")
+
+  test "default (tlsV12) accepts TLS 1.3":
+    check handshakeOk(srv12.port, "-tls1_3")
+
+  test "tlsV13 rejects TLS 1.2":
+    check not handshakeOk(srv13.port, "-tls1_2")
+
+  test "tlsV13 accepts TLS 1.3":
+    check handshakeOk(srv13.port, "-tls1_3")
+
+var srvCipher = start(RequestHandler(handler),
+                      initSettings(port = Port(0), numThreads = 1,
+                                   http3 = false, certFile = certFile,
+                                   keyFile = keyFile,
+                                   tlsCipherSuites = "TLS_AES_128_GCM_SHA256"))
+
+suite "TLS cipher configuration":
+  test "restricted TLS 1.3 cipher suite is honored":
+    let (output, rc) = execCmdEx(
+      "echo | openssl s_client -connect localhost:" & $srvCipher.port &
+      " -tls1_3 2>&1")
+    check rc == 0
+    check "TLS_AES_128_GCM_SHA256" in output      # the only suite we allowed
+    check "TLS_AES_256_GCM_SHA384" notin output   # the default, now excluded
+
+  test "an invalid cipher suite is rejected at startup":
+    expect CatchableError:
+      var bad = start(RequestHandler(handler),
+                      initSettings(port = Port(0), numThreads = 1,
+                                   http3 = false, certFile = certFile,
+                                   keyFile = keyFile,
+                                   tlsCipherSuites = "NOT_A_REAL_CIPHER"))
+      bad.close()
+
+srvCipher.close()
+srv12.close()
+srv13.close()
 srv.close()
 removeDir(certDir)
 echo "server shut down cleanly"

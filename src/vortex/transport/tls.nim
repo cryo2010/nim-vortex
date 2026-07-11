@@ -27,8 +27,14 @@ const
   SSL_ERROR_SYSCALL = cint(5)
   SSL_ERROR_ZERO_RETURN = cint(6)
   SSL_CTRL_MODE = cint(33)
+  SSL_CTRL_SET_MIN_PROTO_VERSION = cint(123)
   SSL_MODE_ENABLE_PARTIAL_WRITE = clong(1)
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
+
+const
+  # OpenSSL protocol version numbers (for set_min_proto_version).
+  TLS1_2_VERSION* = clong(0x0303)
+  TLS1_3_VERSION* = clong(0x0304)
   SSL_TLSEXT_ERR_OK = cint(0)
   SSL_TLSEXT_ERR_NOACK = cint(3)
   OPENSSL_NPN_NEGOTIATED = cint(1)
@@ -43,6 +49,8 @@ proc SSL_CTX_use_PrivateKey_file(ctx: SslCtxPtr, file: cstring,
 proc SSL_CTX_check_private_key(ctx: SslCtxPtr): cint
 proc SSL_CTX_ctrl(ctx: SslCtxPtr, cmd: cint, larg: clong,
                   parg: pointer): clong
+proc SSL_CTX_set_cipher_list(ctx: SslCtxPtr, str: cstring): cint
+proc SSL_CTX_set_ciphersuites(ctx: SslCtxPtr, str: cstring): cint
 proc SSL_CTX_set_alpn_select_cb(ctx: SslCtxPtr,
     cb: proc (ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
               inProtos: ptr uint8, inLen: cuint, arg: pointer): cint {.cdecl.},
@@ -101,10 +109,25 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
     SSL_TLSEXT_ERR_NOACK      # no overlap: proceed without ALPN (=> h1)
 
 proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
-                       protos: string): ptr TlsConfig =
+                       protos: string, minProtoVersion: clong = 0,
+                       cipherList = "", cipherSuites = ""): ptr TlsConfig =
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
+  if minProtoVersion != 0:
+    if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION,
+                    minProtoVersion, nil) != 1:
+      SSL_CTX_free(ctx)
+      raise newException(CatchableError,
+        "cannot set minimum TLS version: " & lastErrorMsg())
+  if cipherList.len > 0 and SSL_CTX_set_cipher_list(ctx, cipherList) != 1:
+    SSL_CTX_free(ctx)
+    raise newException(CatchableError,
+      "invalid TLS cipher list: " & lastErrorMsg())
+  if cipherSuites.len > 0 and SSL_CTX_set_ciphersuites(ctx, cipherSuites) != 1:
+    SSL_CTX_free(ctx)
+    raise newException(CatchableError,
+      "invalid TLS 1.3 cipher suites: " & lastErrorMsg())
   if SSL_CTX_use_certificate_chain_file(ctx, certFile.cstring) != 1:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
@@ -126,10 +149,12 @@ proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
   result.protos = protos
   SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
 
-proc newTlsConfig*(certFile, keyFile: string,
-                   enableH2 = false): ptr TlsConfig =
+proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
+                   minProtoVersion: clong = 0,
+                   cipherList = "", cipherSuites = ""): ptr TlsConfig =
   newTlsConfigWith(TLS_server_method(), certFile, keyFile,
-    if enableH2: "\x02h2\x08http/1.1" else: "\x08http/1.1")
+    (if enableH2: "\x02h2\x08http/1.1" else: "\x08http/1.1"),
+    minProtoVersion, cipherList, cipherSuites)
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
   SSL_CTX_free(cfg.ctx)

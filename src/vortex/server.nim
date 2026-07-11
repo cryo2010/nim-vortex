@@ -49,8 +49,14 @@ proc start*(handler: RequestHandler, settings = initSettings()): Server =
 
   when not defined(plainHttp):
     if settings.certFile.len > 0:
+      let minVer = case settings.minTlsVersion
+                   of tlsV12: TLS1_2_VERSION
+                   of tlsV13: TLS1_3_VERSION
       result.tls = cast[pointer](
-        newTlsConfig(settings.certFile, settings.keyFile, enableH2 = true))
+        newTlsConfig(settings.certFile, settings.keyFile, enableH2 = true,
+                     minProtoVersion = minVer,
+                     cipherList = settings.tlsCipherList,
+                     cipherSuites = settings.tlsCipherSuites))
   else:
     if settings.certFile.len > 0:
       raise newException(CatchableError,
@@ -70,7 +76,8 @@ proc start*(handler: RequestHandler, settings = initSettings()): Server =
   when not defined(plainHttp):
     if result.tls != nil and settings.http3:
       result.quicCfg = cast[pointer](
-        newQuicConfig(settings.certFile, settings.keyFile))
+        newQuicConfig(settings.certFile, settings.keyFile,
+                      cipherSuites = settings.tlsCipherSuites))
       for i in 0 ..< numLoops:
         udpFds[i] = newUdpSocket(cfg)
 

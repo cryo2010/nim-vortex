@@ -23,6 +23,8 @@ maxResetStreams, maxControlFrames, maxHeaderSize, maxBodySize, *Timeout).
     maxConcurrentStreams per h2/h3 connection. The h2 receive buffer is
     compacted as frames are consumed (bounded, not tied to the h1 body
     limit), so tight h1 limits don't clip large h2 bursts. test_security_dos
+- TLS policy   minTlsVersion (default tlsV12, refuses TLS 1.0/1.1);
+    tlsCipherList / tlsCipherSuites override OpenSSL defaults. test_tls
 
 ## Fuzzing
 libFuzzer harnesses over the untrusted-input decoders live in fuzz/

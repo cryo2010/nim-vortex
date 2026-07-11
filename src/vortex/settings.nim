@@ -1,6 +1,10 @@
 import std/net
 
 type
+  TlsMinVersion* = enum
+    tlsV12,   ## TLS 1.2 minimum (default; disallows the insecure 1.0/1.1)
+    tlsV13    ## TLS 1.3 only
+
   Settings* = object
     port*: Port
     address*: string          ## bind address, "" = all interfaces
@@ -33,6 +37,9 @@ type
     certFile*: string
     keyFile*: string
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
+    minTlsVersion*: TlsMinVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
+    tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
+    tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default)
 
 proc initSettings*(
     port = Port(8080),
@@ -56,7 +63,10 @@ proc initSettings*(
     serverHeader = "vortex",
     certFile = "",
     keyFile = "",
-    http3 = true
+    http3 = true,
+    minTlsVersion = tlsV12,
+    tlsCipherList = "",
+    tlsCipherSuites = ""
 ): Settings =
   Settings(
     port: port, address: address, numThreads: numThreads,
@@ -70,5 +80,7 @@ proc initSettings*(
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
-    certFile: certFile, keyFile: keyFile, http3: http3
+    certFile: certFile, keyFile: keyFile, http3: http3,
+    minTlsVersion: minTlsVersion, tlsCipherList: tlsCipherList,
+    tlsCipherSuites: tlsCipherSuites
   )
