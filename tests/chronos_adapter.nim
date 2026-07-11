@@ -1,4 +1,4 @@
-import std/[unittest, net, httpcore, strutils, os, osproc]
+import std/[unittest, net, httpcore, strutils, os, osproc, posix]
 import std/httpclient except Response
 import std/times except milliseconds
 import vortex/[settings, request, server, router]
@@ -41,7 +41,15 @@ proc hBlockingInside(req: Request, res: Response) {.async.} =
     sleep(50)
     res.send(Http200, "worker done", "text/plain")
 
+proc hWs(req: Request, res: Response) {.gcsafe.} =
+  let ws = req.acceptWebSocket()
+  ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+    ws.doAsync:
+      await sleepAsync(15.milliseconds)     # chronos await, loop keeps serving
+      ws.send("async: " & data)
+
 var appRouter = newRouter()
+appRouter.get("/ws", hWs)
 appRouter.get("/", hRoot)
 appRouter.get("/delay", hDelay)
 appRouter.get("/hello/:name", hCapture)
@@ -59,6 +67,36 @@ proc fetch(path: string): string =
   var client = newHttpClient()
   defer: client.close()
   client.getContent(base & path)
+
+proc wsRecvN(s: Socket, n: int): string =
+  result = newString(n)
+  var got = 0
+  while got < n:
+    let k = recv(s.getFd, addr result[got], n - got, cint(0))
+    if k <= 0: raise newException(IOError, "short read")
+    got += k
+
+proc wsRecvFrame(s: Socket): tuple[op: int, payload: string] =
+  let h = wsRecvN(s, 2)
+  var ln = int(uint8(h[1]) and 0x7f)
+  if ln == 126:
+    let e = wsRecvN(s, 2); ln = (int(uint8(e[0])) shl 8) or int(uint8(e[1]))
+  ((int(uint8(h[0])) and 0x0f), (if ln > 0: wsRecvN(s, ln) else: ""))
+
+proc openWsChat(): Socket =
+  result = newSocket(buffered = false)
+  result.connect("127.0.0.1", srv.port)
+  result.send("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" &
+              "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" &
+              "Sec-WebSocket-Version: 13\r\n\r\n")
+  result.setRecvTimeout(2000)
+  var hdr = ""
+  var one = newString(1)
+  while not hdr.endsWith("\r\n\r\n"):
+    let k = recv(result.getFd, addr one[0], 1, cint(0))
+    if k <= 0: break
+    hdr.add one[0]
+  doAssert "101" in hdr, hdr
 
 suite "chronos adapter":
   test "async handler without await":
@@ -116,6 +154,19 @@ suite "chronos adapter":
       base & "/delay")
     check rc == 0
     check output.strip() == "slept|2"
+
+  test "ws.doAsync: await inside a websocket message handler":
+    let s = openWsChat()
+    defer: s.close()
+    var f = "\x81\x85"                        # fin+text, masked, len 5
+    let mask = [0x11'u8, 0x22, 0x33, 0x44]
+    for m in mask: f.add char(m)
+    let msg = "howdy"
+    for i in 0 ..< msg.len: f.add char(uint8(msg[i]) xor mask[i and 3])
+    s.send(f)
+    let r = s.wsRecvFrame()
+    check r.op == 0x1
+    check r.payload == "async: howdy"
 
 srv.close()
 echo "server shut down cleanly"

@@ -10,6 +10,7 @@ import ./request
 import ./http1/parser as h1parser
 import ./http1/codec as h1codec
 import ./http2/codec as h2codec
+import ./websocket/codec as wscodec
 from ./http2/frames import connectionPreface
 when not defined(plainHttp):
   import ./transport/tls
@@ -131,6 +132,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
     tls: tls,
     udpFd: -1)
   result.core.serverHeader = settings.serverHeader
+  result.core.maxWsMessage = settings.maxWsMessageSize
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox
@@ -173,6 +175,8 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     c.closeRequested = true
     c.state = csClosing
     return
+  if c.ws != nil:
+    wsClosed(addr loop.core, c)   # deliver onClose (1006 if no peer close)
   when not defined(plainHttp):
     if c.ssl != nil:
       if not c.handshaking:
@@ -315,6 +319,9 @@ proc processInput(loop: Loop, c: ptr Connection) =
   ## Parse and dispatch as many complete pipelined requests as the buffer
   ## holds. Parsing pauses while a response is outstanding (deferred
   ## handlers) so responses stay ordered.
+  if c.ws != nil:
+    wsInput(addr loop.core, c)
+    return
   if c.h2 != nil:
     loop.h2Input(c)
     return
@@ -373,6 +380,10 @@ proc processInput(loop: Loop, c: ptr Connection) =
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
         return
+      if c.ws != nil:
+        # Handler upgraded to WebSocket: the 101 is queued; the loop
+        # flushes it and all further bytes flow through wsInput.
+        return
       if c.closeAfterFlush:
         c.state = csClosing
         return
@@ -419,6 +430,15 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
     if stream == 0 and not (c.awaitingResponse and c.responded):
       return                     # nothing deferred is pending
     loop.resumeAfterRespond(c, stream)
+
+proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
+  ## LoopCore.flushHook: write a connection's pending output now. Used by a
+  ## loop-thread WebSocket send outside the read path.
+  {.gcsafe.}:
+    let loop = cast[Loop](loopPtr)
+    let c = conn(addr loop.core, fd, gen)
+    if c != nil and c.pendingOut > 0:
+      loop.flushOut(c)
 
 const h2RecvBufferCap = 1024 * 1024
   ## Hard ceiling on an HTTP/2 connection's receive buffer. With
@@ -623,6 +643,13 @@ proc processOutbox(loop: Loop) =
     if int(m.fd) >= loop.core.conns.len: continue
     let c = addr loop.core.conns[int(m.fd)]
     if c.gen != m.gen or c.state == csFree: continue
+    if m.kind == omWs:
+      # A WebSocket frame from an off-loop sender: already serialized
+      # (server frames are unmasked and self-contained), just write it.
+      if c.ws != nil:
+        c.wbuf.add m.data
+        loop.flushOut(c)
+      continue
     if c.pinned > 0: dec c.pinned
     if c.closeRequested:
       loop.closeConn(c)          # connection died while the task ran
@@ -652,6 +679,7 @@ proc tick(loop: Loop) =
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.kick = kickImpl
+  loop.core.flushHook = flushImpl
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
   while not loop.stopFlag[].load(moRelaxed):

@@ -11,15 +11,22 @@ type
   PathParams* = seq[(string, string)]
     ## Route parameters captured by the router; exposed as req.params.
 
+  OutMsgKind* = enum
+    omHttp,                   ## data is a packed HTTP response (see packResponse)
+    omWs                      ## data is a ready-to-write WebSocket frame
+
   OutMsg* = object
-    ## A response produced off-loop (worker thread), routed back to the
-    ## owning event loop in protocol-neutral packed form (see packResponse);
-    ## the loop serializes it as HTTP/1 bytes or HTTP/2 frames.
+    ## A message produced off-loop (worker thread), routed back to the
+    ## owning event loop. HTTP responses arrive in protocol-neutral packed
+    ## form (the loop serializes them as HTTP/1 bytes or HTTP/2 frames);
+    ## WebSocket frames arrive already serialized (server frames are
+    ## unmasked and self-contained), the loop just appends them.
+    kind*: OutMsgKind         ## omHttp by default (existing response path)
     fd*: int32
     gen*: uint32
     stream*: uint32           ## 0 for HTTP/1
     code*: int32
-    data*: string             ## packed contentType + headers + body
+    data*: string             ## packed response, or a full WS frame
 
   Outbox* = object
     ## MPSC channel into an event loop: workers push, the loop drains on
@@ -51,6 +58,7 @@ type
     handshaking*: bool        ## TLS handshake still in progress
     alpn*: string             ## negotiated protocol ("" until known)
     h2*: RootRef              ## http2.codec.H2Conn; nil = HTTP/1 (loop-only)
+    ws*: RootRef              ## websocket.codec.WsConn; nil = not upgraded
     deadline*: int64          ## coarse monotonic seconds; 0 = no timeout
     dlKind*: DeadlineKind
     writeArmed*: bool         ## selector currently watching writability
@@ -87,6 +95,7 @@ type
     dateStr*: string          ## cached RFC 7231 date, refreshed once/second
     serverHeader*: string
     nowSec*: int64            ## coarse monotonic seconds, updated per tick
+    maxWsMessage*: int        ## largest inbound WebSocket message (bytes)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox
@@ -100,6 +109,10 @@ type
                  stream: uint32) {.nimcall, gcsafe.}
       ## Flush/resume after a deferred same-thread respond (async
       ## completion). Set by the event loop; safe to call redundantly.
+    flushHook*: proc (loopPtr: pointer, fd: int32,
+                      gen: uint32) {.nimcall, gcsafe.}
+      ## Flush a connection's write buffer now. Used by a loop-thread
+      ## WebSocket send outside the read path. Set by the event loop.
 
 proc newOutbox*(): ptr Outbox =
   result = createShared(Outbox)
@@ -211,6 +224,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.handshaking = false
   c.alpn = ""
   c.h2 = nil
+  c.ws = nil
   c.deadline = 0
   c.dlKind = dkNone
   c.writeArmed = false

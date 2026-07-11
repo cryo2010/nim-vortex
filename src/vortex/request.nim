@@ -15,6 +15,8 @@ import ./workerpool
 import ./http1/parser as h1parser
 import ./http1/codec as h1codec
 import ./http2/codec as h2codec
+import ./websocket/codec as wscodec
+export wscodec
 when not defined(plainHttp):
   import ./http3/codec as h3codec
 
@@ -387,7 +389,8 @@ type
     ## stays valid (the connection is pinned) until the body sends.
 
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                        stream: uint32) {.nimcall, gcsafe.} =
+                        stream: uint32, data: string) {.nimcall, gcsafe.} =
+  discard data                 # HTTP bodies read the request via `req`
   let fn = cast[BlockingProc](user)
   let req = Request(core: cast[ptr LoopCore](core), fd: fd, gen: gen,
                     stream: stream)
@@ -410,7 +413,7 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   try:
     if req.core.pool == nil:
       blockingTrampoline(cast[pointer](fn), cast[pointer](req.core),
-                         req.fd, req.gen, req.stream)  # no pool: run inline
+                         req.fd, req.gen, req.stream, "")  # no pool: inline
       return
     if req.fd < 0:
       let idx = int(-req.fd) - 2
@@ -443,5 +446,88 @@ template blocking*(request: Request, body: untyped) =
   ## ```
   dispatchBlocking(request,
     proc (req {.inject.}: Request, res {.inject.}: Response)
+        {.nimcall, gcsafe.} =
+      body)
+
+# --- WebSockets -------------------------------------------------------------
+
+proc headerHasToken(value, token: string): bool =
+  ## Case-insensitive search for `token` in a comma-separated header value.
+  for part in value.split(','):
+    if part.strip.toLowerAscii == token: return true
+  false
+
+proc isWebSocketUpgrade*(req: Request): bool =
+  ## True when this request is a valid RFC 6455 WebSocket upgrade
+  ## (HTTP/1.1 only). Call inside a handler, then `acceptWebSocket`.
+  req.httpVersion == 1 and req.method == HttpGet and
+  "websocket" in req.header("upgrade").toLowerAscii and
+  headerHasToken(req.header("connection"), "upgrade") and
+  req.header("sec-websocket-version") == "13" and
+  req.header("sec-websocket-key").len > 0
+
+proc acceptWebSocket*(req: Request): WebSocket =
+  ## Complete the handshake and switch the connection to WebSocket mode.
+  ## Loop thread only; call from the handler after `isWebSocketUpgrade`.
+  ## Set `onMessage` / `onClose` on the returned handle. If the request is
+  ## not upgradeable or already answered, the handle is dead
+  ## (`ws.isAlive == false`) and the caller should send a normal response.
+  result = WebSocket(core: req.core, fd: req.fd, gen: req.gen)
+  if req.stream != 0 or req.fd < 0: return          # HTTP/1.1 only
+  let c = conn(req.core, req.fd, req.gen)
+  if c == nil or c.responded or c.ws != nil: return
+  discard wsAccept(req.core, c, req.header("sec-websocket-key"),
+                   req.core.maxWsMessage)
+
+type
+  WsBlockingProc* = proc (ws: WebSocket, msg: string) {.nimcall, gcsafe.}
+    ## A `ws.blocking:` body. Capture-free (nimcall) like the HTTP one;
+    ## the message is passed in by value rather than read from a handle.
+
+proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
+                          stream: uint32, data: string) {.nimcall, gcsafe.} =
+  let fn = cast[WsBlockingProc](user)
+  let ws = WebSocket(core: cast[ptr LoopCore](core), fd: fd, gen: gen,
+                     stream: stream)
+  try:
+    fn(ws, data)
+  except CatchableError:
+    discard                    # a WebSocket has no "500"; the app decides
+
+proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
+                         fn: WsBlockingProc) {.raises: [].} =
+  ## Hand `fn` (plus the message) to the worker pool. Loop thread only.
+  ## The connection is not pinned, so blocking handlers may run
+  ## concurrently; `ws.send` from the worker is safe (a stale send after
+  ## the socket closes is a no-op via the generation check).
+  try:
+    if ws.core.pool == nil:
+      wsBlockingTrampoline(cast[pointer](fn), cast[pointer](ws.core),
+                           ws.fd, ws.gen, ws.stream, msg)   # no pool: inline
+      return
+    enqueue(cast[ptr WorkerPool](ws.core.pool),
+            WorkerTask(fn: wsBlockingTrampoline, user: cast[pointer](fn),
+                       core: cast[pointer](ws.core), fd: ws.fd, gen: ws.gen,
+                       stream: ws.stream, data: msg))
+  except Exception:
+    discard
+
+template blocking*(socket: WebSocket, message: string, body: untyped) =
+  ## Run `body` on the worker pool in response to a WebSocket message,
+  ## where blocking calls (sync DB drivers, file IO, CPU work) are safe.
+  ## `ws` and `msg` are injected; `body` cannot capture surrounding locals
+  ## (it runs on another thread). Reply with `ws.send`.
+  ##
+  ## Unlike the HTTP `blocking:`, the connection is not paused, so messages
+  ## may be handled concurrently.
+  ##
+  ## ```nim
+  ## ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+  ##   ws.blocking(data):
+  ##     let rows = db.getAllRows(sql"...")   # blocking is fine here
+  ##     ws.send($rows & ": " & msg)          # `msg` is the message here
+  ## ```
+  dispatchWsBlocking(socket, message,
+    proc (ws {.inject.}: WebSocket, msg {.inject.}: string)
         {.nimcall, gcsafe.} =
       body)

@@ -112,6 +112,38 @@ template doAsync*(req: Request, body: untyped) =
   ## call `res.send`. Captures are allowed.
   watch(req, (proc () {.async.} = body)())
 
+proc watchWs(ws: WebSocket, fut: Future[void]) =
+  ## Fire-and-forget for a WebSocket: drive the future to completion on the
+  ## loop; an uncaught exception closes the socket with 1011 (there is no
+  ## HTTP response to answer with a 500).
+  if fut.finished:
+    if fut.failed and ws.isAlive: ws.close(1011)
+    return
+  ensurePump(ws.core)
+  inc pendingOps
+  let watched = fut
+  let target = ws
+  fut.addCallback proc (arg: pointer) {.gcsafe, raises: [].} =
+    dec pendingOps
+    try:
+      if watched.failed and target.isAlive: target.close(1011)
+    except Exception:
+      discard
+
+template doAsync*(ws: WebSocket, body: untyped) =
+  ## Run `body` asynchronously on the loop thread in response to a
+  ## WebSocket message: `await` async drivers, then reply with `ws.send`.
+  ## Captures are allowed. Fire-and-forget: an uncaught exception closes
+  ## the socket with 1011 rather than reaching the peer.
+  ##
+  ## ```nim
+  ## ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+  ##   ws.doAsync:
+  ##     let user = await db.getUser(data)
+  ##     ws.send(user.toJson)
+  ## ```
+  watchWs(ws, (proc () {.async.} = body)())
+
 type
   AsyncRequestHandler* =
     proc (req: Request, res: Response): Future[void] {.gcsafe.}
