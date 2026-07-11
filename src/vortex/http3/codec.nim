@@ -23,6 +23,7 @@ type
     queryCached*: bool
     cachedUrl*: Uri
     cachedQuery*: Table[string, string]
+    pathParams*: PathParams          ## written by the router at match time
     finSeen: bool
     dispatched: bool
     responded*: bool

@@ -50,8 +50,8 @@ run(handler, initSettings(port = Port(8443),
 Router:
 
 ```nim
-proc getUser(req: Request, res: Response, params: PathParams) {.gcsafe.} =
-  res.send(Http200, "user " & params.param("id"))
+proc getUser(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "user " & req.param("id"))
 
 var router = newRouter()
 router.get("/users/:id", getUser)
@@ -65,8 +65,8 @@ Async handlers (optional adapter; asyncdispatch drivers like asyncpg):
 import vortex
 import vortex/adapters/asyncdispatch
 
-proc getUser(req: Request, res: Response, params: PathParams) {.async.} =
-  let user = await db.getUser(params.param("id"))   # loop keeps serving
+proc getUser(req: Request, res: Response) {.async.} =
+  let user = await db.getUser(req.param("id"))   # loop keeps serving
   res.send(Http200, user.toJson)
 
 var router = newRouter()
@@ -96,6 +96,10 @@ immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
   responses), and sending through a dead connection is a safe no-op.
   (`std/httpclient` also exports a `Response` type; in modules using
   both, `import std/httpclient except Response`.)
+- Route parameters are per-request state: `req.param("id")` /
+  `req.params` work anywhere the handle does, including inside
+  `blocking:` bodies. (Stored eagerly at match time: the router computes
+  them while matching, so there is nothing to defer.)
 - `req.path` is the raw request target (query string included, matching
   httpbeast). `req.url` gives the parsed form (`req.url.path` excludes
   the query) and `req.query` a decoded parameter Table; both are lazy

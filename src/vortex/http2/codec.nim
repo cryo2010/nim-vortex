@@ -22,6 +22,7 @@ type
     queryCached*: bool
     cachedUrl*: Uri
     cachedQuery*: Table[string, string]
+    pathParams*: PathParams          ## written by the router at match time
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool

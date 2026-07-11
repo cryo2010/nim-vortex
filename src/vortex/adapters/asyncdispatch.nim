@@ -4,9 +4,8 @@
 ## - register `{.async.}` handlers directly on the router:
 ##
 ##   ```nim
-##   proc getUser(req: Request, res: Response,
-##                params: PathParams) {.async.} =
-##     let user = await db.getUser(params.param("id"))
+##   proc getUser(req: Request, res: Response) {.async.} =
+##     let user = await db.getUser(req.param("id"))
 ##     res.send(Http200, user.toJson)
 ##   router.get("/users/:id", getUser)
 ##   ```
@@ -85,35 +84,30 @@ template doAsync*(req: Request, body: untyped) =
 type
   AsyncRequestHandler* =
     proc (req: Request, res: Response): Future[void] {.gcsafe.}
-  AsyncRouteHandler* =
-    proc (req: Request, res: Response,
-          params: PathParams): Future[void] {.gcsafe.}
 
 proc toHandler*(h: AsyncRequestHandler): RequestHandler =
-  ## Adapt a routerless async handler for `run`/`start`.
+  ## Adapt an async handler to the core handler type (route parameters
+  ## arrive via req.params either way).
   let inner = h
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
       watch(req, inner(req, res))
 
-proc route(r: Router, meth: HttpMethod, path: string, h: AsyncRouteHandler) =
-  let inner = h
-  r.addRoute(meth, path,
-    proc (req: Request, res: Response, params: PathParams) {.gcsafe.} =
-      {.gcsafe.}:
-        watch(req, inner(req, res, params)))
+proc route(r: Router, meth: HttpMethod, path: string,
+           h: AsyncRequestHandler) =
+  r.addRoute(meth, path, toHandler(h))
 
-proc get*(r: Router, path: string, h: AsyncRouteHandler) =
+proc get*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpGet, path, h)
-proc post*(r: Router, path: string, h: AsyncRouteHandler) =
+proc post*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpPost, path, h)
-proc put*(r: Router, path: string, h: AsyncRouteHandler) =
+proc put*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpPut, path, h)
-proc delete*(r: Router, path: string, h: AsyncRouteHandler) =
+proc delete*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpDelete, path, h)
-proc patch*(r: Router, path: string, h: AsyncRouteHandler) =
+proc patch*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpPatch, path, h)
-proc head*(r: Router, path: string, h: AsyncRouteHandler) =
+proc head*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpHead, path, h)
-proc options*(r: Router, path: string, h: AsyncRouteHandler) =
+proc options*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpOptions, path, h)

@@ -6,36 +6,25 @@ import std/[strutils, httpcore]
 import ./request
 
 type
-  PathParams* = seq[(string, string)]
-
-  RouteHandler* = proc (req: Request, res: Response,
-                        params: PathParams) {.gcsafe.}
-
   RouteNode = ref object
     segment: string           ## literal, or param name when isParam
     isParam: bool
     isWild: bool              ## trailing "*": matches the rest
     children: seq[RouteNode]
-    handlers: array[HttpMethod, RouteHandler]
+    handlers: array[HttpMethod, RequestHandler]
 
   Router* = ref object
     root: RouteNode
-    notFound*: RouteHandler   ## default: plain 404
+    notFound*: RequestHandler ## default: plain 404
 
-proc param*(params: PathParams, name: string): string =
-  ## Value of a path parameter; "" when absent.
-  for (n, v) in params:
-    if n == name: return v
-
-proc defaultNotFound(req: Request, res: Response,
-                     params: PathParams) {.gcsafe.} =
+proc defaultNotFound(req: Request, res: Response) {.gcsafe.} =
   res.send(Http404, "404 Not Found", "text/plain")
 
 proc newRouter*(): Router =
   Router(root: RouteNode(), notFound: defaultNotFound)
 
 proc addRoute*(router: Router, meth: HttpMethod, path: string,
-               handler: RouteHandler) =
+               handler: RequestHandler) =
   var node = router.root
   for rawSeg in path.split('/'):
     if rawSeg.len == 0: continue
@@ -63,19 +52,19 @@ proc addRoute*(router: Router, meth: HttpMethod, path: string,
     if isWild: break
   node.handlers[meth] = handler
 
-proc get*(r: Router, path: string, h: RouteHandler) =
+proc get*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpGet, path, h)
-proc post*(r: Router, path: string, h: RouteHandler) =
+proc post*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpPost, path, h)
-proc put*(r: Router, path: string, h: RouteHandler) =
+proc put*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpPut, path, h)
-proc delete*(r: Router, path: string, h: RouteHandler) =
+proc delete*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpDelete, path, h)
-proc patch*(r: Router, path: string, h: RouteHandler) =
+proc patch*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpPatch, path, h)
-proc head*(r: Router, path: string, h: RouteHandler) =
+proc head*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpHead, path, h)
-proc options*(r: Router, path: string, h: RouteHandler) =
+proc options*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpOptions, path, h)
 
 proc match(node: RouteNode, path: string, start: int,
@@ -106,14 +95,15 @@ proc match(node: RouteNode, path: string, start: int,
   nil
 
 proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
-  ## Look up and invoke the handler for a request.
+  ## Look up and invoke the handler for a request; captured route
+  ## parameters become req.params.
   var path = req.path
   let q = path.find('?')
   if q >= 0: path.setLen(q)
   var params: PathParams
   let node = router.root.match(path, 0, params)
   if node == nil:
-    router.notFound(req, res, params)
+    router.notFound(req, res)
     return
   let h = node.handlers[req.method]
   if h == nil:
@@ -126,9 +116,11 @@ proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
     if any:
       res.send(HttpCode(405), "405 Method Not Allowed", "text/plain")
     else:
-      router.notFound(req, res, params)
+      router.notFound(req, res)
     return
-  h(req, res, params)
+  if params.len > 0:
+    req.setParams(move params)
+  h(req, res)
 
 proc toHandler*(router: Router): RequestHandler =
   ## Adapt a router into the server's RequestHandler. The router is

@@ -8,6 +8,9 @@ from std/selectors import SelectEvent, trigger, newSelectEvent, close
 import ./http1/parser
 
 type
+  PathParams* = seq[(string, string)]
+    ## Route parameters captured by the router; exposed as req.params.
+
   OutMsg* = object
     ## A response produced off-loop (worker thread), routed back to the
     ## owning event loop in protocol-neutral packed form (see packResponse);
@@ -59,6 +62,7 @@ type
     queryCached*: bool
     cachedUrl*: Uri
     cachedQuery*: Table[string, string]
+    pathParams*: PathParams   ## written by the router at match time
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
 
@@ -182,6 +186,7 @@ proc resetForNextRequest*(c: var Connection) =
   c.chunkBody.setLen(0)
   c.urlCached = false
   c.queryCached = false
+  c.pathParams.setLen(0)
   c.responded = false
   c.sent100 = false
   c.awaitingResponse = false
@@ -210,6 +215,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.closeRequested = false
   c.urlCached = false
   c.queryCached = false
+  c.pathParams.setLen(0)
   c.responded = false
   c.sent100 = false
   c.awaitingResponse = false

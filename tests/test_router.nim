@@ -2,24 +2,31 @@ import std/[unittest, net, httpcore]
 import std/httpclient except Response
 import vortex/[settings, request, server, router]
 
-proc hRoot(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+proc hRoot(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "root", "text/plain")
 
-proc hUsers(req: Request, res: Response, params: PathParams) {.gcsafe.} =
-  res.send(Http200, "user=" & params.param("id"), "text/plain")
+proc hUsers(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "user=" & req.param("id"), "text/plain")
 
-proc hUserPosts(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+proc hUserPosts(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200,
-    "user=" & params.param("id") & " post=" & params.param("post"),
+    "user=" & req.param("id") & " post=" & req.param("post"),
     "text/plain")
 
-proc hStatic(req: Request, res: Response, params: PathParams) {.gcsafe.} =
-  res.send(Http200, "file=" & params.param("*"), "text/plain")
+proc hStatic(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "file=" & req.param("*"), "text/plain")
 
-proc hCreate(req: Request, res: Response, params: PathParams) {.gcsafe.} =
+proc hCreate(req: Request, res: Response) {.gcsafe.} =
   res.send(Http201, "created:" & req.body, "text/plain")
 
+proc hSlowUser(req: Request, res: Response) {.gcsafe.} =
+  req.blocking:
+    # Route params are per-request state, so they survive into
+    # capture-free worker bodies (impossible with parameter passing).
+    res.send(Http200, "worker user=" & req.param("id"), "text/plain")
+
 var appRouter = newRouter()
+appRouter.get("/slow-users/:id", hSlowUser)
 appRouter.get("/", hRoot)
 appRouter.get("/users/:id", hUsers)
 appRouter.get("/users/{id}/posts/{post}", hUserPosts)
@@ -57,6 +64,9 @@ suite "router":
 
   test "405 for wrong method":
     check fetch("/users")[0] == HttpCode(405)   # only POST is routed
+
+  test "params readable from a blocking: body":
+    check fetch("/slow-users/9") == (Http200, "worker user=9")
 
   test "POST route":
     var client = newHttpClient()

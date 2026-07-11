@@ -9,6 +9,8 @@
 
 import std/[httpcore, strutils, uri, tables]
 import ./connection
+
+export PathParams
 import ./workerpool
 import ./http1/parser as h1parser
 import ./http1/codec as h1codec
@@ -257,6 +259,57 @@ proc query*(req: Request): Table[string, string] =
       result = lazyQuery(c, lazyUrl(c,
         c.rbuf.substr(int(c.parser.pathStart),
                       int(c.parser.pathStart + c.parser.pathLen) - 1)).query)
+
+proc param*(params: PathParams, name: string): string =
+  ## Value of a path parameter; "" when absent.
+  for (n, v) in params:
+    if n == name: return v
+
+proc setParams*(req: Request, params: sink PathParams) =
+  ## Store route parameters for req.params. Called by the router on the
+  ## loop thread at match time; params are computed by matching anyway,
+  ## so they are stored eagerly (a move) rather than lazily.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        st.pathParams = params
+    return
+  withConn(req, c):
+    if req.stream != 0:
+      let st = h2Stream(c, req.stream)
+      if st != nil: st.pathParams = params
+    else:
+      c.pathParams = params
+
+proc params*(req: Request): PathParams =
+  ## Route parameters captured by the router ("/users/:id" etc.); empty
+  ## when no router matched. Valid from any thread holding the handle,
+  ## same as req.body.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        result = st.pathParams
+    return
+  withConn(req, c):
+    if req.stream != 0:
+      let st = h2Stream(c, req.stream)
+      if st != nil: result = st.pathParams
+    else:
+      result = c.pathParams
+
+proc param*(req: Request, name: string): string =
+  ## Single path-parameter lookup; "" when absent.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        return st.pathParams.param(name)
+    return
+  withConn(req, c):
+    if req.stream != 0:
+      let st = h2Stream(c, req.stream)
+      if st != nil: return st.pathParams.param(name)
+    else:
+      return c.pathParams.param(name)
 
 proc httpVersion*(req: Request): int =
   ## 1 for HTTP/1.x, 2 for HTTP/2, 3 for HTTP/3.

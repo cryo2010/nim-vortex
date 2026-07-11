@@ -16,23 +16,23 @@ import std/os
 import ../src/vortex
 import ../src/vortex/adapters/asyncdispatch
 
-proc hRoot(req: Request, res: Response, params: PathParams) {.async.} =
+proc hRoot(req: Request, res: Response) {.async.} =
   res.send(Http200, "Hello, World!\n", "text/plain")
 
-proc hHello(req: Request, res: Response, params: PathParams) {.async.} =
-  let name = params.param("name")        # captures are fine in async bodies
+proc hHello(req: Request, res: Response) {.async.} =
+  let name = req.param("name")        # captures are fine in async bodies
   await sleepAsync(10)
   res.send(Http200, "Hello, " & name & "!\n", "text/plain")
 
-proc hEcho(req: Request, res: Response, params: PathParams) {.async.} =
+proc hEcho(req: Request, res: Response) {.async.} =
   res.send(Http200, "you sent (" & $req.method & "): " & req.body & "\n",
               "text/plain")
 
-proc hSlow(req: Request, res: Response, params: PathParams) {.async.} =
+proc hSlow(req: Request, res: Response) {.async.} =
   await sleepAsync(1000)                 # loop keeps serving other requests
   res.send(Http200, "that took a second\n", "text/plain")
 
-proc hReport(req: Request, res: Response, params: PathParams) {.async.} =
+proc hReport(req: Request, res: Response) {.async.} =
   req.blocking:                          # synchronous escape: worker pool
     sleep(500)                           # stands in for a sync DB/file call
     res.send(Http200, "report built on a worker thread\n", "text/plain")
