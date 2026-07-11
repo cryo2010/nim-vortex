@@ -87,9 +87,10 @@ immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 
 - Handlers run **inline on the event loop**: never block in them (no sync
   DB calls, no `sleep`). Use `req.blocking:` for anything that blocks.
-- Inside `blocking:` the request is available as `req`; the body cannot
-  capture surrounding locals (it runs on another thread); read request
-  data through `req`, which remains valid until you respond.
+- Inside `blocking:` the request and response are available as `req`
+  and `res`; the body cannot capture surrounding locals (it runs on
+  another thread); read request data through `req`, which remains valid
+  until you send the response.
 - Handlers receive the read half (`req`) and the write half (`res`);
   `res.send(...)` may be called after the handler returns (deferred
   responses), and sending through a dead connection is a safe no-op.
