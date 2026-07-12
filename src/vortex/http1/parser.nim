@@ -182,6 +182,9 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
     p.seenContentLength = true
   elif ieqLit(buf, h.nameStart, h.nameLen, "transfer-encoding"):
     if p.seenContentLength: return p.fail(Http400)
+    # Transfer-Encoding is an HTTP/1.1 feature; an HTTP/1.0 request carrying
+    # it is treated as faulty framing (RFC 9112 6.1), a smuggling guard.
+    if p.minor == 0: return p.fail(Http400)
     if ieqLit(buf, h.valStart, h.valLen, "chunked"):
       p.chunked = true
     else:
@@ -198,6 +201,11 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
     # RFC 9112 3.2: reject more than one Host field (smuggling guard).
     if p.seenHost: return p.fail(Http400)
     p.seenHost = true
+    # The Host value is a uri-host[:port] (RFC 9112 3.2 / 9110 4): whitespace
+    # or controls make it invalid.
+    for i in h.valStart ..< h.valStart + h.valLen:
+      if uint8(buf[i]) <= 0x20'u8 or uint8(buf[i]) == 0x7f'u8:
+        return p.fail(Http400)
   prNeedMore
 
 proc parseHeaderLine(p: var RequestParser, buf: openArray[char],
@@ -211,6 +219,13 @@ proc parseHeaderLine(p: var RequestParser, buf: openArray[char],
   while vs < lineEnd and buf[vs] in {' ', '\t'}: inc vs
   var ve = lineEnd
   while ve > vs and buf[ve-1] in {' ', '\t'}: dec ve
+  # Field values must not contain control characters (RFC 9110 5.5): a NUL,
+  # a bare CR, or other C0 control is a request-smuggling / header-injection
+  # vector. HTAB is allowed; obs-text (0x80+) is opaque and permitted.
+  for i in vs ..< ve:
+    let b = uint8(buf[i])
+    if (b < 0x20'u8 and b != 0x09'u8) or b == 0x7f'u8:
+      return p.fail(Http400)
   let h = HeaderSlice(
     nameStart: int32(p.pos), nameLen: int32(colon - p.pos),
     valStart: int32(vs), valLen: int32(ve - vs))

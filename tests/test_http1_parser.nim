@@ -107,6 +107,17 @@ suite "headers":
     check res == prComplete
     check p.expectContinue
 
+  test "a HTAB in a field value is allowed":
+    let (res, _, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nX-Foo:\ta\tb\r\n\r\n")
+    check res == prComplete
+
+  test "a control character in a field value is rejected (RFC 9110 5.5)":
+    for bad in ["\x00", "\r", "\x01", "\x1f", "\x7f"]:
+      let (res, p, _) = parseAll(
+        "GET / HTTP/1.1\r\nHost: x\r\nX-Foo: a" & bad & "b\r\n\r\n")
+      check res == prError
+      check p.errorStatus == Http400
+
 suite "Host header (RFC 9112 3.2)":
   test "HTTP/1.1 without Host is rejected":
     let (res, p, _) = parseAll("GET / HTTP/1.1\r\n\r\n")
@@ -122,6 +133,15 @@ suite "Host header (RFC 9112 3.2)":
       "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")
     check res == prError
     check p.errorStatus == Http400
+
+  test "a Host value with whitespace is rejected":
+    let (res, p, _) = parseAll("GET / HTTP/1.1\r\nHost: a b\r\n\r\n")
+    check res == prError
+    check p.errorStatus == Http400
+
+  test "a bracketed IPv6 Host with a port is accepted":
+    let (res, _, _) = parseAll("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n")
+    check res == prComplete
 
   test "HTTP/1.0 without Host is accepted":
     let (res, _, _) = parseAll("GET / HTTP/1.0\r\n\r\n")
@@ -173,6 +193,12 @@ suite "bodies":
     let (res, _, _) = parseAll("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n" &
       "Transfer-Encoding: chunked\r\n\r\n")
     check res == prError
+
+  test "transfer-encoding on an HTTP/1.0 request rejected (RFC 9112 6.1)":
+    let (res, p, _) = parseAll(
+      "POST / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    check res == prError
+    check p.errorStatus == Http400
 
   test "body over limit":
     let (res, p, _) = parseAll(
