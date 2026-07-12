@@ -13,7 +13,8 @@ type
 
   OutMsgKind* = enum
     omHttp,                   ## data is a packed HTTP response (see packResponse)
-    omWs                      ## data is a ready-to-write WebSocket frame
+    omWs,                     ## data is a ready-to-write WebSocket frame
+    omWsDone                  ## a ws.blocking worker finished: unpin and resume
 
   OutMsg* = object
     ## A message produced off-loop (worker thread), routed back to the

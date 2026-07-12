@@ -383,6 +383,9 @@ proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
       open = false
     of wpFrame:
       open = handleFrame(core, c, w, fr)
+      # A ws.blocking dispatch pinned the connection: stop here and leave the
+      # remaining frames buffered so they run one message at a time, in order.
+      if c.pinned > 0: break
   if pos > 0:
     if pos >= c.rlen:
       c.rlen = 0

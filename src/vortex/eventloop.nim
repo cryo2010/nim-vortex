@@ -328,7 +328,10 @@ proc processInput(loop: Loop, c: ptr Connection) =
   ## holds. Parsing pauses while a response is outstanding (deferred
   ## handlers) so responses stay ordered.
   if c.ws != nil:
-    wsInput(addr loop.core, c)
+    # Pause frame dispatch while a ws.blocking worker holds the connection:
+    # buffered frames wait until it unpins (one message at a time).
+    if c.pinned == 0:
+      wsInput(addr loop.core, c)
     return
   if c.h2 != nil:
     loop.h2Input(c)
@@ -664,6 +667,18 @@ proc processOutbox(loop: Loop) =
       if c.ws != nil:
         c.wbuf.add m.data
         loop.flushOut(c)
+      continue
+    if m.kind == omWsDone:
+      # A ws.blocking worker finished: unpin, then resume dispatching the
+      # frames that were held back while it ran.
+      if c.pinned > 0: dec c.pinned
+      if c.closeRequested:
+        loop.closeConn(c)          # close was deferred while pinned
+        continue
+      if c.pinned == 0 and c.ws != nil:
+        loop.processInput(c)       # dispatch the next buffered message
+        if c.state != csFree and c.pendingOut > 0:
+          loop.flushOut(c)
       continue
     if c.pinned > 0: dec c.pinned
     if c.closeRequested:

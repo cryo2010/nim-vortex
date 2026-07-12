@@ -491,27 +491,42 @@ type
     ## A `ws.blocking:` body. Capture-free (nimcall) like the HTTP one;
     ## the message is passed in by value rather than read from a handle.
 
-proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                          stream: uint32, data: string) {.nimcall, gcsafe.} =
-  let fn = cast[WsBlockingProc](user)
-  let ws = WebSocket(core: cast[ptr LoopCore](core), fd: fd, gen: gen,
-                     stream: stream)
+proc wsRunBody(lc: ptr LoopCore, fn: WsBlockingProc, fd: int32, gen: uint32,
+               stream: uint32, data: string) {.gcsafe.} =
+  let ws = WebSocket(core: lc, fd: fd, gen: gen, stream: stream)
   try:
     fn(ws, data)
   except CatchableError:
     discard                    # a WebSocket has no "500"; the app decides
 
+proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
+                          stream: uint32, data: string) {.nimcall, gcsafe.} =
+  ## Worker-pool entry point: run the body, then signal completion so the
+  ## loop unpins the connection and dispatches the next buffered message.
+  let lc = cast[ptr LoopCore](core)
+  wsRunBody(lc, cast[WsBlockingProc](user), fd, gen, stream, data)
+  try:
+    push(lc.outbox, OutMsg(kind: omWsDone, fd: fd, gen: gen))
+  except Exception:
+    discard
+
 proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
                          fn: WsBlockingProc) {.raises: [].} =
-  ## Hand `fn` (plus the message) to the worker pool. Loop thread only.
-  ## The connection is not pinned, so blocking handlers may run
-  ## concurrently; `ws.send` from the worker is safe (a stale send after
-  ## the socket closes is a no-op via the generation check).
+  ## Pin the connection and hand `fn` (plus the message) to the worker pool.
+  ## Loop thread only. Pinning gives per-connection backpressure: the loop
+  ## stops dispatching further frames until the worker finishes, so one
+  ## message is processed at a time and in order (like the HTTP `blocking:`).
+  ## `ws.send` from the worker is safe (a stale send after the socket closes
+  ## is a no-op via the generation check).
   try:
     if ws.core.pool == nil:
-      wsBlockingTrampoline(cast[pointer](fn), cast[pointer](ws.core),
-                           ws.fd, ws.gen, ws.stream, msg)   # no pool: inline
+      # No pool: run inline on the loop thread. It is already serialized, so
+      # there is nothing to pin and no completion to signal.
+      wsRunBody(ws.core, fn, ws.fd, ws.gen, ws.stream, msg)
       return
+    let c = conn(ws.core, ws.fd, ws.gen)
+    if c == nil: return
+    inc c.pinned
     enqueue(cast[ptr WorkerPool](ws.core.pool),
             WorkerTask(fn: wsBlockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](ws.core), fd: ws.fd, gen: ws.gen,
@@ -525,8 +540,11 @@ template blocking*(socket: WebSocket, message: string, body: untyped) =
   ## `ws` and `msg` are injected; `body` cannot capture surrounding locals
   ## (it runs on another thread). Reply with `ws.send`.
   ##
-  ## Unlike the HTTP `blocking:`, the connection is not paused, so messages
-  ## may be handled concurrently.
+  ## Like the HTTP `blocking:`, the connection is pinned while the body runs:
+  ## the loop stops dispatching further frames until it returns, so messages
+  ## from one connection are handled one at a time and in order, and a slow
+  ## body applies backpressure to that client (frames buffer, bounded by the
+  ## receive cap). Different connections still run in parallel.
   ##
   ## ```nim
   ## ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
