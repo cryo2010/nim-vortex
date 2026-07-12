@@ -614,7 +614,7 @@ when not defined(plainHttp):
         loop.core.h3slots.add H3SlotEntry()
         idx = loop.core.h3slots.len - 1
       loop.core.h3slots[idx].conn =
-        newH3Conn(connSsl, idx, loop.settings.maxBodySize,
+        newH3Conn(addr loop.core, connSsl, idx, loop.settings.maxBodySize,
                   loop.settings.maxConcurrentStreams)
     for idx in 0 ..< loop.core.h3slots.len:
       let slot = addr loop.core.h3slots[idx]
@@ -650,6 +650,19 @@ proc processOutbox(loop: Loop) =
         let idx = int(-m.fd) - 2
         if idx >= loop.core.h3slots.len: continue
         let slot = addr loop.core.h3slots[idx]
+        # RFC 9220 WebSocket messages use per-stream pinning, not the slot
+        # pin, so they route ahead of the omHttp response path.
+        if slot.conn != nil and slot.gen == m.gen and
+            m.kind in {omWs, omWsClose, omWsDone}:
+          let conn = H3Conn(slot.conn)
+          if m.kind == omWsDone:
+            h3WsResume(addr loop.core, conn, uint64(m.stream))
+          else:
+            let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
+            if w != nil:
+              wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
+          h3Touched = true
+          continue
         if slot.pinned > 0: dec slot.pinned
         if slot.gen != m.gen or slot.conn == nil: continue
         if slot.closeReq:
@@ -687,7 +700,7 @@ proc processOutbox(loop: Loop) =
       else:
         let w = wsConnForStream(addr loop.core, c, m.stream)
         if w != nil:
-          wsResumeH2(addr loop.core, c, w)
+          wsResume(addr loop.core, c, w)
           if c.state != csFree and c.pendingOut > 0:
             loop.flushOut(c)
       continue
@@ -736,6 +749,8 @@ proc run*(loop: Loop) =
   loop.core.kick = kickImpl
   loop.core.flushHook = flushImpl
   installWsHooks(addr loop.core)   # h2 WebSocket (RFC 8441) stream lookup
+  when not defined(plainHttp):
+    installH3WsHooks(addr loop.core)   # h3 WebSocket (RFC 9220) stream lookup
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
   while not loop.stopFlag[].load(moRelaxed):

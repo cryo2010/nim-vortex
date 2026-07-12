@@ -196,13 +196,14 @@ reply arrives within `wsPongTimeout` it closes the connection (set
 WebSockets). Building with `-d:wsDeflate` (links zlib) adds
 permessage-deflate (RFC 7692) message compression, negotiated automatically.
 
-The same handler API also serves WebSockets over **HTTP/2 (RFC 8441)**: the
-server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and an Extended
-CONNECT (`:protocol websocket`) opens a WebSocket on a single stream,
-multiplexed with ordinary requests on the connection. `isWebSocketUpgrade` /
-`acceptWebSocket` transparently handle both transports, so the same
-`onMessage` / `ws.send` / `ws.blocking:` / permessage-deflate code works
-over h1 and h2. (Browsers still use HTTP/1.1 for WebSockets; h2 is for
+The same handler API also serves WebSockets over **HTTP/2 (RFC 8441)** and
+**HTTP/3 (RFC 9220)**: the server advertises
+`SETTINGS_ENABLE_CONNECT_PROTOCOL`, and an Extended CONNECT
+(`:protocol websocket`) opens a WebSocket on a single stream, multiplexed
+with ordinary requests on the connection. `isWebSocketUpgrade` /
+`acceptWebSocket` transparently handle all three transports, so the same
+`onMessage` / `ws.send` / `ws.blocking:` / permessage-deflate code works over
+h1, h2, and h3. (Browsers still use HTTP/1.1 for WebSockets; h2/h3 are for
 clients that prefer a single multiplexed connection.)
 
 ### Roadmap and Autobahn conformance
@@ -239,8 +240,12 @@ Node's `ws` (the de facto reference implementation), it is noted.
   `ws.send`, permessage-deflate, and per-stream `ws.blocking` (one stream is
   pinned without stalling the others). Idle ping/timeout over h2 is not yet
   wired (h2 has connection-level PING liveness).
-- [ ] **HTTP/3 WebSockets (RFC 9220)** via Extended CONNECT over QUIC.
-  Optional: browsers use HTTP/1.1 for WebSockets regardless.
+- [x] **HTTP/3 WebSockets (RFC 9220)** via Extended CONNECT over QUIC: the
+  same feature set as h2 (send/receive, fragmentation, control frames, close,
+  cross-thread `ws.send`, permessage-deflate, per-stream `ws.blocking`).
+  Verified end-to-end against aioquic (`nimble h3websocket`), since no browser
+  or `curl` speaks WebSockets over HTTP/3. Idle ping/timeout over h3 is not
+  wired (QUIC keepalive covers liveness).
 
 ## Handler rules
 

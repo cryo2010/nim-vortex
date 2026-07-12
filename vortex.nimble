@@ -66,3 +66,9 @@ task h2spec, "HTTP/2 conformance via h2spec over TLS (Docker)":
   # run.sh builds a vortex HTTP/2-over-TLS server image and runs the
   # summerwind/h2spec image against it; h2spec exits non-zero on failures.
   exec "sh conformance/h2spec/run.sh"
+
+task h3websocket, "HTTP/3 WebSocket conformance (RFC 9220) via aioquic (Docker)":
+  # run.sh builds a vortex h3 WebSocket echo server image and an aioquic
+  # client image, then runs the client against the server over a private
+  # docker network; the client exits non-zero on any mismatch.
+  exec "sh conformance/h3websocket/run.sh"

@@ -129,3 +129,15 @@ jobs:
         # summerwind/h2spec image against it; h2spec exits non-zero on any
         # failed test.
         run: sh conformance/h2spec/run.sh
+
+  h3websocket:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: HTTP/3 WebSocket conformance (RFC 9220, aioquic)
+        # run.sh builds a vortex h3 WebSocket echo server image (archlinux for
+        # OpenSSL >= 3.5) and an aioquic client image, then runs the client
+        # against the server over a private docker network; the aioquic client
+        # exits non-zero on any handshake/echo mismatch. It picks the x86_64
+        # server base itself.
+        run: sh conformance/h3websocket/run.sh

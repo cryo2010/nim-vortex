@@ -7,6 +7,7 @@ import std/[tables, strutils, uri]
 import ./frames, ./qpack
 import ../connection
 import ../transport/quic
+import ../websocket/codec as wscodec
 
 type
   H3Stream* = object
@@ -32,8 +33,11 @@ type
     outBuf: string
     outPos: int
     concludeAfterFlush: bool
+    isWsConnect*: bool               ## RFC 9220 Extended CONNECT websocket
+    ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
   H3Conn* = ref object of RootObj
+    core*: ptr LoopCore       ## owning loop core (for WebSocket callbacks)
     ssl*: SslPtr
     slot*: int
     streams*: Table[uint64, H3Stream]
@@ -53,9 +57,9 @@ proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
     return nil
   H3Conn(core.h3slots[idx].conn)
 
-proc newH3Conn*(ssl: SslPtr, slot: int, maxBody,
+proc newH3Conn*(core: ptr LoopCore, ssl: SslPtr, slot: int, maxBody,
                 maxConcurrentStreams: int): H3Conn =
-  result = H3Conn(ssl: ssl, slot: slot, maxBody: maxBody,
+  result = H3Conn(core: core, ssl: ssl, slot: slot, maxBody: maxBody,
                   maxConcurrentStreams: maxConcurrentStreams)
   result.scratch = newString(4096)
   # Our control stream: stream type + SETTINGS (QPACK capacity 0).
@@ -67,6 +71,8 @@ proc newH3Conn*(ssl: SslPtr, slot: int, maxBody,
     payload.addVarint 0
     payload.addVarint h3SetQpackBlockedStreams
     payload.addVarint 0
+    payload.addVarint h3SetEnableConnectProtocol   # RFC 9220 WebSockets
+    payload.addVarint 1
     result.ctrlBuf.addFrame(h3fSettings, payload)
 
 proc flushCtrl(conn: H3Conn) =
@@ -133,28 +139,144 @@ proc failStream(conn: H3Conn, sid: uint64) =
   st.failed = true
   if not st.responded and st.headersDone:
     discard    # handled by caller responding 400/413
+  if st.ws != nil:                    # a WebSocket was aborted: onClose (1006)
+    wsStreamClosed(conn.core, nil, WsConn(st.ws))
+    st.ws = nil
   quicFree(st.ssl)
   conn.streams.del(sid)
 
-proc validateHeaders(st: var H3Stream): bool =
-  var meth, path, scheme: string
+# --- RFC 9220 WebSockets over HTTP/3 ----------------------------------------
+
+proc h3WsFinalize(conn: H3Conn, sid: uint64, w: WsConn) =
+  ## The WebSocket close frame has flushed: deliver onClose, FIN the stream,
+  ## and drop it.
+  wsStreamClosed(conn.core, nil, w)
+  if sid in conn.streams:
+    conn.streams[sid].ws = nil
+    conn.streams[sid].concludeAfterFlush = true
+    discard conn.flushStream(sid)      # FIN + free + del once drained
+
+proc wsFlushH3(core: ptr LoopCore, c: ptr Connection,
+               w: WsConn) {.nimcall, gcsafe.} =
+  ## `WsConn.flush` for HTTP/3: append produced frames as an h3 DATA frame and
+  ## push them (QUIC handles flow control), finalizing on close.
+  let conn = H3Conn(w.h3conn)
+  let sid = uint64(w.stream)
+  if conn == nil or sid notin conn.streams:
+    w.outBuf.setLen 0
+    return
+  template st: H3Stream = conn.streams[sid]
+  if w.outBuf.len > 0:
+    st.outBuf.addFrame(h3fData, w.outBuf)
+    w.outBuf.setLen 0
+  discard conn.flushStream(sid)
+  if sid notin conn.streams: return
+  w.h2Pending = st.outBuf.len - st.outPos
+  if w.h2Pending == 0:
+    st.outBuf.setLen 0
+    st.outPos = 0
+    if w.wantClose:
+      h3WsFinalize(conn, sid, w)
+    elif w.backedUp:
+      w.backedUp = false
+      if w.onDrain != nil:
+        w.onDrain(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream))
+  else:
+    w.backedUp = true
+
+proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64,
+                 fd: int32, gen: uint32, maxMessage: int,
+                 extensionsOffer, protocolsOffer: string,
+                 serverProtocols: openArray[string]): bool =
+  ## Accept an RFC 9220 Extended CONNECT WebSocket on stream `sid`: reply 200
+  ## HEADERS (no FIN, so the stream stays open) and attach a WsConn.
+  if sid notin conn.streams: return false
+  template st: H3Stream = conn.streams[sid]
+  if not st.isWsConnect or st.responded or st.ws != nil: return false
+  st.responded = true
+  let (w, proto, ext) = wsSetup(core, fd, gen, maxMessage, uint32(sid),
+                                extensionsOffer, protocolsOffer,
+                                serverProtocols)
+  w.flush = wsFlushH3
+  w.h3conn = conn
+  st.ws = w
+  var fs = ""
+  addPrefix(fs)
+  qpack.encodeStatus(fs, 200)
+  if core.serverHeader.len > 0:
+    qpack.encodeHeader(fs, "server", core.serverHeader)
+  qpack.encodeHeader(fs, "date", core.dateStr)
+  if proto.len > 0: qpack.encodeHeader(fs, "sec-websocket-protocol", proto)
+  if ext.len > 0: qpack.encodeHeader(fs, "sec-websocket-extensions", ext)
+  st.outBuf.addFrame(h3fHeaders, fs)     # no concludeAfterFlush: stays open
+  discard conn.flushStream(sid)
+  true
+
+proc h3WsLookup(corep: pointer, fd: int32, gen: uint32,
+                stream: uint32): RootRef {.nimcall, gcsafe.} =
+  ## LoopCore.wsH3Lookup: resolve a stream's WsConn for the public API.
+  let core = cast[ptr LoopCore](corep)
+  let conn = h3ConnOf(core, fd, gen)
+  if conn != nil and uint64(stream) in conn.streams:
+    return conn.streams[uint64(stream)].ws
+  nil
+
+proc installH3WsHooks*(core: ptr LoopCore) =
+  ## Register the WebSocket-over-HTTP/3 lookup so the WebSocket layer can
+  ## reach per-stream state without importing the h3 codec.
+  core.wsH3Lookup = h3WsLookup
+
+proc h3WsResume*(core: ptr LoopCore, conn: H3Conn, sid: uint64) =
+  ## An h3 ws.blocking worker finished: clear the per-stream pin and pump the
+  ## frames buffered while it ran.
+  if sid in conn.streams and conn.streams[sid].ws != nil:
+    wsResume(core, nil, WsConn(conn.streams[sid].ws))
+
+proc h3WsTeardownAll*(conn: H3Conn) =
+  ## Deliver onClose (1006) for every WebSocket stream when the connection
+  ## is torn down.
+  for sid, st in conn.streams.mpairs:
+    if st.ws != nil:
+      wsStreamClosed(conn.core, nil, WsConn(st.ws))
+      st.ws = nil
+
+type H3HeaderKind* = enum h3hInvalid, h3hRequest, h3hWebSocket
+
+proc classifyH3Headers*(headers: openArray[(string, string)]): H3HeaderKind =
+  ## Validate the pseudo-header set and classify it: a normal request, an
+  ## RFC 9220 Extended CONNECT websocket, or invalid. Pure (no stream state)
+  ## so it is unit-testable without a live QUIC connection.
+  var meth, path, scheme, protocol: string
+  var hasAuthority = false
   var pseudoDone = false
-  for (name, val) in st.headers:
-    if name.len == 0: return false
+  for (name, val) in headers:
+    if name.len == 0: return h3hInvalid
     if name[0] == ':':
-      if pseudoDone: return false
+      if pseudoDone: return h3hInvalid
       case name
       of ":method": meth = val
       of ":path": path = val
       of ":scheme": scheme = val
-      of ":authority": discard
-      else: return false
+      of ":authority": hasAuthority = true
+      of ":protocol": protocol = val      # RFC 9220 Extended CONNECT
+      else: return h3hInvalid
     else:
       pseudoDone = true
       for ch in name:
-        if ch in 'A'..'Z': return false
-  if meth.len == 0 or path.len == 0 or scheme.len == 0: return false
-  st.isHead = meth == "HEAD"
+        if ch in 'A'..'Z': return h3hInvalid
+  if meth == "CONNECT" and protocol == "websocket":
+    if path.len == 0 or scheme.len == 0 or not hasAuthority: return h3hInvalid
+    return h3hWebSocket
+  if protocol.len > 0: return h3hInvalid   # :protocol only for a ws-connect
+  if meth.len == 0 or path.len == 0 or scheme.len == 0: return h3hInvalid
+  h3hRequest
+
+proc validateHeaders(st: var H3Stream): bool =
+  let kind = classifyH3Headers(st.headers)
+  if kind == h3hInvalid: return false
+  st.isWsConnect = kind == h3hWebSocket
+  for (name, val) in st.headers:
+    if name == ":method": st.isHead = val == "HEAD"
   true
 
 proc parseStreamFrames(conn: H3Conn, sid: uint64,
@@ -194,13 +316,20 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
       if not st.headersDone:
         conn.failStream(sid)
         return false
-      if st.body.len + st.frameLen > conn.maxBody:
-        conn.failStream(sid)
-        return false
-      let old = st.body.len
-      st.body.setLen(old + st.frameLen)
-      if st.frameLen > 0:
-        copyMem(addr st.body[old], addr st.rbuf[pos], st.frameLen)
+      if st.ws != nil:
+        # RFC 9220 WebSocket stream: DATA payload is WebSocket framing.
+        wsFeed(conn.core, nil, WsConn(st.ws),
+               st.rbuf.toOpenArray(pos, pos + st.frameLen - 1))
+      elif st.isWsConnect:
+        break                        # not accepted yet: dispatch first, wait
+      else:
+        if st.body.len + st.frameLen > conn.maxBody:
+          conn.failStream(sid)
+          return false
+        let old = st.body.len
+        st.body.setLen(old + st.frameLen)
+        if st.frameLen > 0:
+          copyMem(addr st.body[old], addr st.rbuf[pos], st.frameLen)
     of h3fPushPromise, h3fCancelPush, h3fSettings, h3fGoaway:
       # Not valid on request streams (SETTINGS/GOAWAY are control-only).
       conn.failStream(sid)
@@ -213,10 +342,19 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
   if pos > 0:
     if pos >= st.rbuf.len: st.rbuf.setLen(0)
     else: st.rbuf = st.rbuf.substr(pos)
-  if st.finSeen and st.headersDone and not st.dispatched and
-      not st.frameHdrDone:
-    st.dispatched = true
-    ready.add sid
+  if st.ws != nil:
+    if st.finSeen:                   # peer closed the WebSocket stream
+      wsPeerClosed(conn.core, nil, WsConn(st.ws))
+    return true                      # WS streams never take the request path
+  if not st.dispatched and st.headersDone:
+    # A ws-connect dispatches on headers (the stream stays open); an ordinary
+    # request waits for the full body (FIN).
+    if st.isWsConnect:
+      st.dispatched = true
+      ready.add sid
+    elif st.finSeen and not st.frameHdrDone:
+      st.dispatched = true
+      ready.add sid
   true
 
 proc pumpRequestStream(conn: H3Conn, sid: uint64, ready: var seq[uint64]) =
@@ -277,6 +415,7 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
       conn.pumpRequestStream(sid, ready)
 
 proc h3Free*(conn: H3Conn) =
+  h3WsTeardownAll(conn)             # onClose for any RFC 9220 WebSocket streams
   for sid, st in conn.streams:
     quicFree(st.ssl)
   conn.streams.clear()
