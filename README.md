@@ -159,6 +159,27 @@ ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
     ws.send(user.toJson)
 ```
 
+When you push faster than a peer can read, `ws.send` parks the overflow in
+the connection's write buffer. `ws.bufferedAmount` reports that backlog in
+bytes (queued but not yet written to the socket, like the browser
+`WebSocket.bufferedAmount`), and `ws.onDrain` fires on the loop thread once
+it empties, so you can pause a producer while the backlog is high and resume
+from the drain:
+
+```nim
+proc pump(ws: WebSocket) {.gcsafe.} =
+  while ws.bufferedAmount < 1 shl 20 and source.hasNext:  # cap the backlog at 1 MiB
+    ws.send(source.next)
+
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+  ws.onDrain = pump                       # resume when the write buffer drains
+  pump(ws)
+```
+
+`bufferedAmount` is a loop-thread snapshot: read it from a handler callback,
+not another thread (off-loop `send`s queue on the outbox and are not counted
+until the loop picks them up).
+
 Works over `ws://` and, with a cert, `wss://`. Fragmented messages are
 reassembled (bounded by `maxWsMessageSize`), ping/pong and the close
 handshake are handled for you, and text is validated as UTF-8. Idle
@@ -193,10 +214,9 @@ Node's `ws` (the de facto reference implementation), it is noted.
   `req.acceptWebSocket(["chat", ...])`; the first that the client also
   offered (server preference) is echoed in the handshake and readable via
   `ws.subprotocol`.
-- [ ] **Backpressure introspection**: a `bufferedAmount`-style accessor
-  (and a drained signal) so an application can throttle a slow consumer.
-  Today `ws.send` buffers into the connection write buffer without
-  exposing its depth; `ws` exposes `bufferedAmount` and a send callback.
+- [x] **Backpressure introspection**: `ws.bufferedAmount` reports the write
+  backlog and `ws.onDrain` fires when it empties, so an application pushing
+  faster than a slow consumer reads can throttle and resume (see above).
 - [ ] **Per-connection backpressure for `ws.blocking:`**: pin the
   connection so one message is processed at a time, matching the HTTP
   `blocking:` semantics (WebSocket handlers currently run concurrently).
