@@ -35,6 +35,9 @@ task testchronos, "Test the chronos async adapter (needs chronos)":
 task testdeflate, "Test WebSocket permessage-deflate (needs zlib)":
   exec "nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src " &
        "-o:tests/websocket_deflate tests/websocket_deflate.nim"
+  # The HTTP/2 (RFC 8441) suite gains a permessage-deflate case under the flag.
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src " &
+       "-o:tests/test_http2_websocket tests/test_http2_websocket.nim"
 
 task fuzz, "Fuzz the parser/HPACK/QPACK decoders in Docker (needs docker)":
   # The Dockerfile bundles clang + the libFuzzer runtime; the image's

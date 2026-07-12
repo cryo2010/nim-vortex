@@ -458,8 +458,16 @@ proc headerHasToken(value, token: string): bool =
   false
 
 proc isWebSocketUpgrade*(req: Request): bool =
-  ## True when this request is a valid RFC 6455 WebSocket upgrade
-  ## (HTTP/1.1 only). Call inside a handler, then `acceptWebSocket`.
+  ## True when this request is a WebSocket handshake: an RFC 6455 upgrade
+  ## over HTTP/1.1, or an RFC 8441 Extended CONNECT over HTTP/2. Call inside
+  ## a handler, then `acceptWebSocket`.
+  if req.httpVersion == 2 and req.fd >= 0:
+    # HTTP/2: :method CONNECT + :protocol websocket (the h2 codec already
+    # validated scheme/path/authority presence for a ws-connect stream).
+    return req.method == HttpConnect and
+      h2Field(conn(req.core, req.fd, req.gen), req.stream, ":protocol") ==
+        "websocket" and
+      req.header("sec-websocket-version") == "13"
   req.httpVersion == 1 and req.method == HttpGet and
   "websocket" in req.header("upgrade").toLowerAscii and
   headerHasToken(req.header("connection"), "upgrade") and
@@ -468,19 +476,28 @@ proc isWebSocketUpgrade*(req: Request): bool =
 
 proc acceptWebSocket*(req: Request,
                       protocols: openArray[string] = []): WebSocket =
-  ## Complete the handshake and switch the connection to WebSocket mode.
-  ## Loop thread only; call from the handler after `isWebSocketUpgrade`.
-  ## Set `onMessage` / `onClose` on the returned handle. If the request is
-  ## not upgradeable or already answered, the handle is dead
-  ## (`ws.isAlive == false`) and the caller should send a normal response.
+  ## Complete the handshake and switch to WebSocket mode. Loop thread only;
+  ## call from the handler after `isWebSocketUpgrade`. Set `onMessage` /
+  ## `onClose` on the returned handle. If the request is not upgradeable or
+  ## already answered, the handle is dead (`ws.isAlive == false`) and the
+  ## caller should send a normal response.
   ##
   ## `protocols` is the server's supported subprotocols in preference
   ## order; the first that the client also offered is negotiated and echoed
   ## in the handshake. Read it back with `ws.subprotocol` ("" if none).
-  result = WebSocket(core: req.core, fd: req.fd, gen: req.gen)
-  if req.stream != 0 or req.fd < 0: return          # HTTP/1.1 only
+  result = WebSocket(core: req.core, fd: req.fd, gen: req.gen,
+                     stream: req.stream)
+  if req.fd < 0: return                             # HTTP/3 not supported
   let c = conn(req.core, req.fd, req.gen)
-  if c == nil or c.responded or c.ws != nil: return
+  if c == nil: return
+  if req.stream != 0:
+    # HTTP/2 (RFC 8441): reply 200 on the stream and attach a WsConn.
+    discard h2WsAccept(c, req.stream, req.core.maxWsMessage,
+                       req.header("sec-websocket-extensions"),
+                       req.header("sec-websocket-protocol"), protocols,
+                       req.core.dateStr, req.core.serverHeader)
+    return
+  if c.responded or c.ws != nil: return
   discard wsAccept(req.core, c, req.header("sec-websocket-key"),
                    req.core.maxWsMessage,
                    req.header("sec-websocket-extensions"),
@@ -506,7 +523,7 @@ proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   wsRunBody(lc, cast[WsBlockingProc](user), fd, gen, stream, data)
   try:
-    push(lc.outbox, OutMsg(kind: omWsDone, fd: fd, gen: gen))
+    push(lc.outbox, OutMsg(kind: omWsDone, fd: fd, gen: gen, stream: stream))
   except Exception:
     discard
 
@@ -526,7 +543,14 @@ proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
       return
     let c = conn(ws.core, ws.fd, ws.gen)
     if c == nil: return
-    inc c.pinned
+    if ws.stream == 0:
+      inc c.pinned                       # HTTP/1: pin the whole connection
+    else:
+      # HTTP/2: pin only this stream so the other multiplexed streams stay
+      # responsive while the worker runs.
+      let w = wsConnForStream(ws.core, c, ws.stream)
+      if w == nil: return
+      w.blockingPinned = true
     enqueue(cast[ptr WorkerPool](ws.core.pool),
             WorkerTask(fn: wsBlockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](ws.core), fd: ws.fd, gen: ws.gen,

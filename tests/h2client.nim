@@ -6,6 +6,7 @@
 
 import std/[net, posix, oserrors]
 import vortex/http2/frames
+import vortex/http2/hpack
 
 const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 const getRequest = "\x82\x86\x84"    # :method GET, :scheme http, :path /
@@ -51,6 +52,28 @@ proc addSettingsFrame*(buf: var string) =
   payload.addSetting(setMaxConcurrentStreams, 100)
   buf.addFrameHeader(payload.len, ftSettings, 0, 0)
   buf.add payload
+
+proc addExtendedConnect*(buf: var string, sid: uint32,
+                         headers: openArray[(string, string)]) =
+  ## HEADERS frame for an RFC 8441 Extended CONNECT: END_HEADERS but NOT
+  ## END_STREAM, so the stream stays open for WebSocket framing. Headers are
+  ## HPACK literals (server decodes them the same as a browser's).
+  var hb = ""
+  for (n, v) in headers: hb.encodeHeader(n, v)
+  buf.addFrameHeader(hb.len, ftHeaders, flagEndHeaders, sid)
+  buf.add hb
+
+proc addData*(buf: var string, sid: uint32, payload: string,
+              endStream = false) =
+  buf.addFrameHeader(payload.len, ftData,
+                     (if endStream: flagEndStream else: 0'u8), sid)
+  buf.add payload
+
+proc decodeHeaders*(payload: string): seq[(string, string)] =
+  ## Decode a response HEADERS block (the server uses static-table/literal
+  ## encoding, so a fresh decoder per block is fine).
+  var dec = initHpackDecoder(4096, maxDecoded = 1 shl 20)
+  dec.decodeHeaderBlock(payload, 0, payload.len, result)
 
 proc sendHeaders*(c: var H2TestConn, sid: uint32, endStream = true) =
   var f = ""
