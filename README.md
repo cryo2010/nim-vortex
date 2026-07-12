@@ -272,6 +272,42 @@ Node's `ws` (the de facto reference implementation), it is noted.
   the query) and `req.query` a decoded parameter Table; both are lazy
   and cached per request, on any protocol.
 
+## Streaming responses
+
+For bodies you do not want to buffer whole (large downloads, server-sent
+events, proxying), stream the response instead of `res.send`:
+
+```nim
+proc handler(req: Request, res: Response) {.gcsafe.} =
+  res.sendHead(Http200, "text/plain")   # status + headers, no Content-Length
+  res.write("first chunk\n")
+  res.write("second chunk\n")
+  res.finish()                          # terminate the body
+```
+
+`sendHead` opens the body (HTTP/1.1 uses `Transfer-Encoding: chunked`; HTTP/2
+and HTTP/3 leave the stream open with DATA frames), `write` appends a chunk,
+and `finish` ends it (optionally with trailers over HTTP/1.1). The framing is
+identical across all three protocols.
+
+`write` returns `false` once the unsent backlog reaches `respHighWater`; a
+producer that outruns a slow client should pause and resume from `onDrain`,
+the same backpressure contract as WebSocket sends:
+
+```nim
+proc pump(res: Response) {.gcsafe.} =
+  while moreData():
+    if not res.write(nextChunk()):
+      res.onDrain(pump)               # backed up: resume when it empties
+      return
+  res.finish()
+```
+
+`res.bufferedAmount` reports the current backlog. Streaming is driven on the
+loop thread (from the handler or an async/onDrain callback); it composes with
+the async adapters. Request-body streaming (`onBody` / `router.stream`) is the
+next milestone.
+
 ## Build flags
 
 Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
@@ -328,8 +364,10 @@ and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 
 ## Status
 
-Pre-1.0. Deferred (planned): streaming request/response
-bodies, dynamic QPACK, h2c upgrade, Windows.
+Pre-1.0. Streaming response bodies (`res.sendHead`/`write`/`finish`) are
+supported on h1/h2/h3; streaming request bodies are the next milestone.
+Deferred (planned): streaming request bodies, dynamic QPACK, h2c upgrade,
+Windows.
 
 ## Thanks
 

@@ -113,3 +113,88 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
     copyMem(addr wbuf[oldLen], unsafeAddr body[0], body.len)
 
 const continue100* = "HTTP/1.1 100 Continue\r\n\r\n"
+
+# --- streaming responses (res.sendHead / write / finish) --------------------
+
+proc addHex(s: var string, v: int) =
+  ## Minimal-width lowercase hex, for chunk sizes.
+  if v == 0:
+    s.add '0'
+    return
+  const digits = "0123456789abcdef"
+  var buf: array[16, char]
+  var n = v
+  var i = 0
+  while n > 0:
+    buf[i] = digits[n and 0xf]
+    n = n shr 4
+    inc i
+  while i > 0:
+    dec i
+    s.add buf[i]
+
+proc appendStreamHead*(wbuf: var string, code: HttpCode,
+                       dateStr, serverHeader, contentType: string,
+                       extraHeaders: openArray[(string, string)],
+                       chunked: bool, keepAlive: bool,
+                       announceKeepAlive = false, altSvc = "") =
+  ## Serialize the head of a streaming response: no Content-Length. When
+  ## `chunked` the body is Transfer-Encoding: chunked (HTTP/1.1); otherwise
+  ## it is delimited by connection close (HTTP/1.0 clients) and the caller
+  ## must close after the final byte.
+  let codeInt = int(code)
+  if codeInt in 100 .. 599:
+    wbuf.add statusLines[codeInt]
+  else:
+    wbuf.add "HTTP/1.1 "
+    wbuf.addInt codeInt
+    wbuf.add "\r\n"
+  if serverHeader.len > 0:
+    wbuf.add "Server: "
+    wbuf.add serverHeader
+    wbuf.add "\r\n"
+  wbuf.add "Date: "
+  wbuf.add dateStr
+  wbuf.add "\r\n"
+  if contentType.len > 0:
+    wbuf.add "Content-Type: "
+    wbuf.add contentType
+    wbuf.add "\r\n"
+  if chunked:
+    wbuf.add "Transfer-Encoding: chunked\r\n"
+  if not keepAlive or not chunked:
+    wbuf.add "Connection: close\r\n"
+  elif announceKeepAlive:
+    wbuf.add "Connection: keep-alive\r\n"
+  if altSvc.len > 0:
+    wbuf.add "Alt-Svc: "
+    wbuf.add altSvc
+    wbuf.add "\r\n"
+  for (name, val) in extraHeaders:
+    wbuf.add name
+    wbuf.add ": "
+    wbuf.add val
+    wbuf.add "\r\n"
+  wbuf.add "\r\n"
+
+proc appendChunk*(wbuf: var string, data: openArray[char]) =
+  ## One Transfer-Encoding chunk. Empty data is skipped (a zero-length chunk
+  ## would terminate the body).
+  if data.len == 0: return
+  wbuf.addHex data.len
+  wbuf.add "\r\n"
+  let oldLen = wbuf.len
+  wbuf.setLen(oldLen + data.len)
+  copyMem(addr wbuf[oldLen], unsafeAddr data[0], data.len)
+  wbuf.add "\r\n"
+
+proc appendLastChunk*(wbuf: var string,
+                      trailers: openArray[(string, string)] = []) =
+  ## Terminate a chunked body: the zero-length chunk plus optional trailers.
+  wbuf.add "0\r\n"
+  for (name, val) in trailers:
+    wbuf.add name
+    wbuf.add ": "
+    wbuf.add val
+    wbuf.add "\r\n"
+  wbuf.add "\r\n"

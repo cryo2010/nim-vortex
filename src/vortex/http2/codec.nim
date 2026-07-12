@@ -27,6 +27,9 @@ type
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool
+    streaming*: bool                 ## res.sendHead opened a streamed body
+    respBackedUp*: bool              ## write() hit the window; onDrain pending
+    onRespDrain*: RespDrainCb        ## streamed-response drain callback
     isWsConnect*: bool               ## RFC 8441 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
@@ -192,13 +195,122 @@ proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
     st.pendingIsLast = false
   h2WsPush(h2, c, sid)
 
+proc h2RespPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
+  ## Flush a streamed response's pending body bounded by flow control and,
+  ## when the backlog empties after backpressure, fire onDrain. Mirrors
+  ## h2WsPush; `pendingIsLast` is set by h2StreamFinish so the last DATA
+  ## carries END_STREAM and sendData deletes the stream on completion.
+  if sid notin h2.streams: return
+  h2.sendData(c, sid)
+  if sid notin h2.streams: return           # finished and fully drained
+  template st: H2Stream = h2.streams[sid]
+  let backlog = st.pendingBody.len - st.pendingPos
+  if backlog == 0:
+    st.pendingBody.setLen 0
+    st.pendingPos = 0
+    if st.respBackedUp:
+      st.respBackedUp = false
+      if st.onRespDrain != nil:
+        st.onRespDrain(h2.core, c.fd, c.gen, sid)
+  else:
+    st.respBackedUp = true
+
 proc h2ResumeSend(h2: H2Conn, c: ptr Connection, sid: uint32) =
   ## Resume a stream blocked on the send window: WebSocket streams need the
-  ## WS finalize/backpressure bookkeeping, ordinary responses just sendData.
-  if sid in h2.streams and h2.streams[sid].ws != nil:
+  ## WS finalize/backpressure bookkeeping, streamed responses need the
+  ## response drain bookkeeping, ordinary responses just sendData.
+  if sid notin h2.streams:
+    return
+  elif h2.streams[sid].ws != nil:
     h2WsPush(h2, c, sid)
+  elif h2.streams[sid].streaming:
+    h2RespPush(h2, c, sid)
   else:
     h2.sendData(c, sid)
+
+# --- streaming responses (res.sendHead / write / finish over HTTP/2) --------
+
+proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
+                 dateStr, serverHeader, contentType: string,
+                 extraHeaders: openArray[(string, string)], altSvc = "") =
+  ## Send a streamed response's HEADERS (no content-length, no END_STREAM) and
+  ## open the body. Subsequent bytes flow via h2StreamWrite/h2StreamFinish.
+  let h2 = h2Conn(c)
+  if sid notin h2.streams or h2.streams[sid].responded: return
+  template st: H2Stream = h2.streams[sid]
+  st.responded = true
+  st.streaming = true
+  if st.isHead:
+    st.pendingIsLast = true            # HEAD: headers only, close the stream
+  var hb = ""
+  encodeStatus(hb, code)
+  if serverHeader.len > 0:
+    encodeHeader(hb, "server", serverHeader)
+  encodeHeader(hb, "date", dateStr)
+  if contentType.len > 0:
+    encodeHeader(hb, "content-type", contentType)
+  if altSvc.len > 0:
+    encodeHeader(hb, "alt-svc", altSvc)
+  for (name, val) in extraHeaders:
+    encodeHeader(hb, name.toLowerAscii, val)
+  var off = 0
+  var first = true
+  while first or off < hb.len:
+    let chunk = min(hb.len - off, h2.peerMaxFrame)
+    let lastFrag = off + chunk >= hb.len
+    var flags = if lastFrag: flagEndHeaders else: 0'u8
+    if first and st.isHead: flags = flags or flagEndStream
+    c.wbuf.addFrameHeader(chunk,
+      (if first: ftHeaders else: ftContinuation), flags, sid)
+    c.wbuf.add hb[off ..< off + chunk]
+    off += chunk
+    first = false
+  if st.isHead:
+    h2.streams.del(sid)
+    dec h2.activeStreams
+
+proc h2StreamWrite*(c: ptr Connection, sid: uint32,
+                    data: openArray[char]): int =
+  ## Append a body chunk to a streamed response and push it bounded by flow
+  ## control. Returns the unsent backlog (pending body bytes) for backpressure.
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
+    return 0
+  template st: H2Stream = h2.streams[sid]
+  if st.isHead: return 0
+  if data.len > 0:
+    if st.pendingPos > 0 and st.pendingPos == st.pendingBody.len:
+      st.pendingBody.setLen 0            # compact a fully-drained buffer
+      st.pendingPos = 0
+    let oldLen = st.pendingBody.len
+    st.pendingBody.setLen(oldLen + data.len)
+    copyMem(addr st.pendingBody[oldLen], unsafeAddr data[0], data.len)
+  h2RespPush(h2, c, sid)
+  if sid notin h2.streams: return 0
+  h2.streams[sid].pendingBody.len - h2.streams[sid].pendingPos
+
+proc h2StreamFinish*(c: ptr Connection, sid: uint32) =
+  ## Terminate a streamed response: mark the pending body final so the last
+  ## DATA frame carries END_STREAM, then push.
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
+    return
+  template st: H2Stream = h2.streams[sid]
+  st.streaming = false
+  st.onRespDrain = nil
+  if st.isHead:
+    return                               # HEAD stream already closed at head
+  st.pendingIsLast = true
+  if st.pendingBody.len - st.pendingPos > 0:
+    # A final real DATA chunk remains; sendData tags it END_STREAM (and, if the
+    # window is closed, h2ResumeSend does so when it reopens).
+    h2.sendData(c, sid)
+  else:
+    # The body already fully drained before finish: the prior DATA frames went
+    # out without END_STREAM, so emit a bare END_STREAM DATA frame to close it.
+    c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
+    h2.streams.del(sid)
+    dec h2.activeStreams
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
   ## LoopCore.wsStreamLookup: resolve a stream's WsConn for the public API.

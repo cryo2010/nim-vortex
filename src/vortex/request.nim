@@ -380,6 +380,158 @@ proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
 
+# --- streaming responses ----------------------------------------------------
+
+const respHighWater* = 256 * 1024
+  ## write() reports backpressure once the unsent backlog reaches this many
+  ## bytes; the producer should pause and resume from onDrain.
+
+proc sendHead*(res: Response, code: HttpCode, contentType = "",
+               headers: openArray[(string, string)] = []) =
+  ## Begin a streaming response: send the status line and headers, then emit
+  ## the body incrementally with `write` and terminate with `finish`. No
+  ## Content-Length is sent (HTTP/1.1 uses chunked framing). Loop-thread only
+  ## (call from the handler or an async/onDrain callback, not a worker).
+  if currentThreadId() != res.core.threadId: return
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        h3SendHead(res.core, h3c, uint64(res.stream), int(code),
+                   contentType, headers)
+    return
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return
+  if res.stream != 0:
+    h2SendHead(c, int(code), res.stream, res.core.dateStr,
+               res.core.serverHeader, contentType, headers, res.core.altSvc)
+    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+    return
+  if c.responded: return
+  c.responded = true
+  if c.parser.httpMethod == HttpHead:
+    # HEAD carries no body: emit the head as a normal empty response.
+    applyResponse(res.core, c, 0, int(code), contentType, headers, "")
+    return
+  c.respStreaming = true
+  let ka = c.parser.keepAlive
+  let chunked = c.parser.minor >= 1     # HTTP/1.0 clients: close-delimited
+  c.respChunked = chunked
+  appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                   contentType, headers, chunked, keepAlive = ka,
+                   announceKeepAlive = ka and c.parser.minor == 0,
+                   altSvc = res.core.altSvc)
+  res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+
+proc write*(res: Response, data: openArray[char]): bool {.discardable.} =
+  ## Append a body chunk to a streaming response and flush. Returns false once
+  ## the unsent backlog reaches `respHighWater`; the producer should then stop
+  ## and wait for `onDrain`. Safe no-op (returns false) on a dead connection.
+  if currentThreadId() != res.core.threadId: return false
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
+    return false
+  var c = conn(res.core, res.fd, res.gen)
+  if c == nil: return false
+  if res.stream != 0:
+    let backlog = h2StreamWrite(c, res.stream, data)
+    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+    return backlog < respHighWater
+  if not c.respStreaming: return false
+  if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
+  if c.respChunked:
+    appendChunk(c.wbuf, data)
+  elif data.len > 0:
+    let oldLen = c.wbuf.len
+    c.wbuf.setLen(oldLen + data.len)
+    copyMem(addr c.wbuf[oldLen], unsafeAddr data[0], data.len)
+  res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  c = conn(res.core, res.fd, res.gen)   # flush may have closed on error
+  if c == nil: return false
+  if pendingOut(c) >= respHighWater:
+    c.respBackedUp = true
+    return false
+  true
+
+proc finish*(res: Response, trailers: openArray[(string, string)] = []) =
+  ## Terminate a streaming response (the chunked 0-chunk plus optional
+  ## trailers, or a connection close for HTTP/1.0), flush, and resume the
+  ## connection for the next request.
+  if currentThreadId() != res.core.threadId: return
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        h3StreamFinish(h3c, uint64(res.stream))
+    return
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return
+  if res.stream != 0:
+    h2StreamFinish(c, res.stream)
+    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+    return
+  if not c.respStreaming: return
+  c.respStreaming = false
+  c.respBackedUp = false
+  c.onRespDrain = nil
+  if c.respChunked and c.parser.httpMethod != HttpHead:
+    appendLastChunk(c.wbuf, trailers)
+  if not c.parser.keepAlive or not c.respChunked or c.peerHalfClosed:
+    c.closeAfterFlush = true
+  # kick resumes the paused pipeline when finish runs after the handler
+  # returned (deferred); inline finish is a no-op here and the dispatch
+  # return path resets and flushes.
+  res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+
+proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
+  ## Register a callback fired (loop thread) when a backed-up streaming
+  ## response's write backlog empties, so the producer can resume writing.
+  if currentThreadId() != res.core.threadId: return
+  let captured = cb
+  # The h3 reflush path cannot pass the handle words, so h3's callback closes
+  # over the Response; h1/h2 reconstruct it from the passed words.
+  let held = res
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        let st = h3StreamPtr(h3c, uint64(res.stream))
+        if st != nil:
+          st.onRespDrain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
+                                stream: uint32) {.gcsafe.} =
+            captured(held)
+    return
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return
+  let drain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
+                   stream: uint32) {.gcsafe.} =
+    captured(Response(core: core, fd: fd, gen: gen, stream: stream))
+  if res.stream != 0:
+    let st = h2Stream(c, res.stream)
+    if st != nil: st.onRespDrain = drain
+    return
+  c.onRespDrain = drain
+
+proc bufferedAmount*(res: Response): int =
+  ## Bytes queued for the streaming response but not yet written to the
+  ## socket. Zero when idle or on a dead connection.
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        return h3StreamBacklog(h3c, uint64(res.stream))
+    return 0
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return 0
+  if res.stream != 0:
+    let st = h2Stream(c, res.stream)
+    if st == nil: return 0
+    return st.pendingBody.len - st.pendingPos
+  pendingOut(c)
+
 # --- blocking dispatch ------------------------------------------------------
 
 type

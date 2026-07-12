@@ -48,6 +48,12 @@ type
     dkWsPing,   ## WebSocket idle: send a keepalive ping when it expires
     dkWsPong    ## ping sent: close the connection if it expires with no reply
 
+  RespDrainCb* = proc (core: ptr LoopCore, fd: int32, gen: uint32,
+                       stream: uint32) {.gcsafe.}
+    ## A streaming response's onDrain: called on the loop thread when the
+    ## write backlog empties. Reconstructs a Response from the handle words
+    ## and invokes the user callback (request.nim). Loop-thread only.
+
   Connection* = object
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
@@ -82,6 +88,12 @@ type
     lingerClose*: bool        ## drain peer before close (reliable error delivery)
     peerHalfClosed*: bool     ## peer sent FIN (half-close): no more requests,
                               ## but a buffered one still gets its response
+    # Streaming response state (res.sendHead/write/finish). HTTP/1 only;
+    # h2/h3 keep their streaming flags on the per-stream struct.
+    respStreaming*: bool      ## a chunked/close-delimited response is open
+    respChunked*: bool        ## true = Transfer-Encoding: chunked framing
+    respBackedUp*: bool       ## write() reported backpressure; onDrain pending
+    onRespDrain*: RespDrainCb
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
@@ -224,6 +236,10 @@ proc resetForNextRequest*(c: var Connection) =
   c.responded = false
   c.sent100 = false
   c.awaitingResponse = false
+  c.respStreaming = false
+  c.respChunked = false
+  c.respBackedUp = false
+  c.onRespDrain = nil
   c.parser.reset(0)
 
 proc clear*(c: var Connection, initialBufSize: int) =
@@ -257,6 +273,10 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.closeAfterFlush = false
   c.lingerClose = false
   c.peerHalfClosed = false
+  c.respStreaming = false
+  c.respChunked = false
+  c.respBackedUp = false
+  c.onRespDrain = nil
   c.requestCount = 0
   c.parser.reset(0)
   c.state = csActive
