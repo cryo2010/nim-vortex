@@ -466,19 +466,25 @@ proc isWebSocketUpgrade*(req: Request): bool =
   req.header("sec-websocket-version") == "13" and
   req.header("sec-websocket-key").len > 0
 
-proc acceptWebSocket*(req: Request): WebSocket =
+proc acceptWebSocket*(req: Request,
+                      protocols: openArray[string] = []): WebSocket =
   ## Complete the handshake and switch the connection to WebSocket mode.
   ## Loop thread only; call from the handler after `isWebSocketUpgrade`.
   ## Set `onMessage` / `onClose` on the returned handle. If the request is
   ## not upgradeable or already answered, the handle is dead
   ## (`ws.isAlive == false`) and the caller should send a normal response.
+  ##
+  ## `protocols` is the server's supported subprotocols in preference
+  ## order; the first that the client also offered is negotiated and echoed
+  ## in the handshake. Read it back with `ws.subprotocol` ("" if none).
   result = WebSocket(core: req.core, fd: req.fd, gen: req.gen)
   if req.stream != 0 or req.fd < 0: return          # HTTP/1.1 only
   let c = conn(req.core, req.fd, req.gen)
   if c == nil or c.responded or c.ws != nil: return
   discard wsAccept(req.core, c, req.header("sec-websocket-key"),
                    req.core.maxWsMessage,
-                   req.header("sec-websocket-extensions"))
+                   req.header("sec-websocket-extensions"),
+                   req.header("sec-websocket-protocol"), protocols)
 
 type
   WsBlockingProc* = proc (ws: WebSocket, msg: string) {.nimcall, gcsafe.}
