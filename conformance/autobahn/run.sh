@@ -4,8 +4,8 @@
 # Builds a vortex echo server image, runs it, and points the
 # crossbario/autobahn-testsuite fuzzingclient at it over a private docker
 # network. Exits non-zero if any executed case reports a failing behavior.
-# Compression cases (12-13) are excluded until permessage-deflate lands
-# (see the WebSocket roadmap in the README).
+# All case groups (1-13) run, including permessage-deflate compression
+# (12-13); the echo server is built with -d:wsDeflate.
 #
 # Usage:  sh conformance/autobahn/run.sh        (or `nimble autobahn`)
 # Needs: docker + python3. The full HTML report lands in
@@ -68,7 +68,7 @@ for case in sorted(agent, key=num):
     if b in ("FAILED", "WRONG CODE") or bc in ("FAILED", "WRONG CODE"):
         bad.append((case, b, bc))
 print(f"{len(agent)} cases run, {len(bad)} failing "
-      f"(compression cases 12-13 excluded)")
+      f"(all groups 1-13, incl. permessage-deflate)")
 for case, b, bc in bad:
     print(f"  FAIL {case}: behavior={b} close={bc}")
 sys.exit(1 if bad else 0)
