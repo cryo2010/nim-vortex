@@ -21,6 +21,9 @@ single port and a single handler API.
   100-continue), HTTP/2 (TLS ALPN and h2c prior knowledge; h2spec-clean),
   HTTP/3 over QUIC (OpenSSL >= 3.5 server API), with automatic `Alt-Svc`
   advertisement, plus **WebSockets** (RFC 6455) over `ws://` and `wss://`.
+- **Dual-stack**: binds IPv4 and IPv6 by default (`address = "::"` with
+  IPv4-mapped, falling back to IPv4-only where IPv6 is unavailable); set an
+  explicit `address` to pin one family.
 - **Dependencies**: none beyond OpenSSL >= 3.5 at runtime for TLS/h2/h3.
   Build with `-d:plainHttp` for a zero-dependency cleartext (h1 + h2c)
   server.

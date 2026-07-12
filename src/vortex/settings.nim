@@ -7,7 +7,9 @@ type
 
   Settings* = object
     port*: Port
-    address*: string          ## bind address, "" = all interfaces
+    address*: string          ## bind address; "" = all interfaces, dual-stack
+                              ## ("::" with IPv4-mapped, IPv4 fallback). Set an
+                              ## explicit IPv4/IPv6 address to pin the family.
     numThreads*: int          ## 0 = countProcessors()
     workerThreads*: int       ## worker pool size for `blocking:` (0 = numThreads * 2)
     listenBacklog*: int
