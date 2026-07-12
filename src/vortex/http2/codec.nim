@@ -395,6 +395,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     h2.noteControlFrame(c)
     if c.state == csClosing: return
     var i = 0
+    var initialWindowChanged = false
     while i < fh.length:
       let id = get16(c.rbuf, payloadPos + i)
       let value = get32(c.rbuf, payloadPos + i + 2)
@@ -406,6 +407,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.peerInitialWindow = int32(value)
         for sid, st in h2.streams.mpairs:
           st.sendWindow += delta
+        initialWindowChanged = true
       of setMaxFrameSize:
         if value < 16384'u32 or value > 16777215'u32:
           h2.connError(c, errProtocol); return
@@ -415,6 +417,14 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       else: discard                  # header table size: encoder is static-only
       i += 6
     c.wbuf.addFrameHeader(0, ftSettings, flagAck, 0)
+    if initialWindowChanged:
+      # Raising SETTINGS_INITIAL_WINDOW_SIZE grows every stream's send
+      # window (RFC 7540 6.9.2): flush DATA it may have unblocked, the same
+      # retry the connection-level WINDOW_UPDATE path does.
+      var retry: seq[uint32]
+      for sid, st in h2.streams:
+        if st.pendingBody.len - st.pendingPos > 0: retry.add sid
+      for sid in retry: h2.sendData(c, sid)
 
   of ftPing:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
