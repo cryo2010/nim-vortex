@@ -79,11 +79,15 @@ proc connectUdp(port: int): SocketHandle =
 proc buildH3Request(): string =
   ## h3 HEADERS frame around a QPACK field section of prefix 00 00 plus
   ## indexed statics 17 (:method GET), 23 (:scheme https), 1 (:path /),
-  ## each encoded as 0xc0 | index.
+  ## each encoded as 0xc0 | index, then :authority (an https request must
+  ## carry one, RFC 9114 4.3.1) as a literal referencing static index 0.
   var payload = "\x00\x00"
   payload.add char(0xc0 or 17)
   payload.add char(0xc0 or 23)
   payload.add char(0xc0 or 1)
+  payload.add char(0x50)          # literal field line, name = static 0 (:authority)
+  payload.add char(9)             # value length 9, no Huffman
+  payload.add "localhost"
   result = ""
   result.addFrame(h3fHeaders, payload)
 
