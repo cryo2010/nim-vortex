@@ -477,7 +477,8 @@ proc acceptWebSocket*(req: Request): WebSocket =
   let c = conn(req.core, req.fd, req.gen)
   if c == nil or c.responded or c.ws != nil: return
   discard wsAccept(req.core, c, req.header("sec-websocket-key"),
-                   req.core.maxWsMessage)
+                   req.core.maxWsMessage,
+                   req.header("sec-websocket-extensions"))
 
 type
   WsBlockingProc* = proc (ws: WebSocket, msg: string) {.nimcall, gcsafe.}

@@ -15,8 +15,9 @@ type
 
   WsFrame* = object
     fin*: bool
+    rsv1*: bool               ## permessage-deflate: a compressed message
     opcode*: WsOpcode
-    payload*: string          ## already unmasked
+    payload*: string          ## already unmasked (still compressed if rsv1)
 
   WsParse* = enum
     wpNeedMore                 ## incomplete; call again with more bytes
@@ -39,7 +40,9 @@ proc parseFrame*(buf: string, avail: int, pos: var int,
   if avail - start < 2: return wpNeedMore
   let b0 = uint8(buf[start])
   let b1 = uint8(buf[start + 1])
-  if (b0 and 0x70) != 0: return wpError        # RSV bits set, no extensions
+  # RSV2/RSV3 are unused (no extension defines them); RSV1 is permessage-
+  # deflate's "compressed" flag, validated in context by the codec.
+  if (b0 and 0x30) != 0: return wpError
   let opByte = b0 and 0x0f
   if not knownOpcode(opByte): return wpError
   let op = cast[WsOpcode](opByte)   # validated above; cast avoids HoleEnumConv
@@ -75,6 +78,7 @@ proc parseFrame*(buf: string, avail: int, pos: var int,
   if avail - start < header + 4 + payloadLen: return wpNeedMore
 
   frame.fin = fin
+  frame.rsv1 = (b0 and 0x40) != 0
   frame.opcode = op
   frame.payload.setLen(payloadLen)
   let m0 = uint8(buf[maskOff]); let m1 = uint8(buf[maskOff+1])
@@ -86,9 +90,11 @@ proc parseFrame*(buf: string, avail: int, pos: var int,
   wpFrame
 
 proc appendFrame*(dst: var string, opcode: WsOpcode,
-                  payload: openArray[char], fin = true) =
-  ## Serialize a server frame (unmasked) into `dst`.
-  dst.add char((if fin: 0x80'u8 else: 0'u8) or uint8(opcode))
+                  payload: openArray[char], fin = true, rsv1 = false) =
+  ## Serialize a server frame (unmasked) into `dst`. `rsv1` marks a
+  ## permessage-deflate compressed message (first frame only).
+  dst.add char((if fin: 0x80'u8 else: 0'u8) or
+               (if rsv1: 0x40'u8 else: 0'u8) or uint8(opcode))
   let n = payload.len
   if n <= 125:
     dst.add char(uint8(n))

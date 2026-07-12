@@ -60,6 +60,20 @@ jobs:
         # test; this installs it and runs the adapter's own suite (orc).
         run: nimble testchronos -y
 
+  testdeflate:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc openssl zlib
+      - uses: actions/checkout@v7
+      - name: Test WebSocket permessage-deflate
+        # Opt-in -d:wsDeflate feature (links zlib), so its suite is separate
+        # from the default nimble test.
+        run: nimble testdeflate -y
+
   # The REDbot and fuzz checks ship as Docker images (bundling REDbot and
   # the libFuzzer runtime). These jobs run on the plain runner, where
   # Docker is available, so they exercise the images themselves. The image

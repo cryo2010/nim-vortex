@@ -160,8 +160,10 @@ handshake are handled for you, and text is validated as UTF-8. Idle
 connections are kept alive and half-open ones reaped automatically: after
 `wsPingInterval` seconds without a frame the server sends a ping, and if no
 reply arrives within `wsPongTimeout` it closes the connection (set
-`wsPingInterval = 0` to disable). HTTP/1.1 only for now (HTTP/2 per RFC
-8441 is not yet supported).
+`wsPingInterval = 0` to disable). Building with `-d:wsDeflate` (links
+zlib) adds permessage-deflate (RFC 7692) message compression, negotiated
+automatically. HTTP/1.1 only for now (HTTP/2 per RFC 8441 is not yet
+supported).
 
 ### Roadmap and Autobahn conformance
 
@@ -173,14 +175,15 @@ The gaps below are tracked as TODO; where a gap is a known difference from
 Node's `ws` (the de facto reference implementation), it is noted.
 
 - [x] **Autobahn conformance**: `nimble autobahn` (see
-  [conformance/autobahn/](conformance/autobahn/)) runs the suite against a
-  vortex echo server. All 301 non-compression cases pass (framing,
-  pings/pongs, reserved bits, opcodes, fragmentation, UTF-8, close
-  handling, limits: groups 1-7 and 9-10).
-- [ ] **permessage-deflate** (RFC 7692) message compression. Not
-  implemented, so the Autobahn run excludes the compression cases (12-13).
-  This is the last protocol gap for a full Autobahn pass, and the main
-  difference versus `ws`.
+  [conformance/autobahn/](conformance/autobahn/)) runs the full suite
+  against a vortex echo server. All cases pass (framing, pings/pongs,
+  reserved bits, opcodes, fragmentation, UTF-8, close handling, limits, and
+  permessage-deflate: groups 1-13).
+- [x] **permessage-deflate** (RFC 7692) message compression, opt-in via
+  `-d:wsDeflate` (links zlib). Off by default, so the default and
+  `-d:plainHttp` builds are unchanged and take on no compression
+  dependency or attack surface; inbound decompression is bounded by
+  `maxWsMessageSize` (close 1009) and fuzzed.
 - [ ] **Subprotocol negotiation**: honor the client's
   `Sec-WebSocket-Protocol` offer and echo the server-selected subprotocol
   in the handshake (`ws` supports this via `handleProtocols`).
@@ -223,6 +226,10 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 (`nimble bench` builds the benchmark server this way).
 
 `-d:plainHttp` removes the OpenSSL dependency (and TLS/h2-over-TLS/h3).
+
+`-d:wsDeflate` (link with `--passL:-lz`) enables WebSocket
+permessage-deflate compression via zlib. Off by default so the standard
+build keeps its OpenSSL-only footprint.
 
 ## Verification
 
