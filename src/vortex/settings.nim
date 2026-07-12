@@ -19,6 +19,7 @@ type
     maxBodySize*: int         ## 413 when exceeded
     initialBufferSize*: int   ## per-connection read/write buffer starting size
     maxWsMessageSize*: int    ## largest inbound WebSocket message (close 1009 over it)
+    wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
 
     # DoS budgets (0 disables the check)
     maxConnections*: int          ## live connections per loop thread
@@ -57,6 +58,7 @@ proc initSettings*(
     maxBodySize = 8 * 1024 * 1024,
     initialBufferSize = 8 * 1024,
     maxWsMessageSize = 1024 * 1024,
+    wsCompression = true,
     maxConnections = 65536,
     maxConcurrentStreams = 256,
     maxResetStreams = 512,
@@ -82,7 +84,7 @@ proc initSettings*(
     reusePort: reusePort, maxHeaderSize: maxHeaderSize,
     maxHeaderCount: maxHeaderCount, maxBodySize: maxBodySize,
     initialBufferSize: initialBufferSize,
-    maxWsMessageSize: maxWsMessageSize,
+    maxWsMessageSize: maxWsMessageSize, wsCompression: wsCompression,
     maxConnections: maxConnections,
     maxConcurrentStreams: maxConcurrentStreams,
     maxResetStreams: maxResetStreams, maxControlFrames: maxControlFrames,

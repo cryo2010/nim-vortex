@@ -74,10 +74,18 @@ suite "frame parsing":
     var f = "\x81\x02hi"                    # fin+text, len 2, no mask bit
     check parseOne(f).res == wpError
 
-  test "reserved bits set are rejected":
+  test "RSV2/RSV3 are rejected":
+    for bit in [0x20'u8, 0x10]:             # RSV2, RSV3: no extension uses them
+      var buf = masked(0x1, "x")
+      buf[0] = char(uint8(buf[0]) or bit)
+      check parseOne(buf).res == wpError
+
+  test "RSV1 is accepted and exposed (permessage-deflate flag)":
     var buf = masked(0x1, "x")
-    buf[0] = char(uint8(buf[0]) or 0x40)    # set RSV1
-    check parseOne(buf).res == wpError
+    buf[0] = char(uint8(buf[0]) or 0x40)    # RSV1: the codec decides legality
+    let (r, f, _) = parseOne(buf)
+    check r == wpFrame
+    check f.rsv1
 
   test "unknown opcode is rejected":
     check parseOne(masked(0x3, "x")).res == wpError

@@ -134,6 +134,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   result.core.serverHeader = settings.serverHeader
   result.core.maxWsMessage = settings.maxWsMessageSize
   result.core.wsPingInterval = settings.wsPingInterval
+  result.core.wsCompression = settings.wsCompression
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox

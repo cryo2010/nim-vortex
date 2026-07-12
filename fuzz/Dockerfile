@@ -16,10 +16,11 @@ ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
 
 # clang + compiler-rt provide the libFuzzer runtime; nim/gcc build the
-# harnesses; openssl is vortex's link dependency.
+# harnesses; openssl is vortex's link dependency; zlib backs the
+# permessage-deflate (wsdeflate) target.
 # --disable-sandbox: pacman's Landlock sandbox cannot apply in a container.
 RUN pacman -Syu --noconfirm --needed --disable-sandbox \
-      nim gcc clang compiler-rt openssl && \
+      nim gcc clang compiler-rt openssl zlib && \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex

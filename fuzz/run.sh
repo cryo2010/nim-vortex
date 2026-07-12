@@ -13,15 +13,18 @@
 set -e
 DUR="${DUR:-30}"
 CLANG="${CLANG:-clang}"
-targets="${*:-http1 hpack qpack}"
+targets="${*:-http1 hpack qpack wsdeflate}"
 
 for t in $targets; do
+  # The permessage-deflate inflate path needs zlib + the compile flag.
+  extra=""
+  [ "$t" = wsdeflate ] && extra="-d:wsDeflate --passL:-lz"
   echo "== building fuzz_$t =="
   nim c --cc:clang --clang.exe:"$CLANG" --clang.linkerexe:"$CLANG" \
     --noMain:on --mm:orc -d:useMalloc --opt:speed \
     --boundChecks:on --overflowChecks:on \
     --passC:-fsanitize=fuzzer,address --passL:-fsanitize=fuzzer,address \
-    -o:"fuzz/fuzz_$t" "fuzz/fuzz_$t.nim"
+    $extra -o:"fuzz/fuzz_$t" "fuzz/fuzz_$t.nim"
   mkdir -p "fuzz/corpus/$t"
   echo "== fuzzing $t for ${DUR}s =="
   "./fuzz/fuzz_$t" -max_total_time="$DUR" -print_final_stats=1 \

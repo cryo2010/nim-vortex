@@ -11,6 +11,9 @@ import std/base64
 import ../connection
 import ./frames
 import ./sha1
+when defined(wsDeflate):
+  import std/strutils
+  import ./deflate
 
 type
   WsKind* = enum
@@ -41,6 +44,11 @@ type
     maxMessage: int
     closeSent: bool          ## a close frame has been queued
     closeNotified: bool      ## onClose has been delivered
+    when defined(wsDeflate):
+      pmd: bool              ## permessage-deflate negotiated on this connection
+      msgCompressed: bool    ## the in-progress message's first frame had RSV1
+      deflate: Deflator      ## compresses outbound messages
+      inflate: Inflator      ## decompresses inbound messages
 
 const
   wsMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -71,14 +79,66 @@ proc wsAppendPing*(c: ptr Connection) =
   ## Queue a keepalive ping frame (empty payload). Loop thread only.
   c.wbuf.appendFrame(opPing, "")
 
+when defined(wsDeflate):
+  type PmdNegotiation = object
+    accept: bool
+    respHeader: string        ## the negotiated Sec-WebSocket-Extensions value
+    serverNoCtx: bool         ## reset our deflate window per message
+    clientNoCtx: bool         ## client resets its window per message
+    serverWindow: int         ## our deflate window (from server_max_window_bits)
+
+  proc negotiatePmd(offer: string): PmdNegotiation =
+    ## Parse the client's Sec-WebSocket-Extensions offer (RFC 7692 7.1) and,
+    ## if it includes an acceptable permessage-deflate offer, produce the
+    ## agreed parameters and the response header value. Our inflate always
+    ## uses the max window, so client_max_window_bits is accepted but not
+    ## echoed (omitting it is a valid response and simplest to reason about).
+    result.serverWindow = 15
+    for ext in offer.split(','):
+      let parts = ext.split(';')
+      if parts.len == 0 or parts[0].strip.toLowerAscii != "permessage-deflate":
+        continue
+      var srvNoCtx, cliNoCtx = false
+      var srvWin = 15
+      var ok = true
+      for i in 1 ..< parts.len:
+        let p = parts[i].strip
+        if p.len == 0: continue
+        let eq = p.find('=')
+        let name = (if eq >= 0: p[0 ..< eq] else: p).strip.toLowerAscii
+        let val = (if eq >= 0: p[eq+1 .. ^1].strip.strip(chars = {'"'}) else: "")
+        case name
+        of "server_no_context_takeover": srvNoCtx = true
+        of "client_no_context_takeover": cliNoCtx = true
+        of "server_max_window_bits":
+          if val.len > 0:
+            let n = (try: parseInt(val) except: -1)
+            if n in 8 .. 15: srvWin = n else: ok = false
+        of "client_max_window_bits":
+          if val.len > 0 and (try: parseInt(val) except: -1) notin 8 .. 15:
+            ok = false                         # malformed value
+        else: ok = false                       # unknown param: decline offer
+      if not ok: continue
+      result.accept = true
+      result.serverNoCtx = srvNoCtx
+      result.clientNoCtx = cliNoCtx
+      result.serverWindow = srvWin
+      var h = "permessage-deflate"
+      if srvNoCtx: h.add "; server_no_context_takeover"
+      if cliNoCtx: h.add "; client_no_context_takeover"
+      if srvWin < 15: h.add "; server_max_window_bits=" & $srvWin
+      result.respHeader = h
+      return
+
 # --- handshake --------------------------------------------------------------
 
 proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
-               maxMessage: int): WsConn =
+               maxMessage: int, extensionsOffer = ""): WsConn =
   ## Write the 101 handshake into the connection's write buffer and switch
   ## it into WebSocket mode. Loop thread only. A dedicated serializer is
   ## needed because appendResponse always emits Content-Length, which a
-  ## 101 upgrade must not carry.
+  ## 101 upgrade must not carry. `extensionsOffer` is the client's
+  ## Sec-WebSocket-Extensions value (used to negotiate permessage-deflate).
   c.wbuf.add "HTTP/1.1 101 Switching Protocols\r\n"
   if core.serverHeader.len > 0:
     c.wbuf.add "Server: "
@@ -88,10 +148,24 @@ proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
   c.wbuf.add "Connection: Upgrade\r\n"
   c.wbuf.add "Sec-WebSocket-Accept: "
   c.wbuf.add acceptKey(clientKey)
-  c.wbuf.add "\r\n\r\n"
-  c.responded = true
+  c.wbuf.add "\r\n"
 
   let w = WsConn(maxMessage: maxMessage)
+  when defined(wsDeflate):
+    if core.wsCompression and extensionsOffer.len > 0:
+      let neg = negotiatePmd(extensionsOffer)
+      if neg.accept:
+        w.deflate = initDeflator(neg.serverWindow, neg.serverNoCtx)
+        w.inflate = initInflator(neg.clientNoCtx)
+        if w.deflate.inited and w.inflate.inited:
+          w.pmd = true
+          c.wbuf.add "Sec-WebSocket-Extensions: "
+          c.wbuf.add neg.respHeader
+          c.wbuf.add "\r\n"
+        else:
+          w.deflate.close(); w.inflate.close()
+  c.wbuf.add "\r\n"
+  c.responded = true
   c.ws = w
   # Drop the consumed HTTP request bytes so the frame pump starts at the
   # first WebSocket byte (any the client pipelined after the upgrade).
@@ -169,16 +243,33 @@ proc validCloseCode(code: uint16): bool =
   (code >= 3000 and code <= 4999)
 
 proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
-                     op: WsOpcode, data: string): bool =
-  ## Deliver a complete message. Returns false if the connection is now
-  ## closing (invalid UTF-8 in a text message).
-  if op == opText and not validUtf8(data):
+                     op: WsOpcode, data: string, compressed: bool): bool =
+  ## Deliver a complete message, decompressing first if it was compressed.
+  ## Returns false if the connection is now closing.
+  var payload = data
+  when defined(wsDeflate):
+    if compressed:
+      let r = w.inflate.decompress(data, w.maxMessage)
+      case r.status
+      of dsTooBig: failClose(core, c, w, 1009); return false   # bomb / too big
+      of dsError:  failClose(core, c, w, 1002); return false   # bad deflate
+      of dsOk:     payload = r.data
+  if op == opText and not validUtf8(payload):
     failClose(core, c, w, 1007)          # not valid UTF-8
     return false
   if w.onMessage != nil:
     let kind = if op == opBinary: wsBinary else: wsText
-    w.onMessage(WebSocket(core: core, fd: c.fd, gen: c.gen), data, kind)
+    w.onMessage(WebSocket(core: core, fd: c.fd, gen: c.gen), payload, kind)
   true
+
+proc rsv1Ok(w: WsConn, fr: WsFrame): bool =
+  ## RSV1 is only legal on the first frame of a data message, and only when
+  ## permessage-deflate was negotiated.
+  if not fr.rsv1: return true
+  when defined(wsDeflate):
+    return w.pmd
+  else:
+    return false
 
 proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
                  fr: WsFrame): bool =
@@ -217,19 +308,27 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     if w.fragging:
       failClose(core, c, w, 1002)          # data frame mid-fragment
       return false
+    if not rsv1Ok(w, fr):
+      failClose(core, c, w, 1002)          # RSV1 set without permessage-deflate
+      return false
+    let compressed = fr.rsv1
     if fr.fin:
-      dispatchMessage(core, c, w, fr.opcode, fr.payload)
+      dispatchMessage(core, c, w, fr.opcode, fr.payload, compressed)
     else:
       w.fragging = true
       w.fragOp = fr.opcode
       w.frag = fr.payload
+      when defined(wsDeflate): w.msgCompressed = compressed
       true
   of opContinuation:
     if not w.fragging:
       failClose(core, c, w, 1002)          # continuation with nothing open
       return false
+    if fr.rsv1:
+      failClose(core, c, w, 1002)          # RSV1 only on the first frame
+      return false
     if w.frag.len + fr.payload.len > w.maxMessage:
-      failClose(core, c, w, 1009)          # message too big
+      failClose(core, c, w, 1009)          # message too big (still compressed)
       return false
     w.frag.add fr.payload
     if fr.fin:
@@ -237,7 +336,9 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       let op = w.fragOp
       let msg = move w.frag
       w.frag = ""
-      dispatchMessage(core, c, w, op, msg)
+      var compressed = false
+      when defined(wsDeflate): compressed = w.msgCompressed
+      dispatchMessage(core, c, w, op, msg, compressed)
     else:
       true
 
@@ -272,10 +373,15 @@ proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
 
 proc wsClosed*(core: ptr LoopCore, c: ptr Connection) =
   ## Called by the loop when the connection is torn down: deliver onClose
-  ## (abnormal 1006) if the peer never sent a close frame.
+  ## (abnormal 1006) if the peer never sent a close frame, and free the
+  ## zlib state.
   if c.ws == nil: return
   let w = WsConn(c.ws)
   notifyClose(core, c, w, 1006, "")
+  when defined(wsDeflate):
+    if w.pmd:
+      w.deflate.close()
+      w.inflate.close()
   c.ws = nil
 
 # --- public send/close API --------------------------------------------------
@@ -295,6 +401,17 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
       return
     let c = conn(ws.core, ws.fd, ws.gen)
     if c == nil or c.ws == nil: return
+    when defined(wsDeflate):
+      let w = WsConn(c.ws)
+      # Compress data messages when permessage-deflate is negotiated; control
+      # frames and empty messages go out uncompressed. (Off-loop sends above
+      # are always uncompressed: the deflate stream is loop-thread state.)
+      if w.pmd and (op == opText or op == opBinary) and data.len > 0:
+        let comp = w.deflate.compress(data)
+        c.wbuf.appendFrame(op, comp, rsv1 = true)
+        if ws.core.flushHook != nil:
+          ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
+        return
     c.wbuf.appendFrame(op, data)
     if ws.core.flushHook != nil:
       ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
