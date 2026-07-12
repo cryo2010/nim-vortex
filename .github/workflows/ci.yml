@@ -163,3 +163,15 @@ jobs:
         # h3spec exits non-zero on any failure. The QUIC transport group is
         # OpenSSL's stack (not vortex) and is excluded.
         run: sh conformance/h3spec/run.sh
+
+  zap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Security scan (OWASP ZAP baseline)
+        # run.sh builds a plaintext vortex site image and runs ZAP's packaged
+        # zap-baseline.py against it over a private docker network. zap.conf
+        # promotes the security-header rules the app satisfies to FAIL, so the
+        # scan exits non-zero if a regression drops one of those headers. It
+        # picks the x86_64 server base itself.
+        run: sh conformance/zap/run.sh

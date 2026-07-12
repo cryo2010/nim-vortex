@@ -85,3 +85,10 @@ task h3spec, "HTTP/3 conformance via h3spec, HTTP/3-servers group (Docker)":
   # non-zero on any failure. (The QUIC transport group is OpenSSL's stack,
   # not vortex, so it is excluded.)
   exec "sh conformance/h3spec/run.sh"
+
+task zap, "Security scan via the OWASP ZAP baseline scanner (Docker)":
+  # run.sh builds a plaintext vortex site image and runs ZAP's packaged
+  # zap-baseline.py against it over a private docker network. zap.conf
+  # promotes the security-header rules the app satisfies to FAIL, so the run
+  # exits non-zero if a regression drops one of those headers.
+  exec "sh conformance/zap/run.sh"
