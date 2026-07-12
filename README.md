@@ -303,7 +303,9 @@ build keeps its OpenSSL-only footprint.
 - HTTP/1.1 conformance: `nimble redbot` runs [REDbot](https://redbot.org)
   against a live server in Docker and fails on any BAD-level finding (or
   `sh conformance/run.sh` with a host REDbot). See
-  [conformance/](conformance/).
+  [conformance/](conformance/). `nimble h1spec` additionally runs
+  [h1spec](https://github.com/dropseed/h1spec)'s request/header/body/framing
+  cases in Docker (32/32 pass). See [conformance/h1spec/](conformance/h1spec/).
 - WebSocket conformance: `nimble autobahn` runs the
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
   in Docker (301/301 non-compression cases pass). See
