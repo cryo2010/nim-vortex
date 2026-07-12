@@ -80,6 +80,8 @@ type
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
     lingerClose*: bool        ## drain peer before close (reliable error delivery)
+    peerHalfClosed*: bool     ## peer sent FIN (half-close): no more requests,
+                              ## but a buffered one still gets its response
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
@@ -254,6 +256,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.awaitingResponse = false
   c.closeAfterFlush = false
   c.lingerClose = false
+  c.peerHalfClosed = false
   c.requestCount = 0
   c.parser.reset(0)
   c.state = csActive

@@ -518,8 +518,16 @@ proc handleRead(loop: Loop, c: ptr Connection) =
       if n < wanted:
         break                  # kernel buffer drained; skip the EAGAIN syscall
     elif n == 0:
-      loop.closeConn(c)        # peer closed
-      return
+      # Peer sent FIN. For HTTP/1 it may have half-closed its write side after
+      # a complete request and is now waiting for the response (a legitimate
+      # client pattern), so process what is buffered and close after replying
+      # rather than dropping the request. h2/ws treat a bare FIN as the
+      # connection going away.
+      if c.h2 != nil or c.ws != nil:
+        loop.closeConn(c)
+        return
+      c.peerHalfClosed = true
+      break
     else:
       let err = cint(osLastError())
       if err == EINTR: continue
@@ -529,6 +537,14 @@ proc handleRead(loop: Loop, c: ptr Connection) =
   loop.processInput(c)
   if c.state != csFree and (c.pendingOut > 0 or c.closeAfterFlush):
     loop.flushOut(c)
+  if c.peerHalfClosed and c.state == csActive:
+    # The peer will send no more requests: close once any response has been
+    # written (the deferred/worker case sets closeAfterFlush and closes when
+    # the response arrives).
+    if c.awaitingResponse or c.pendingOut > 0:
+      c.closeAfterFlush = true
+    else:
+      loop.closeConn(c)
 
 when not defined(plainHttp):
   proc driveHandshake(loop: Loop, c: ptr Connection) =
@@ -792,9 +808,6 @@ proc run*(loop: Loop) =
       let c = addr loop.core.conns[key.fd]
       if c.state == csFree:
         continue
-      if Event.Error in key.events:
-        loop.closeConn(c)
-        continue
       if c.state == csDraining:
         loop.handleDrain(c)      # read-discard until EOF/deadline, then close
         continue
@@ -807,7 +820,11 @@ proc run*(loop: Loop) =
           loop.flushOut(c)
           if c.state == csFree:
             continue
-        if Event.Read in key.events:
+        # A peer FIN arrives as Event.Error (kqueue EV_EOF) alongside any
+        # buffered request. Read it -- handleRead drains the request, responds,
+        # and closes gracefully on the EOF -- rather than resetting, which
+        # would discard a response the peer half-closed to wait for.
+        if Event.Read in key.events or Event.Error in key.events:
           loop.handleRead(c)
       except Exception:
         # A per-connection bug must never take down the loop thread.
