@@ -246,6 +246,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
           c.wpos += n
           continue
         of tlsWantWrite:
+          if c.ws != nil: wsBackpressure(c)
           loop.armWrite(c)
           return
         of tlsWantRead:
@@ -261,6 +262,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
       let err = cint(osLastError())
       if err == EINTR: continue
       if err == EAGAIN or err == EWOULDBLOCK:
+        if c.ws != nil: wsBackpressure(c)
         loop.armWrite(c)
         return
       loop.closeConn(c)
@@ -273,6 +275,8 @@ proc flushOut(loop: Loop, c: ptr Connection) =
       loop.beginLingerClose(c)   # drain peer so the error is delivered
     else:
       loop.closeConn(c)
+  elif c.ws != nil:
+    wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code

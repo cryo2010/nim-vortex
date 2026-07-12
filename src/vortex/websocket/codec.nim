@@ -31,12 +31,15 @@ type
                        kind: WsKind) {.closure, gcsafe.}
   WsCloseCb* = proc (ws: WebSocket, code: uint16,
                      reason: string) {.closure, gcsafe.}
+  WsDrainCb* = proc (ws: WebSocket) {.closure, gcsafe.}
 
   WsConn* = ref object of RootObj
     ## Stored in `Connection.ws`. Loop-thread only, so the callbacks may be
     ## capturing closures (unlike `blocking:`).
     onMessage*: WsMessageCb
     onClose*: WsCloseCb
+    onDrain*: WsDrainCb       ## fired when the write backlog empties
+    backedUp: bool           ## the socket refused bytes; onDrain owes a call
     frag: string             ## reassembly buffer for a fragmented message
     fragOp: WsOpcode         ## opcode of the message being assembled
     fragging: bool
@@ -404,6 +407,21 @@ proc wsClosed*(core: ptr LoopCore, c: ptr Connection) =
       w.inflate.close()
   c.ws = nil
 
+proc wsBackpressure*(c: ptr Connection) {.inline.} =
+  ## The socket refused the last write, so bytes are parked in the write
+  ## buffer: remember it so onDrain fires once they flush. Loop thread only.
+  WsConn(c.ws).backedUp = true
+
+proc wsDrained*(core: ptr LoopCore, c: ptr Connection) =
+  ## The write buffer just emptied. If this connection had been backed up,
+  ## clear the flag and fire onDrain so the app can resume sending. Loop
+  ## thread only; called from the event loop's flushOut.
+  let w = WsConn(c.ws)
+  if w.backedUp:
+    w.backedUp = false
+    if w.onDrain != nil:
+      w.onDrain(WebSocket(core: core, fd: c.fd, gen: c.gen))
+
 # --- public send/close API --------------------------------------------------
 
 proc sendFrame(ws: WebSocket, op: WsOpcode,
@@ -476,6 +494,24 @@ proc `onMessage=`*(ws: WebSocket, cb: WsMessageCb) =
 proc `onClose=`*(ws: WebSocket, cb: WsCloseCb) =
   let c = conn(ws.core, ws.fd, ws.gen)
   if c != nil and c.ws != nil: WsConn(c.ws).onClose = cb
+
+proc `onDrain=`*(ws: WebSocket, cb: WsDrainCb) =
+  ## Set a callback fired (on the loop thread) when the write backlog drains
+  ## back to zero after send() was throttled by a slow peer. Pair it with
+  ## `bufferedAmount` to stop sending while the backlog is high and resume
+  ## from here. No-op if the connection is gone.
+  let c = conn(ws.core, ws.fd, ws.gen)
+  if c != nil and c.ws != nil: WsConn(c.ws).onDrain = cb
+
+proc bufferedAmount*(ws: WebSocket): int =
+  ## Bytes queued by send() but not yet written to the socket. Grows when
+  ## the peer stops reading and drains as the kernel accepts bytes; poll it
+  ## to throttle a slow consumer (browser WebSocket.bufferedAmount). 0 if the
+  ## connection is gone. Loop-thread snapshot: read it from a handler
+  ## callback (onMessage/onDrain), not another thread. Off-loop sends queue
+  ## on the outbox and are not counted until the loop picks them up.
+  let c = conn(ws.core, ws.fd, ws.gen)
+  if c != nil and c.ws != nil: c.pendingOut else: 0
 
 proc isAlive*(ws: WebSocket): bool =
   let c = conn(ws.core, ws.fd, ws.gen)
