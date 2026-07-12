@@ -14,6 +14,7 @@ type
   OutMsgKind* = enum
     omHttp,                   ## data is a packed HTTP response (see packResponse)
     omWs,                     ## data is a ready-to-write WebSocket frame
+    omWsClose,                ## data is a WebSocket close frame; close after flush
     omWsDone                  ## a ws.blocking worker finished: unpin and resume
 
   OutMsg* = object
@@ -118,6 +119,11 @@ type
                       gen: uint32) {.nimcall, gcsafe.}
       ## Flush a connection's write buffer now. Used by a loop-thread
       ## WebSocket send outside the read path. Set by the event loop.
+    wsStreamLookup*: proc (c: pointer, stream: uint32): RootRef
+                       {.nimcall, gcsafe.}
+      ## Resolve an HTTP/2 (RFC 8441) WebSocket stream's WsConn from a
+      ## `WebSocket` handle. Set by the h2 codec; the WebSocket layer cannot
+      ## import the h2 codec, so it reaches per-stream state through this.
 
 proc newOutbox*(): ptr Outbox =
   result = createShared(Outbox)

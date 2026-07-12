@@ -192,10 +192,18 @@ handshake are handled for you, and text is validated as UTF-8. Idle
 connections are kept alive and half-open ones reaped automatically: after
 `wsPingInterval` seconds without a frame the server sends a ping, and if no
 reply arrives within `wsPongTimeout` it closes the connection (set
-`wsPingInterval = 0` to disable). Building with `-d:wsDeflate` (links
-zlib) adds permessage-deflate (RFC 7692) message compression, negotiated
-automatically. HTTP/1.1 only for now (HTTP/2 per RFC 8441 is not yet
-supported).
+`wsPingInterval = 0` to disable; idle ping/timeout applies to HTTP/1.1
+WebSockets). Building with `-d:wsDeflate` (links zlib) adds
+permessage-deflate (RFC 7692) message compression, negotiated automatically.
+
+The same handler API also serves WebSockets over **HTTP/2 (RFC 8441)**: the
+server advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`, and an Extended
+CONNECT (`:protocol websocket`) opens a WebSocket on a single stream,
+multiplexed with ordinary requests on the connection. `isWebSocketUpgrade` /
+`acceptWebSocket` transparently handle both transports, so the same
+`onMessage` / `ws.send` / `ws.blocking:` / permessage-deflate code works
+over h1 and h2. (Browsers still use HTTP/1.1 for WebSockets; h2 is for
+clients that prefer a single multiplexed connection.)
 
 ### Roadmap and Autobahn conformance
 
@@ -226,9 +234,13 @@ Node's `ws` (the de facto reference implementation), it is noted.
 - [x] **Per-connection backpressure for `ws.blocking:`**: the connection is
   pinned while the body runs, so one message is processed at a time and in
   order, matching the HTTP `blocking:` semantics (see above).
-- [ ] **HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)** WebSockets via Extended
-  CONNECT. Optional: browsers use HTTP/1.1 for WebSockets regardless, so
-  this is a multiplexing optimization, not a compatibility requirement.
+- [x] **HTTP/2 WebSockets (RFC 8441)** via Extended CONNECT: message
+  send/receive, fragmentation, control frames, close, cross-thread
+  `ws.send`, permessage-deflate, and per-stream `ws.blocking` (one stream is
+  pinned without stalling the others). Idle ping/timeout over h2 is not yet
+  wired (h2 has connection-level PING liveness).
+- [ ] **HTTP/3 WebSockets (RFC 9220)** via Extended CONNECT over QUIC.
+  Optional: browsers use HTTP/1.1 for WebSockets regardless.
 
 ## Handler rules
 

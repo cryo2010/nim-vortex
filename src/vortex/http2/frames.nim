@@ -47,6 +47,7 @@ const
   setInitialWindowSize* = 4'u16
   setMaxFrameSize* = 5'u16
   setMaxHeaderListSize* = 6'u16
+  setEnableConnectProtocol* = 8'u16   # RFC 8441: Extended CONNECT (WebSockets)
 
   connectionPreface* = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
   defaultMaxFrameSize* = 16384

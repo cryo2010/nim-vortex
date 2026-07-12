@@ -6,6 +6,7 @@
 import std/[tables, strutils, uri]
 import ./frames, ./hpack
 import ../connection
+import ../websocket/codec as wscodec
 
 type
   H2Stream* = object
@@ -26,8 +27,11 @@ type
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool
+    isWsConnect*: bool               ## RFC 8441 Extended CONNECT websocket
+    ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
   H2Conn* = ref object of RootObj
+    core*: ptr LoopCore              ## owning loop core (for WS callbacks)
     streams*: Table[uint32, H2Stream]
     decoder*: HpackDecoder
     parsePos*: int                   ## consumed offset in conn.rbuf
@@ -57,9 +61,11 @@ const
 proc h2Conn*(c: ptr Connection): H2Conn {.inline.} =
   H2Conn(c.h2)
 
-proc newH2Conn*(maxBody, maxHeaderList, maxConcurrentStreams,
-                maxResetStreams, maxControlFrames: int): H2Conn =
+proc newH2Conn*(core: ptr LoopCore, maxBody, maxHeaderList,
+                maxConcurrentStreams, maxResetStreams,
+                maxControlFrames: int): H2Conn =
   H2Conn(
+    core: core,
     decoder: initHpackDecoder(4096, maxDecoded = maxHeaderList),
     connSendWindow: defaultInitialWindow,
     peerMaxFrame: defaultMaxFrameSize,
@@ -77,6 +83,7 @@ proc sendOurSettings(c: ptr Connection) =
   payload.addSetting(setMaxConcurrentStreams,
                      uint32(h2Conn(c).maxConcurrentStreams))
   payload.addSetting(setMaxFrameSize, uint32(ourMaxFrameSize))
+  payload.addSetting(setEnableConnectProtocol, 1)   # RFC 8441 WebSockets
   c.wbuf.addFrameHeader(payload.len, ftSettings, 0, 0)
   c.wbuf.add payload
 
@@ -88,6 +95,9 @@ proc connError(h2: H2Conn, c: ptr Connection, err: uint32) =
 proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
   c.wbuf.addRstStream(sid, err)
   if sid in h2.streams:
+    if h2.streams[sid].ws != nil:               # WebSocket aborted: onClose
+      wsStreamClosed(h2.core, c, WsConn(h2.streams[sid].ws))
+      h2.streams[sid].ws = nil
     h2.streams.del(sid)
     dec h2.activeStreams
 
@@ -127,6 +137,127 @@ proc sendData(h2: H2Conn, c: ptr Connection, sid: uint32) =
     st.pendingPos += chunk
     st.sendWindow -= int32(chunk)
     h2.connSendWindow -= int32(chunk)
+
+# --- RFC 8441 WebSockets over HTTP/2 ----------------------------------------
+
+proc h2WsFinalize(h2: H2Conn, c: ptr Connection, sid: uint32, w: WsConn) =
+  ## The WebSocket close frame has fully flushed: send END_STREAM, deliver
+  ## onClose, and drop the stream.
+  c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
+  wsStreamClosed(h2.core, c, w)
+  if sid in h2.streams:
+    h2.streams[sid].ws = nil
+    h2.streams.del(sid)
+    dec h2.activeStreams
+
+proc h2WsPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
+  ## Flush a WebSocket stream's queued outbound frames as DATA (bounded by
+  ## flow control), finalize on close, and track backpressure for onDrain /
+  ## bufferedAmount. `pendingIsLast` stays false so sendData never emits
+  ## END_STREAM or deletes the stream on its own.
+  if sid notin h2.streams or h2.streams[sid].ws == nil: return
+  let w = WsConn(h2.streams[sid].ws)
+  h2.sendData(c, sid)
+  template st: H2Stream = h2.streams[sid]
+  let backlog = st.pendingBody.len - st.pendingPos
+  w.h2Pending = backlog
+  if backlog == 0:
+    st.pendingBody.setLen 0
+    st.pendingPos = 0
+    if w.wantClose:
+      h2WsFinalize(h2, c, sid, w)
+    elif w.backedUp:
+      w.backedUp = false
+      if w.onDrain != nil:
+        w.onDrain(WebSocket(core: h2.core, fd: c.fd, gen: c.gen, stream: sid))
+  else:
+    w.backedUp = true
+
+proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
+               w: WsConn) {.nimcall, gcsafe.} =
+  ## `WsConn.flush` for HTTP/2: append produced frames to the stream's
+  ## pending outbound and push them as DATA.
+  let h2 = h2Conn(c)
+  let sid = w.stream
+  if h2 == nil or sid notin h2.streams:
+    w.outBuf.setLen 0
+    return
+  template st: H2Stream = h2.streams[sid]
+  if w.outBuf.len > 0:
+    if st.pendingPos > 0 and st.pendingPos == st.pendingBody.len:
+      st.pendingBody.setLen 0            # compact a fully-drained buffer
+      st.pendingPos = 0
+    st.pendingBody.add w.outBuf
+    w.outBuf.setLen 0
+    st.pendingIsLast = false
+  h2WsPush(h2, c, sid)
+
+proc h2ResumeSend(h2: H2Conn, c: ptr Connection, sid: uint32) =
+  ## Resume a stream blocked on the send window: WebSocket streams need the
+  ## WS finalize/backpressure bookkeeping, ordinary responses just sendData.
+  if sid in h2.streams and h2.streams[sid].ws != nil:
+    h2WsPush(h2, c, sid)
+  else:
+    h2.sendData(c, sid)
+
+proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
+  ## LoopCore.wsStreamLookup: resolve a stream's WsConn for the public API.
+  let c = cast[ptr Connection](cp)
+  if c.h2 != nil:
+    let h2 = H2Conn(c.h2)
+    if stream in h2.streams: return h2.streams[stream].ws
+  nil
+
+proc installWsHooks*(core: ptr LoopCore) =
+  ## Register the WebSocket-over-HTTP/2 lookup so the WebSocket layer can
+  ## reach per-stream state without importing the h2 codec.
+  core.wsStreamLookup = h2WsLookup
+
+proc h2WsTeardownAll*(c: ptr Connection) =
+  ## Deliver onClose (1006) for every WebSocket stream when the connection
+  ## dies. Loop thread; called from the event loop's closeConn.
+  if c.h2 == nil: return
+  let h2 = H2Conn(c.h2)
+  for sid, st in h2.streams.mpairs:
+    if st.ws != nil:
+      wsStreamClosed(h2.core, c, WsConn(st.ws))
+      st.ws = nil
+
+proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
+                 extensionsOffer, protocolsOffer: string,
+                 serverProtocols: openArray[string],
+                 dateStr, serverHeader: string): bool =
+  ## Accept an RFC 8441 Extended CONNECT WebSocket on stream `sid`: reply 200
+  ## (no END_STREAM, so the stream stays open for framing) and attach a
+  ## WsConn. Returns false if the stream is not an unanswered ws-connect.
+  let h2 = h2Conn(c)
+  if sid notin h2.streams: return false
+  template st: H2Stream = h2.streams[sid]
+  if not st.isWsConnect or st.responded or st.ws != nil: return false
+  st.responded = true
+  let (w, proto, ext) = wsSetup(h2.core, maxMessage, sid,
+                                extensionsOffer, protocolsOffer,
+                                serverProtocols)
+  w.flush = wsFlushH2
+  st.ws = w
+  var hb = ""
+  encodeStatus(hb, 200)
+  if serverHeader.len > 0: encodeHeader(hb, "server", serverHeader)
+  encodeHeader(hb, "date", dateStr)
+  if proto.len > 0: encodeHeader(hb, "sec-websocket-protocol", proto)
+  if ext.len > 0: encodeHeader(hb, "sec-websocket-extensions", ext)
+  var off = 0
+  var first = true
+  while first or off < hb.len:
+    let chunk = min(hb.len - off, h2.peerMaxFrame)
+    let lastFrag = off + chunk >= hb.len
+    let flags = if lastFrag: flagEndHeaders else: 0'u8   # never END_STREAM
+    c.wbuf.addFrameHeader(chunk,
+      (if first: ftHeaders else: ftContinuation), flags, sid)
+    c.wbuf.add hb[off ..< off + chunk]
+    off += chunk
+    first = false
+  true
 
 proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
                 dateStr, serverHeader, contentType: string,
@@ -200,7 +331,8 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       return
     st.endStreamSeen = true
   else:
-    var meth, path, scheme: string
+    var meth, path, scheme, protocol: string
+    var hasAuthority = false
     var pseudoDone = false
     var listSize = 0
     for (name, val) in fields:
@@ -222,7 +354,10 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
         of ":scheme":
           if scheme.len > 0: h2.streamError(c, sid, errProtocol); return
           scheme = val
-        of ":authority": discard
+        of ":authority": hasAuthority = true
+        of ":protocol":                        # RFC 8441 Extended CONNECT
+          if protocol.len > 0: h2.streamError(c, sid, errProtocol); return
+          protocol = val
         else:
           h2.streamError(c, sid, errProtocol)  # unknown/response pseudo
           return
@@ -248,9 +383,19 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
             h2.streamError(c, sid, errProtocol)
             return
         else: discard
-    if meth.len == 0 or path.len == 0 or scheme.len == 0:
-      h2.streamError(c, sid, errProtocol)
-      return
+    # RFC 8441: an Extended CONNECT websocket carries :protocol plus a full
+    # :scheme/:path/:authority (unlike a plain CONNECT, which omits them and
+    # we do not support). The stream stays open for framing after dispatch.
+    let isWs = meth == "CONNECT" and protocol == "websocket"
+    if isWs:
+      if path.len == 0 or scheme.len == 0 or not hasAuthority:
+        h2.streamError(c, sid, errProtocol); return
+      st.isWsConnect = true
+    else:
+      if protocol.len > 0:                 # :protocol only for a ws-connect
+        h2.streamError(c, sid, errProtocol); return
+      if meth.len == 0 or path.len == 0 or scheme.len == 0:
+        h2.streamError(c, sid, errProtocol); return
     if listSize > h2.maxHeaderList:
       h2.streamError(c, sid, errEnhanceYourCalm)
       return
@@ -262,7 +407,11 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
     st.isHead = meth == "HEAD"
     if endStream:
       st.endStreamSeen = true
-  if st.endStreamSeen and not st.dispatched:
+  if st.isWsConnect and not st.dispatched:
+    # Dispatch as soon as the headers are in; DATA becomes WebSocket framing.
+    st.dispatched = true
+    ready.add sid
+  elif st.endStreamSeen and not st.dispatched:
     if st.contentLength >= 0 and int64(st.body.len) != st.contentLength:
       h2.streamError(c, sid, errProtocol)
       return
@@ -304,7 +453,14 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         dataStart += 1
         dataLen -= 1 + padLen
       template st: H2Stream = h2.streams[sid]
-      if st.body.len + dataLen > h2.maxBody:
+      if st.ws != nil:
+        # RFC 8441 WebSocket stream: DATA payload is WebSocket framing.
+        wsFeedH2(h2.core, c, WsConn(st.ws),
+                 c.rbuf.toOpenArray(dataStart, dataStart + dataLen - 1))
+        if (fh.flags and flagEndStream) != 0 and sid in h2.streams and
+            h2.streams[sid].ws != nil:
+          wsPeerClosed(h2.core, c, WsConn(h2.streams[sid].ws))
+      elif st.body.len + dataLen > h2.maxBody:
         h2.streamError(c, sid, errRefusedStream)
       else:
         let old = st.body.len
@@ -424,7 +580,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       var retry: seq[uint32]
       for sid, st in h2.streams:
         if st.pendingBody.len - st.pendingPos > 0: retry.add sid
-      for sid in retry: h2.sendData(c, sid)
+      for sid in retry: h2ResumeSend(h2, c, sid)
 
   of ftPing:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
@@ -449,13 +605,13 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       var retry: seq[uint32]
       for sid, st in h2.streams:
         if st.pendingBody.len - st.pendingPos > 0: retry.add sid
-      for sid in retry: h2.sendData(c, sid)
+      for sid in retry: h2ResumeSend(h2, c, sid)
     elif fh.streamId in h2.streams:
       template st: H2Stream = h2.streams[fh.streamId]
       if int64(st.sendWindow) + int64(inc32) > 0x7fffffff'i64:
         h2.streamError(c, fh.streamId, errFlowControl); return
       st.sendWindow += int32(inc32)
-      h2.sendData(c, fh.streamId)
+      h2ResumeSend(h2, c, fh.streamId)
     elif fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
 
@@ -465,6 +621,9 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol); return   # RST on idle stream
     if fh.streamId in h2.streams:
+      if h2.streams[fh.streamId].ws != nil:      # WebSocket reset: onClose
+        wsStreamClosed(h2.core, c, WsConn(h2.streams[fh.streamId].ws))
+        h2.streams[fh.streamId].ws = nil
       h2.streams.del(fh.streamId)
       dec h2.activeStreams
     # Rapid Reset (CVE-2023-44487): a peer that opens then immediately

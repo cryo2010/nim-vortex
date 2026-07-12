@@ -181,6 +181,8 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     return
   if c.ws != nil:
     wsClosed(addr loop.core, c)   # deliver onClose (1006 if no peer close)
+  if c.h2 != nil:
+    h2WsTeardownAll(c)            # onClose for every RFC 8441 WebSocket stream
   when not defined(plainHttp):
     if c.ssl != nil:
       if not c.handshaking:
@@ -318,7 +320,8 @@ proc h2Input(loop: Loop, c: ptr Connection) =
       c.dlKind = dkNone
 
 proc initH2(loop: Loop, c: ptr Connection) =
-  c.h2 = newH2Conn(loop.settings.maxBodySize, loop.settings.maxHeaderSize,
+  c.h2 = newH2Conn(addr loop.core,
+                   loop.settings.maxBodySize, loop.settings.maxHeaderSize,
                    loop.settings.maxConcurrentStreams,
                    loop.settings.maxResetStreams,
                    loop.settings.maxControlFrames)
@@ -661,24 +664,32 @@ proc processOutbox(loop: Loop) =
     if int(m.fd) >= loop.core.conns.len: continue
     let c = addr loop.core.conns[int(m.fd)]
     if c.gen != m.gen or c.state == csFree: continue
-    if m.kind == omWs:
-      # A WebSocket frame from an off-loop sender: already serialized
-      # (server frames are unmasked and self-contained), just write it.
-      if c.ws != nil:
-        c.wbuf.add m.data
+    if m.kind == omWs or m.kind == omWsClose:
+      # A WebSocket frame from an off-loop sender (already serialized): route
+      # to the h1 connection or the h2 stream, then flush.
+      let w = wsConnForStream(addr loop.core, c, m.stream)
+      if w != nil:
+        wsFlushRaw(addr loop.core, c, w, m.data, m.kind == omWsClose)
         loop.flushOut(c)
       continue
     if m.kind == omWsDone:
-      # A ws.blocking worker finished: unpin, then resume dispatching the
-      # frames that were held back while it ran.
-      if c.pinned > 0: dec c.pinned
-      if c.closeRequested:
-        loop.closeConn(c)          # close was deferred while pinned
-        continue
-      if c.pinned == 0 and c.ws != nil:
-        loop.processInput(c)       # dispatch the next buffered message
-        if c.state != csFree and c.pendingOut > 0:
-          loop.flushOut(c)
+      # A ws.blocking worker finished: unpin and resume dispatching the
+      # frames held back while it ran (connection pin for h1, stream for h2).
+      if m.stream == 0:
+        if c.pinned > 0: dec c.pinned
+        if c.closeRequested:
+          loop.closeConn(c)        # close was deferred while pinned
+          continue
+        if c.pinned == 0 and c.ws != nil:
+          loop.processInput(c)     # dispatch the next buffered message
+          if c.state != csFree and c.pendingOut > 0:
+            loop.flushOut(c)
+      else:
+        let w = wsConnForStream(addr loop.core, c, m.stream)
+        if w != nil:
+          wsResumeH2(addr loop.core, c, w)
+          if c.state != csFree and c.pendingOut > 0:
+            loop.flushOut(c)
       continue
     if c.pinned > 0: dec c.pinned
     if c.closeRequested:
@@ -724,6 +735,7 @@ proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.kick = kickImpl
   loop.core.flushHook = flushImpl
+  installWsHooks(addr loop.core)   # h2 WebSocket (RFC 8441) stream lookup
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
   while not loop.stopFlag[].load(moRelaxed):
