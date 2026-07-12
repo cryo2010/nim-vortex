@@ -7,12 +7,11 @@
 ## through the loop's outbox (as `res.send` does for HTTP responses), so a
 ## worker or timer holding a `WebSocket` handle can push safely.
 
-import std/base64
+import std/[base64, strutils]
 import ../connection
 import ./frames
 import ./sha1
 when defined(wsDeflate):
-  import std/strutils
   import ./deflate
 
 type
@@ -44,6 +43,7 @@ type
     maxMessage: int
     closeSent: bool          ## a close frame has been queued
     closeNotified: bool      ## onClose has been delivered
+    subprotocol: string      ## negotiated Sec-WebSocket-Protocol ("" = none)
     when defined(wsDeflate):
       pmd: bool              ## permessage-deflate negotiated on this connection
       msgCompressed: bool    ## the in-progress message's first frame had RSV1
@@ -63,6 +63,17 @@ proc currentThreadId(): int {.inline.} =
 
 proc acceptKey(clientKey: string): string =
   encode(sha1(clientKey & wsMagic))
+
+proc negotiateProtocol(offer: string, serverProtocols: openArray[string]): string =
+  ## Choose a subprotocol: the first one in the server's list (server
+  ## preference) that the client also offered. "" if none match.
+  if serverProtocols.len == 0 or offer.len == 0: return ""
+  var offered: seq[string]
+  for p in offer.split(','):
+    offered.add p.strip
+  for sp in serverProtocols:
+    if sp in offered: return sp
+  ""
 
 proc armWsPing*(core: ptr LoopCore, c: ptr Connection) =
   ## (Re)start the WebSocket idle timer: after wsPingInterval seconds with
@@ -133,12 +144,15 @@ when defined(wsDeflate):
 # --- handshake --------------------------------------------------------------
 
 proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
-               maxMessage: int, extensionsOffer = ""): WsConn =
+               maxMessage: int, extensionsOffer = "", protocolsOffer = "",
+               serverProtocols: openArray[string] = []): WsConn =
   ## Write the 101 handshake into the connection's write buffer and switch
   ## it into WebSocket mode. Loop thread only. A dedicated serializer is
   ## needed because appendResponse always emits Content-Length, which a
   ## 101 upgrade must not carry. `extensionsOffer` is the client's
-  ## Sec-WebSocket-Extensions value (used to negotiate permessage-deflate).
+  ## Sec-WebSocket-Extensions value (permessage-deflate); `protocolsOffer`
+  ## is its Sec-WebSocket-Protocol value, negotiated against
+  ## `serverProtocols`.
   c.wbuf.add "HTTP/1.1 101 Switching Protocols\r\n"
   if core.serverHeader.len > 0:
     c.wbuf.add "Server: "
@@ -151,6 +165,12 @@ proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
   c.wbuf.add "\r\n"
 
   let w = WsConn(maxMessage: maxMessage)
+  let chosen = negotiateProtocol(protocolsOffer, serverProtocols)
+  if chosen.len > 0:
+    w.subprotocol = chosen
+    c.wbuf.add "Sec-WebSocket-Protocol: "
+    c.wbuf.add chosen
+    c.wbuf.add "\r\n"
   when defined(wsDeflate):
     if core.wsCompression and extensionsOffer.len > 0:
       let neg = negotiatePmd(extensionsOffer)
@@ -460,3 +480,8 @@ proc `onClose=`*(ws: WebSocket, cb: WsCloseCb) =
 proc isAlive*(ws: WebSocket): bool =
   let c = conn(ws.core, ws.fd, ws.gen)
   c != nil and c.ws != nil
+
+proc subprotocol*(ws: WebSocket): string =
+  ## The negotiated subprotocol, or "" if none was agreed.
+  let c = conn(ws.core, ws.fd, ws.gen)
+  if c != nil and c.ws != nil: WsConn(c.ws).subprotocol else: ""

@@ -113,6 +113,11 @@ A handler detects the upgrade and calls `req.acceptWebSocket()`; set
 capture locals). `ws.send` / `ws.close` are non-blocking and safe to call
 from any thread, so you can push to a socket from a worker or a timer.
 
+To negotiate a subprotocol, pass your supported list (in preference order)
+to `req.acceptWebSocket(["chat", "json"])`; the first one the client also
+offered is echoed in the handshake and available as `ws.subprotocol` ("" if
+none matched).
+
 ```nim
 proc handler(req: Request, res: Response) {.gcsafe.} =
   if req.isWebSocketUpgrade:
@@ -184,9 +189,10 @@ Node's `ws` (the de facto reference implementation), it is noted.
   `-d:plainHttp` builds are unchanged and take on no compression
   dependency or attack surface; inbound decompression is bounded by
   `maxWsMessageSize` (close 1009) and fuzzed.
-- [ ] **Subprotocol negotiation**: honor the client's
-  `Sec-WebSocket-Protocol` offer and echo the server-selected subprotocol
-  in the handshake (`ws` supports this via `handleProtocols`).
+- [x] **Subprotocol negotiation**: pass your supported protocols to
+  `req.acceptWebSocket(["chat", ...])`; the first that the client also
+  offered (server preference) is echoed in the handshake and readable via
+  `ws.subprotocol`.
 - [ ] **Backpressure introspection**: a `bufferedAmount`-style accessor
   (and a drained signal) so an application can throttle a slow consumer.
   Today `ws.send` buffers into the connection write buffer without
