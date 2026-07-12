@@ -36,18 +36,31 @@ type
     isWsConnect*: bool               ## RFC 9220 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
+  H3UniStream = object
+    ## A peer-initiated unidirectional stream (control / QPACK encoder /
+    ## decoder). We parse enough to enforce the RFC 9114/9204 error cases.
+    ssl: SslPtr
+    buf: string
+    typ: int64                ## -1 until the stream-type varint is read
+    settingsSeen: bool        ## control stream: SETTINGS received
+    frameType: uint64         ## control stream frame-parse state
+    frameLen: int
+    frameHdrDone: bool
+    finSeen: bool
+
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore       ## owning loop core (for WebSocket callbacks)
     ssl*: SslPtr
     slot*: int
     streams*: Table[uint64, H3Stream]
-    unis: seq[SslPtr]         ## peer's unidirectional streams (drained)
+    unis: seq[H3UniStream]    ## peer's unidirectional streams
     ctrl: SslPtr              ## our control stream
     ctrlBuf: string
     ctrlPos: int
     maxBody: int
     maxConcurrentStreams: int
     scratch: string
+    closing: bool
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -134,6 +147,14 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   st.concludeAfterFlush = true
   discard conn.flushStream(sid)
 
+proc h3ConnError(conn: H3Conn, code: uint64) =
+  ## Raise an HTTP/3 connection error (RFC 9114 8): close the QUIC connection
+  ## with `code` as the application error code (a CONNECTION_CLOSE). The loop
+  ## frees the slot on its next pass.
+  if conn.closing: return
+  conn.closing = true
+  quicCloseConn(conn.ssl, code)
+
 proc failStream(conn: H3Conn, sid: uint64) =
   template st: H3Stream = conn.streams[sid]
   st.failed = true
@@ -144,6 +165,14 @@ proc failStream(conn: H3Conn, sid: uint64) =
     st.ws = nil
   quicFree(st.ssl)
   conn.streams.del(sid)
+
+proc h3StreamError(conn: H3Conn, sid: uint64, code: uint64) =
+  ## Raise an HTTP/3 stream error (RFC 9114, e.g. a malformed request ->
+  ## H3_MESSAGE_ERROR): RESET_STREAM with the error code and drop the stream,
+  ## leaving the rest of the connection intact.
+  if sid notin conn.streams: return
+  quicResetStream(conn.streams[sid].ssl, code)
+  conn.failStream(sid)
 
 # --- RFC 9220 WebSockets over HTTP/3 ----------------------------------------
 
@@ -247,28 +276,44 @@ proc classifyH3Headers*(headers: openArray[(string, string)]): H3HeaderKind =
   ## RFC 9220 Extended CONNECT websocket, or invalid. Pure (no stream state)
   ## so it is unit-testable without a live QUIC connection.
   var meth, path, scheme, protocol: string
-  var hasAuthority = false
+  var seenMethod, seenPath, seenScheme, seenAuthority, seenProtocol = false
+  var hasHost = false
   var pseudoDone = false
   for (name, val) in headers:
     if name.len == 0: return h3hInvalid
     if name[0] == ':':
-      if pseudoDone: return h3hInvalid
+      if pseudoDone: return h3hInvalid          # pseudo after a regular field
       case name
-      of ":method": meth = val
-      of ":path": path = val
-      of ":scheme": scheme = val
-      of ":authority": hasAuthority = true
-      of ":protocol": protocol = val      # RFC 9220 Extended CONNECT
-      else: return h3hInvalid
+      of ":method":
+        if seenMethod: return h3hInvalid        # duplicated pseudo-header
+        seenMethod = true; meth = val
+      of ":path":
+        if seenPath: return h3hInvalid
+        seenPath = true; path = val
+      of ":scheme":
+        if seenScheme: return h3hInvalid
+        seenScheme = true; scheme = val
+      of ":authority":
+        if seenAuthority: return h3hInvalid
+        seenAuthority = true
+      of ":protocol":                           # RFC 9220 Extended CONNECT
+        if seenProtocol: return h3hInvalid
+        seenProtocol = true; protocol = val
+      else: return h3hInvalid                    # unknown / prohibited pseudo
     else:
       pseudoDone = true
       for ch in name:
         if ch in 'A'..'Z': return h3hInvalid
+      if name == "host": hasHost = true
   if meth == "CONNECT" and protocol == "websocket":
-    if path.len == 0 or scheme.len == 0 or not hasAuthority: return h3hInvalid
+    if path.len == 0 or scheme.len == 0 or not seenAuthority: return h3hInvalid
     return h3hWebSocket
-  if protocol.len > 0: return h3hInvalid   # :protocol only for a ws-connect
+  if seenProtocol: return h3hInvalid         # :protocol only for a ws-connect
   if meth.len == 0 or path.len == 0 or scheme.len == 0: return h3hInvalid
+  # A scheme with a mandatory authority component (http/https) requires an
+  # :authority pseudo-header or a Host field (RFC 9114 4.3.1).
+  if (scheme == "http" or scheme == "https") and not seenAuthority and
+      not hasHost: return h3hInvalid
   h3hRequest
 
 proc validateHeaders(st: var H3Stream): bool =
@@ -305,16 +350,20 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
         try:
           decodeFieldSection(st.rbuf, pos, pos + st.frameLen, st.headers)
         except QpackError:
-          conn.failStream(sid)
+          # A field-section decode failure corrupts the shared QPACK state:
+          # a connection error (RFC 9204 2.2).
+          h3ConnError(conn, qpackDecompressionFailed)
           return false
         if not validateHeaders(st):
-          conn.failStream(sid)
+          # Malformed request: a stream error (RFC 9114 4.1.2).
+          h3StreamError(conn, sid, h3MessageError)
           return false
         st.headersDone = true
       # else: trailers (discarded)
     of h3fData:
       if not st.headersDone:
-        conn.failStream(sid)
+        # DATA before HEADERS: invalid frame sequence (RFC 9114 4.1).
+        h3ConnError(conn, h3FrameUnexpected)
         return false
       if st.ws != nil:
         # RFC 9220 WebSocket stream: DATA payload is WebSocket framing.
@@ -331,8 +380,10 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
         if st.frameLen > 0:
           copyMem(addr st.body[old], addr st.rbuf[pos], st.frameLen)
     of h3fPushPromise, h3fCancelPush, h3fSettings, h3fGoaway:
-      # Not valid on request streams (SETTINGS/GOAWAY are control-only).
-      conn.failStream(sid)
+      # These frames never appear on a request stream (SETTINGS/GOAWAY/
+      # CANCEL_PUSH are control-stream only): H3_FRAME_UNEXPECTED (RFC 9114
+      # 7.2.x, a connection error).
+      h3ConnError(conn, h3FrameUnexpected)
       return false
     else:
       discard                      # unknown frames are skipped
@@ -384,9 +435,91 @@ proc pumpRequestStream(conn: H3Conn, sid: uint64, ready: var seq[uint64]) =
   if readSome or st.finSeen:
     discard conn.parseStreamFrames(sid, ready)
 
+proc parseControlStream(conn: H3Conn, u: var H3UniStream) =
+  ## Enforce RFC 9114 6.2.1 / 7.2 on the peer's control stream: the first
+  ## frame must be SETTINGS, no second SETTINGS, no DATA/HEADERS, and no
+  ## HTTP/2-only settings identifiers.
+  var pos = 0
+  while true:
+    if not u.frameHdrDone:
+      var p = pos
+      var typ, length: uint64
+      if getVarint(u.buf, p, u.buf.len, typ) != viOk: break
+      if getVarint(u.buf, p, u.buf.len, length) != viOk: break
+      u.frameType = typ; u.frameLen = int(length); u.frameHdrDone = true
+      pos = p
+    if not u.settingsSeen and u.frameType != h3fSettings:
+      h3ConnError(conn, h3MissingSettings); return
+    if u.buf.len - pos < u.frameLen: break
+    case u.frameType
+    of h3fSettings:
+      if u.settingsSeen:
+        h3ConnError(conn, h3FrameUnexpected); return   # second SETTINGS
+      u.settingsSeen = true
+      var sp = pos
+      let endp = pos + u.frameLen
+      while sp < endp:
+        var id, v: uint64
+        if getVarint(u.buf, sp, endp, id) != viOk: break
+        if getVarint(u.buf, sp, endp, v) != viOk: break
+        if id in [0x02'u64, 0x03, 0x04, 0x05]:   # HTTP/2 settings (RFC 9114 7.2.4.1)
+          h3ConnError(conn, h3SettingsError); return
+    of h3fData, h3fHeaders:
+      h3ConnError(conn, h3FrameUnexpected); return   # not allowed on control
+    else: discard                                    # unknown frames ignored
+    pos += u.frameLen
+    u.frameHdrDone = false
+    u.frameLen = 0
+  if pos > 0: u.buf = u.buf.substr(pos)
+
+proc parseQpackEncoder(conn: H3Conn, u: var H3UniStream) =
+  ## We advertise QPACK max table capacity 0, so a Set Dynamic Table Capacity
+  ## instruction with a non-zero value exceeds it (RFC 9204 4.1.3).
+  if u.buf.len > 0:
+    let b = uint8(u.buf[0])
+    if (b and 0xE0) == 0x20 and b != 0x20:    # 001xxxxx, value > 0
+      h3ConnError(conn, qpackEncoderStreamError); return
+  u.buf.setLen 0                              # dynamic table unused: drain
+
+proc parseQpackDecoder(conn: H3Conn, u: var H3UniStream) =
+  ## An Insert Count Increment of 0 is illegal (RFC 9204 4.4.3): byte 0x00
+  ## (00xxxxxx prefix, value 0).
+  if u.buf.len > 0 and uint8(u.buf[0]) == 0x00:
+    h3ConnError(conn, qpackDecoderStreamError); return
+  u.buf.setLen 0
+
+proc parseUniStream(conn: H3Conn, u: var H3UniStream) =
+  while true:
+    let (n, ioSt) = tlsRead(u.ssl, addr conn.scratch[0], conn.scratch.len)
+    case ioSt
+    of tlsOk:
+      let old = u.buf.len
+      u.buf.setLen(old + n)
+      copyMem(addr u.buf[old], addr conn.scratch[0], n)
+    of tlsClosed:
+      u.finSeen = true; break
+    else: break
+  if u.typ < 0:                                # read the stream-type varint
+    var p = 0
+    var t: uint64
+    if getVarint(u.buf, p, u.buf.len, t) != viOk: return
+    u.typ = int64(t)
+    u.buf = u.buf.substr(p)
+  # A control or QPACK stream is critical: closing it is a connection error
+  # (RFC 9114 6.2.1).
+  if u.finSeen and u.typ in [int64(h3sControl), int64(h3sQpackEncoder),
+                             int64(h3sQpackDecoder)]:
+    h3ConnError(conn, h3ClosedCriticalStream); return
+  case u.typ
+  of int64(h3sControl):      conn.parseControlStream(u)
+  of int64(h3sQpackEncoder): conn.parseQpackEncoder(u)
+  of int64(h3sQpackDecoder): conn.parseQpackDecoder(u)
+  else: u.buf.setLen 0                          # push/unknown: drain
+
 proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
   ## Accept new streams and advance all existing ones; appends request
   ## streams that became ready for dispatch.
+  if conn.closing: return
   conn.flushCtrl()
   while true:
     let s = quicAcceptStream(conn.ssl)
@@ -401,13 +534,11 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
       else:
         conn.streams[quicStreamId(s)] = H3Stream(ssl: s, id: quicStreamId(s))
     else:
-      conn.unis.add s
-  # Drain peer uni streams (control/QPACK); contents are ignored in
-  # capacity-0 mode but must be read to release flow control.
-  for u in conn.unis:
-    while true:
-      let (_, ioSt) = tlsRead(u, addr conn.scratch[0], conn.scratch.len)
-      if ioSt != tlsOk: break
+      conn.unis.add H3UniStream(ssl: s, typ: -1)
+  # Parse peer uni streams (control / QPACK), enforcing their error cases.
+  for i in 0 ..< conn.unis.len:
+    conn.parseUniStream(conn.unis[i])
+    if conn.closing: return
   var sids: seq[uint64]
   for sid in conn.streams.keys: sids.add sid
   for sid in sids:
@@ -420,7 +551,7 @@ proc h3Free*(conn: H3Conn) =
     quicFree(st.ssl)
   conn.streams.clear()
   for u in conn.unis:
-    quicFree(u)
+    quicFree(u.ssl)
   conn.unis.setLen(0)
   if conn.ctrl != nil:
     quicFree(conn.ctrl)

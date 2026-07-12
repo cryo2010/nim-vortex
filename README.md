@@ -288,6 +288,15 @@ build keeps its OpenSSL-only footprint.
 - HTTP/2 conformance: `nimble h2spec` runs
   [h2spec](https://github.com/summerwind/h2spec) over TLS in Docker and
   fails on any failed test. See [conformance/h2spec/](conformance/h2spec/).
+- HTTP/3 conformance: `nimble h3spec` runs
+  [h3spec](https://github.com/kazu-yamamoto/h3spec)'s HTTP/3 + QPACK
+  error-case group in Docker (15/15 pass). The QUIC transport group is
+  OpenSSL's stack, not vortex, so it is excluded. See
+  [conformance/h3spec/](conformance/h3spec/).
+- HTTP/3 WebSocket conformance: `nimble h3websocket` runs an
+  [aioquic](https://github.com/aiortc/aioquic) RFC 9220 client against a
+  vortex echo server in Docker. See
+  [conformance/h3websocket/](conformance/h3websocket/).
 - HTTP/1.1 conformance: `nimble redbot` runs [REDbot](https://redbot.org)
   against a live server in Docker and fails on any BAD-level finding (or
   `sh conformance/run.sh` with a host REDbot). See

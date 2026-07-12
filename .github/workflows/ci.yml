@@ -141,3 +141,14 @@ jobs:
         # exits non-zero on any handshake/echo mismatch. It picks the x86_64
         # server base itself.
         run: sh conformance/h3websocket/run.sh
+
+  h3spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: HTTP/3 conformance (h3spec, HTTP/3-servers group)
+        # run.sh builds a vortex h3 server image and an h3spec client image,
+        # then runs h3spec's HTTP/3 + QPACK error-case group against it;
+        # h3spec exits non-zero on any failure. The QUIC transport group is
+        # OpenSSL's stack (not vortex) and is excluded.
+        run: sh conformance/h3spec/run.sh

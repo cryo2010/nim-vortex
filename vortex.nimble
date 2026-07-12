@@ -72,3 +72,10 @@ task h3websocket, "HTTP/3 WebSocket conformance (RFC 9220) via aioquic (Docker)"
   # client image, then runs the client against the server over a private
   # docker network; the client exits non-zero on any mismatch.
   exec "sh conformance/h3websocket/run.sh"
+
+task h3spec, "HTTP/3 conformance via h3spec, HTTP/3-servers group (Docker)":
+  # run.sh builds a vortex h3 server image and an h3spec client image, then
+  # runs h3spec's HTTP/3 + QPACK error-case group against it; h3spec exits
+  # non-zero on any failure. (The QUIC transport group is OpenSSL's stack,
+  # not vortex, so it is excluded.)
+  exec "sh conformance/h3spec/run.sh"
