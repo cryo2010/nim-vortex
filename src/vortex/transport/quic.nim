@@ -43,6 +43,22 @@ proc SSL_stream_conclude(ssl: SslPtr, flags: uint64): cint
 proc SSL_get_shutdown(ssl: SslPtr): cint
 {.pop.}
 
+type
+  SslShutdownExArgs = object
+    quicErrorCode: uint64
+    quicReason: cstring
+  SslStreamResetArgs = object
+    quicErrorCode: uint64
+
+proc SSL_shutdown_ex(ssl: SslPtr, flags: uint64, args: ptr SslShutdownExArgs,
+                     argsLen: csize_t): cint
+  {.importc: "SSL_shutdown_ex", cdecl, dynlib: sslLibName.}
+proc SSL_stream_reset(ssl: SslPtr, args: ptr SslStreamResetArgs,
+                      argsLen: csize_t): cint
+  {.importc: "SSL_stream_reset", cdecl, dynlib: sslLibName.}
+
+const SSL_SHUTDOWN_FLAG_IMMEDIATE = 0x01'u64
+
 proc SSL_free_q(ssl: SslPtr)
   {.importc: "SSL_free", cdecl, dynlib: sslLibName.}
 
@@ -97,6 +113,21 @@ proc quicEventTimeoutMs*(ssl: SslPtr): int =
 proc quicConclude*(ssl: SslPtr) =
   ## Send FIN on a stream (response complete).
   discard SSL_stream_conclude(ssl, 0)
+
+proc quicCloseConn*(conn: SslPtr, errorCode: uint64) =
+  ## Close the QUIC connection with an application (HTTP/3) error code,
+  ## emitting CONNECTION_CLOSE. Immediate: does not wait to flush streams.
+  ## Used for HTTP/3 connection errors (RFC 9114 8).
+  var args = SslShutdownExArgs(quicErrorCode: errorCode, quicReason: nil)
+  discard SSL_shutdown_ex(conn, SSL_SHUTDOWN_FLAG_IMMEDIATE, addr args,
+                          csize_t(sizeof(args)))
+  discard SSL_handle_events(conn)   # flush the CONNECTION_CLOSE to the wire
+
+proc quicResetStream*(ssl: SslPtr, errorCode: uint64) =
+  ## Abort a stream with RESET_STREAM carrying an application error code
+  ## (RFC 9114 stream error, e.g. a malformed request -> H3_MESSAGE_ERROR).
+  var args = SslStreamResetArgs(quicErrorCode: errorCode)
+  discard SSL_stream_reset(ssl, addr args, csize_t(sizeof(args)))
 
 proc quicConnDead*(conn: SslPtr): bool =
   SSL_get_shutdown(conn) != 0

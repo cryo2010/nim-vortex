@@ -30,10 +30,18 @@ const
   # Error codes (RFC 9114 section 8.1)
   h3NoError* = 0x0100'u64
   h3GeneralProtocolError* = 0x0101'u64
+  h3ClosedCriticalStream* = 0x0104'u64
   h3FrameUnexpected* = 0x0105'u64
   h3FrameError* = 0x0106'u64
-  h3MessageError* = 0x010e'u64
+  h3IdError* = 0x0108'u64
+  h3SettingsError* = 0x0109'u64
+  h3MissingSettings* = 0x010a'u64
   h3RequestRejected* = 0x010b'u64
+  h3MessageError* = 0x010e'u64
+  # QPACK error codes (RFC 9204 section 6)
+  qpackDecompressionFailed* = 0x0200'u64
+  qpackEncoderStreamError* = 0x0201'u64
+  qpackDecoderStreamError* = 0x0202'u64
 
 proc getVarint*(buf: openArray[char], pos: var int, endPos: int,
                 value: var uint64): VarintResult =

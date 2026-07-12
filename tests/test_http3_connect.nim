@@ -12,7 +12,20 @@ when not defined(plainHttp):
   suite "HTTP/3 Extended CONNECT classification (RFC 9220)":
     test "a normal request is classified as a request":
       check classifyH3Headers(
-        [(":method", "GET"), (":scheme", "https"), (":path", "/")]) == h3hRequest
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         (":authority", "example.com")]) == h3hRequest
+
+    test "an https request needs an authority (:authority or Host)":
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/")]) == h3hInvalid
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         ("host", "example.com")]) == h3hRequest
+
+    test "a duplicated pseudo-header is invalid":
+      check classifyH3Headers(
+        [(":method", "GET"), (":method", "POST"), (":scheme", "https"),
+         (":path", "/"), (":authority", "x")]) == h3hInvalid
 
     test "Extended CONNECT websocket with authority is a websocket":
       check classifyH3Headers(

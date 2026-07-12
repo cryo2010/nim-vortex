@@ -24,3 +24,7 @@ conformance/autobahn/reports/
 conformance/autobahn/echo_server
 conformance/h2spec/h2spec_server
 conformance/h2spec/*.pem
+conformance/h3spec/h3spec_server
+conformance/h3spec/*.pem
+conformance/h3websocket/echo_server
+conformance/h3websocket/*.pem
