@@ -146,6 +146,12 @@ ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
     ws.send($rows)
 ```
 
+Like the HTTP `blocking:`, the connection is pinned while the body runs: the
+loop holds off dispatching further frames until it returns, so messages from
+one connection are handled one at a time and in order, and a slow body
+applies backpressure to that client. Different connections still run in
+parallel across the pool.
+
 For genuinely async drivers (asyncdispatch/chronos `Future`s), import an
 async adapter and use `ws.doAsync:` to `await` on the loop thread. Captures
 are allowed; an uncaught exception closes the socket with 1011:
@@ -217,9 +223,9 @@ Node's `ws` (the de facto reference implementation), it is noted.
 - [x] **Backpressure introspection**: `ws.bufferedAmount` reports the write
   backlog and `ws.onDrain` fires when it empties, so an application pushing
   faster than a slow consumer reads can throttle and resume (see above).
-- [ ] **Per-connection backpressure for `ws.blocking:`**: pin the
-  connection so one message is processed at a time, matching the HTTP
-  `blocking:` semantics (WebSocket handlers currently run concurrently).
+- [x] **Per-connection backpressure for `ws.blocking:`**: the connection is
+  pinned while the body runs, so one message is processed at a time and in
+  order, matching the HTTP `blocking:` semantics (see above).
 - [ ] **HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220)** WebSockets via Extended
   CONNECT. Optional: browsers use HTTP/1.1 for WebSockets regardless, so
   this is a multiplexing optimization, not a compatibility requirement.
