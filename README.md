@@ -310,6 +310,11 @@ build keeps its OpenSSL-only footprint.
   [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
   in Docker (301/301 non-compression cases pass). See
   [conformance/autobahn/](conformance/autobahn/).
+- Security scan: `nimble zap` runs the [OWASP ZAP](https://www.zaproxy.org/)
+  packaged baseline (passive) scan against a hardened vortex site in Docker.
+  Its rule config promotes the security-header rules the app satisfies to FAIL,
+  so the run gates against a regression that drops one. See
+  [conformance/zap/](conformance/zap/).
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
 
 The chronos adapter is covered by `nimble testchronos` (its dependency is
