@@ -185,10 +185,32 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
     # Transfer-Encoding is an HTTP/1.1 feature; an HTTP/1.0 request carrying
     # it is treated as faulty framing (RFC 9112 6.1), a smuggling guard.
     if p.minor == 0: return p.fail(Http400)
-    if ieqLit(buf, h.valStart, h.valLen, "chunked"):
+    # Walk the comma-separated transfer-coding list. chunked (the only coding
+    # we decode) must be the final one; a non-final chunked leaves the body
+    # length unreliable -> 400 (RFC 9112 6.1). Any other coding we do not
+    # understand -> 501.
+    var i = h.valStart
+    let last = h.valStart + h.valLen
+    var codings = 0
+    var prevChunked = false
+    var lastChunked = false
+    var chunkedNonFinal = false
+    while i < last:
+      while i < last and buf[i] in {' ', '\t', ','}: inc i     # skip OWS/commas
+      if i >= last: break
+      let ns = i
+      while i < last and buf[i] notin {' ', '\t', ',', ';'}: inc i
+      let isChunked = ieqLit(buf, ns, i - ns, "chunked")
+      if prevChunked: chunkedNonFinal = true    # a coding follows a chunked
+      prevChunked = isChunked
+      lastChunked = isChunked
+      inc codings
+      while i < last and buf[i] != ',': inc i    # skip parameters to next comma
+    if codings == 0 or chunkedNonFinal: return p.fail(Http400)
+    if lastChunked and codings == 1:
       p.chunked = true
     else:
-      return p.fail(Http501)
+      return p.fail(Http501)                     # unknown / unsupported coding
   elif ieqLit(buf, h.nameStart, h.nameLen, "connection"):
     if hasToken(buf, h.valStart, h.valLen, "close"):
       p.keepAlive = false
