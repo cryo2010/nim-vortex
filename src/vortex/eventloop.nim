@@ -51,62 +51,68 @@ type
 proc monoSec(): int64 {.inline.} =
   getMonoTime().ticks div 1_000_000_000
 
+proc openBoundSocket(host: string, port: Port, sockType: SockType,
+                     proto: Protocol, reusePort: bool): SocketHandle =
+  ## Resolve `host`, create a socket of the resolved address family, and bind
+  ## it. An IPv6 wildcard ("::") is made dual-stack (IPV6_V6ONLY off) so it
+  ## also accepts IPv4-mapped connections. Raises OSError on failure.
+  let ai = getAddrInfo(host, port, Domain.AF_UNSPEC, sockType, proto)
+  let fd = createNativeSocket(ai.ai_family, ai.ai_socktype, ai.ai_protocol)
+  if fd == osInvalidSocket:
+    freeAddrInfo(ai)
+    raiseOSError(osLastError())
+  var one = cint(1)
+  discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+                     addr one, SockLen(sizeof(one)))
+  if reusePort:
+    discard setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
+                       addr one, SockLen(sizeof(one)))
+  if ai.ai_family == posix.AF_INET6:
+    var v6only = cint(0)               # accept IPv4-mapped too (dual-stack)
+    discard setsockopt(fd, posix.IPPROTO_IPV6, posix.IPV6_V6ONLY,
+                       addr v6only, SockLen(sizeof(v6only)))
+  let bindRes = bindAddr(fd, ai.ai_addr, SockLen(ai.ai_addrlen))
+  freeAddrInfo(ai)
+  if bindRes < 0:
+    fd.close()
+    raiseOSError(osLastError())
+  fd.setBlocking(false)
+  fd
+
+proc bindListener(settings: Settings, sockType: SockType,
+                  proto: Protocol): SocketHandle =
+  ## Bind with the configured address, or dual-stack ("::") by default.
+  ## The default falls back to IPv4 ("0.0.0.0") on hosts without IPv6.
+  let host = if settings.address.len > 0: settings.address else: "::"
+  try:
+    result = openBoundSocket(host, settings.port, sockType, proto,
+                             settings.reusePort)
+  except OSError:
+    if settings.address.len > 0: raise
+    result = openBoundSocket("0.0.0.0", settings.port, sockType, proto,
+                             settings.reusePort)
+
 proc newListenSocket*(settings: Settings): SocketHandle =
   ## Raw nonblocking listener fd. Plain data so it can cross threads;
   ## with reusePort every loop thread creates its own.
-  let fd = createNativeSocket(Domain.AF_INET, SockType.SOCK_STREAM,
-                              Protocol.IPPROTO_TCP)
-  if fd == osInvalidSocket:
+  result = bindListener(settings, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
+  if nativesockets.listen(result, cint(settings.listenBacklog)) < 0:
+    result.close()
     raiseOSError(osLastError())
-  var one = cint(1)
-  discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-                     addr one, SockLen(sizeof(one)))
-  if settings.reusePort:
-    discard setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
-                       addr one, SockLen(sizeof(one)))
-  let host = if settings.address.len > 0: settings.address else: "0.0.0.0"
-  let ai = getAddrInfo(host, settings.port, Domain.AF_INET)
-  let bindRes = bindAddr(fd, ai.ai_addr, SockLen(ai.ai_addrlen))
-  freeAddrInfo(ai)
-  if bindRes < 0:
-    fd.close()
-    raiseOSError(osLastError())
-  if nativesockets.listen(fd, cint(settings.listenBacklog)) < 0:
-    fd.close()
-    raiseOSError(osLastError())
-  fd.setBlocking(false)
-  fd
 
 proc newUdpSocket*(settings: Settings): SocketHandle =
   ## Nonblocking SO_REUSEPORT UDP socket for QUIC, bound like the TCP one.
-  let fd = createNativeSocket(Domain.AF_INET, SockType.SOCK_DGRAM,
-                              Protocol.IPPROTO_UDP)
-  if fd == osInvalidSocket:
-    raiseOSError(osLastError())
-  var one = cint(1)
-  discard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-                     addr one, SockLen(sizeof(one)))
-  if settings.reusePort:
-    discard setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
-                       addr one, SockLen(sizeof(one)))
-  let host = if settings.address.len > 0: settings.address else: "0.0.0.0"
-  let ai = getAddrInfo(host, settings.port, Domain.AF_INET,
-                       SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP)
-  let bindRes = bindAddr(fd, ai.ai_addr, SockLen(ai.ai_addrlen))
-  freeAddrInfo(ai)
-  if bindRes < 0:
-    fd.close()
-    raiseOSError(osLastError())
-  fd.setBlocking(false)
-  fd
+  bindListener(settings, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP)
 
 proc boundPort*(fd: SocketHandle): Port =
-  ## The actual bound port (useful after binding port 0 in tests).
-  var sa: Sockaddr_in
+  ## The actual bound port (useful after binding port 0 in tests). The port
+  ## sits at the same offset in sockaddr_in and sockaddr_in6, so one cast
+  ## works for both families.
+  var sa: Sockaddr_storage
   var saLen = SockLen(sizeof(sa))
   if getsockname(fd, cast[ptr SockAddr](addr sa), addr saLen) < 0:
     raiseOSError(osLastError())
-  Port(nativesockets.ntohs(sa.sin_port))
+  Port(nativesockets.ntohs(cast[ptr Sockaddr_in](addr sa).sin_port))
 
 proc refreshDate(loop: Loop) =
   let wallSec = getTime().toUnix
