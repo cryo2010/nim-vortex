@@ -105,7 +105,10 @@ suite "HTTP/2 flood defenses":
       burst.addHeaders(sid, endStream = true)
       sid += 2
     c.sendRaw(burst)
-    let frames = c.readFrames(3000)
+    # Stop as soon as all n responses arrive (deterministic) rather than
+    # waiting out a quiet period, which is timing-sensitive under load.
+    let frames = c.readFrames(3000,
+      until = proc(f: seq[Frame]): bool = f.count(ftHeaders) >= n)
     c.close()
     check frames.goawayError() == -1
     check frames.count(ftHeaders) == n  # every request got a response

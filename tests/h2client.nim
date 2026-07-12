@@ -4,7 +4,7 @@
 ## src/vortex/http2/frames; requests use the three static-table HPACK
 ## indexes (:method GET / :scheme http / :path /), so no encoder is needed.
 
-import std/[net, posix]
+import std/[net, posix, oserrors]
 import vortex/http2/frames
 
 const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -63,19 +63,29 @@ proc sendRst*(c: var H2TestConn, sid: uint32, err = errCancel) =
   c.sendRaw(f)
 
 proc pump(c: var H2TestConn, timeoutMs: int): bool =
-  ## Read one chunk into the buffer. False on EOF/timeout.
+  ## Read one chunk into the buffer. False on EOF or a real (SO_RCVTIMEO)
+  ## timeout; a transient EINTR is retried so an interrupted syscall never
+  ## ends the read early and drops responses that are still in flight.
   c.setTimeout(timeoutMs)
   var chunk = newString(16 * 1024)
-  let n = recv(c.sock.getFd, addr chunk[0], chunk.len, cint(0))
-  if n <= 0: return false
-  c.buf.add chunk[0 ..< n]
-  true
+  while true:
+    let n = recv(c.sock.getFd, addr chunk[0], chunk.len, cint(0))
+    if n > 0:
+      c.buf.add chunk[0 ..< n]
+      return true
+    if n < 0 and cint(osLastError()) == EINTR:
+      continue                         # interrupted: retry
+    return false                       # EOF or timeout
 
 type Frame* = tuple[typ: uint8, flags: uint8, streamId: uint32, payload: string]
 
-proc readFrames*(c: var H2TestConn, timeoutMs = 1500,
-                 maxFrames = 100000): seq[Frame] =
-  ## Collect complete frames (with payloads) until EOF or a quiet period.
+proc readFrames*(c: var H2TestConn, timeoutMs = 1500, maxFrames = 100000,
+                 until: proc(frames: seq[Frame]): bool = nil): seq[Frame] =
+  ## Collect complete frames (with payloads). Returns as soon as `until` is
+  ## satisfied (e.g. "all N responses arrived"), else on EOF or a quiet
+  ## period. The `until` form is deterministic: it stops on the expected
+  ## outcome instead of waiting out a fixed quiet timeout, so it is not
+  ## sensitive to how fast the responses trickle in under load.
   var pos = 0
   while result.len < maxFrames:
     while c.buf.len - pos >= frameHeaderLen:
@@ -88,6 +98,7 @@ proc readFrames*(c: var H2TestConn, timeoutMs = 1500,
     if pos > 0:
       c.buf = c.buf.substr(pos)
       pos = 0
+    if until != nil and until(result): break
     if not c.pump(timeoutMs): break
 
 proc goawayError*(frames: seq[Frame]): int =
