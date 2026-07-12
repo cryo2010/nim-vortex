@@ -89,6 +89,17 @@ jobs:
             --build-arg BASE=archlinux:latest .
           docker run --rm vortex-redbot
 
+  h1spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: HTTP/1.1 conformance (h1spec)
+        # run.sh builds a plaintext vortex HTTP/1.1 server image and a pinned
+        # dropseed/h1spec client image, then runs h1spec against it over a
+        # private docker network; h1spec exits non-zero on any failing case.
+        # It picks the x86_64 server base itself.
+        run: sh conformance/h1spec/run.sh
+
   fuzz:
     runs-on: ubuntu-latest
     steps:

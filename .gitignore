@@ -22,6 +22,7 @@ conformance/redbot_server
 conformance/reports/
 conformance/autobahn/reports/
 conformance/autobahn/echo_server
+conformance/h1spec/h1spec_server
 conformance/h2spec/h2spec_server
 conformance/h2spec/*.pem
 conformance/h3spec/h3spec_server

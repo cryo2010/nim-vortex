@@ -62,6 +62,12 @@ task autobahn, "WebSocket conformance via the Autobahn testsuite (Docker)":
   # image base by host arch and exits non-zero on any failing case.
   exec "sh conformance/autobahn/run.sh"
 
+task h1spec, "HTTP/1.1 conformance via h1spec (Docker)":
+  # run.sh builds a plaintext vortex HTTP/1.1 server image and a
+  # dropseed/h1spec client image, then runs h1spec against it over a private
+  # docker network; h1spec exits non-zero on any failing case.
+  exec "sh conformance/h1spec/run.sh"
+
 task h2spec, "HTTP/2 conformance via h2spec over TLS (Docker)":
   # run.sh builds a vortex HTTP/2-over-TLS server image and runs the
   # summerwind/h2spec image against it; h2spec exits non-zero on failures.
