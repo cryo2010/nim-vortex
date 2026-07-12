@@ -212,6 +212,24 @@ suite "bodies":
     check res == prError
     check p.errorStatus == Http501
 
+  test "chunked as a non-final transfer-coding rejected (RFC 9112 6.1)":
+    let (res, p, _) = parseAll(
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")
+    check res == prError
+    check p.errorStatus == Http400
+
+  test "chunked as the final coding among others is unsupported (501)":
+    let (res, p, _) = parseAll(
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
+    check res == prError
+    check p.errorStatus == Http501
+
+  test "a lone chunked coding is accepted":
+    let (res, p, _) = parseAll(
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    check res == prComplete
+    check p.chunked
+
 suite "chunked":
   const chunked = "POST /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
                   "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n"
