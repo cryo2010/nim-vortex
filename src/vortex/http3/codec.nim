@@ -33,6 +33,9 @@ type
     outBuf: string
     outPos: int
     concludeAfterFlush: bool
+    streaming*: bool                 ## res.sendHead opened a streamed body
+    respBackedUp: bool               ## flush hit QUIC backpressure; onDrain due
+    onRespDrain*: RespDrainCb        ## streamed-response drain callback
     isWsConnect*: bool               ## RFC 9220 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
@@ -146,6 +149,75 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
     st.outBuf.addFrame(h3fData, body)
   st.concludeAfterFlush = true
   discard conn.flushStream(sid)
+
+# --- streaming responses (res.sendHead / write / finish over HTTP/3) --------
+
+proc h3StreamDrained(conn: H3Conn, sid: uint64) =
+  ## Fire a streamed response's onDrain once its QUIC-backpressured backlog
+  ## empties. Called after every flush of a streaming stream.
+  if sid notin conn.streams: return
+  template st: H3Stream = conn.streams[sid]
+  if not st.streaming: return
+  if st.outBuf.len - st.outPos == 0:
+    st.outBuf.setLen 0
+    st.outPos = 0
+    if st.respBackedUp:
+      st.respBackedUp = false
+      if st.onRespDrain != nil:
+        st.onRespDrain(conn.core, 0, 0, uint32(sid))   # handle captured in cb
+  else:
+    st.respBackedUp = true
+
+proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
+                 contentType: string,
+                 extraHeaders: openArray[(string, string)]) =
+  ## Send a streamed response's HEADERS (no content-length, no FIN) and open
+  ## the body. Subsequent bytes flow via h3StreamWrite/h3StreamFinish.
+  if sid notin conn.streams or conn.streams[sid].responded: return
+  template st: H3Stream = conn.streams[sid]
+  st.responded = true
+  st.streaming = true
+  var fs = ""
+  addPrefix(fs)
+  qpack.encodeStatus(fs, code)
+  if core.serverHeader.len > 0:
+    qpack.encodeHeader(fs, "server", core.serverHeader)
+  qpack.encodeHeader(fs, "date", core.dateStr)
+  if contentType.len > 0:
+    qpack.encodeHeader(fs, "content-type", contentType)
+  for (name, val) in extraHeaders:
+    qpack.encodeHeader(fs, name.toLowerAscii, val)
+  st.outBuf.addFrame(h3fHeaders, fs)
+  if st.isHead:
+    st.streaming = false
+    st.concludeAfterFlush = true       # HEAD: headers only, FIN
+  discard conn.flushStream(sid)
+
+proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
+  ## Append a body chunk (an h3 DATA frame) to a streamed response and flush.
+  ## Returns the unsent backlog for backpressure.
+  if sid notin conn.streams or not conn.streams[sid].streaming: return 0
+  template st: H3Stream = conn.streams[sid]
+  if data.len > 0:
+    st.outBuf.addFrame(h3fData, data)
+  if conn.flushStream(sid): return 0    # stream finished/removed
+  conn.h3StreamDrained(sid)
+  if sid notin conn.streams: return 0
+  st.outBuf.len - st.outPos
+
+proc h3StreamFinish*(conn: H3Conn, sid: uint64) =
+  ## Terminate a streamed response: FIN the QUIC stream once the backlog drains.
+  if sid notin conn.streams or not conn.streams[sid].streaming: return
+  template st: H3Stream = conn.streams[sid]
+  st.streaming = false
+  st.onRespDrain = nil
+  st.concludeAfterFlush = true
+  discard conn.flushStream(sid)
+
+proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
+  ## Unsent bytes queued on a streamed response (for res.bufferedAmount).
+  if sid notin conn.streams: return 0
+  conn.streams[sid].outBuf.len - conn.streams[sid].outPos
 
 proc h3ConnError(conn: H3Conn, code: uint64) =
   ## Raise an HTTP/3 connection error (RFC 9114 8): close the QUIC connection
@@ -412,6 +484,8 @@ proc pumpRequestStream(conn: H3Conn, sid: uint64, ready: var seq[uint64]) =
   template st: H3Stream = conn.streams[sid]
   if st.outBuf.len > st.outPos or st.concludeAfterFlush:
     if conn.flushStream(sid): return
+    conn.h3StreamDrained(sid)          # resume a QUIC-backpressured stream
+    if sid notin conn.streams: return
   var readSome = false
   while true:
     let (n, ioSt) = tlsRead(st.ssl, addr conn.scratch[0], conn.scratch.len)

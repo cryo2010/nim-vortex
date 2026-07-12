@@ -29,6 +29,18 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     req.blocking:
       sleep(100)
       res.send(Http200, "slow h3 done", "text/plain")
+  of "/stream":
+    res.sendHead(Http200, "text/plain")
+    res.write("Hello, ")
+    res.write("streamed ")
+    res.write("h3!")
+    res.finish()
+  of "/streambig":
+    res.sendHead(Http200, "application/octet-stream")
+    let chunk = repeat('y', 4096)
+    for i in 0 ..< 64:
+      discard res.write(chunk)
+    res.finish()
   else:
     res.send(Http404, "nope", "text/plain")
 
@@ -80,6 +92,17 @@ suite "HTTP/3 (QUIC, via curl)":
   test "several sequential requests":
     for i in 0 ..< 3:
       check h3curl(base & "/")[0] == "hello h3"
+
+  test "streamed response over h3":
+    let (output, rc) = h3curl("-w '|%{http_version}' " & base & "/stream")
+    check rc == 0
+    check output == "Hello, streamed h3!|3"
+
+  test "large streamed response over h3":
+    let (output, rc) = h3curl(
+      "-o /dev/null -w '%{size_download}' " & base & "/streambig")
+    check rc == 0
+    check output == $(64 * 4096)
 
   test "alt-svc advertised on h1/h2":
     let (output, rc) = execCmdEx(

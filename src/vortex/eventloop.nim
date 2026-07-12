@@ -285,6 +285,10 @@ proc flushOut(loop: Loop, c: ptr Connection) =
       loop.closeConn(c)
   elif c.ws != nil:
     wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
+  elif c.respStreaming and c.respBackedUp:
+    c.respBackedUp = false
+    if c.onRespDrain != nil:
+      c.onRespDrain(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code
@@ -398,6 +402,11 @@ proc processInput(loop: Loop, c: ptr Connection) =
           return
       if not c.responded:
         # Deferred response (worker pool / adapter); pause until respond.
+        c.awaitingResponse = true
+        return
+      if c.respStreaming:
+        # A streaming response is open (sendHead sent, not finished): pause
+        # the pipeline until finish() resumes it via kick.
         c.awaitingResponse = true
         return
       if c.ws != nil:
@@ -537,10 +546,11 @@ proc handleRead(loop: Loop, c: ptr Connection) =
   loop.processInput(c)
   if c.state != csFree and (c.pendingOut > 0 or c.closeAfterFlush):
     loop.flushOut(c)
-  if c.peerHalfClosed and c.state == csActive:
+  if c.peerHalfClosed and c.state == csActive and not c.respStreaming:
     # The peer will send no more requests: close once any response has been
     # written (the deferred/worker case sets closeAfterFlush and closes when
-    # the response arrives).
+    # the response arrives). A streaming response is exempt -- the client may
+    # half-close its write side and keep reading; finish() closes it.
     if c.awaitingResponse or c.pendingOut > 0:
       c.closeAfterFlush = true
     else:
