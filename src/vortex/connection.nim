@@ -124,6 +124,11 @@ type
       ## Resolve an HTTP/2 (RFC 8441) WebSocket stream's WsConn from a
       ## `WebSocket` handle. Set by the h2 codec; the WebSocket layer cannot
       ## import the h2 codec, so it reaches per-stream state through this.
+    wsH3Lookup*: proc (core: pointer, fd: int32, gen: uint32,
+                       stream: uint32): RootRef {.nimcall, gcsafe.}
+      ## Resolve an HTTP/3 (RFC 9220) WebSocket stream's WsConn. Set by the h3
+      ## codec. h3 handles have `fd < 0` (an h3 slot, not a `ptr Connection`),
+      ## so this takes the whole handle rather than a connection pointer.
 
 proc newOutbox*(): ptr Outbox =
   result = createShared(Outbox)

@@ -235,7 +235,7 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
   template st: H2Stream = h2.streams[sid]
   if not st.isWsConnect or st.responded or st.ws != nil: return false
   st.responded = true
-  let (w, proto, ext) = wsSetup(h2.core, maxMessage, sid,
+  let (w, proto, ext) = wsSetup(h2.core, c.fd, c.gen, maxMessage, sid,
                                 extensionsOffer, protocolsOffer,
                                 serverProtocols)
   w.flush = wsFlushH2
@@ -455,7 +455,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       template st: H2Stream = h2.streams[sid]
       if st.ws != nil:
         # RFC 8441 WebSocket stream: DATA payload is WebSocket framing.
-        wsFeedH2(h2.core, c, WsConn(st.ws),
+        wsFeed(h2.core, c, WsConn(st.ws),
                  c.rbuf.toOpenArray(dataStart, dataStart + dataLen - 1))
         if (fh.flags and flagEndStream) != 0 and sid in h2.streams and
             h2.streams[sid].ws != nil:

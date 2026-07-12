@@ -458,12 +458,20 @@ proc headerHasToken(value, token: string): bool =
   false
 
 proc isWebSocketUpgrade*(req: Request): bool =
-  ## True when this request is a WebSocket handshake: an RFC 6455 upgrade
-  ## over HTTP/1.1, or an RFC 8441 Extended CONNECT over HTTP/2. Call inside
-  ## a handler, then `acceptWebSocket`.
-  if req.httpVersion == 2 and req.fd >= 0:
-    # HTTP/2: :method CONNECT + :protocol websocket (the h2 codec already
-    # validated scheme/path/authority presence for a ws-connect stream).
+  ## True when this request is a WebSocket handshake: an RFC 6455 upgrade over
+  ## HTTP/1.1, or an Extended CONNECT over HTTP/2 (RFC 8441) or HTTP/3
+  ## (RFC 9220). Call inside a handler, then `acceptWebSocket`.
+  if req.fd < 0:
+    # HTTP/3: :method CONNECT + :protocol websocket (the h3 codec already
+    # validated scheme/path/authority for a ws-connect stream).
+    when not defined(plainHttp):
+      return req.method == HttpConnect and
+        h3FieldOf(req, ":protocol") == "websocket" and
+        req.header("sec-websocket-version") == "13"
+    else:
+      return false
+  if req.httpVersion == 2:
+    # HTTP/2: :method CONNECT + :protocol websocket (validated by the codec).
     return req.method == HttpConnect and
       h2Field(conn(req.core, req.fd, req.gen), req.stream, ":protocol") ==
         "websocket" and
@@ -487,7 +495,16 @@ proc acceptWebSocket*(req: Request,
   ## in the handshake. Read it back with `ws.subprotocol` ("" if none).
   result = WebSocket(core: req.core, fd: req.fd, gen: req.gen,
                      stream: req.stream)
-  if req.fd < 0: return                             # HTTP/3 not supported
+  if req.fd < 0:
+    # HTTP/3 (RFC 9220): reply 200 on the QUIC stream and attach a WsConn.
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        discard h3WsAccept(req.core, h3c, uint64(req.stream), req.fd, req.gen,
+                           req.core.maxWsMessage,
+                           req.header("sec-websocket-extensions"),
+                           req.header("sec-websocket-protocol"), protocols)
+    return
   let c = conn(req.core, req.fd, req.gen)
   if c == nil: return
   if req.stream != 0:
@@ -541,16 +558,22 @@ proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
       # there is nothing to pin and no completion to signal.
       wsRunBody(ws.core, fn, ws.fd, ws.gen, ws.stream, msg)
       return
-    let c = conn(ws.core, ws.fd, ws.gen)
-    if c == nil: return
-    if ws.stream == 0:
-      inc c.pinned                       # HTTP/1: pin the whole connection
-    else:
-      # HTTP/2: pin only this stream so the other multiplexed streams stay
-      # responsive while the worker runs.
-      let w = wsConnForStream(ws.core, c, ws.stream)
+    if ws.fd < 0:
+      # HTTP/3: pin only this QUIC stream (per-stream), like HTTP/2.
+      let w = wsConnForH3(ws.core, ws.fd, ws.gen, ws.stream)
       if w == nil: return
       w.blockingPinned = true
+    else:
+      let c = conn(ws.core, ws.fd, ws.gen)
+      if c == nil: return
+      if ws.stream == 0:
+        inc c.pinned                     # HTTP/1: pin the whole connection
+      else:
+        # HTTP/2: pin only this stream so the other multiplexed streams stay
+        # responsive while the worker runs.
+        let w = wsConnForStream(ws.core, c, ws.stream)
+        if w == nil: return
+        w.blockingPinned = true
     enqueue(cast[ptr WorkerPool](ws.core.pool),
             WorkerTask(fn: wsBlockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](ws.core), fd: ws.fd, gen: ws.gen,

@@ -25,6 +25,7 @@ const
   h3SetQpackMaxTableCapacity* = 0x01'u64
   h3SetMaxFieldSectionSize* = 0x06'u64
   h3SetQpackBlockedStreams* = 0x07'u64
+  h3SetEnableConnectProtocol* = 0x08'u64   # RFC 9220: Extended CONNECT (WS)
 
   # Error codes (RFC 9114 section 8.1)
   h3NoError* = 0x0100'u64

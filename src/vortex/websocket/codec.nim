@@ -57,13 +57,16 @@ type
     # Transport abstraction: the core appends serialized frames to `outBuf`
     # and sets `wantClose`; `flush` drains them (HTTP/1 -> c.wbuf, HTTP/2 ->
     # stream DATA). `stream`/`inBuf`/`blockingPinned` back the HTTP/2 side.
-    stream*: uint32          ## 0 for HTTP/1.1, else the h2 stream id
+    stream*: uint32          ## 0 for HTTP/1.1, else the h2/h3 stream id
+    fd*: int32               ## handle identity for callbacks (h3 has no Connection)
+    gen*: uint32
     outBuf*: string          ## serialized frames awaiting flush
     wantClose*: bool         ## close the transport once outBuf is flushed
     flush*: WsFlush
-    inBuf*: string           ## h2 inbound bytes accumulated from DATA frames
-    blockingPinned*: bool    ## an h2 ws.blocking worker holds this stream
-    h2Pending*: int          ## h2 outbound bytes queued but blocked on window
+    inBuf*: string           ## h2/h3 inbound bytes accumulated from DATA frames
+    blockingPinned*: bool    ## a per-stream ws.blocking worker holds this stream
+    h2Pending*: int          ## h2/h3 outbound bytes queued but not yet on the wire
+    h3conn*: RootRef         ## the H3Conn for an h3 stream (reach it + stream)
     when defined(wsDeflate):
       pmd: bool              ## permessage-deflate negotiated on this connection
       msgCompressed: bool    ## the in-progress message's first frame had RSV1
@@ -175,16 +178,17 @@ proc wsFlushH1*(core: ptr LoopCore, c: ptr Connection,
 
 # --- handshake --------------------------------------------------------------
 
-proc wsSetup*(core: ptr LoopCore, maxMessage: int, stream: uint32,
-              extensionsOffer, protocolsOffer: string,
+proc wsSetup*(core: ptr LoopCore, fd: int32, gen: uint32, maxMessage: int,
+              stream: uint32, extensionsOffer, protocolsOffer: string,
               serverProtocols: openArray[string]):
               tuple[w: WsConn, protocol: string, extensions: string] =
   ## Build a `WsConn` and negotiate the subprotocol + permessage-deflate from
   ## the client's offers, without touching any wire buffer. Returns the
   ## chosen subprotocol ("" = none) and the Sec-WebSocket-Extensions response
   ## value ("" = no compression) for the caller's handshake. Shared by the
-  ## HTTP/1.1 and HTTP/2 (RFC 8441) accept paths.
-  let w = WsConn(maxMessage: maxMessage, stream: stream)
+  ## HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) accept paths. `fd`/`gen`
+  ## identify the handle so callbacks can be delivered without a `Connection`.
+  let w = WsConn(maxMessage: maxMessage, stream: stream, fd: fd, gen: gen)
   result.w = w
   let chosen = negotiateProtocol(protocolsOffer, serverProtocols)
   if chosen.len > 0:
@@ -212,7 +216,7 @@ proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
   ## Sec-WebSocket-Extensions value (permessage-deflate); `protocolsOffer`
   ## is its Sec-WebSocket-Protocol value, negotiated against
   ## `serverProtocols`.
-  let (w, proto, ext) = wsSetup(core, maxMessage, 0,
+  let (w, proto, ext) = wsSetup(core, c.fd, c.gen, maxMessage, 0,
                                 extensionsOffer, protocolsOffer,
                                 serverProtocols)
   w.flush = wsFlushH1
@@ -256,7 +260,7 @@ proc notifyClose(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   if w.closeNotified: return
   w.closeNotified = true
   if w.onClose != nil:
-    w.onClose(WebSocket(core: core, fd: c.fd, gen: c.gen, stream: w.stream),
+    w.onClose(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream),
               code, reason)
 
 proc failClose(core: ptr LoopCore, c: ptr Connection, w: WsConn,
@@ -330,7 +334,7 @@ proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     return false
   if w.onMessage != nil:
     let kind = if op == opBinary: wsBinary else: wsText
-    w.onMessage(WebSocket(core: core, fd: c.fd, gen: c.gen, stream: w.stream),
+    w.onMessage(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream),
                 payload, kind)
   true
 
@@ -434,9 +438,9 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     of wpFrame:
       open = handleFrame(core, c, w, fr)
       # A ws.blocking dispatch paused this WebSocket (connection pin for
-      # HTTP/1, per-stream pin for HTTP/2): stop and leave the rest buffered
-      # so messages run one at a time, in order.
-      if c.pinned > 0 or w.blockingPinned: break
+      # HTTP/1, per-stream pin for HTTP/2 and HTTP/3): stop and leave the rest
+      # buffered so messages run one at a time, in order. `c` is nil for h3.
+      if (c != nil and c.pinned > 0) or w.blockingPinned: break
   pos
 
 proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
@@ -456,11 +460,13 @@ proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
     if c.ws != nil and not c.closeAfterFlush:
       armWsPing(core, c)
 
-proc wsFeedH2*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
+proc wsFeed*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
                data: openArray[char]) =
-  ## Feed the payload of a DATA frame on an HTTP/2 WebSocket stream: buffer
-  ## it and pump complete frames (unless a ws.blocking worker holds this
-  ## stream), then flush any produced frames via the stream's transport.
+  ## Feed inbound WebSocket bytes carried in an HTTP/2 or HTTP/3 DATA frame:
+  ## buffer them and pump complete frames (unless a ws.blocking worker holds
+  ## this stream), then flush any produced frames via the stream's transport.
+  ## `c` is the h2 connection, or nil for h3 (the flush reaches the stream
+  ## through the WsConn).
   if data.len > 0:
     let old = w.inBuf.len
     w.inBuf.setLen(old + data.len)
@@ -480,11 +486,11 @@ proc wsFeedH2*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   if w.flush != nil:
     w.flush(core, c, w)
 
-proc wsResumeH2*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
-  ## An h2 ws.blocking worker finished: clear the per-stream pin and pump
-  ## any frames buffered while it ran.
+proc wsResume*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
+  ## A per-stream ws.blocking worker (h2 or h3) finished: clear the pin and
+  ## pump any frames buffered while it ran.
   w.blockingPinned = false
-  wsFeedH2(core, c, w, [])
+  wsFeed(core, c, w, [])
 
 proc wsStreamClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   ## Tear down one WebSocket's WsConn: deliver an abnormal onClose (1006) if
@@ -525,14 +531,21 @@ proc wsDrained*(core: ptr LoopCore, c: ptr Connection) =
   if w.backedUp:
     w.backedUp = false
     if w.onDrain != nil:
-      w.onDrain(WebSocket(core: core, fd: c.fd, gen: c.gen))
+      w.onDrain(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream))
 
 # --- public send/close API --------------------------------------------------
 
 proc wsConnOf*(ws: WebSocket): (ptr Connection, WsConn) =
-  ## Resolve the connection and WsConn for a handle: `c.ws` for HTTP/1.1, or
-  ## the stream's WsConn (via the h2 lookup hook) for HTTP/2. `(c, nil)` when
-  ## the WebSocket is gone.
+  ## Resolve the connection and WsConn for a handle: `c.ws` for HTTP/1.1, the
+  ## stream's WsConn via a lookup hook for HTTP/2 / HTTP/3. `(nil, nil)` when
+  ## the WebSocket is gone. For h3 (`fd < 0`) there is no `ptr Connection`, so
+  ## the returned connection is nil and the flush reaches the stream through
+  ## the WsConn.
+  if ws.fd < 0:
+    if ws.core.wsH3Lookup != nil:
+      return (nil, WsConn(ws.core.wsH3Lookup(cast[pointer](ws.core), ws.fd,
+                                             ws.gen, ws.stream)))
+    return (nil, nil)
   let c = conn(ws.core, ws.fd, ws.gen)
   if c == nil: return (nil, nil)
   if ws.stream == 0:
@@ -548,6 +561,14 @@ proc wsConnForStream*(core: ptr LoopCore, c: ptr Connection,
   if stream == 0: return WsConn(c.ws)
   if core.wsStreamLookup != nil:
     return WsConn(core.wsStreamLookup(cast[pointer](c), stream))
+  nil
+
+proc wsConnForH3*(core: ptr LoopCore, fd: int32, gen: uint32,
+                  stream: uint32): WsConn =
+  ## Resolve an h3 stream's WsConn from a handle (`fd < 0`). Used by the event
+  ## loop's outbox routing for HTTP/3 WebSockets.
+  if core.wsH3Lookup != nil:
+    return WsConn(core.wsH3Lookup(cast[pointer](core), fd, gen, stream))
   nil
 
 proc wsFlushRaw*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
@@ -643,14 +664,14 @@ proc `onDrain=`*(ws: WebSocket, cb: WsDrainCb) =
 proc bufferedAmount*(ws: WebSocket): int =
   ## Bytes queued by send() but not yet written to the peer. Grows when the
   ## peer stops reading and drains as it catches up; poll it to throttle a
-  ## slow consumer (browser WebSocket.bufferedAmount). For HTTP/2 this is the
-  ## stream's send-window backlog. 0 if the WebSocket is gone. Loop-thread
+  ## slow consumer (browser WebSocket.bufferedAmount). For HTTP/2 and HTTP/3
+  ## this is the stream's send backlog. 0 if the WebSocket is gone. Loop-thread
   ## snapshot: read it from a handler callback (onMessage/onDrain), not
   ## another thread; off-loop sends queue on the outbox and are not counted
   ## until the loop picks them up.
   let (c, w) = wsConnOf(ws)
   if w == nil: return 0
-  if ws.stream == 0: c.pendingOut else: w.h2Pending
+  if ws.fd >= 0 and ws.stream == 0: c.pendingOut else: w.h2Pending
 
 proc isAlive*(ws: WebSocket): bool =
   let (_, w) = wsConnOf(ws)
