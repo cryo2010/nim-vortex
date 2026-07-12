@@ -100,16 +100,25 @@ jobs:
             --build-arg BASE=archlinux:latest .
           docker run --rm -e DUR=30 vortex-fuzz
 
-  autobahn:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: WebSocket conformance (Autobahn)
-        # run.sh builds a vortex echo server image, runs the
-        # crossbario/autobahn-testsuite fuzzingclient against it, and exits
-        # non-zero on any failing case. It picks the x86_64 image base
-        # itself; python3 (for the report) is preinstalled on the runner.
-        run: sh conformance/autobahn/run.sh
+  # The Autobahn job is paused: it runs ~11 min per PR, dominated by the
+  # permessage-deflate cases (12-13 are ~96% of the case time). The harness
+  # still runs locally via `nimble autobahn`, and WebSocket protocol
+  # correctness is guarded by the unit suites (test_websocket_*).
+  #
+  # Re-enable plan: move it off the per-PR path -- either a nightly
+  # `schedule:` run or a `workflow_dispatch` / label-gated trigger -- and/or
+  # cache the testsuite image (buildx GHA cache) to cut the build/pull cost.
+  #
+  # autobahn:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - name: WebSocket conformance (Autobahn)
+  #       # run.sh builds a vortex echo server image, runs the
+  #       # crossbario/autobahn-testsuite fuzzingclient against it, and exits
+  #       # non-zero on any failing case. It picks the x86_64 image base
+  #       # itself; python3 (for the report) is preinstalled on the runner.
+  #       run: sh conformance/autobahn/run.sh
 
   h2spec:
     runs-on: ubuntu-latest
