@@ -310,6 +310,14 @@ It takes an optional headers argument (`res.stream(Http200, ct, headers): ...`).
 For a backpressure-driven or async producer, drive `sendHead`/`write`/`finish`/
 `onDrain` directly instead.
 
+If the block raises, the template calls `res.abort()` rather than `finish` (and
+re-raises). Because the status and headers are already committed once `sendHead`
+has run, a failure partway cannot become a `500`; `abort` instead makes the
+truncation visible so the client does not mistake a short body for a complete
+one: HTTP/1.1 closes the connection before the terminating chunk, and HTTP/2 /
+HTTP/3 reset the stream with an internal error. Call `res.abort()` yourself if
+you catch an error mid-stream in the manual API.
+
 `write` returns `false` once the unsent backlog reaches `respHighWater`; a
 producer that outruns a slow client should pause and resume from `onDrain`,
 the same backpressure contract as WebSocket sends:

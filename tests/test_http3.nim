@@ -41,6 +41,10 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     for i in 0 ..< 64:
       discard res.write(chunk)
     res.finish()
+  of "/boom":
+    res.stream(Http200, "text/plain"):
+      res.write("partial")
+      raise newException(ValueError, "boom mid-stream")
   else:
     res.send(Http404, "nope", "text/plain")
 
@@ -103,6 +107,10 @@ suite "HTTP/3 (QUIC, via curl)":
       "-o /dev/null -w '%{size_download}' " & base & "/streambig")
     check rc == 0
     check output == $(64 * 4096)
+
+  test "a mid-stream exception resets the h3 stream (client sees an error)":
+    let (_, rc) = h3curl("-o /dev/null " & base & "/boom")
+    check rc != 0
 
   test "alt-svc advertised on h1/h2":
     let (output, rc) = execCmdEx(

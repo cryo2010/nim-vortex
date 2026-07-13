@@ -312,6 +312,17 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32) =
     h2.streams.del(sid)
     dec h2.activeStreams
 
+proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
+  ## Abort a streamed response mid-body: RST_STREAM(INTERNAL_ERROR) so the peer
+  ## sees the transfer was cut short, not cleanly completed. No-op unless the
+  ## stream is an open streamed response.
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
+    return
+  h2.streams[sid].streaming = false
+  h2.streams[sid].onRespDrain = nil
+  h2.streamError(c, sid, errInternal)
+
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
   ## LoopCore.wsStreamLookup: resolve a stream's WsConn for the public API.
   let c = cast[ptr Connection](cp)
