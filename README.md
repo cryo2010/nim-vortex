@@ -109,6 +109,12 @@ testchronos`.
 Embedded / test usage: `var srv = start(handler, settings)` returns
 immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 
+Shutdown is graceful: `requestShutdown()` (or a SIGINT/SIGTERM under `run`, or
+`srv.close()`) stops accepting and closes the listener so the port frees for a
+replacement, sends HTTP/2 `GOAWAY`, lets in-flight requests and open streams
+finish, then closes. Idle keep-alive connections close promptly; anything still
+running is force-closed once `shutdownGrace` seconds elapse.
+
 ## WebSockets
 
 A handler detects the upgrade and calls `req.acceptWebSocket()`; set
@@ -427,10 +433,9 @@ and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 
 ## Status
 
-Pre-1.0. Streaming response bodies (`res.sendHead`/`write`/`finish`) are
-supported on h1/h2/h3; streaming request bodies are the next milestone.
-Deferred (planned): streaming request bodies, dynamic QPACK, h2c upgrade,
-Windows.
+Pre-1.0. Streaming request and response bodies (with backpressure) are
+supported on h1/h2/h3, and shutdown is graceful. Deferred (planned): dynamic
+QPACK, h2c upgrade, Windows.
 
 ## Thanks
 

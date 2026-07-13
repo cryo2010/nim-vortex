@@ -47,6 +47,8 @@ type
     quicListener: pointer        # SSL* listener
     h3Ready: seq[uint64]         # reused h3 dispatch buffer
     connCount: int               # live TCP connections (maxConnections cap)
+    draining: bool               # graceful shutdown in progress
+    drainDeadline: int64         # monotonic sec; force-close remaining after
 
 proc monoSec(): int64 {.inline.} =
   getMonoTime().ticks div 1_000_000_000
@@ -848,6 +850,76 @@ proc tick(loop: Loop) =
     loop.refreshDate()
     loop.sweepTimeouts()
 
+# --- graceful shutdown ------------------------------------------------------
+
+proc activeH3Conns(loop: Loop): int =
+  when not defined(plainHttp):
+    for slot in loop.core.h3slots:
+      if slot.conn != nil: inc result
+
+proc markDrain(loop: Loop, c: ptr Connection) =
+  ## Signal one TCP connection to finish its in-flight work and close.
+  if c.state != csActive: return
+  if c.h2 != nil:
+    h2Goaway(c)                           # refuse new streams, send GOAWAY
+    if h2ActiveStreams(c) == 0:
+      c.closeAfterFlush = true
+    loop.flushOut(c)
+  elif c.ws != nil:
+    discard                                # WebSockets: force-closed at deadline
+  elif c.awaitingResponse or c.pendingOut > 0:
+    c.parser.keepAlive = false            # finish the in-flight response, then close
+    c.closeAfterFlush = true
+    loop.flushOut(c)
+  else:
+    loop.closeConn(c)                     # idle keep-alive / partial request
+
+proc beginDrain(loop: Loop) =
+  ## Enter graceful shutdown: stop accepting, tell live connections to finish,
+  ## and arm the grace deadline.
+  loop.draining = true
+  if loop.listenFd >= 0:
+    try: loop.selector.unregister(loop.listenFd)
+    except CatchableError: discard
+    discard posix.close(cint(loop.listenFd))   # free the port for a replacement
+    loop.listenFd = -1
+  for fd in 0 ..< loop.core.conns.len:
+    loop.markDrain(addr loop.core.conns[fd])
+  let grace = max(0, loop.settings.shutdownGrace)
+  loop.drainDeadline = loop.core.nowSec + int64(grace)
+
+proc drainSweep(loop: Loop) =
+  ## Close connections that finished their in-flight work this iteration.
+  for fd in 0 ..< loop.core.conns.len:
+    let c = addr loop.core.conns[fd]
+    if c.state != csActive: continue
+    if c.h2 != nil:
+      if h2Conn(c).goingAway and h2ActiveStreams(c) == 0:
+        if c.pendingOut > 0: c.closeAfterFlush = true
+        else: loop.closeConn(c)
+    elif c.ws == nil and not c.awaitingResponse and c.pendingOut == 0:
+      loop.closeConn(c)                   # h1 became idle after its response
+  when not defined(plainHttp):
+    for i in 0 ..< loop.core.h3slots.len:
+      let slot = addr loop.core.h3slots[i]
+      if slot.conn != nil and H3Conn(slot.conn).h3StreamCount == 0:
+        loop.h3FreeSlot(i)                # no in-flight request streams left
+
+proc forceCloseAll(loop: Loop) =
+  ## Grace expired: drop whatever is still open.
+  for fd in 0 ..< loop.core.conns.len:
+    let c = addr loop.core.conns[fd]
+    if c.state != csFree:
+      c.pinned = 0
+      loop.closeConn(c)
+  when not defined(plainHttp):
+    for i in 0 ..< loop.core.h3slots.len:
+      loop.core.h3slots[i].pinned = 0
+      loop.h3FreeSlot(i)
+
+proc drainDone(loop: Loop): bool {.inline.} =
+  loop.connCount == 0 and loop.activeH3Conns == 0
+
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.kick = kickImpl
@@ -857,8 +929,15 @@ proc run*(loop: Loop) =
     installH3WsHooks(addr loop.core)   # h3 WebSocket (RFC 9220) stream lookup
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
-  while not loop.stopFlag[].load(moRelaxed):
+  while true:
+    if loop.stopFlag[].load(moRelaxed) and not loop.draining:
+      loop.tick()                     # refresh nowSec before arming the deadline
+      loop.beginDrain()
+    if loop.draining and loop.drainDone():
+      break
     var timeoutMs = 1000
+    if loop.draining:
+      timeoutMs = 100                 # check the grace deadline promptly
     if loop.pumpCap >= 0:
       # An adapter has pending async operations: bound the wait so
       # timer/IO completions from its dispatcher aren't starved.
@@ -927,6 +1006,13 @@ proc run*(loop: Loop) =
       # finish in the same pass instead of after a selector timeout.
       loop.pumpCap = loop.core.pumpHook()
     loop.tick()
+    if loop.draining:
+      loop.drainSweep()               # close connections that just finished
+      if loop.drainDone():
+        break
+      if loop.core.nowSec >= loop.drainDeadline:
+        loop.forceCloseAll()          # grace expired: drop the rest
+        break
   when not defined(plainHttp):
     if loop.quicListener != nil:
       for i in 0 ..< loop.core.h3slots.len:
@@ -935,7 +1021,8 @@ proc run*(loop: Loop) =
       quicFree(loop.quicListener)
       discard posix.close(cint(loop.udpFd))
   loop.selector.close()
-  discard posix.close(cint(loop.listenFd))
+  if loop.listenFd >= 0:                 # beginDrain may have closed it already
+    discard posix.close(cint(loop.listenFd))
 
 type LoopThreadArg* = tuple
   ## Plain-data bundle for starting a loop on its own thread; the Loop

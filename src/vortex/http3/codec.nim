@@ -692,6 +692,10 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
     if sid in conn.streams:
       conn.pumpRequestStream(sid, ready)
 
+proc h3StreamCount*(conn: H3Conn): int =
+  ## Open request streams (for graceful-shutdown draining).
+  conn.streams.len
+
 proc h3Free*(conn: H3Conn) =
   h3WsTeardownAll(conn)             # onClose for any RFC 9220 WebSocket streams
   for sid, st in conn.streams:
