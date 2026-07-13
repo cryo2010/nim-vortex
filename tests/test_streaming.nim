@@ -26,6 +26,19 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.sendHead(Http200, "text/plain")
     res.write("body")
     res.finish({"X-Checksum": "abc123"})
+  of "/tmpl":
+    res.stream(Http200, "text/plain"):
+      res.write("template ")
+      res.write("streamed!")
+  of "/tmplhdr":
+    res.stream(Http200, "text/plain", {"X-Made-By": "vortex"}):
+      res.write("with headers")
+  of "/boom":
+    # The body raises after committing a 200 and some data: the stream must be
+    # aborted (no chunked terminator / RST_STREAM), not finished cleanly.
+    res.stream(Http200, "text/plain"):
+      res.write("partial data")
+      raise newException(ValueError, "boom mid-stream")
   of "/pump":
     # A backpressure-honoring producer: write until write() reports the
     # backlog is full, then resume from onDrain. Exercises the deferred
@@ -105,6 +118,27 @@ suite "HTTP/1 streaming responses":
     check "Transfer-Encoding: chunked" in head
     check dechunk(body).len == 1024 * 4096
 
+  test "res.stream template sends head and finishes automatically":
+    let (head, body) = splitHeadBody(rawGet("/tmpl"))
+    check "Transfer-Encoding: chunked" in head
+    check dechunk(body) == "template streamed!"
+
+  test "res.stream template with headers":
+    let resp = rawGet("/tmplhdr")
+    check "X-Made-By: vortex" in resp
+    let (_, body) = splitHeadBody(resp)
+    check dechunk(body) == "with headers"
+
+  test "a mid-stream exception aborts without a clean chunked terminator":
+    let resp = rawGet("/boom")
+    let (head, body) = splitHeadBody(resp)
+    check "HTTP/1.1 200" in head          # status already committed
+    check "Transfer-Encoding: chunked" in head
+    check "partial data" in body
+    # The abort closes the connection without the final "0\r\n\r\n" chunk, so a
+    # client sees a truncated transfer rather than a well-formed short body.
+    check not resp.endsWith("0\r\n\r\n")
+
   test "trailers are emitted after the last chunk":
     let resp = rawGet("/trailer")
     check "X-Checksum: abc123" in resp
@@ -149,6 +183,11 @@ suite "HTTP/2 streaming responses":
     let (output, rc) = h2curl("-I -w '%{size_download}' " & base & "/stream")
     check rc == 0
     check output.endsWith("0")
+
+  test "a mid-stream exception resets the h2 stream (client sees an error)":
+    # RST_STREAM after HEADERS+DATA: curl fails rather than reporting success.
+    let (_, rc) = h2curl("-o /dev/null " & base & "/boom")
+    check rc != 0
 
 srv.close()
 echo "server shut down cleanly"

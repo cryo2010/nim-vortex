@@ -246,6 +246,15 @@ proc h3StreamError(conn: H3Conn, sid: uint64, code: uint64) =
   quicResetStream(conn.streams[sid].ssl, code)
   conn.failStream(sid)
 
+proc h3StreamAbort*(conn: H3Conn, sid: uint64) =
+  ## Abort a streamed response mid-body: RESET_STREAM(H3_INTERNAL_ERROR) so the
+  ## peer sees the transfer was cut short, not cleanly finished. No-op unless
+  ## the stream is an open streamed response.
+  if sid notin conn.streams or not conn.streams[sid].streaming: return
+  conn.streams[sid].streaming = false
+  conn.streams[sid].onRespDrain = nil
+  conn.h3StreamError(sid, h3InternalError)
+
 # --- RFC 9220 WebSockets over HTTP/3 ----------------------------------------
 
 proc h3WsFinalize(conn: H3Conn, sid: uint64, w: WsConn) =

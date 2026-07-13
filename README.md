@@ -290,6 +290,34 @@ and HTTP/3 leave the stream open with DATA frames), `write` appends a chunk,
 and `finish` ends it (optionally with trailers over HTTP/1.1). The framing is
 identical across all three protocols.
 
+For the common "produce it all inline" case (a file download), the `res.stream`
+template brackets a block with `sendHead` and `finish` (and closes the stream
+even if the block raises):
+
+```nim
+proc download(req: Request, res: Response) {.gcsafe.} =
+  res.stream(Http200, "application/octet-stream"):
+    var f = open("big.bin")
+    defer: f.close()
+    var buf = newString(64 * 1024)
+    while true:
+      let n = f.readChars(buf)
+      if n == 0: break
+      discard res.write(buf.toOpenArray(0, n - 1))
+```
+
+It takes an optional headers argument (`res.stream(Http200, ct, headers): ...`).
+For a backpressure-driven or async producer, drive `sendHead`/`write`/`finish`/
+`onDrain` directly instead.
+
+If the block raises, the template calls `res.abort()` rather than `finish` (and
+re-raises). Because the status and headers are already committed once `sendHead`
+has run, a failure partway cannot become a `500`; `abort` instead makes the
+truncation visible so the client does not mistake a short body for a complete
+one: HTTP/1.1 closes the connection before the terminating chunk, and HTTP/2 /
+HTTP/3 reset the stream with an internal error. Call `res.abort()` yourself if
+you catch an error mid-stream in the manual API.
+
 `write` returns `false` once the unsent backlog reaches `respHighWater`; a
 producer that outruns a slow client should pause and resume from `onDrain`,
 the same backpressure contract as WebSocket sends:

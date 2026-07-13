@@ -532,6 +532,62 @@ proc bufferedAmount*(res: Response): int =
     return st.pendingBody.len - st.pendingPos
   pendingOut(c)
 
+proc abort*(res: Response) =
+  ## Abort a streamed response mid-body *without* a clean terminator, so the
+  ## client can tell the transfer was cut short rather than completed: HTTP/1.1
+  ## closes the connection before the final chunk; HTTP/2 and HTTP/3 reset the
+  ## stream with an internal error. Use this instead of `finish` when the body
+  ## cannot be completed (an error partway through). No-op if not streaming.
+  if currentThreadId() != res.core.threadId: return
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        h3StreamAbort(h3c, uint64(res.stream))
+    return
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return
+  if res.stream != 0:
+    h2StreamAbort(c, res.stream)
+    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+    return
+  if not c.respStreaming: return
+  c.respStreaming = false
+  c.respBackedUp = false
+  c.onRespDrain = nil
+  # No terminating chunk: closing mid-stream is the truncation signal. (For a
+  # close-delimited HTTP/1.0 body there is no in-band signal; close is all we
+  # have.)
+  c.closeAfterFlush = true
+  res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+
+template stream*(res: Response, code: HttpCode, contentType: string,
+                 headers: openArray[(string, string)], body: untyped) =
+  ## A block form of a streamed response: sends the head, runs `body` (which
+  ## calls `res.write(...)` for each chunk), and terminates the stream
+  ## afterwards even if `body` raises. Best for producing the whole body inline
+  ## (e.g. a file download loop); for a backpressure-driven or async producer,
+  ## drive `sendHead`/`write`/`finish`/`onDrain` directly.
+  ##
+  ##   res.stream(Http200, "text/plain"):
+  ##     for chunk in chunks: res.write(chunk)
+  ##
+  ## If `body` raises, the stream is aborted (not finished) so the client sees
+  ## an incomplete transfer rather than a well-formed but truncated body, and
+  ## the exception propagates.
+  sendHead(res, code, contentType, headers)
+  var streamCompleted = false
+  try:
+    body
+    streamCompleted = true
+  finally:
+    if streamCompleted: finish(res)
+    else: abort(res)
+
+template stream*(res: Response, code: HttpCode, contentType: string,
+                 body: untyped) =
+  res.stream(code, contentType, [], body)
+
 # --- blocking dispatch ------------------------------------------------------
 
 type
