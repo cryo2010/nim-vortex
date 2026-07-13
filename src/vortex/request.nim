@@ -424,7 +424,8 @@ proc ackBody*(req: Request, n: int) =
   let c = conn(req.core, req.fd, req.gen)
   if c == nil or req.stream == 0: return
   h2AckBody(c, req.stream, n)
-  req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+  try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+  except Exception: discard
 
 # --- streaming responses ----------------------------------------------------
 
@@ -432,105 +433,130 @@ const respHighWater* = 256 * 1024
   ## write() reports backpressure once the unsent backlog reaches this many
   ## bytes; the producer should pause and resume from onDrain.
 
+proc flushConn(res: Response) {.raises: [].} =
+  ## Call the loop's flush hook, containing its untyped effect so the streaming
+  ## API stays callable from a strict-effect async body (chronos infers the
+  ## hook as raising Exception, which `{.async.}` forbids).
+  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  except Exception: discard
+
+proc kickConn(res: Response) {.raises: [].} =
+  try: res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+  except Exception: discard
+
 proc sendHead*(res: Response, code: HttpCode, contentType = "",
-               headers: openArray[(string, string)] = []) =
+               headers: openArray[(string, string)] = []) {.raises: [].} =
   ## Begin a streaming response: send the status line and headers, then emit
   ## the body incrementally with `write` and terminate with `finish`. No
   ## Content-Length is sent (HTTP/1.1 uses chunked framing). Loop-thread only
   ## (call from the handler or an async/onDrain callback, not a worker).
-  if currentThreadId() != res.core.threadId: return
-  if res.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(res.core, res.fd, res.gen)
-      if h3c != nil:
-        h3SendHead(res.core, h3c, uint64(res.stream), int(code),
-                   contentType, headers)
-    return
-  let c = conn(res.core, res.fd, res.gen)
-  if c == nil: return
-  if res.stream != 0:
-    h2SendHead(c, int(code), res.stream, res.core.dateStr,
-               res.core.serverHeader, contentType, headers, res.core.altSvc)
-    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
-    return
-  if c.responded: return
-  c.responded = true
-  if c.parser.httpMethod == HttpHead:
-    # HEAD carries no body: emit the head as a normal empty response.
-    applyResponse(res.core, c, 0, int(code), contentType, headers, "")
-    return
-  c.respStreaming = true
-  let ka = c.parser.keepAlive
-  let chunked = c.parser.minor >= 1     # HTTP/1.0 clients: close-delimited
-  c.respChunked = chunked
-  appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
-                   contentType, headers, chunked, keepAlive = ka,
-                   announceKeepAlive = ka and c.parser.minor == 0,
-                   altSvc = res.core.altSvc)
-  res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
+  try:
+    if currentThreadId() != res.core.threadId: return
+    if res.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(res.core, res.fd, res.gen)
+        if h3c != nil:
+          h3SendHead(res.core, h3c, uint64(res.stream), int(code),
+                     contentType, headers)
+      return
+    let c = conn(res.core, res.fd, res.gen)
+    if c == nil: return
+    if res.stream != 0:
+      h2SendHead(c, int(code), res.stream, res.core.dateStr,
+                 res.core.serverHeader, contentType, headers, res.core.altSvc)
+      flushConn(res)
+      return
+    if c.responded: return
+    c.responded = true
+    if c.parser.httpMethod == HttpHead:
+      # HEAD carries no body: emit the head as a normal empty response.
+      applyResponse(res.core, c, 0, int(code), contentType, headers, "")
+      return
+    c.respStreaming = true
+    let ka = c.parser.keepAlive
+    let chunked = c.parser.minor >= 1     # HTTP/1.0 clients: close-delimited
+    c.respChunked = chunked
+    appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                     contentType, headers, chunked, keepAlive = ka,
+                     announceKeepAlive = ka and c.parser.minor == 0,
+                     altSvc = res.core.altSvc)
+    flushConn(res)
+  except Exception:
+    discard
 
-proc write*(res: Response, data: openArray[char]): bool {.discardable.} =
+proc write*(res: Response, data: openArray[char]): bool {.discardable,
+            raises: [].} =
   ## Append a body chunk to a streaming response and flush. Returns false once
   ## the unsent backlog reaches `respHighWater`; the producer should then stop
   ## and wait for `onDrain`. Safe no-op (returns false) on a dead connection.
-  if currentThreadId() != res.core.threadId: return false
-  if res.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(res.core, res.fd, res.gen)
-      if h3c != nil:
-        return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
+  ## `{.raises: [].}` (the body is contained) so it composes in strict-effect
+  ## async bodies -- a producer's `if not res.write(chunk): await res.drained()`.
+  try:
+    if currentThreadId() != res.core.threadId: return false
+    if res.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(res.core, res.fd, res.gen)
+        if h3c != nil:
+          return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
+      return false
+    var c = conn(res.core, res.fd, res.gen)
+    if c == nil: return false
+    if res.stream != 0:
+      let backlog = h2StreamWrite(c, res.stream, data)
+      flushConn(res)
+      return backlog < respHighWater
+    if not c.respStreaming: return false
+    if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
+    if c.respChunked:
+      appendChunk(c.wbuf, data)
+    elif data.len > 0:
+      let oldLen = c.wbuf.len
+      c.wbuf.setLen(oldLen + data.len)
+      copyMem(addr c.wbuf[oldLen], unsafeAddr data[0], data.len)
+    flushConn(res)
+    c = conn(res.core, res.fd, res.gen)   # flush may have closed on error
+    if c == nil: return false
+    if pendingOut(c) >= respHighWater:
+      c.respBackedUp = true
+      return false
+    return true
+  except Exception:
     return false
-  var c = conn(res.core, res.fd, res.gen)
-  if c == nil: return false
-  if res.stream != 0:
-    let backlog = h2StreamWrite(c, res.stream, data)
-    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
-    return backlog < respHighWater
-  if not c.respStreaming: return false
-  if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
-  if c.respChunked:
-    appendChunk(c.wbuf, data)
-  elif data.len > 0:
-    let oldLen = c.wbuf.len
-    c.wbuf.setLen(oldLen + data.len)
-    copyMem(addr c.wbuf[oldLen], unsafeAddr data[0], data.len)
-  res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
-  c = conn(res.core, res.fd, res.gen)   # flush may have closed on error
-  if c == nil: return false
-  if pendingOut(c) >= respHighWater:
-    c.respBackedUp = true
-    return false
-  true
 
-proc finish*(res: Response, trailers: openArray[(string, string)] = []) =
+proc finish*(res: Response, trailers: openArray[(string, string)] = [])
+             {.raises: [].} =
   ## Terminate a streaming response (the chunked 0-chunk plus optional
   ## trailers, or a connection close for HTTP/1.0), flush, and resume the
-  ## connection for the next request.
-  if currentThreadId() != res.core.threadId: return
-  if res.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(res.core, res.fd, res.gen)
-      if h3c != nil:
-        h3StreamFinish(h3c, uint64(res.stream))
-    return
-  let c = conn(res.core, res.fd, res.gen)
-  if c == nil: return
-  if res.stream != 0:
-    h2StreamFinish(c, res.stream)
-    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
-    return
-  if not c.respStreaming: return
-  c.respStreaming = false
-  c.respBackedUp = false
-  c.onRespDrain = nil
-  if c.respChunked and c.parser.httpMethod != HttpHead:
-    appendLastChunk(c.wbuf, trailers)
-  if not c.parser.keepAlive or not c.respChunked or c.peerHalfClosed:
-    c.closeAfterFlush = true
-  # kick resumes the paused pipeline when finish runs after the handler
-  # returned (deferred); inline finish is a no-op here and the dispatch
-  # return path resets and flushes.
-  res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+  ## connection for the next request. `{.raises: [].}` (contained) for async.
+  try:
+    if currentThreadId() != res.core.threadId: return
+    if res.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(res.core, res.fd, res.gen)
+        if h3c != nil:
+          h3StreamFinish(h3c, uint64(res.stream))
+      return
+    let c = conn(res.core, res.fd, res.gen)
+    if c == nil: return
+    if res.stream != 0:
+      h2StreamFinish(c, res.stream)
+      flushConn(res)
+      return
+    if not c.respStreaming: return
+    c.respStreaming = false
+    c.respBackedUp = false
+    c.onRespDrain = nil
+    if c.respChunked and c.parser.httpMethod != HttpHead:
+      appendLastChunk(c.wbuf, trailers)
+    if not c.parser.keepAlive or not c.respChunked or c.peerHalfClosed:
+      c.closeAfterFlush = true
+    # kick resumes the paused pipeline when finish runs after the handler
+    # returned (deferred); inline finish is a no-op here and the dispatch
+    # return path resets and flushes.
+    kickConn(res)
+  except Exception:
+    discard
 
 proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## Register a callback fired (loop thread) when a backed-up streaming
@@ -578,34 +604,38 @@ proc bufferedAmount*(res: Response): int =
     return st.pendingBody.len - st.pendingPos
   pendingOut(c)
 
-proc abort*(res: Response) =
+proc abort*(res: Response) {.raises: [].} =
   ## Abort a streamed response mid-body *without* a clean terminator, so the
   ## client can tell the transfer was cut short rather than completed: HTTP/1.1
   ## closes the connection before the final chunk; HTTP/2 and HTTP/3 reset the
   ## stream with an internal error. Use this instead of `finish` when the body
   ## cannot be completed (an error partway through). No-op if not streaming.
-  if currentThreadId() != res.core.threadId: return
-  if res.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(res.core, res.fd, res.gen)
-      if h3c != nil:
-        h3StreamAbort(h3c, uint64(res.stream))
-    return
-  let c = conn(res.core, res.fd, res.gen)
-  if c == nil: return
-  if res.stream != 0:
-    h2StreamAbort(c, res.stream)
-    res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
-    return
-  if not c.respStreaming: return
-  c.respStreaming = false
-  c.respBackedUp = false
-  c.onRespDrain = nil
-  # No terminating chunk: closing mid-stream is the truncation signal. (For a
-  # close-delimited HTTP/1.0 body there is no in-band signal; close is all we
-  # have.)
-  c.closeAfterFlush = true
-  res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+  ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
+  try:
+    if currentThreadId() != res.core.threadId: return
+    if res.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(res.core, res.fd, res.gen)
+        if h3c != nil:
+          h3StreamAbort(h3c, uint64(res.stream))
+      return
+    let c = conn(res.core, res.fd, res.gen)
+    if c == nil: return
+    if res.stream != 0:
+      h2StreamAbort(c, res.stream)
+      flushConn(res)
+      return
+    if not c.respStreaming: return
+    c.respStreaming = false
+    c.respBackedUp = false
+    c.onRespDrain = nil
+    # No terminating chunk: closing mid-stream is the truncation signal. (For a
+    # close-delimited HTTP/1.0 body there is no in-band signal; close is all we
+    # have.)
+    c.closeAfterFlush = true
+    kickConn(res)
+  except Exception:
+    discard
 
 template stream*(res: Response, code: HttpCode, contentType: string,
                  headers: openArray[(string, string)], body: untyped) =
