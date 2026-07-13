@@ -333,8 +333,43 @@ proc pump(res: Response) {.gcsafe.} =
 
 `res.bufferedAmount` reports the current backlog. Streaming is driven on the
 loop thread (from the handler or an async/onDrain callback); it composes with
-the async adapters. Request-body streaming (`onBody` / `router.stream`) is the
-next milestone.
+the async adapters.
+
+### Streaming request bodies
+
+To consume a large upload without buffering it whole, register a route with
+`router.stream` (or pass a `streamRoute` predicate to `start`). Its handler is
+dispatched at headers-complete and reads the body incrementally via
+`req.onBody`:
+
+```nim
+proc upload(req: Request, res: Response) {.gcsafe.} =
+  req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+    sink(chunk)                     # write to disk, hash, proxy, ...
+    if last: res.send(Http200, "ok")
+
+var router = newRouter()
+router.stream(HttpPost, "/upload", upload)
+start(router.toHandler, settings, router.streamPredicate)
+```
+
+Works on HTTP/1.1 (Content-Length and chunked), HTTP/2, and HTTP/3 (`last` is
+true on the final chunk: the length boundary, the chunked terminator,
+END_STREAM, or FIN). Ordinary routes are unchanged and still get `req.body`;
+the `streamRoute` predicate is only consulted when set, so a server with no
+streaming routes keeps the buffered fast path at zero cost. HTTP/1.1
+Content-Length uploads stream in bounded memory (consumed bytes are dropped);
+chunked delivers incrementally, bounded per read.
+
+With the async adapters, `await req.read()` pulls the body chunk by chunk, and
+consumption drives **flow control**: HTTP/2 defers the per-stream
+`WINDOW_UPDATE` until a chunk is read (the connection window stays eager, so one
+slow stream never blocks the others), and HTTP/3 pauses draining the QUIC stream
+past a high-water mark so OpenSSL stops extending the peer's window. A slow
+consumer therefore throttles the sender end to end. In a plain (synchronous)
+`onBody` handler this is automatic (the callback holds the loop while it runs);
+`req.onBody(cb, manualAck = true)` + `req.ackBody(n)` expose the same control
+directly.
 
 ## Build flags
 

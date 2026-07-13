@@ -380,6 +380,52 @@ proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
 
+# --- streaming request bodies (inbound) -------------------------------------
+
+proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
+             {.gcsafe.}, manualAck = false) =
+  ## Register a sink for the request body, called on the loop thread as bytes
+  ## arrive (`last` true on the final chunk). Only meaningful in a handler
+  ## dispatched for a streaming route (router.stream / a start streamRoute
+  ## predicate), which runs at headers-complete before the body; for an
+  ## ordinary buffered handler the body is already in `req.body`.
+  ##
+  ## With `manualAck` the consumer must call `req.ackBody(n)` for each chunk it
+  ## has processed; the HTTP/2 stream flow-control window (and HTTP/3 stream
+  ## reads) are only replenished on ack, so a slow consumer throttles the peer.
+  ## The default auto-acks each chunk once the callback returns (a synchronous
+  ## consumer is already throttled by holding the loop thread). The async
+  ## adapters use `manualAck` and ack on `read()`.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        h3SetOnBody(h3c, uint64(req.stream), cb, manualAck)
+    return
+  let c = conn(req.core, req.fd, req.gen)
+  if c == nil: return
+  if req.stream != 0:
+    h2SetOnBody(c, req.stream, cb, manualAck)
+    return
+  c.onBodyCb = cb
+
+proc ackBody*(req: Request, n: int) =
+  ## Grant flow-control credit for `n` consumed request-body bytes on a
+  ## `manualAck` streaming handler: HTTP/2 sends a stream WINDOW_UPDATE, HTTP/3
+  ## resumes reading the QUIC stream. No-op on HTTP/1 (backpressure there is the
+  ## socket) and for the auto-ack default. Loop-thread only.
+  if n <= 0 or currentThreadId() != req.core.threadId: return
+  if req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        h3AckBody(h3c, uint64(req.stream), n)
+    return
+  let c = conn(req.core, req.fd, req.gen)
+  if c == nil or req.stream == 0: return
+  h2AckBody(c, req.stream, n)
+  req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+
 # --- streaming responses ----------------------------------------------------
 
 const respHighWater* = 256 * 1024
@@ -491,11 +537,11 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## response's write backlog empties, so the producer can resume writing.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
-  # The h3 reflush path cannot pass the handle words, so h3's callback closes
-  # over the Response; h1/h2 reconstruct it from the passed words.
-  let held = res
   if res.fd < 0:
     when not defined(plainHttp):
+      # The h3 reflush path cannot pass the handle words, so h3's callback
+      # closes over the Response; h1/h2 reconstruct it from the passed words.
+      let held = res
       let h3c = h3ConnOf(res.core, res.fd, res.gen)
       if h3c != nil:
         let st = h3StreamPtr(h3c, uint64(res.stream))

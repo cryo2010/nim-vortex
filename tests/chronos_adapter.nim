@@ -26,6 +26,15 @@ proc hFanIn(req: Request, res: Response) {.async.} =
     total += i
   res.send(Http200, $total, "text/plain")
 
+proc hUpload(req: Request, res: Response) {.async.} =
+  # Pull-based body streaming: await req.read() until "".
+  var total = 0
+  while true:
+    let chunk = await req.read()
+    if chunk.len == 0: break
+    total += chunk.len
+  res.send(Http200, "got " & $total, "text/plain")
+
 proc hBoom(req: Request, res: Response) {.async.} =
   await sleepAsync(10.milliseconds)
   raise newException(ValueError, "async exploded")
@@ -57,10 +66,12 @@ appRouter.get("/fan", hFanIn)
 appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
+appRouter.stream(HttpPost, "/upload", hUpload)
 
 var srv = start(appRouter.toHandler,
                 initSettings(port = Port(0), numThreads = 1,
-                             workerThreads = 2))
+                             workerThreads = 2),
+                appRouter.streamPredicate)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc fetch(path: string): string =
@@ -110,6 +121,26 @@ suite "chronos adapter":
 
   test "multiple sequential awaits":
     check fetch("/fan") == "6"
+
+  test "await req.read() streams a request body":
+    let body = "z".repeat(200 * 1024)
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", srv.port)
+    s.send("POST /upload HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
+           "Content-Length: " & $body.len & "\r\n\r\n")
+    var off = 0
+    while off < body.len:
+      let n = min(16 * 1024, body.len - off)
+      s.send(body[off ..< off + n]); inc off, n
+    s.setRecvTimeout(4000)
+    var resp: string
+    var buf = newString(65536)
+    while true:
+      let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
+      if k <= 0: break
+      resp.add buf[0 ..< k]
+    check resp.endsWith("got " & $body.len)
 
   test "keep-alive works across deferred responses":
     var client = newHttpClient()

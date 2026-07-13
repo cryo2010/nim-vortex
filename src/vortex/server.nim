@@ -30,10 +30,12 @@ type
     quicCfg: pointer           ## ptr TlsConfig for QUIC or nil
     port*: Port                ## actual bound port (settings may say 0)
 
-proc start*(handler: RequestHandler, settings = initSettings()): Server =
+proc start*(handler: RequestHandler, settings = initSettings(),
+            streamRoute: StreamRouteCb = nil): Server =
   ## Start loops and workers in the background; returns immediately.
   ## Use `close` (or `waitFor` after installing your own stop signal)
-  ## to shut down.
+  ## to shut down. `streamRoute` (e.g. `router.streamPredicate`) opts requests
+  ## into inbound streaming; nil keeps every request buffered.
   stopRequested.store(false, moRelaxed)
   var numLoops =
     if settings.numThreads > 0: settings.numThreads
@@ -90,7 +92,8 @@ proc start*(handler: RequestHandler, settings = initSettings()): Server =
                   stopFlag: addr stopRequested, listenFd: fds[i],
                   pool: cast[pointer](result.pool),
                   outbox: result.outboxes[i], tls: result.tls,
-                  quicCfg: result.quicCfg, udpFd: udpFds[i]))
+                  quicCfg: result.quicCfg, udpFd: udpFds[i],
+                  streamRoute: streamRoute))
 
 proc waitFor*(server: var Server) =
   ## Block until the loops exit (stop signal), then tear down workers.
@@ -117,8 +120,9 @@ proc close*(server: var Server) =
   requestShutdown()
   server.waitFor()
 
-proc run*(handler: RequestHandler, settings = initSettings()) =
+proc run*(handler: RequestHandler, settings = initSettings(),
+          streamRoute: StreamRouteCb = nil) =
   ## Start serving; blocks until SIGINT/SIGTERM or `requestShutdown`.
   installSignalHandlers()
-  var server = start(handler, settings)
+  var server = start(handler, settings, streamRoute)
   server.waitFor()

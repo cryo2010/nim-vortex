@@ -124,7 +124,8 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
               stopFlag: ptr Atomic[bool], listenFd: SocketHandle,
               pool: pointer = nil, outbox: ptr Outbox = nil,
               tls: pointer = nil, quicCfg: pointer = nil,
-              udpFd: SocketHandle = osInvalidSocket): Loop =
+              udpFd: SocketHandle = osInvalidSocket,
+              streamRoute: StreamRouteCb = nil): Loop =
   result = Loop(
     selector: newSelector[FdKind](),
     listenFd: int(listenFd),
@@ -137,6 +138,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
     stopFlag: stopFlag,
     tls: tls,
     udpFd: -1)
+  result.core.streamRoute = streamRoute
   result.core.serverHeader = settings.serverHeader
   result.core.maxWsMessage = settings.maxWsMessageSize
   result.core.wsPingInterval = settings.wsPingInterval
@@ -336,6 +338,60 @@ proc initH2(loop: Loop, c: ptr Connection) =
                    loop.settings.maxResetStreams,
                    loop.settings.maxControlFrames)
 
+proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
+  ## Deliver newly-arrived request-body bytes to a streaming handler's onBody.
+  ## `c.bodyFed` tracks how much has been delivered; `last` is set once the
+  ## whole body is in so the final call carries the tail with last=true.
+  if c.onBodyCb == nil: return
+  let cb = c.onBodyCb
+  if c.parser.chunked:
+    # Decoded chunk bytes accumulate in c.chunkBody; end-of-body (the 0-chunk)
+    # is only known when the parser reaches prComplete, i.e. `last`.
+    let avail = c.chunkBody.len - c.bodyFed
+    if avail <= 0 and not last: return
+    if avail > 0:
+      cb(toOpenArray(c.chunkBody, c.bodyFed, c.chunkBody.len - 1), last)
+      c.bodyFed = c.chunkBody.len
+    elif last:
+      cb(toOpenArray(c.chunkBody, 0, -1), true)   # empty final chunk
+  else:
+    # Content-Length. Deliver the buffered body bytes, then drop them from rbuf
+    # so an arbitrarily large upload streams in O(read-burst) memory instead of
+    # being held whole. The parser stays authoritative: bodyStart is fixed and
+    # the consumed count is subtracted from parser.bodyLen, so ppBody still
+    # reaches prComplete when the final bytes arrive; parser.pos is set to the
+    # tail so resetForNextRequest (here or via the deferred-resume path) drops
+    # exactly the head + consumed body and keeps any pipelined next request.
+    let bodyStart = c.parser.bodyStart
+    let avail = min(c.rlen - bodyStart, c.parser.bodyLen)
+    if avail <= 0:
+      if last and c.parser.bodyLen == 0:
+        cb(toOpenArray(c.rbuf, 0, -1), true)    # empty body
+      return
+    cb(toOpenArray(c.rbuf, bodyStart, bodyStart + avail - 1),
+       avail == c.parser.bodyLen)
+    let tailLen = c.rlen - (bodyStart + avail)
+    if tailLen > 0:                              # a pipelined request follows
+      moveMem(addr c.rbuf[bodyStart], addr c.rbuf[bodyStart + avail], tailLen)
+    c.rlen = bodyStart + tailLen
+    c.parser.bodyLen -= avail
+    c.parser.pos = bodyStart                     # tail now begins here
+
+proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
+  ## Dispatch a streaming route's handler at headers-complete so it can
+  ## register `req.onBody` before the body arrives. Handles both
+  ## Content-Length and chunked (Transfer-Encoding) request bodies.
+  if not loop.core.streamRoute(addr loop.core, c.fd, c.gen, 0): return
+  c.reqStreaming = true
+  c.bodyFed = 0
+  let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
+  try:
+    {.gcsafe.}:
+      loop.handler(req, response(req))
+  except CatchableError:
+    if not c.responded:
+      loop.respondError(c, Http500)
+
 proc processInput(loop: Loop, c: ptr Connection) =
   ## Parse and dispatch as many complete pipelined requests as the buffer
   ## holds. Parsing pauses while a response is outstanding (deferred
@@ -376,6 +432,13 @@ proc processInput(loop: Loop, c: ptr Connection) =
           c.wbuf.add continue100
         if c.dlKind != dkBody:
           c.setDeadline(loop, dkBody)
+        # Streaming route: dispatch at headers-complete, then feed the body
+        # incrementally to onBody instead of waiting for the whole request.
+        if loop.core.streamRoute != nil and not c.reqStreaming and
+            not c.responded:
+          loop.startStreamingDispatch(c)
+        if c.reqStreaming:
+          loop.feedBody(c, last = false)
       elif c.rlen > c.parser.reqStart and c.dlKind != dkHeader:
         # Bytes of the next request head are pending.
         c.setDeadline(loop, dkHeader)
@@ -392,14 +455,23 @@ proc processInput(loop: Loop, c: ptr Connection) =
       if loop.settings.maxRequestsPerSocket > 0 and
           c.requestCount >= loop.settings.maxRequestsPerSocket:
         c.parser.keepAlive = false
-      let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
-      try:
-        {.gcsafe.}:
-          loop.handler(req, response(req))
-      except CatchableError:
-        if not c.responded:
-          loop.respondError(c, Http500)
-          return
+      # A whole streaming request that arrived in one read never hit the
+      # prNeedMore path, so try to dispatch it here (startStreamingDispatch
+      # evaluates the predicate and sets reqStreaming only for a stream route).
+      if not c.reqStreaming and loop.core.streamRoute != nil:
+        loop.startStreamingDispatch(c)
+      if c.reqStreaming:
+        # Streaming handler already ran (early or just now): deliver the tail.
+        loop.feedBody(c, last = true)
+      else:
+        let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
+        try:
+          {.gcsafe.}:
+            loop.handler(req, response(req))
+        except CatchableError:
+          if not c.responded:
+            loop.respondError(c, Http500)
+            return
       if not c.responded:
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
@@ -879,8 +951,10 @@ type LoopThreadArg* = tuple
   tls: pointer
   quicCfg: pointer
   udpFd: SocketHandle
+  streamRoute: StreamRouteCb
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
-                     arg.pool, arg.outbox, arg.tls, arg.quicCfg, arg.udpFd)
+                     arg.pool, arg.outbox, arg.tls, arg.quicCfg, arg.udpFd,
+                     arg.streamRoute)
   loop.run()
