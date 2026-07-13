@@ -124,5 +124,42 @@ suite "HTTP/1 streaming request bodies":
     let resp = rawPostChunked("/upload", "")
     check splitBody(resp) == "got 0"
 
+  test "a multi-megabyte upload streams (bounded rbuf, compaction)":
+    let body = "q".repeat(4 * 1024 * 1024)
+    let resp = rawPost("/upload", body)
+    check splitBody(resp) == "got " & $body.len
+
+  test "keep-alive: two streamed uploads on one connection":
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.setRecvTimeout(4000)
+    for n in [111, 222222]:
+      s.send("POST /upload HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n" &
+             "Content-Length: " & $n & "\r\n\r\n" & "z".repeat(n))
+      let want = "got " & $n
+      var resp: string
+      while want notin resp:
+        var buf = newString(8192)
+        let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
+        if k <= 0: break
+        resp.add buf[0 ..< k]
+      check want in resp
+
+  test "pipelined: streamed upload then a buffered request":
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.setRecvTimeout(4000)
+    # Both requests in one write: the tail (req 2) must survive req 1's
+    # compaction and be served.
+    s.send("POST /upload HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n" &
+           "Content-Length: 5000\r\n\r\n" & "a".repeat(5000) &
+           "POST /buffered HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
+           "Content-Length: 3\r\n\r\nabc")
+    let resp = recvUntilClose(s)
+    check "got 5000" in resp
+    check "buffered:3" in resp
+
 srv.close()
 echo "server shut down cleanly"

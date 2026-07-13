@@ -355,18 +355,27 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
     elif last:
       cb(toOpenArray(c.chunkBody, 0, -1), true)   # empty final chunk
   else:
-    # Content-Length: raw bytes sit in rbuf[bodyStart ..< bodyStart+bodyLen].
+    # Content-Length. Deliver the buffered body bytes, then drop them from rbuf
+    # so an arbitrarily large upload streams in O(read-burst) memory instead of
+    # being held whole. The parser stays authoritative: bodyStart is fixed and
+    # the consumed count is subtracted from parser.bodyLen, so ppBody still
+    # reaches prComplete when the final bytes arrive; parser.pos is set to the
+    # tail so resetForNextRequest (here or via the deferred-resume path) drops
+    # exactly the head + consumed body and keeps any pipelined next request.
     let bodyStart = c.parser.bodyStart
-    let total = c.parser.bodyLen
-    let avail = min(c.rlen, bodyStart + total) - (bodyStart + c.bodyFed)
-    if avail <= 0 and not last: return
-    let isLast = last and c.bodyFed + max(avail, 0) >= total
-    if avail > 0:
-      let from0 = bodyStart + c.bodyFed
-      cb(toOpenArray(c.rbuf, from0, from0 + avail - 1), isLast)
-      c.bodyFed += avail
-    elif isLast:
-      cb(toOpenArray(c.rbuf, 0, -1), true)      # empty final chunk
+    let avail = min(c.rlen - bodyStart, c.parser.bodyLen)
+    if avail <= 0:
+      if last and c.parser.bodyLen == 0:
+        cb(toOpenArray(c.rbuf, 0, -1), true)    # empty body
+      return
+    cb(toOpenArray(c.rbuf, bodyStart, bodyStart + avail - 1),
+       avail == c.parser.bodyLen)
+    let tailLen = c.rlen - (bodyStart + avail)
+    if tailLen > 0:                              # a pipelined request follows
+      moveMem(addr c.rbuf[bodyStart], addr c.rbuf[bodyStart + avail], tailLen)
+    c.rlen = bodyStart + tailLen
+    c.parser.bodyLen -= avail
+    c.parser.pos = bodyStart                     # tail now begins here
 
 proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   ## Dispatch a streaming route's handler at headers-complete so it can
