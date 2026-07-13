@@ -111,9 +111,10 @@ immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
 
 Shutdown is graceful: `requestShutdown()` (or a SIGINT/SIGTERM under `run`, or
 `srv.close()`) stops accepting and closes the listener so the port frees for a
-replacement, sends HTTP/2 `GOAWAY`, lets in-flight requests and open streams
-finish, then closes. Idle keep-alive connections close promptly; anything still
-running is force-closed once `shutdownGrace` seconds elapse.
+replacement, sends HTTP/2 and HTTP/3 `GOAWAY`, closes open WebSockets with a
+`1001` (going away), and lets in-flight requests and streams finish before
+closing. Idle keep-alive connections close promptly; anything still running is
+force-closed once `shutdownGrace` seconds elapse.
 
 ## WebSockets
 
