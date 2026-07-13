@@ -109,6 +109,25 @@ type
   AsyncRequestHandler* =
     proc (req: Request, res: Response): Future[void] {.gcsafe.}
 
+# --- awaitable outbound backpressure (await res.drained) --------------------
+
+proc drained*(res: Response): Future[void] =
+  ## Await until a streamed response's write backlog empties, so a producer can
+  ## resume after `res.write` reported backpressure (returned false) without the
+  ## onDrain callback trampoline:
+  ##
+  ##   res.sendHead(Http200, "application/octet-stream")
+  ##   for chunk in source:
+  ##     if not res.write(chunk): await res.drained()
+  ##   res.finish()
+  result = newFuture[void]("res.drained")
+  if res.bufferedAmount == 0:
+    complete(result)
+    return
+  let fut = result
+  res.onDrain proc (r: Response) {.gcsafe.} =
+    if not fut.finished: complete(fut)
+
 # --- pull-based request-body reading (await req.read) -----------------------
 #
 # The core delivers the body push-style via req.onBody; this wraps that into an

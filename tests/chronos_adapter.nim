@@ -35,6 +35,14 @@ proc hUpload(req: Request, res: Response) {.async.} =
     total += chunk.len
   res.send(Http200, "got " & $total, "text/plain")
 
+proc hStream(req: Request, res: Response) {.async.} =
+  # Outbound streaming with awaitable backpressure.
+  res.sendHead(Http200, "text/plain")
+  for i in 0 ..< 50:
+    if not res.write("chunk"):
+      await res.drained()
+  res.finish()
+
 proc hBoom(req: Request, res: Response) {.async.} =
   await sleepAsync(10.milliseconds)
   raise newException(ValueError, "async exploded")
@@ -67,6 +75,7 @@ appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
 appRouter.stream(HttpPost, "/upload", hUpload)
+appRouter.get("/stream", hStream)
 
 var srv = start(appRouter.toHandler,
                 initSettings(port = Port(0), numThreads = 1,
@@ -121,6 +130,9 @@ suite "chronos adapter":
 
   test "multiple sequential awaits":
     check fetch("/fan") == "6"
+
+  test "await res.drained() streams an outbound body":
+    check fetch("/stream") == "chunk".repeat(50)
 
   test "await req.read() streams a request body":
     let body = "z".repeat(200 * 1024)
