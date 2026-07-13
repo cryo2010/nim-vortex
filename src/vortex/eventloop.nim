@@ -866,7 +866,9 @@ proc markDrain(loop: Loop, c: ptr Connection) =
       c.closeAfterFlush = true
     loop.flushOut(c)
   elif c.ws != nil:
-    discard                                # WebSockets: force-closed at deadline
+    # HTTP/1 WebSocket: server-initiated 1001 (going away) close handshake.
+    wscodec.close(WebSocket(core: addr loop.core, fd: c.fd, gen: c.gen,
+                            stream: 0), 1001, "going away")
   elif c.awaitingResponse or c.pendingOut > 0:
     c.parser.keepAlive = false            # finish the in-flight response, then close
     c.closeAfterFlush = true
@@ -885,6 +887,9 @@ proc beginDrain(loop: Loop) =
     loop.listenFd = -1
   for fd in 0 ..< loop.core.conns.len:
     loop.markDrain(addr loop.core.conns[fd])
+  when not defined(plainHttp):
+    for slot in loop.core.h3slots:
+      if slot.conn != nil: h3Goaway(H3Conn(slot.conn))   # RFC 9114 GOAWAY
   let grace = max(0, loop.settings.shutdownGrace)
   loop.drainDeadline = loop.core.nowSec + int64(grace)
 

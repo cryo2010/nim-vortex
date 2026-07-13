@@ -69,6 +69,8 @@ type
     maxConcurrentStreams: int
     scratch: string
     closing: bool
+    lastStreamId: uint64      ## highest request stream id accepted (for GOAWAY)
+    goneAway: bool            ## GOAWAY sent
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -679,7 +681,9 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
         quicConclude(s)
         quicFree(s)
       else:
-        conn.streams[quicStreamId(s)] = H3Stream(ssl: s, id: quicStreamId(s))
+        let sid = quicStreamId(s)
+        if sid > conn.lastStreamId: conn.lastStreamId = sid
+        conn.streams[sid] = H3Stream(ssl: s, id: sid)
     else:
       conn.unis.add H3UniStream(ssl: s, typ: -1)
   # Parse peer uni streams (control / QPACK), enforcing their error cases.
@@ -695,6 +699,17 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
 proc h3StreamCount*(conn: H3Conn): int =
   ## Open request streams (for graceful-shutdown draining).
   conn.streams.len
+
+proc h3Goaway*(conn: H3Conn) =
+  ## Graceful shutdown: send GOAWAY on the control stream (RFC 9114 5.2). The
+  ## client stops opening request streams at or above this id; in-flight streams
+  ## (all <= lastStreamId) still finish.
+  if conn.goneAway or conn.ctrl == nil: return
+  conn.goneAway = true
+  var payload = ""
+  payload.addVarint conn.lastStreamId + 4    # next client bidi stream is refused
+  conn.ctrlBuf.addFrame(h3fGoaway, payload)
+  conn.flushCtrl()
 
 proc h3Free*(conn: H3Conn) =
   h3WsTeardownAll(conn)             # onClose for any RFC 9220 WebSocket streams
