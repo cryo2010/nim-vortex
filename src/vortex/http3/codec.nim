@@ -38,6 +38,9 @@ type
     onRespDrain*: RespDrainCb        ## streamed-response drain callback
     streamingReq*: bool              ## router.stream route: dispatch on headers
     onBodyCb*: BodyCb                ## inbound streaming sink (req.onBody)
+    bodyManualAck: bool              ## consumer acks via req.ackBody
+    bodyOutstanding: int             ## delivered-but-unacked bytes (manualAck)
+    readPaused: bool                 ## backpressure: stop draining the stream
     isWsConnect*: bool               ## RFC 9220 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
@@ -223,25 +226,37 @@ proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
 
 # --- inbound streaming (req.onBody) -----------------------------------------
 
+const h3BackpressureHigh = 256 * 1024
+  ## manualAck streaming: pause draining the QUIC stream once this many
+  ## delivered-but-unacked bytes are outstanding, so OpenSSL stops extending
+  ## the peer's stream flow-control window until the consumer catches up.
+
 proc h3DeliverBody(conn: H3Conn, sid: uint64, last: bool) =
   ## Hand buffered request-body bytes to a streaming stream's onBody and clear
   ## the buffer (bounded memory). No-op until the handler registers onBody. The
   ## callback may res.send (deleting this stream), so move the buffer out and
-  ## touch nothing on the stream afterwards.
+  ## touch nothing on the stream afterwards. Under manualAck, track outstanding
+  ## bytes and pause reads past the high-water mark (req.ackBody resumes).
   if sid notin conn.streams: return
   template st: H3Stream = conn.streams[sid]
   if st.onBodyCb == nil: return
   if st.body.len > 0 or last:
     let cb = st.onBodyCb
+    let manual = st.bodyManualAck
     var buf: string
     swap(buf, st.body)
     cb(buf.toOpenArray(0, buf.len - 1), last)
+    if manual and buf.len > 0 and sid in conn.streams:
+      conn.streams[sid].bodyOutstanding += buf.len
+      if conn.streams[sid].bodyOutstanding > h3BackpressureHigh:
+        conn.streams[sid].readPaused = true
 
-proc h3SetOnBody*(conn: H3Conn, sid: uint64, cb: BodyCb) =
+proc h3SetOnBody*(conn: H3Conn, sid: uint64, cb: BodyCb, manualAck = false) =
   ## request.onBody for HTTP/3: store the sink and flush whatever body already
   ## arrived before the handler ran (last=true if the peer already sent FIN).
   if sid notin conn.streams: return
   conn.streams[sid].onBodyCb = cb
+  conn.streams[sid].bodyManualAck = manualAck
   h3DeliverBody(conn, sid, conn.streams[sid].finSeen)
 
 proc h3ConnError(conn: H3Conn, code: uint64) =
@@ -530,6 +545,8 @@ proc pumpRequestStream(conn: H3Conn, sid: uint64, ready: var seq[uint64]) =
     if conn.flushStream(sid): return
     conn.h3StreamDrained(sid)          # resume a QUIC-backpressured stream
     if sid notin conn.streams: return
+  if st.readPaused:
+    return                             # backpressure: stop draining (ackBody resumes)
   var readSome = false
   while true:
     let (n, ioSt) = tlsRead(st.ssl, addr conn.scratch[0], conn.scratch.len)
@@ -552,6 +569,18 @@ proc pumpRequestStream(conn: H3Conn, sid: uint64, ready: var seq[uint64]) =
       return
   if readSome or st.finSeen:
     discard conn.parseStreamFrames(sid, ready)
+
+proc h3AckBody*(conn: H3Conn, sid: uint64, n: int) =
+  ## req.ackBody for HTTP/3: reduce the outstanding count and, if that lifts the
+  ## backpressure pause, resume draining the QUIC stream (OpenSSL then extends
+  ## the peer's flow-control window as we read).
+  if sid notin conn.streams: return
+  template st: H3Stream = conn.streams[sid]
+  st.bodyOutstanding -= n
+  if st.readPaused and st.bodyOutstanding <= h3BackpressureHigh:
+    st.readPaused = false
+    var ready: seq[uint64]
+    conn.pumpRequestStream(sid, ready)
 
 proc parseControlStream(conn: H3Conn, u: var H3UniStream) =
   ## Enforce RFC 9114 6.2.1 / 7.2 on the peer's control stream: the first

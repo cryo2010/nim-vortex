@@ -118,6 +118,7 @@ type
 
 type
   BodyReader = ref object
+    req: Request
     chunks: Deque[string]
     eof: bool
     waiter: Future[string]         ## a read() suspended on an empty queue
@@ -128,13 +129,20 @@ proc toStr(a: openArray[char]): string =
   result = newString(a.len)
   if a.len > 0: copyMem(addr result[0], unsafeAddr a[0], a.len)
 
+proc take(r: BodyReader): string =
+  ## Dequeue a chunk and grant flow-control credit for it (manualAck): the peer
+  ## is only allowed to send more once the consumer has pulled this much.
+  result = r.chunks.popFirst()
+  try: r.req.ackBody(result.len)
+  except Exception: discard
+
 proc feed(r: BodyReader, chunk: openArray[char], last: bool) =
   if chunk.len > 0: r.chunks.addLast(toStr(chunk))
   if last: r.eof = true
   if r.waiter != nil and not r.waiter.finished:
     let w = r.waiter
     r.waiter = nil
-    if r.chunks.len > 0: w.complete(r.chunks.popFirst())
+    if r.chunks.len > 0: w.complete(r.take())
     else: w.complete("")           # eof (a waiter is only set on an empty queue)
 
 proc read*(req: Request): Future[string] =
@@ -143,8 +151,10 @@ proc read*(req: Request): Future[string] =
   ## `stream` below (or a `streamRoute` predicate); otherwise resolves to "".
   result = newFuture[string]("request.read")
   let r = bodyReaders.getOrDefault((req.fd, req.gen, req.stream))
-  if r == nil or r.chunks.len > 0:
-    result.complete(if r == nil: "" else: r.chunks.popFirst())
+  if r == nil:
+    result.complete("")
+  elif r.chunks.len > 0:
+    result.complete(r.take())
   elif r.eof:
     result.complete("")
   else:
@@ -154,11 +164,11 @@ proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
   let h = inner
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
-      let r = BodyReader(chunks: initDeque[string]())
+      let r = BodyReader(req: req, chunks: initDeque[string]())
       let k = (req.fd, req.gen, req.stream)
       bodyReaders[k] = r
-      req.onBody proc (chunk: openArray[char], last: bool) {.gcsafe.} =
-        r.feed(chunk, last)
+      req.onBody(proc (chunk: openArray[char], last: bool) {.gcsafe.} =
+        r.feed(chunk, last), manualAck = true)
       let fut = h(req, res)
       fut.addCallback proc () {.gcsafe.} = bodyReaders.del(k)
       watch(req, fut)

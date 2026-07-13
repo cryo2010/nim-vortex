@@ -359,8 +359,17 @@ END_STREAM, or FIN). Ordinary routes are unchanged and still get `req.body`;
 the `streamRoute` predicate is only consulted when set, so a server with no
 streaming routes keeps the buffered fast path at zero cost. HTTP/1.1
 Content-Length uploads stream in bounded memory (consumed bytes are dropped);
-chunked and h2/h3 currently deliver incrementally but bound the buffer per
-read/frame.
+chunked delivers incrementally, bounded per read.
+
+With the async adapters, `await req.read()` pulls the body chunk by chunk, and
+consumption drives **flow control**: HTTP/2 defers the per-stream
+`WINDOW_UPDATE` until a chunk is read (the connection window stays eager, so one
+slow stream never blocks the others), and HTTP/3 pauses draining the QUIC stream
+past a high-water mark so OpenSSL stops extending the peer's window. A slow
+consumer therefore throttles the sender end to end. In a plain (synchronous)
+`onBody` handler this is automatic (the callback holds the loop while it runs);
+`req.onBody(cb, manualAck = true)` + `req.ackBody(n)` expose the same control
+directly.
 
 ## Build flags
 
