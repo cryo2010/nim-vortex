@@ -98,6 +98,14 @@ proc connError(h2: H2Conn, c: ptr Connection, err: uint32) =
   c.closeAfterFlush = true
   c.state = csClosing
 
+proc h2Goaway*(c: ptr Connection) =
+  ## Graceful shutdown: refuse new streams (RFC 9113 6.8) and send
+  ## GOAWAY(NO_ERROR) up to the last accepted stream. Existing streams finish.
+  let h2 = h2Conn(c)
+  if h2 == nil or h2.goingAway: return
+  h2.goingAway = true
+  c.wbuf.addGoaway(h2.lastStreamId, 0'u32)
+
 proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
   c.wbuf.addRstStream(sid, err)
   if sid in h2.streams:
