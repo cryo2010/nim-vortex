@@ -3,7 +3,7 @@
 ## instead of it being buffered into `req.body`. Buffered routes on the same
 ## server must keep working unchanged.
 
-import std/[unittest, net, posix, strutils, httpcore]
+import std/[unittest, net, posix, strutils, httpcore, os, osproc]
 import vortex/[settings, request, server, router]
 import ./helper
 
@@ -161,5 +161,32 @@ suite "HTTP/1 streaming request bodies":
     check "got 5000" in resp
     check "buffered:3" in resp
 
+proc h2curl(args: string): (string, int) =
+  let (output, rc) = execCmdEx("curl -s --http2-prior-knowledge " & args)
+  (output.strip(), rc)
+
+let base = "http://127.0.0.1:" & $port
+let tmpUp = getTempDir() / "vortex_h2up_" & $getCurrentProcessId()
+writeFile(tmpUp, "m".repeat(300 * 1024))
+
+suite "HTTP/2 streaming request bodies":
+  test "streamed upload over h2 (DATA frames -> onBody)":
+    let (output, rc) = h2curl(
+      "--data-binary @" & tmpUp & " -w '|%{http_version}' " & base & "/upload")
+    check rc == 0
+    check output == "got " & $(300 * 1024) & "|2"
+
+  test "streamed echo over h2 returns the exact body":
+    let (output, rc) = h2curl("--data-binary @" & tmpUp & " " & base & "/echo")
+    check rc == 0
+    check output.len == 300 * 1024
+    check output == readFile(tmpUp)
+
+  test "empty streamed body over h2":
+    let (output, rc) = h2curl("-X POST -w '|%{http_version}' " & base & "/upload")
+    check rc == 0
+    check output == "got 0|2"
+
+removeFile(tmpUp)
 srv.close()
 echo "server shut down cleanly"

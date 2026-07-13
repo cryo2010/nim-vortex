@@ -389,9 +389,17 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
   ## dispatched for a streaming route (router.stream / a start streamRoute
   ## predicate), which runs at headers-complete before the body; for an
   ## ordinary buffered handler the body is already in `req.body`.
-  if req.fd < 0: return                 # h3: TODO (phase 2)
+  if req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        h3SetOnBody(h3c, uint64(req.stream), cb)
+    return
   let c = conn(req.core, req.fd, req.gen)
-  if c == nil or req.stream != 0: return # h2: TODO (phase 2)
+  if c == nil: return
+  if req.stream != 0:
+    h2SetOnBody(c, req.stream, cb)
+    return
   c.onBodyCb = cb
 
 # --- streaming responses ----------------------------------------------------

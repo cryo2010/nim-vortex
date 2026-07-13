@@ -30,6 +30,8 @@ type
     streaming*: bool                 ## res.sendHead opened a streamed body
     respBackedUp*: bool              ## write() hit the window; onDrain pending
     onRespDrain*: RespDrainCb        ## streamed-response drain callback
+    streamingReq*: bool              ## router.stream route: dispatch on headers
+    onBodyCb*: BodyCb                ## inbound streaming sink (req.onBody)
     isWsConnect*: bool               ## RFC 8441 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
@@ -433,6 +435,32 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
     st.pendingIsLast = true
     h2.sendData(c, sid)
 
+# --- inbound streaming (req.onBody) -----------------------------------------
+
+proc h2DeliverBody(h2: H2Conn, sid: uint32, last: bool) =
+  ## Hand buffered request-body bytes to a streaming stream's onBody and clear
+  ## the buffer (bounded memory). No-op until the handler registers onBody.
+  if sid notin h2.streams: return
+  template st: H2Stream = h2.streams[sid]
+  if st.onBodyCb == nil: return
+  if st.body.len > 0 or last:
+    # The callback may res.send (deleting this stream from the table), so move
+    # the buffer out and clear it *before* the call, and touch nothing on `st`
+    # afterwards.
+    let cb = st.onBodyCb
+    var buf: string
+    swap(buf, st.body)
+    cb(buf.toOpenArray(0, buf.len - 1), last)
+
+proc h2SetOnBody*(c: ptr Connection, sid: uint32, cb: BodyCb) =
+  ## request.onBody for HTTP/2: store the sink on the stream and flush whatever
+  ## body already arrived before the handler ran (with last=true if the peer
+  ## already half-closed).
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams: return
+  h2.streams[sid].onBodyCb = cb
+  h2DeliverBody(h2, sid, h2.streams[sid].endStreamSeen)
+
 # --- request validation / dispatch -----------------------------------------
 
 proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
@@ -530,8 +558,16 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
     st.isHead = meth == "HEAD"
     if endStream:
       st.endStreamSeen = true
+    if not st.isWsConnect and h2.core.streamRoute != nil and
+        h2.core.streamRoute(h2.core, c.fd, c.gen, sid):
+      st.streamingReq = true          # dispatch on headers; DATA -> onBody
   if st.isWsConnect and not st.dispatched:
     # Dispatch as soon as the headers are in; DATA becomes WebSocket framing.
+    st.dispatched = true
+    ready.add sid
+  elif st.streamingReq and not st.dispatched:
+    # Streaming route: run the handler now so it can register req.onBody; the
+    # body is delivered as DATA frames arrive.
     st.dispatched = true
     ready.add sid
   elif st.endStreamSeen and not st.dispatched:
@@ -585,6 +621,16 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
           wsPeerClosed(h2.core, c, WsConn(h2.streams[sid].ws))
       elif st.body.len + dataLen > h2.maxBody:
         h2.streamError(c, sid, errRefusedStream)
+      elif st.streamingReq:
+        # Inbound streaming: hand DATA to onBody and clear (bounded memory);
+        # no content-length reconciliation since the body is not retained.
+        if dataLen > 0:
+          let old = st.body.len
+          st.body.setLen(old + dataLen)
+          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+        let endS = (fh.flags and flagEndStream) != 0
+        if endS: st.endStreamSeen = true
+        h2.h2DeliverBody(sid, endS)
       else:
         let old = st.body.len
         st.body.setLen(old + dataLen)

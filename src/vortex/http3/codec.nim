@@ -36,6 +36,8 @@ type
     streaming*: bool                 ## res.sendHead opened a streamed body
     respBackedUp: bool               ## flush hit QUIC backpressure; onDrain due
     onRespDrain*: RespDrainCb        ## streamed-response drain callback
+    streamingReq*: bool              ## router.stream route: dispatch on headers
+    onBodyCb*: BodyCb                ## inbound streaming sink (req.onBody)
     isWsConnect*: bool               ## RFC 9220 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
 
@@ -218,6 +220,29 @@ proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
   ## Unsent bytes queued on a streamed response (for res.bufferedAmount).
   if sid notin conn.streams: return 0
   conn.streams[sid].outBuf.len - conn.streams[sid].outPos
+
+# --- inbound streaming (req.onBody) -----------------------------------------
+
+proc h3DeliverBody(conn: H3Conn, sid: uint64, last: bool) =
+  ## Hand buffered request-body bytes to a streaming stream's onBody and clear
+  ## the buffer (bounded memory). No-op until the handler registers onBody. The
+  ## callback may res.send (deleting this stream), so move the buffer out and
+  ## touch nothing on the stream afterwards.
+  if sid notin conn.streams: return
+  template st: H3Stream = conn.streams[sid]
+  if st.onBodyCb == nil: return
+  if st.body.len > 0 or last:
+    let cb = st.onBodyCb
+    var buf: string
+    swap(buf, st.body)
+    cb(buf.toOpenArray(0, buf.len - 1), last)
+
+proc h3SetOnBody*(conn: H3Conn, sid: uint64, cb: BodyCb) =
+  ## request.onBody for HTTP/3: store the sink and flush whatever body already
+  ## arrived before the handler ran (last=true if the peer already sent FIN).
+  if sid notin conn.streams: return
+  conn.streams[sid].onBodyCb = cb
+  h3DeliverBody(conn, sid, conn.streams[sid].finSeen)
 
 proc h3ConnError(conn: H3Conn, code: uint64) =
   ## Raise an HTTP/3 connection error (RFC 9114 8): close the QUIC connection
@@ -440,6 +465,11 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
           h3StreamError(conn, sid, h3MessageError)
           return false
         st.headersDone = true
+        if not st.isWsConnect and conn.core.streamRoute != nil and
+            conn.core.streamRoute(conn.core, int32(-(conn.slot + 2)),
+                                  conn.core.h3slots[conn.slot].gen,
+                                  uint32(sid)):
+          st.streamingReq = true      # dispatch on headers; DATA -> onBody
       # else: trailers (discarded)
     of h3fData:
       if not st.headersDone:
@@ -460,6 +490,9 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
         st.body.setLen(old + st.frameLen)
         if st.frameLen > 0:
           copyMem(addr st.body[old], addr st.rbuf[pos], st.frameLen)
+        if st.streamingReq:
+          conn.h3DeliverBody(sid, false)   # to onBody (last comes on FIN)
+          if sid notin conn.streams: return false
     of h3fPushPromise, h3fCancelPush, h3fSettings, h3fGoaway:
       # These frames never appear on a request stream (SETTINGS/GOAWAY/
       # CANCEL_PUSH are control-stream only): H3_FRAME_UNEXPECTED (RFC 9114
@@ -479,14 +512,16 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
       wsPeerClosed(conn.core, nil, WsConn(st.ws))
     return true                      # WS streams never take the request path
   if not st.dispatched and st.headersDone:
-    # A ws-connect dispatches on headers (the stream stays open); an ordinary
-    # request waits for the full body (FIN).
-    if st.isWsConnect:
+    # A ws-connect or a streaming route dispatches on headers (the stream stays
+    # open, body flows via onBody); an ordinary request waits for the full body.
+    if st.isWsConnect or st.streamingReq:
       st.dispatched = true
       ready.add sid
     elif st.finSeen and not st.frameHdrDone:
       st.dispatched = true
       ready.add sid
+  if st.streamingReq and st.finSeen:
+    conn.h3DeliverBody(sid, true)    # final chunk; may delete the stream
   true
 
 proc pumpRequestStream(conn: H3Conn, sid: uint64, ready: var seq[uint64]) =

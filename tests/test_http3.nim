@@ -1,5 +1,5 @@
 import std/[unittest, net, httpcore, osproc, strutils, os]
-import vortex/[settings, request, server]
+import vortex/[settings, request, server, connection]
 
 # HTTP/3 needs an h3-capable curl (Homebrew's links libnghttp3/ngtcp2).
 const h3curlBin = "/opt/homebrew/opt/curl/bin/curl"
@@ -45,14 +45,26 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.stream(Http200, "text/plain"):
       res.write("partial")
       raise newException(ValueError, "boom mid-stream")
+  of "/up":
+    # Streaming request body: consume via onBody, reply with the byte count.
+    let acc = new(int)
+    req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+      acc[] += chunk.len
+      if last: res.send(Http200, "got " & $acc[], "text/plain")
   else:
     res.send(Http404, "nope", "text/plain")
+
+proc streamPred(core: ptr LoopCore, fd: int32, gen: uint32,
+                stream: uint32): bool {.gcsafe.} =
+  let req = Request(core: core, fd: fd, gen: gen, stream: stream)
+  req.path == "/up" and req.method == HttpPost
 
 var srv = start(RequestHandler(handler),
                 initSettings(port = Port(0), numThreads = 1,
                              workerThreads = 2, certFile = certFile,
                              keyFile = keyFile,
-                             maxBodySize = 1024 * 1024))
+                             maxBodySize = 1024 * 1024),
+                streamPred)
 let base = "https://localhost:" & $srv.port
 
 proc h3curl(args: string): (string, int) =
@@ -111,6 +123,13 @@ suite "HTTP/3 (QUIC, via curl)":
   test "a mid-stream exception resets the h3 stream (client sees an error)":
     let (_, rc) = h3curl("-o /dev/null " & base & "/boom")
     check rc != 0
+
+  test "streamed request body over h3 (DATA -> onBody)":
+    let tmp = certDir / "up.bin"
+    writeFile(tmp, "u".repeat(300 * 1024))
+    let (output, rc) = h3curl("--data-binary @" & tmp & " " & base & "/up")
+    check rc == 0
+    check output == "got " & $(300 * 1024)
 
   test "alt-svc advertised on h1/h2":
     let (output, rc) = execCmdEx(
