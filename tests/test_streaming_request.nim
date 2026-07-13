@@ -61,6 +61,27 @@ proc rawPost(path, body: string): string =
     if k <= 0: break
     result.add buf[0 ..< k]
 
+proc rawPostChunked(path, body: string, chunkSize = 16 * 1024): string =
+  ## POST `body` using Transfer-Encoding: chunked, split into wire chunks.
+  let s = newSocket(buffered = false)
+  defer: s.close()
+  s.connect("127.0.0.1", port)
+  s.send("POST " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
+         "Transfer-Encoding: chunked\r\n\r\n")
+  var off = 0
+  while off < body.len:
+    let n = min(chunkSize, body.len - off)
+    s.send(n.toHex.strip(chars = {'0'}, leading = true, trailing = false)
+             .toLowerAscii & "\r\n" & body[off ..< off + n] & "\r\n")
+    inc off, n
+  s.send("0\r\n\r\n")
+  s.setRecvTimeout(4000)
+  var buf = newString(65536)
+  while true:
+    let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
+    if k <= 0: break
+    result.add buf[0 ..< k]
+
 proc splitBody(resp: string): string =
   let i = resp.find("\r\n\r\n")
   resp[i + 4 .. ^1]
@@ -88,6 +109,20 @@ suite "HTTP/1 streaming request bodies":
   test "buffered routes still work alongside streaming ones":
     let resp = rawPost("/buffered", "12345")
     check splitBody(resp) == "buffered:5"
+
+  test "chunked streamed upload reassembles via onBody":
+    let body = "y".repeat(200 * 1024)
+    let resp = rawPostChunked("/upload", body, chunkSize = 8 * 1024)
+    check splitBody(resp) == "got " & $body.len
+
+  test "chunked streamed echo returns the exact body":
+    let body = "Lorem ipsum dolor sit amet. ".repeat(4000)  # ~110 KiB
+    let resp = rawPostChunked("/echo", body, chunkSize = 4096)
+    check splitBody(resp) == body
+
+  test "empty chunked streamed body":
+    let resp = rawPostChunked("/upload", "")
+    check splitBody(resp) == "got 0"
 
 srv.close()
 echo "server shut down cleanly"

@@ -339,29 +339,39 @@ proc initH2(loop: Loop, c: ptr Connection) =
                    loop.settings.maxControlFrames)
 
 proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
-  ## Deliver newly-arrived request-body bytes to a streaming handler's onBody
-  ## (Content-Length bodies). `c.bodyFed` tracks how much has been delivered;
-  ## `last` is set once the whole body is buffered so the final call carries
-  ## the tail with last=true.
+  ## Deliver newly-arrived request-body bytes to a streaming handler's onBody.
+  ## `c.bodyFed` tracks how much has been delivered; `last` is set once the
+  ## whole body is in so the final call carries the tail with last=true.
   if c.onBodyCb == nil: return
-  let bodyStart = c.parser.bodyStart
-  let total = c.parser.bodyLen
-  let avail = min(c.rlen, bodyStart + total) - (bodyStart + c.bodyFed)
-  if avail <= 0 and not last: return
-  let isLast = last and c.bodyFed + max(avail, 0) >= total
   let cb = c.onBodyCb
-  if avail > 0:
-    let from0 = bodyStart + c.bodyFed
-    cb(toOpenArray(c.rbuf, from0, from0 + avail - 1), isLast)
-    c.bodyFed += avail
-  elif isLast:
-    cb(toOpenArray(c.rbuf, 0, -1), true)      # empty final chunk
+  if c.parser.chunked:
+    # Decoded chunk bytes accumulate in c.chunkBody; end-of-body (the 0-chunk)
+    # is only known when the parser reaches prComplete, i.e. `last`.
+    let avail = c.chunkBody.len - c.bodyFed
+    if avail <= 0 and not last: return
+    if avail > 0:
+      cb(toOpenArray(c.chunkBody, c.bodyFed, c.chunkBody.len - 1), last)
+      c.bodyFed = c.chunkBody.len
+    elif last:
+      cb(toOpenArray(c.chunkBody, 0, -1), true)   # empty final chunk
+  else:
+    # Content-Length: raw bytes sit in rbuf[bodyStart ..< bodyStart+bodyLen].
+    let bodyStart = c.parser.bodyStart
+    let total = c.parser.bodyLen
+    let avail = min(c.rlen, bodyStart + total) - (bodyStart + c.bodyFed)
+    if avail <= 0 and not last: return
+    let isLast = last and c.bodyFed + max(avail, 0) >= total
+    if avail > 0:
+      let from0 = bodyStart + c.bodyFed
+      cb(toOpenArray(c.rbuf, from0, from0 + avail - 1), isLast)
+      c.bodyFed += avail
+    elif isLast:
+      cb(toOpenArray(c.rbuf, 0, -1), true)      # empty final chunk
 
 proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   ## Dispatch a streaming route's handler at headers-complete so it can
-  ## register `req.onBody` before the body arrives. Content-Length bodies
-  ## only for now; chunked stays on the buffered path.
-  if c.parser.chunked: return
+  ## register `req.onBody` before the body arrives. Handles both
+  ## Content-Length and chunked (Transfer-Encoding) request bodies.
   if not loop.core.streamRoute(addr loop.core, c.fd, c.gen, 0): return
   c.reqStreaming = true
   c.bodyFed = 0
@@ -439,8 +449,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
       # A whole streaming request that arrived in one read never hit the
       # prNeedMore path, so try to dispatch it here (startStreamingDispatch
       # evaluates the predicate and sets reqStreaming only for a stream route).
-      if not c.reqStreaming and loop.core.streamRoute != nil and
-          not c.parser.chunked:
+      if not c.reqStreaming and loop.core.streamRoute != nil:
         loop.startStreamingDispatch(c)
       if c.reqStreaming:
         # Streaming handler already ran (early or just now): deliver the tail.
