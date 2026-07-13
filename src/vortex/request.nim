@@ -532,6 +532,26 @@ proc bufferedAmount*(res: Response): int =
     return st.pendingBody.len - st.pendingPos
   pendingOut(c)
 
+template stream*(res: Response, code: HttpCode, contentType: string,
+                 headers: openArray[(string, string)], body: untyped) =
+  ## Sugar for a streamed response: sends the head, runs `body` (which calls
+  ## `res.write(...)` for each chunk), and terminates the stream afterwards
+  ## even if `body` raises. Best for producing the whole body inline (e.g. a
+  ## file download loop); for a backpressure-driven or async producer, drive
+  ## `sendHead`/`write`/`finish`/`onDrain` directly.
+  ##
+  ##   res.stream(Http200, "text/plain"):
+  ##     for chunk in chunks: res.write(chunk)
+  sendHead(res, code, contentType, headers)
+  try:
+    body
+  finally:
+    finish(res)
+
+template stream*(res: Response, code: HttpCode, contentType: string,
+                 body: untyped) =
+  res.stream(code, contentType, [], body)
+
 # --- blocking dispatch ------------------------------------------------------
 
 type

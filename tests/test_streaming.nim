@@ -26,6 +26,13 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.sendHead(Http200, "text/plain")
     res.write("body")
     res.finish({"X-Checksum": "abc123"})
+  of "/sugar":
+    res.stream(Http200, "text/plain"):
+      res.write("sugar ")
+      res.write("streamed!")
+  of "/sugarhdr":
+    res.stream(Http200, "text/plain", {"X-Made-By": "vortex"}):
+      res.write("with headers")
   of "/pump":
     # A backpressure-honoring producer: write until write() reports the
     # backlog is full, then resume from onDrain. Exercises the deferred
@@ -104,6 +111,17 @@ suite "HTTP/1 streaming responses":
     let (head, body) = splitHeadBody(resp)
     check "Transfer-Encoding: chunked" in head
     check dechunk(body).len == 1024 * 4096
+
+  test "res.stream sugar sends head and finishes automatically":
+    let (head, body) = splitHeadBody(rawGet("/sugar"))
+    check "Transfer-Encoding: chunked" in head
+    check dechunk(body) == "sugar streamed!"
+
+  test "res.stream sugar with headers":
+    let resp = rawGet("/sugarhdr")
+    check "X-Made-By: vortex" in resp
+    let (_, body) = splitHeadBody(resp)
+    check dechunk(body) == "with headers"
 
   test "trailers are emitted after the last chunk":
     let resp = rawGet("/trailer")
