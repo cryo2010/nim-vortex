@@ -26,11 +26,11 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.sendHead(Http200, "text/plain")
     res.write("body")
     res.finish({"X-Checksum": "abc123"})
-  of "/sugar":
+  of "/tmpl":
     res.stream(Http200, "text/plain"):
-      res.write("sugar ")
+      res.write("template ")
       res.write("streamed!")
-  of "/sugarhdr":
+  of "/tmplhdr":
     res.stream(Http200, "text/plain", {"X-Made-By": "vortex"}):
       res.write("with headers")
   of "/pump":
@@ -112,13 +112,13 @@ suite "HTTP/1 streaming responses":
     check "Transfer-Encoding: chunked" in head
     check dechunk(body).len == 1024 * 4096
 
-  test "res.stream sugar sends head and finishes automatically":
-    let (head, body) = splitHeadBody(rawGet("/sugar"))
+  test "res.stream template sends head and finishes automatically":
+    let (head, body) = splitHeadBody(rawGet("/tmpl"))
     check "Transfer-Encoding: chunked" in head
-    check dechunk(body) == "sugar streamed!"
+    check dechunk(body) == "template streamed!"
 
-  test "res.stream sugar with headers":
-    let resp = rawGet("/sugarhdr")
+  test "res.stream template with headers":
+    let resp = rawGet("/tmplhdr")
     check "X-Made-By: vortex" in resp
     let (_, body) = splitHeadBody(resp)
     check dechunk(body) == "with headers"

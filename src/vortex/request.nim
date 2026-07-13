@@ -534,11 +534,11 @@ proc bufferedAmount*(res: Response): int =
 
 template stream*(res: Response, code: HttpCode, contentType: string,
                  headers: openArray[(string, string)], body: untyped) =
-  ## Sugar for a streamed response: sends the head, runs `body` (which calls
-  ## `res.write(...)` for each chunk), and terminates the stream afterwards
-  ## even if `body` raises. Best for producing the whole body inline (e.g. a
-  ## file download loop); for a backpressure-driven or async producer, drive
-  ## `sendHead`/`write`/`finish`/`onDrain` directly.
+  ## A block form of a streamed response: sends the head, runs `body` (which
+  ## calls `res.write(...)` for each chunk), and terminates the stream
+  ## afterwards even if `body` raises. Best for producing the whole body inline
+  ## (e.g. a file download loop); for a backpressure-driven or async producer,
+  ## drive `sendHead`/`write`/`finish`/`onDrain` directly.
   ##
   ##   res.stream(Http200, "text/plain"):
   ##     for chunk in chunks: res.write(chunk)
