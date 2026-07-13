@@ -505,11 +505,11 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## response's write backlog empties, so the producer can resume writing.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
-  # The h3 reflush path cannot pass the handle words, so h3's callback closes
-  # over the Response; h1/h2 reconstruct it from the passed words.
-  let held = res
   if res.fd < 0:
     when not defined(plainHttp):
+      # The h3 reflush path cannot pass the handle words, so h3's callback
+      # closes over the Response; h1/h2 reconstruct it from the passed words.
+      let held = res
       let h3c = h3ConnOf(res.core, res.fd, res.gen)
       if h3c != nil:
         let st = h3StreamPtr(h3c, uint64(res.stream))

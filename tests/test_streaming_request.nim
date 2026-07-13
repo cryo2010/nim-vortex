@@ -1,0 +1,93 @@
+## Streaming request bodies over HTTP/1.1: a `router.stream` route is
+## dispatched at headers-complete and consumes the body via `req.onBody`
+## instead of it being buffered into `req.body`. Buffered routes on the same
+## server must keep working unchanged.
+
+import std/[unittest, net, posix, strutils, httpcore]
+import vortex/[settings, request, server, router]
+import ./helper
+
+proc hUpload(req: Request, res: Response) {.gcsafe.} =
+  ## Streaming: accumulate via onBody, reply with the byte count on the last
+  ## chunk. (The accumulator proves incremental delivery reassembles.)
+  let acc = new(string)
+  req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+    let base = acc[].len
+    acc[].setLen(base + chunk.len)
+    for i in 0 ..< chunk.len: acc[][base + i] = chunk[i]
+    if last:
+      res.send(Http200, "got " & $acc[].len, "text/plain")
+
+proc hEchoStream(req: Request, res: Response) {.gcsafe.} =
+  let acc = new(string)
+  req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+    let base = acc[].len
+    acc[].setLen(base + chunk.len)
+    for i in 0 ..< chunk.len: acc[][base + i] = chunk[i]
+    if last:
+      res.send(Http200, acc[], "application/octet-stream")
+
+proc hBuffered(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "buffered:" & $req.body.len, "text/plain")
+
+var rt = newRouter()
+rt.stream(HttpPost, "/upload", hUpload)
+rt.stream(HttpPost, "/echo", hEchoStream)
+rt.post("/buffered", hBuffered)
+
+var srv = start(rt.toHandler,
+                initSettings(port = Port(0), numThreads = 1,
+                             maxBodySize = 8 * 1024 * 1024),
+                rt.streamPredicate)
+let port = srv.port
+
+proc rawPost(path, body: string): string =
+  let s = newSocket(buffered = false)
+  defer: s.close()
+  s.connect("127.0.0.1", port)
+  s.send("POST " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
+         "Content-Length: " & $body.len & "\r\n\r\n")
+  # Send the body in chunks so it spans multiple reads on the server (exercises
+  # incremental onBody delivery rather than a single buffered read).
+  var off = 0
+  while off < body.len:
+    let n = min(16 * 1024, body.len - off)
+    s.send(body[off ..< off + n])
+    inc off, n
+  s.setRecvTimeout(4000)
+  var buf = newString(65536)
+  while true:
+    let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
+    if k <= 0: break
+    result.add buf[0 ..< k]
+
+proc splitBody(resp: string): string =
+  let i = resp.find("\r\n\r\n")
+  resp[i + 4 .. ^1]
+
+suite "HTTP/1 streaming request bodies":
+  test "onBody reassembles a large streamed upload":
+    let body = "x".repeat(256 * 1024)
+    let resp = rawPost("/upload", body)
+    check "HTTP/1.1 200" in resp
+    check splitBody(resp) == "got " & $body.len
+
+  test "streamed echo returns the exact body":
+    let body = "The quick brown fox. ".repeat(5000)  # ~105 KiB
+    let resp = rawPost("/echo", body)
+    check splitBody(resp) == body
+
+  test "small streamed body (arrives in one read)":
+    let resp = rawPost("/upload", "hello")
+    check splitBody(resp) == "got 5"
+
+  test "empty streamed body":
+    let resp = rawPost("/upload", "")
+    check splitBody(resp) == "got 0"
+
+  test "buffered routes still work alongside streaming ones":
+    let resp = rawPost("/buffered", "12345")
+    check splitBody(resp) == "buffered:5"
+
+srv.close()
+echo "server shut down cleanly"

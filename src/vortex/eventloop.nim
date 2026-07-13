@@ -338,6 +338,41 @@ proc initH2(loop: Loop, c: ptr Connection) =
                    loop.settings.maxResetStreams,
                    loop.settings.maxControlFrames)
 
+proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
+  ## Deliver newly-arrived request-body bytes to a streaming handler's onBody
+  ## (Content-Length bodies). `c.bodyFed` tracks how much has been delivered;
+  ## `last` is set once the whole body is buffered so the final call carries
+  ## the tail with last=true.
+  if c.onBodyCb == nil: return
+  let bodyStart = c.parser.bodyStart
+  let total = c.parser.bodyLen
+  let avail = min(c.rlen, bodyStart + total) - (bodyStart + c.bodyFed)
+  if avail <= 0 and not last: return
+  let isLast = last and c.bodyFed + max(avail, 0) >= total
+  let cb = c.onBodyCb
+  if avail > 0:
+    let from0 = bodyStart + c.bodyFed
+    cb(toOpenArray(c.rbuf, from0, from0 + avail - 1), isLast)
+    c.bodyFed += avail
+  elif isLast:
+    cb(toOpenArray(c.rbuf, 0, -1), true)      # empty final chunk
+
+proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
+  ## Dispatch a streaming route's handler at headers-complete so it can
+  ## register `req.onBody` before the body arrives. Content-Length bodies
+  ## only for now; chunked stays on the buffered path.
+  if c.parser.chunked: return
+  if not loop.core.streamRoute(addr loop.core, c.fd, c.gen, 0): return
+  c.reqStreaming = true
+  c.bodyFed = 0
+  let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
+  try:
+    {.gcsafe.}:
+      loop.handler(req, response(req))
+  except CatchableError:
+    if not c.responded:
+      loop.respondError(c, Http500)
+
 proc processInput(loop: Loop, c: ptr Connection) =
   ## Parse and dispatch as many complete pipelined requests as the buffer
   ## holds. Parsing pauses while a response is outstanding (deferred
@@ -378,6 +413,13 @@ proc processInput(loop: Loop, c: ptr Connection) =
           c.wbuf.add continue100
         if c.dlKind != dkBody:
           c.setDeadline(loop, dkBody)
+        # Streaming route: dispatch at headers-complete, then feed the body
+        # incrementally to onBody instead of waiting for the whole request.
+        if loop.core.streamRoute != nil and not c.reqStreaming and
+            not c.responded:
+          loop.startStreamingDispatch(c)
+        if c.reqStreaming:
+          loop.feedBody(c, last = false)
       elif c.rlen > c.parser.reqStart and c.dlKind != dkHeader:
         # Bytes of the next request head are pending.
         c.setDeadline(loop, dkHeader)
@@ -394,14 +436,24 @@ proc processInput(loop: Loop, c: ptr Connection) =
       if loop.settings.maxRequestsPerSocket > 0 and
           c.requestCount >= loop.settings.maxRequestsPerSocket:
         c.parser.keepAlive = false
-      let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
-      try:
-        {.gcsafe.}:
-          loop.handler(req, response(req))
-      except CatchableError:
-        if not c.responded:
-          loop.respondError(c, Http500)
-          return
+      # A whole streaming request that arrived in one read never hit the
+      # prNeedMore path, so try to dispatch it here (startStreamingDispatch
+      # evaluates the predicate and sets reqStreaming only for a stream route).
+      if not c.reqStreaming and loop.core.streamRoute != nil and
+          not c.parser.chunked:
+        loop.startStreamingDispatch(c)
+      if c.reqStreaming:
+        # Streaming handler already ran (early or just now): deliver the tail.
+        loop.feedBody(c, last = true)
+      else:
+        let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
+        try:
+          {.gcsafe.}:
+            loop.handler(req, response(req))
+        except CatchableError:
+          if not c.responded:
+            loop.respondError(c, Http500)
+            return
       if not c.responded:
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
