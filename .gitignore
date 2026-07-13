@@ -30,3 +30,4 @@ conformance/h3spec/*.pem
 conformance/h3websocket/echo_server
 conformance/h3websocket/*.pem
 conformance/zap/zap_server
+/demo
