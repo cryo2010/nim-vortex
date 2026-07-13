@@ -124,7 +124,8 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
               stopFlag: ptr Atomic[bool], listenFd: SocketHandle,
               pool: pointer = nil, outbox: ptr Outbox = nil,
               tls: pointer = nil, quicCfg: pointer = nil,
-              udpFd: SocketHandle = osInvalidSocket): Loop =
+              udpFd: SocketHandle = osInvalidSocket,
+              streamRoute: StreamRouteCb = nil): Loop =
   result = Loop(
     selector: newSelector[FdKind](),
     listenFd: int(listenFd),
@@ -137,6 +138,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
     stopFlag: stopFlag,
     tls: tls,
     udpFd: -1)
+  result.core.streamRoute = streamRoute
   result.core.serverHeader = settings.serverHeader
   result.core.maxWsMessage = settings.maxWsMessageSize
   result.core.wsPingInterval = settings.wsPingInterval
@@ -879,8 +881,10 @@ type LoopThreadArg* = tuple
   tls: pointer
   quicCfg: pointer
   udpFd: SocketHandle
+  streamRoute: StreamRouteCb
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
-                     arg.pool, arg.outbox, arg.tls, arg.quicCfg, arg.udpFd)
+                     arg.pool, arg.outbox, arg.tls, arg.quicCfg, arg.udpFd,
+                     arg.streamRoute)
   loop.run()

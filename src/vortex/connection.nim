@@ -54,6 +54,19 @@ type
     ## write backlog empties. Reconstructs a Response from the handle words
     ## and invokes the user callback (request.nim). Loop-thread only.
 
+  BodyCb* = proc (chunk: openArray[char], last: bool) {.gcsafe.}
+    ## An inbound streaming body sink (req.onBody): called on the loop thread
+    ## as request body bytes arrive, `last` true on the final chunk. Set by a
+    ## streaming handler dispatched at headers-complete.
+
+  StreamRouteCb* = proc (core: ptr LoopCore, fd: int32, gen: uint32,
+                         stream: uint32): bool {.gcsafe.}
+    ## Opt-in predicate: given a request whose head is parsed, returns whether
+    ## it should be dispatched as a streaming route (handler runs at
+    ## headers-complete, body delivered via onBody) instead of buffered. Set
+    ## per loop from the router / start; nil = every request is buffered (the
+    ## default, zero cost). Reconstructs a Request from the handle words.
+
   Connection* = object
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
@@ -94,6 +107,12 @@ type
     respChunked*: bool        ## true = Transfer-Encoding: chunked framing
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
     onRespDrain*: RespDrainCb
+    # Inbound streaming (req.onBody). A streaming route is dispatched at
+    # headers-complete; body bytes are delivered incrementally instead of
+    # buffered whole.
+    reqStreaming*: bool       ## dispatched early; body flows to onBody
+    bodyFed*: int             ## body bytes already delivered to onBody
+    onBodyCb*: BodyCb
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
@@ -143,6 +162,10 @@ type
       ## Resolve an HTTP/3 (RFC 9220) WebSocket stream's WsConn. Set by the h3
       ## codec. h3 handles have `fd < 0` (an h3 slot, not a `ptr Connection`),
       ## so this takes the whole handle rather than a connection pointer.
+    streamRoute*: StreamRouteCb
+      ## Opt-in inbound-streaming predicate (see StreamRouteCb). nil unless the
+      ## server was started with streaming routes; the loop only consults it
+      ## when non-nil, so the buffered path pays nothing.
 
 proc newOutbox*(): ptr Outbox =
   result = createShared(Outbox)
@@ -240,6 +263,9 @@ proc resetForNextRequest*(c: var Connection) =
   c.respChunked = false
   c.respBackedUp = false
   c.onRespDrain = nil
+  c.reqStreaming = false
+  c.bodyFed = 0
+  c.onBodyCb = nil
   c.parser.reset(0)
 
 proc clear*(c: var Connection, initialBufSize: int) =
@@ -277,6 +303,9 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.respChunked = false
   c.respBackedUp = false
   c.onRespDrain = nil
+  c.reqStreaming = false
+  c.bodyFed = 0
+  c.onBodyCb = nil
   c.requestCount = 0
   c.parser.reset(0)
   c.state = csActive

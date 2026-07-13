@@ -380,6 +380,20 @@ proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
 
+# --- streaming request bodies (inbound) -------------------------------------
+
+proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
+             {.gcsafe.}) =
+  ## Register a sink for the request body, called on the loop thread as bytes
+  ## arrive (`last` true on the final chunk). Only meaningful in a handler
+  ## dispatched for a streaming route (router.stream / a start streamRoute
+  ## predicate), which runs at headers-complete before the body; for an
+  ## ordinary buffered handler the body is already in `req.body`.
+  if req.fd < 0: return                 # h3: TODO (phase 2)
+  let c = conn(req.core, req.fd, req.gen)
+  if c == nil or req.stream != 0: return # h2: TODO (phase 2)
+  c.onBodyCb = cb
+
 # --- streaming responses ----------------------------------------------------
 
 const respHighWater* = 256 * 1024
