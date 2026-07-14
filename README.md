@@ -435,8 +435,10 @@ and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 ## Status
 
 Pre-1.0. Streaming request and response bodies (with backpressure) are
-supported on h1/h2/h3, and shutdown is graceful. Deferred (planned): dynamic
-QPACK, h2c upgrade, Windows.
+supported on h1/h2/h3, shutdown is graceful, and HTTP/3 accepts QPACK
+dynamic-table-compressed request headers. Deferred (planned): QPACK dynamic
+encoding of responses, Windows. (h2c `Upgrade` is intentionally omitted: RFC
+9113 removed it; cleartext HTTP/2 uses prior knowledge.)
 
 ## Thanks
 

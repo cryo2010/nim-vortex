@@ -102,6 +102,13 @@ suite "QPACK encoder-stream instructions":
     check t.decodeEncoderInstructions(buf, 4096) == 4
     check t.insertCount == 1
 
+  test "an oversized capacity is a protocol error, not treated as incomplete":
+    # A complete Set Dynamic Table Capacity whose value overflows the integer
+    # decoder must raise (not be buffered as a partial instruction).
+    var t: QpackDynTable
+    expect QpackError:
+      discard t.decodeEncoderInstructions("\x3F\x80\x80\x80\x80\x01", 4096)
+
 suite "QPACK field-section decode":
   test "static indexed (RIC 0) still decodes":
     var t: QpackDynTable                   # empty = capacity-0 mode

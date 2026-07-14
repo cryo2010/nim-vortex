@@ -6,6 +6,7 @@
 ##
 ## Integer, string, and Huffman primitives are shared with HPACK.
 
+import std/strutils
 import ./qpack_tables
 import ../http2/hpack
 
@@ -106,8 +107,10 @@ proc decodeEncoderInstructions*(t: var QpackDynTable, buf: openArray[char],
           raise newException(QpackError, "duplicate index out of range")
         let (n, v) = t.get(abs)
         discard t.insert(n, v)
-    except HpackError:
-      return start          # incomplete instruction: leave it buffered
+    except HpackError as e:
+      if e.msg.startsWith("truncated"):
+        return start        # incomplete instruction: leave it buffered
+      raise newException(QpackError, e.msg)   # malformed (overflow / too large)
     result = pos
 
 proc decodeRequiredInsertCount(enc, totalInserts, maxEntries: int): int =
@@ -203,6 +206,16 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
         headers.add (dyn.get(abs)[0], value)
   except HpackError as e:
     raise newException(QpackError, e.msg)
+
+# --- decoder-stream instructions (RFC 9204 4.4) -----------------------------
+
+proc encodeInsertCountIncrement*(buf: var string, n: int) =
+  ## 00 increment(6): acknowledge `n` dynamic-table insertions.
+  encodeInt(buf, n, 6, 0x00)
+
+proc encodeSectionAck*(buf: var string, streamId: int) =
+  ## 1 stream-id(7): acknowledge a field section that used the dynamic table.
+  encodeInt(buf, streamId, 7, 0x80)
 
 # --- encoding ---------------------------------------------------------------
 
