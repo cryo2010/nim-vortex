@@ -71,8 +71,14 @@ disables the corresponding check where noted.
   decoder tracks the accumulated decoded field-list size and raises during
   decode once it exceeds the cap (wired to `maxHeaderSize`), rather than
   checking only after fully expanding.
-- **QPACK** runs in capacity-0 mode: the dynamic table is forbidden, so there
-  is no amplification vector to bound.
+- **QPACK.** vortex advertises a bounded dynamic-table capacity (4096 bytes)
+  as its decoder limit, so the peer's request-header dynamic table can never
+  grow past that ceiling, and a field section is further bounded by its HEADERS
+  frame length (itself capped by `maxBody`). The response encoder is
+  deliberately conservative: it never evicts, and only references entries the
+  peer's decoder has acknowledged, so it never emits a reference that would
+  block the decoder (`BLOCKED_STREAMS` stays 0, and there is no eviction or
+  reference-counting state for an attacker to churn).
 
 ### HTTP/1.1 parsing
 
@@ -151,7 +157,10 @@ Security behavior is covered at three levels.
   confirms the lingering close delivers a 431 before closing.
 - **Conformance.** The HTTP/2 implementation passes `h2spec` (145 passed, 1
   skipped, 0 failed against a TLS server); the one skipped case is
-  HTTP/2-over-TLS-only and does not apply to the cleartext run.
+  HTTP/2-over-TLS-only and does not apply to the cleartext run. The HTTP/3
+  implementation passes `h3spec`'s HTTP/3-servers group (15 examples, 0
+  failures), which covers the HTTP/3 and QPACK error cases. Both run as Docker
+  conformance jobs in CI (`nimble h2spec` / `nimble h3spec`).
 
 Run everything with `nimble test`.
 
@@ -215,17 +224,18 @@ balancer, or CDN), for two reasons:
   per IP. All treat per-IP as infrastructure's job.
 
 If vortex is deployed directly on the internet with no fronting layer, put a
-proxy in front for per-IP limiting, or track the opt-in per-IP feature noted
-in `security.txt`.
+proxy in front for per-IP limiting. A minimal mitigation for the proxyless
+edge case (a default-off, opt-in, per-thread per-source-IP connection counter)
+could be added without the full trusted-proxy and real-IP machinery, but it is
+not core work.
 
 ## Known limitations and roadmap
 
-These are tracked in `security.txt` and are future work, not open holes:
+These are future work, not open holes:
 
-- **HTTP/3 conformance** is smoke-tested against real clients but not yet run
-  against an h3spec-style suite.
-- **CI fuzzing** with a persisted, growing corpus (OSS-Fuzz style) is not yet
-  wired up; the harnesses currently run on demand.
+- **Persisted fuzz corpus.** The libFuzzer harnesses run in CI (the `fuzz`
+  job fuzzes each decoder for 30s per push), but without a persisted, growing
+  corpus (OSS-Fuzz style) each run starts cold from the seed corpus.
 - **TLS transport crypto** is OpenSSL's (see the Transport security section
   for the policy vortex layers on top). Certificate rotation, OCSP stapling,
   and session-ticket key management are not exposed yet.
