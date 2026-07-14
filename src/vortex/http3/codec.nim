@@ -75,6 +75,12 @@ type
     qpackDecStream: SslPtr    ## our QPACK decoder stream (acks to the peer)
     decBuf: string            ## decoder-stream output
     decPos: int
+    qpackEnc: QpackEncoder    ## encoder dynamic table (our response headers)
+    qpackEncStream: SslPtr    ## our QPACK encoder stream (inserts to the peer)
+    encBuf: string            ## encoder-stream output
+    encPos: int
+    peerMaxCap: int           ## peer's advertised QPACK_MAX_TABLE_CAPACITY
+    encCapSet: bool           ## our encoder table capacity has been set
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -111,6 +117,10 @@ proc newH3Conn*(core: ptr LoopCore, ssl: SslPtr, slot: int, maxBody,
   result.qpackDecStream = quicNewUniStream(ssl)
   if result.qpackDecStream != nil:
     result.decBuf.addVarint h3sQpackDecoder
+  # Our QPACK encoder stream: dynamic-table inserts for our response headers.
+  result.qpackEncStream = quicNewUniStream(ssl)
+  if result.qpackEncStream != nil:
+    result.encBuf.addVarint h3sQpackEncoder
 
 proc flushCtrl(conn: H3Conn) =
   while conn.ctrlPos < conn.ctrlBuf.len and conn.ctrl != nil:
@@ -128,6 +138,25 @@ proc flushDecStream(conn: H3Conn) =
   if conn.decPos > 0 and conn.decPos == conn.decBuf.len:   # fully sent: compact
     conn.decBuf.setLen(0)
     conn.decPos = 0
+
+proc flushEncStream(conn: H3Conn) =
+  while conn.encPos < conn.encBuf.len and conn.qpackEncStream != nil:
+    let (n, st) = tlsWrite(conn.qpackEncStream, addr conn.encBuf[conn.encPos],
+                           conn.encBuf.len - conn.encPos)
+    if st == tlsOk: conn.encPos += n
+    else: break
+  if conn.encPos > 0 and conn.encPos == conn.encBuf.len:   # fully sent: compact
+    conn.encBuf.setLen(0)
+    conn.encPos = 0
+
+proc applyEncoderCapacity(conn: H3Conn) =
+  ## Once the peer's SETTINGS have advertised a QPACK table capacity, size our
+  ## encoder table (min with our own cap) and queue Set Dynamic Table Capacity.
+  if conn.encCapSet or conn.peerMaxCap <= 0: return
+  conn.encCapSet = true
+  conn.qpackEnc.setCapacity(min(conn.peerMaxCap, qpackDecoderMaxCapacity))
+  conn.encBuf.add conn.qpackEnc.takeInstructions()
+  conn.flushEncStream()
 
 proc flushStream(conn: H3Conn, sid: uint64): bool =
   ## True when the stream is finished and was removed.
@@ -162,18 +191,18 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   # they must not advertise content-length (or content-type). Distinct
   # from HEAD (skipBody), which keeps the length a GET would have sent.
   let bodiless = code in 100 .. 199 or code == 204 or code == 304
-  var fs = ""
-  addPrefix(fs)
-  qpack.encodeStatus(fs, code)
-  if core.serverHeader.len > 0:
-    qpack.encodeHeader(fs, "server", core.serverHeader)
-  qpack.encodeHeader(fs, "date", core.dateStr)
-  if contentType.len > 0 and not bodiless:
-    qpack.encodeHeader(fs, "content-type", contentType)
-  if not bodiless:
-    qpack.encodeHeader(fs, "content-length", $body.len)
-  for (name, val) in extraHeaders:
-    qpack.encodeHeader(fs, name.toLowerAscii, val)
+  var hdrs: seq[(string, string)]
+  if core.serverHeader.len > 0: hdrs.add ("server", core.serverHeader)
+  hdrs.add ("date", core.dateStr)
+  if contentType.len > 0 and not bodiless: hdrs.add ("content-type", contentType)
+  if not bodiless: hdrs.add ("content-length", $body.len)
+  for (name, val) in extraHeaders: hdrs.add (name.toLowerAscii, val)
+  # QPACK dynamic encoding: references acknowledged entries and queues inserts
+  # for repeated fields (a no-op fallback to static/literal until the peer's
+  # capacity SETTING arrives). Send the encoder-stream inserts, then the frame.
+  let fs = conn.qpackEnc.encodeSection(code, hdrs)
+  conn.encBuf.add conn.qpackEnc.takeInstructions()
+  conn.flushEncStream()
   template st: H3Stream = conn.streams[sid]
   st.outBuf.addFrame(h3fHeaders, fs)
   if body.len > 0 and not skipBody and not bodiless:
@@ -642,6 +671,9 @@ proc parseControlStream(conn: H3Conn, u: var H3UniStream) =
         if getVarint(u.buf, sp, endp, v) != viOk: break
         if id in [0x02'u64, 0x03, 0x04, 0x05]:   # HTTP/2 settings (RFC 9114 7.2.4.1)
           h3ConnError(conn, h3SettingsError); return
+        elif id == h3SetQpackMaxTableCapacity:   # size our response encoder
+          conn.peerMaxCap = int(v)
+      conn.applyEncoderCapacity()
     of h3fData, h3fHeaders:
       h3ConnError(conn, h3FrameUnexpected); return   # not allowed on control
     else: discard                                    # unknown frames ignored
@@ -669,11 +701,16 @@ proc parseQpackEncoder(conn: H3Conn, u: var H3UniStream) =
     conn.flushDecStream()
 
 proc parseQpackDecoder(conn: H3Conn, u: var H3UniStream) =
-  ## An Insert Count Increment of 0 is illegal (RFC 9204 4.4.3): byte 0x00
-  ## (00xxxxxx prefix, value 0).
-  if u.buf.len > 0 and uint8(u.buf[0]) == 0x00:
+  ## Apply the peer's decoder-stream instructions: Insert Count Increment
+  ## acknowledges our response-encoder insertions (RFC 9204 4.4). A protocol
+  ## violation (e.g. an Insert Count Increment of 0) is QPACK_DECODER_STREAM_ERROR.
+  var consumed = 0
+  try:
+    consumed = applyDecoderInstructions(conn.qpackEnc, u.buf)
+  except QpackError:
     h3ConnError(conn, qpackDecoderStreamError); return
-  u.buf.setLen 0
+  if consumed > 0:
+    u.buf = u.buf.substr(consumed)
 
 proc parseUniStream(conn: H3Conn, u: var H3UniStream) =
   while true:
@@ -709,6 +746,7 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
   if conn.closing: return
   conn.flushCtrl()
   conn.flushDecStream()
+  conn.flushEncStream()
   while true:
     let s = quicAcceptStream(conn.ssl)
     if s == nil: break
@@ -764,6 +802,9 @@ proc h3Free*(conn: H3Conn) =
   if conn.qpackDecStream != nil:
     quicFree(conn.qpackDecStream)
     conn.qpackDecStream = nil
+  if conn.qpackEncStream != nil:
+    quicFree(conn.qpackEncStream)
+    conn.qpackEncStream = nil
   quicFree(conn.ssl)
   conn.ssl = nil
 
