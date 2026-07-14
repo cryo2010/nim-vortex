@@ -71,6 +71,10 @@ type
     closing: bool
     lastStreamId: uint64      ## highest request stream id accepted (for GOAWAY)
     goneAway: bool            ## GOAWAY sent
+    qpackDec: QpackDynTable   ## decoder dynamic table (peer's request headers)
+    qpackDecStream: SslPtr    ## our QPACK decoder stream (acks to the peer)
+    decBuf: string            ## decoder-stream output
+    decPos: int
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -80,23 +84,33 @@ proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
     return nil
   H3Conn(core.h3slots[idx].conn)
 
+const qpackDecoderMaxCapacity = 4096
+  ## Advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY: the peer's encoder may use a
+  ## dynamic table up to this size for the request headers it sends us.
+
 proc newH3Conn*(core: ptr LoopCore, ssl: SslPtr, slot: int, maxBody,
                 maxConcurrentStreams: int): H3Conn =
   result = H3Conn(core: core, ssl: ssl, slot: slot, maxBody: maxBody,
                   maxConcurrentStreams: maxConcurrentStreams)
   result.scratch = newString(4096)
-  # Our control stream: stream type + SETTINGS (QPACK capacity 0).
+  # Our control stream: stream type + SETTINGS. We advertise a QPACK dynamic
+  # table so peers can compress request headers; BLOCKED_STREAMS stays 0 so the
+  # encoder never references an unacknowledged entry (no stream blocking).
   result.ctrl = quicNewUniStream(ssl)
   if result.ctrl != nil:
     result.ctrlBuf.addVarint h3sControl
     var payload = ""
     payload.addVarint h3SetQpackMaxTableCapacity
-    payload.addVarint 0
+    payload.addVarint uint64(qpackDecoderMaxCapacity)
     payload.addVarint h3SetQpackBlockedStreams
     payload.addVarint 0
     payload.addVarint h3SetEnableConnectProtocol   # RFC 9220 WebSockets
     payload.addVarint 1
     result.ctrlBuf.addFrame(h3fSettings, payload)
+  # Our QPACK decoder stream: acknowledgments back to the peer's encoder.
+  result.qpackDecStream = quicNewUniStream(ssl)
+  if result.qpackDecStream != nil:
+    result.decBuf.addVarint h3sQpackDecoder
 
 proc flushCtrl(conn: H3Conn) =
   while conn.ctrlPos < conn.ctrlBuf.len and conn.ctrl != nil:
@@ -104,6 +118,16 @@ proc flushCtrl(conn: H3Conn) =
                            conn.ctrlBuf.len - conn.ctrlPos)
     if st == tlsOk: conn.ctrlPos += n
     else: break
+
+proc flushDecStream(conn: H3Conn) =
+  while conn.decPos < conn.decBuf.len and conn.qpackDecStream != nil:
+    let (n, st) = tlsWrite(conn.qpackDecStream, addr conn.decBuf[conn.decPos],
+                           conn.decBuf.len - conn.decPos)
+    if st == tlsOk: conn.decPos += n
+    else: break
+  if conn.decPos > 0 and conn.decPos == conn.decBuf.len:   # fully sent: compact
+    conn.decBuf.setLen(0)
+    conn.decPos = 0
 
 proc flushStream(conn: H3Conn, sid: uint64): bool =
   ## True when the stream is finished and was removed.
@@ -470,13 +494,18 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
     case st.frameType
     of h3fHeaders:
       if not st.headersDone:
+        var ric = 0
         try:
-          decodeFieldSection(st.rbuf, pos, pos + st.frameLen, st.headers)
+          ric = decodeFieldSection(st.rbuf, pos, pos + st.frameLen,
+                                   st.headers, conn.qpackDec)
         except QpackError:
           # A field-section decode failure corrupts the shared QPACK state:
           # a connection error (RFC 9204 2.2).
           h3ConnError(conn, qpackDecompressionFailed)
           return false
+        if ric > 0:                    # used the dynamic table: acknowledge it
+          conn.decBuf.encodeSectionAck(int(sid))
+          conn.flushDecStream()
         if not validateHeaders(st):
           # Malformed request: a stream error (RFC 9114 4.1.2).
           h3StreamError(conn, sid, h3MessageError)
@@ -622,13 +651,22 @@ proc parseControlStream(conn: H3Conn, u: var H3UniStream) =
   if pos > 0: u.buf = u.buf.substr(pos)
 
 proc parseQpackEncoder(conn: H3Conn, u: var H3UniStream) =
-  ## We advertise QPACK max table capacity 0, so a Set Dynamic Table Capacity
-  ## instruction with a non-zero value exceeds it (RFC 9204 4.1.3).
-  if u.buf.len > 0:
-    let b = uint8(u.buf[0])
-    if (b and 0xE0) == 0x20 and b != 0x20:    # 001xxxxx, value > 0
-      h3ConnError(conn, qpackEncoderStreamError); return
-  u.buf.setLen 0                              # dynamic table unused: drain
+  ## Apply the peer's encoder-stream instructions (inserts into our decoder
+  ## dynamic table), then acknowledge new insertions with Insert Count
+  ## Increment on our decoder stream (RFC 9204 4.3 / 4.4.3).
+  let before = conn.qpackDec.insertCount
+  var consumed = 0
+  try:
+    consumed = decodeEncoderInstructions(conn.qpackDec, u.buf,
+                                         qpackDecoderMaxCapacity)
+  except QpackError:
+    h3ConnError(conn, qpackEncoderStreamError); return
+  if consumed > 0:
+    u.buf = u.buf.substr(consumed)            # keep any partial instruction
+  let inserted = conn.qpackDec.insertCount - before
+  if inserted > 0:
+    conn.decBuf.encodeInsertCountIncrement(inserted)
+    conn.flushDecStream()
 
 proc parseQpackDecoder(conn: H3Conn, u: var H3UniStream) =
   ## An Insert Count Increment of 0 is illegal (RFC 9204 4.4.3): byte 0x00
@@ -670,6 +708,7 @@ proc h3Pump*(conn: H3Conn, ready: var seq[uint64]) =
   ## streams that became ready for dispatch.
   if conn.closing: return
   conn.flushCtrl()
+  conn.flushDecStream()
   while true:
     let s = quicAcceptStream(conn.ssl)
     if s == nil: break
@@ -722,6 +761,9 @@ proc h3Free*(conn: H3Conn) =
   if conn.ctrl != nil:
     quicFree(conn.ctrl)
     conn.ctrl = nil
+  if conn.qpackDecStream != nil:
+    quicFree(conn.qpackDecStream)
+    conn.qpackDecStream = nil
   quicFree(conn.ssl)
   conn.ssl = nil
 
