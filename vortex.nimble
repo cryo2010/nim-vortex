@@ -92,3 +92,9 @@ task zap, "Security scan via the OWASP ZAP baseline scanner (Docker)":
   # promotes the security-header rules the app satisfies to FAIL, so the run
   # exits non-zero if a regression drops one of those headers.
   exec "sh conformance/zap/run.sh"
+
+task h2load, "HTTP/1.1 + HTTP/2 load/stress smoke via h2load (Docker)":
+  # run.sh builds a plaintext vortex server image and an nghttp2 h2load client
+  # image, then fires many concurrent h1 and h2c requests at it over a private
+  # docker network; it fails on any failed/errored/timed-out or non-2xx request.
+  exec "sh conformance/h2load/run.sh"
