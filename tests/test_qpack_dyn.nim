@@ -149,6 +149,20 @@ suite "QPACK field-section decode":
     expect QpackError:
       discard decodeFieldSection("\x02\x00\x80", 0, 3, h, t)
 
+  test "a truncated field-section prefix errors (no out-of-bounds read)":
+    var t: QpackDynTable
+    var h: seq[(string, string)]
+    expect QpackError:                       # RIC byte present, Base byte missing
+      discard decodeFieldSection("\x00", 0, 1, h, t)
+    expect QpackError:                       # nothing at all
+      discard decodeFieldSection("", 0, 0, h, t)
+
+  test "a prefix-only field section decodes to no headers":
+    var t: QpackDynTable
+    var h: seq[(string, string)]
+    check decodeFieldSection("\x00\x00", 0, 2, h, t) == 0
+    check h.len == 0
+
   test "static encoder round-trips through the decoder":
     var enc = ""
     addPrefix(enc)

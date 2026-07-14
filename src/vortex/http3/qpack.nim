@@ -145,8 +145,9 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
                                         dyn.insertCount, maxEntries)
     if ric > dyn.insertCount:                # blocked reference (not supported)
       raise newException(QpackError, "required insert count exceeds inserts")
-    let signByte = uint8(buf[pos])
-    let sign = (signByte and 0x80) != 0
+    if pos >= endPos:                        # Sign/Delta Base byte is required
+      raise newException(QpackError, "truncated field section prefix")
+    let sign = (uint8(buf[pos]) and 0x80) != 0
     let deltaBase = decodeInt(buf, pos, endPos, 7)
     let base = if sign: ric - deltaBase - 1 else: ric + deltaBase
     result = ric
