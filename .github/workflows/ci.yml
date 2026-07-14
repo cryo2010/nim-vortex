@@ -213,3 +213,14 @@ jobs:
         # over a private docker network; it fails on any failed/errored/timed-out
         # or non-2xx request. It picks the x86_64 server base itself.
         run: sh conformance/h2load/run.sh
+
+  testssl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: TLS scan (testssl.sh)
+        # run.sh builds a vortex TLS server image and runs drwetter/testssl.sh
+        # against it over a private docker network (protocols/ciphers/vulns); it
+        # fails on any HIGH/CRITICAL finding. It picks the x86_64 server base
+        # itself.
+        run: sh conformance/testssl/run.sh
