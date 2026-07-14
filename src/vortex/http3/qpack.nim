@@ -267,3 +267,130 @@ proc encodeHeader*(buf: var string, name, value: string) =
   else:
     encodeRawStr(buf, name, 3, 0x20)             # literal name
   encodeRawStr(buf, value, 7, 0x00)
+
+# --- dynamic-table encoder (response header compression) --------------------
+#
+# A conservative encoder: it inserts repeated response header fields into a
+# dynamic table but only *references* entries the peer's decoder has already
+# acknowledged (`known`). So it never produces a blocking reference (peer
+# BLOCKED_STREAMS is irrelevant) and never needs to evict -- it just stops
+# inserting once the table is full. That trades some compression for simplicity
+# and safety (a bad reference would break the peer's decoder for the connection).
+
+proc qpackStaticFullIndex(name, value: string): int =
+  ## Static index of a full (name, value) match, else -1.
+  for i in 0 .. high(qpackStaticTable):
+    if qpackStaticTable[i][0] == name and qpackStaticTable[i][1] == value:
+      return i
+  -1
+
+proc fits(t: QpackDynTable, name, value: string): bool {.inline.} =
+  t.size + entrySize(name, value) <= t.capacity   # would insert without evicting
+
+proc findAcked(t: QpackDynTable, name, value: string, known: int): int =
+  ## Absolute index of an acknowledged (abs < known) (name,value) entry, else
+  ## -1. The encoder never evicts, so dropped == 0 and abs == the position.
+  for i in 0 ..< t.entries.len:
+    let abs = t.dropped + i
+    if abs >= known: break
+    if t.entries[i][0] == name and t.entries[i][1] == value: return abs
+  -1
+
+proc encodeRequiredInsertCount(ric, maxEntries: int): int {.inline.} =
+  if ric == 0: 0 else: (ric mod (2 * maxEntries)) + 1
+
+type
+  QpackEncoder* = object
+    table: QpackDynTable
+    known: int              ## acknowledged insertions (Insert Count Increment)
+    insts: string           ## pending encoder-stream instructions
+
+proc setCapacity*(e: var QpackEncoder, cap: int) =
+  ## Set the dynamic table capacity and queue the encoder-stream instruction.
+  if cap == e.table.capacity: return
+  e.table.setCapacity(cap)
+  encodeInt(e.insts, cap, 5, 0x20)               # Set Dynamic Table Capacity
+
+proc ackInsertions*(e: var QpackEncoder, n: int) =
+  ## The peer acknowledged `n` more insertions (Insert Count Increment).
+  e.known = min(e.known + n, e.table.insertCount)
+
+proc takeInstructions*(e: var QpackEncoder): string =
+  ## Move out the queued encoder-stream instructions. The field section is sent
+  ## too, but references only acknowledged entries, so cross-stream ordering is
+  ## safe.
+  result = move(e.insts)
+
+proc applyDecoderInstructions*(e: var QpackEncoder, buf: openArray[char]): int =
+  ## Process the peer's decoder-stream instructions (RFC 9204 4.4): apply Insert
+  ## Count Increment (acknowledging our insertions) and skip Section
+  ## Acknowledgment and Stream Cancellation (we never evict, so they need no
+  ## tracking). Returns bytes consumed; a partial trailing instruction is left.
+  ## Raises QpackError on a protocol violation (Insert Count Increment of 0).
+  var pos = 0
+  while pos < buf.len:
+    let start = pos
+    let b = uint8(buf[pos])
+    try:
+      if (b and 0x80) != 0:
+        discard decodeInt(buf, pos, buf.len, 7)      # Section Acknowledgment
+      elif (b and 0x40) != 0:
+        discard decodeInt(buf, pos, buf.len, 6)      # Stream Cancellation
+      else:
+        let inc = decodeInt(buf, pos, buf.len, 6)    # Insert Count Increment
+        if inc == 0:
+          raise newException(QpackError, "insert count increment of zero")
+        e.ackInsertions(inc)
+    except HpackError as ex:
+      if ex.msg.startsWith("truncated"): return start
+      raise newException(QpackError, ex.msg)
+    result = pos
+
+proc cacheable(name: string): bool {.inline.} =
+  name != "date" and name != "content-length"   # values vary every response
+
+proc encodeSection*(e: var QpackEncoder, status: int,
+                    hdrs: openArray[(string, string)]): string =
+  ## Encode a response field section (`:status` first, then hdrs). Names must
+  ## already be lowercase.
+  type Kind = enum kStaticIdx, kDynIdx, kStaticNameLit, kLiteral
+  var reps: seq[tuple[kind: Kind, a: int, name, value: string]]
+  var ric = 0
+  # Pass 1: decide each representation, insert new cacheable entries, find RIC.
+  for (name, value) in hdrs:
+    let sFull = qpackStaticFullIndex(name, value)
+    if sFull >= 0:
+      reps.add (kStaticIdx, sFull, "", "")
+      continue
+    if e.table.capacity > 0:
+      let dAbs = e.table.findAcked(name, value, e.known)
+      if dAbs >= 0:
+        reps.add (kDynIdx, dAbs, "", "")
+        if dAbs + 1 > ric: ric = dAbs + 1
+        continue
+      if cacheable(name) and e.table.fits(name, value):
+        let sName = qpackStaticIndexOf(name)
+        if sName >= 0:
+          encodeInt(e.insts, sName, 6, 0xc0)     # Insert w/ Name Ref (static)
+        else:
+          encodeRawStr(e.insts, name, 5, 0x40)   # Insert w/ Literal Name
+        encodeRawStr(e.insts, value, 7, 0x00)
+        discard e.table.insert(name, value)
+    let sName2 = qpackStaticIndexOf(name)
+    if sName2 >= 0: reps.add (kStaticNameLit, sName2, "", value)
+    else: reps.add (kLiteral, 0, name, value)
+  # Pass 2: prefix (RIC + base=RIC), :status, then the representations.
+  let maxEntries = if e.table.capacity > 0: e.table.capacity div 32 else: 0
+  encodeInt(result, encodeRequiredInsertCount(ric, maxEntries), 8, 0x00)
+  result.add '\0'                                # base = RIC: sign 0, delta 0
+  encodeStatus(result, status)
+  for r in reps:
+    case r.kind
+    of kStaticIdx: encodeInt(result, r.a, 6, 0xc0)
+    of kDynIdx: encodeInt(result, ric - 1 - r.a, 6, 0x80)   # indexed dynamic
+    of kStaticNameLit:
+      encodeInt(result, r.a, 4, 0x50)
+      encodeRawStr(result, r.value, 7, 0x00)
+    of kLiteral:
+      encodeRawStr(result, r.name, 3, 0x20)
+      encodeRawStr(result, r.value, 7, 0x00)

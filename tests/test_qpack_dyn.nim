@@ -175,4 +175,51 @@ suite "QPACK field-section decode":
     check h == @[(":status", "200"), ("content-type", "text/plain"),
                  ("x-custom", "hi")]
 
+suite "QPACK dynamic response encoder":
+  test "repeated headers are inserted then referenced; round-trips":
+    var enc: QpackEncoder
+    enc.setCapacity(4096)
+    var peer: QpackDynTable                # the client's decoder dynamic table
+    peer.setCapacity(4096)
+    let hdrs = @[("server", "vortex"), ("x-app", "demo"),
+                 ("content-type", "application/json")]
+
+    # Response 1: nothing acknowledged yet -> literal, with inserts queued on
+    # the encoder stream.
+    let fs1 = enc.encodeSection(200, hdrs)
+    let insts = enc.takeInstructions()
+    check insts.len > 0
+    # The peer applies the inserts and acknowledges them.
+    discard peer.decodeEncoderInstructions(insts, 4096)
+    enc.ackInsertions(peer.insertCount)
+    var h1: seq[(string, string)]
+    discard decodeFieldSection(fs1, 0, fs1.len, h1, peer)
+    check h1 == @[(":status", "200"), ("server", "vortex"), ("x-app", "demo"),
+                  ("content-type", "application/json")]
+
+    # Response 2: now references the dynamic entries -> smaller, still decodes.
+    let fs2 = enc.encodeSection(200, hdrs)
+    check enc.takeInstructions().len == 0        # nothing new to insert
+    check fs2.len < fs1.len                       # compressed
+    var h2: seq[(string, string)]
+    discard decodeFieldSection(fs2, 0, fs2.len, h2, peer)
+    check h2 == h1
+
+  test "capacity 0 falls back to static/literal (decodes with empty table)":
+    var enc: QpackEncoder                  # no setCapacity: dynamic disabled
+    let fs = enc.encodeSection(404, @[("x-app", "demo")])
+    check enc.takeInstructions().len == 0
+    var h: seq[(string, string)]
+    var empty: QpackDynTable
+    discard decodeFieldSection(fs, 0, fs.len, h, empty)
+    check h == @[(":status", "404"), ("x-app", "demo")]
+
+  test "per-response-varying headers are not cached":
+    var enc: QpackEncoder
+    enc.setCapacity(4096)
+    discard enc.takeInstructions()               # drain the Set Capacity instr
+    discard enc.encodeSection(200, @[("date", "Mon, 01 Jan 2024 00:00:00 GMT"),
+                                     ("content-length", "42")])
+    check enc.takeInstructions().len == 0        # date/content-length not inserted
+
 echo "qpack dynamic table ok"
