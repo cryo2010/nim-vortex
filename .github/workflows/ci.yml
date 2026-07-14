@@ -46,6 +46,33 @@ jobs:
           nim c --mm:${{ matrix.mm }} --threads:on -d:plainHttp
           -o:/tmp/vortex_plain src/vortex.nim
 
+  sanitize:
+    runs-on: ubuntu-latest
+    # Privileged so we can lower the host's mmap randomization (see below);
+    # arch for OpenSSL >= 3.5, like the test job.
+    container:
+      image: archlinux:latest
+      options: --privileged
+    env:
+      NIM_SANITIZE: "1"          # tests/config.nims adds -fsanitize=address,undefined
+      ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - name: Lower ASLR entropy for AddressSanitizer
+        # GitHub's Ubuntu 24.04 host kernel uses high mmap randomization, which
+        # breaks ASan's shadow-memory mapping; 28 bits is the documented value.
+        run: sysctl -w vm.mmap_rnd_bits=28 || true
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git curl openssl
+      - uses: actions/checkout@v7
+      - name: Run the test suite under ASan + UBSan
+        # Extends the fuzzer's ASan coverage from the parser targets to the whole
+        # server (event loop, h2/h3 codecs, worker pool). A memory or UB error
+        # fails the job.
+        run: nimble test -y
+
   testchronos:
     runs-on: ubuntu-latest
     container: archlinux:latest
