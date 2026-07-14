@@ -12,6 +12,104 @@ import ../http2/hpack
 type
   QpackError* = object of CatchableError
 
+  QpackDynTable* = object
+    ## QPACK decoder dynamic table (RFC 9204 3.2): a FIFO of inserted entries,
+    ## the oldest evicted to stay within `capacity` bytes. Entries have stable
+    ## absolute indices; `dropped` is how many have been evicted, so absolute
+    ## index i lives at `entries[i - dropped]` while `has(i)` holds.
+    entries: seq[(string, string)]
+    dropped: int                 ## count evicted (absolute index of entries[0])
+    size: int                    ## current byte size
+    capacity*: int               ## max byte size (Set Dynamic Table Capacity)
+
+proc entrySize(name, value: string): int {.inline.} =
+  name.len + value.len + 32      ## RFC 9204 3.2.1
+
+proc insertCount*(t: QpackDynTable): int {.inline.} =
+  ## Total insertions ever (the absolute index the next insert will get).
+  t.dropped + t.entries.len
+
+proc has*(t: QpackDynTable, absIdx: int): bool {.inline.} =
+  absIdx >= t.dropped and absIdx < t.insertCount
+
+proc get*(t: QpackDynTable, absIdx: int): (string, string) {.inline.} =
+  t.entries[absIdx - t.dropped]
+
+proc evictOne(t: var QpackDynTable) =
+  t.size -= entrySize(t.entries[0][0], t.entries[0][1])
+  t.entries.delete(0)
+  inc t.dropped
+
+proc setCapacity*(t: var QpackDynTable, cap: int) =
+  ## Set the table capacity, evicting the oldest entries to fit (RFC 9204 4.3.1).
+  t.capacity = cap
+  while t.size > t.capacity and t.entries.len > 0:
+    t.evictOne()
+
+proc insert*(t: var QpackDynTable, name, value: string): bool {.discardable.} =
+  ## Insert an entry, evicting oldest to make room. Returns false (no insert)
+  ## if it cannot fit even in an empty table.
+  let sz = entrySize(name, value)
+  while t.size + sz > t.capacity and t.entries.len > 0:
+    t.evictOne()
+  if t.size + sz > t.capacity:
+    return false
+  t.entries.add (name, value)
+  t.size += sz
+  true
+
+proc decodeEncoderInstructions*(t: var QpackDynTable, buf: openArray[char],
+                                maxCapacity: int): int =
+  ## Apply as many complete QPACK encoder-stream instructions (RFC 9204 4.3) as
+  ## `buf` holds and return the number of bytes consumed; a trailing partial
+  ## instruction is left for the next call. Raises QpackError on a protocol
+  ## violation (bad index, capacity over the advertised maximum).
+  var pos = 0
+  while pos < buf.len:
+    let start = pos
+    let b = uint8(buf[pos])
+    try:
+      if (b and 0x80) != 0:
+        # Insert with Name Reference (4.3.2): 1 T index(6) + value.
+        let isStatic = (b and 0x40) != 0
+        let idx = decodeInt(buf, pos, buf.len, 6)
+        var name: string
+        if isStatic:
+          if idx > high(qpackStaticTable):
+            raise newException(QpackError, "static name index out of range")
+          name = qpackStaticTable[idx][0]
+        else:
+          let abs = t.insertCount - 1 - idx        # relative to insert count
+          if not t.has(abs):
+            raise newException(QpackError, "dynamic name index out of range")
+          name = t.get(abs)[0]
+        var value: string
+        decodeStr(buf, pos, buf.len, 7, value)
+        discard t.insert(name, value)
+      elif (b and 0xc0) == 0x40:
+        # Insert with Literal Name (4.3.3): 01 H name(5) + value.
+        var name, value: string
+        decodeStr(buf, pos, buf.len, 5, name)
+        decodeStr(buf, pos, buf.len, 7, value)
+        discard t.insert(name, value)
+      elif (b and 0xe0) == 0x20:
+        # Set Dynamic Table Capacity (4.3.1): 001 capacity(5).
+        let cap = decodeInt(buf, pos, buf.len, 5)
+        if cap > maxCapacity:
+          raise newException(QpackError, "capacity exceeds the maximum")
+        t.setCapacity(cap)
+      else:
+        # Duplicate (4.3.4): 000 index(5).
+        let idx = decodeInt(buf, pos, buf.len, 5)
+        let abs = t.insertCount - 1 - idx
+        if not t.has(abs):
+          raise newException(QpackError, "duplicate index out of range")
+        let (n, v) = t.get(abs)
+        discard t.insert(n, v)
+    except HpackError:
+      return start          # incomplete instruction: leave it buffered
+    result = pos
+
 proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
                          headers: var seq[(string, string)]) =
   ## Decode a complete encoded field section (one HEADERS frame payload).
