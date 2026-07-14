@@ -421,6 +421,15 @@ build keeps its OpenSSL-only footprint.
   Its rule config promotes the security-header rules the app satisfies to FAIL,
   so the run gates against a regression that drops one. See
   [conformance/zap/](conformance/zap/).
+- TLS scan: `nimble testssl` runs [testssl.sh](https://testssl.sh/) against a
+  vortex TLS server in Docker (protocols/ciphers/vulnerabilities) and fails on
+  any HIGH/CRITICAL finding. See [conformance/testssl/](conformance/testssl/).
+- Load/stress smoke: `nimble h2load` fires many concurrent h1 + h2c requests at
+  a vortex server with nghttp2's [h2load](https://nghttp2.org/) in Docker,
+  failing on any failed/errored/non-2xx request. See
+  [conformance/h2load/](conformance/h2load/).
+- Sanitizers: the CI `sanitize` job runs the whole suite under
+  AddressSanitizer + UBSan (`NIM_SANITIZE=1 nimble test`).
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
 
 The chronos adapter is covered by `nimble testchronos` (its dependency is

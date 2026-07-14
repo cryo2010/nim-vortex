@@ -31,4 +31,6 @@ conformance/h3websocket/echo_server
 conformance/h3websocket/*.pem
 conformance/zap/zap_server
 conformance/h2load/h2load_server
+conformance/testssl/testssl_server
+conformance/testssl/*.pem
 /demo

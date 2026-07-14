@@ -98,3 +98,9 @@ task h2load, "HTTP/1.1 + HTTP/2 load/stress smoke via h2load (Docker)":
   # image, then fires many concurrent h1 and h2c requests at it over a private
   # docker network; it fails on any failed/errored/timed-out or non-2xx request.
   exec "sh conformance/h2load/run.sh"
+
+task testssl, "TLS configuration scan via testssl.sh (Docker)":
+  # run.sh builds a vortex TLS server image and runs drwetter/testssl.sh against
+  # it over a private docker network, checking protocols/ciphers/vulnerabilities;
+  # it fails on any HIGH/CRITICAL finding.
+  exec "sh conformance/testssl/run.sh"
