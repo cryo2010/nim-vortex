@@ -110,45 +110,97 @@ proc decodeEncoderInstructions*(t: var QpackDynTable, buf: openArray[char],
       return start          # incomplete instruction: leave it buffered
     result = pos
 
+proc decodeRequiredInsertCount(enc, totalInserts, maxEntries: int): int =
+  ## Reconstruct the absolute Required Insert Count from its wrapped encoding
+  ## (RFC 9204 4.5.1.1). `enc` is the value from the 8-bit prefix.
+  if enc == 0: return 0
+  let fullRange = 2 * maxEntries
+  if enc > fullRange:
+    raise newException(QpackError, "required insert count out of range")
+  let maxValue = totalInserts + maxEntries
+  let maxWrapped = (maxValue div fullRange) * fullRange
+  result = maxWrapped + enc - 1
+  if result > maxValue:
+    if result <= fullRange:
+      raise newException(QpackError, "required insert count out of range")
+    result -= fullRange
+  if result == 0:
+    raise newException(QpackError, "required insert count of zero encoded")
+
 proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
-                         headers: var seq[(string, string)]) =
-  ## Decode a complete encoded field section (one HEADERS frame payload).
+                         headers: var seq[(string, string)],
+                         dyn: QpackDynTable = QpackDynTable()): int
+                        {.discardable.} =
+  ## Decode a complete encoded field section (one HEADERS frame payload) against
+  ## `dyn` (an empty table = capacity-0 mode, where any dynamic reference is out
+  ## of range and errors). Returns the Required Insert Count (0 if the dynamic
+  ## table was not referenced), for the caller's Section Acknowledgment.
   var pos = start
   try:
-    # Prefix: Required Insert Count (8-bit) + S/Delta Base (7-bit).
-    let ric = decodeInt(buf, pos, endPos, 8)
-    if ric != 0:
-      raise newException(QpackError, "dynamic table use with capacity 0")
-    discard decodeInt(buf, pos, endPos, 7)   # base: irrelevant at RIC 0
+    let maxEntries = dyn.capacity div 32
+    let ric = decodeRequiredInsertCount(decodeInt(buf, pos, endPos, 8),
+                                        dyn.insertCount, maxEntries)
+    if ric > dyn.insertCount:                # blocked reference (not supported)
+      raise newException(QpackError, "required insert count exceeds inserts")
+    let signByte = uint8(buf[pos])
+    let sign = (signByte and 0x80) != 0
+    let deltaBase = decodeInt(buf, pos, endPos, 7)
+    let base = if sign: ric - deltaBase - 1 else: ric + deltaBase
+    result = ric
     while pos < endPos:
       let b = uint8(buf[pos])
       if (b and 0x80) != 0:
-        # Indexed field line (1TXXXXXX); T must be 1 (static).
-        if (b and 0x40) == 0:
-          raise newException(QpackError, "dynamic index with capacity 0")
+        # Indexed field line: 1 T index(6).
+        let isStatic = (b and 0x40) != 0
         let idx = decodeInt(buf, pos, endPos, 6)
-        if idx > high(qpackStaticTable):
-          raise newException(QpackError, "static index out of range")
-        headers.add (qpackStaticTable[idx][0], qpackStaticTable[idx][1])
-      elif (b and 0xc0) == 0x40:
-        # Literal with name reference (01NTXXXX); T must be 1.
-        if (b and 0x10) == 0:
-          raise newException(QpackError, "dynamic name ref with capacity 0")
+        if isStatic:
+          if idx > high(qpackStaticTable):
+            raise newException(QpackError, "static index out of range")
+          headers.add qpackStaticTable[idx]
+        else:
+          let abs = base - 1 - idx
+          if abs < 0 or not dyn.has(abs):
+            raise newException(QpackError, "dynamic index out of range")
+          headers.add dyn.get(abs)
+      elif (b and 0x40) != 0:
+        # Literal with name reference: 01 N T index(4).
+        let isStatic = (b and 0x10) != 0
         let idx = decodeInt(buf, pos, endPos, 4)
-        if idx > high(qpackStaticTable):
-          raise newException(QpackError, "static index out of range")
+        var name: string
+        if isStatic:
+          if idx > high(qpackStaticTable):
+            raise newException(QpackError, "static index out of range")
+          name = qpackStaticTable[idx][0]
+        else:
+          let abs = base - 1 - idx
+          if abs < 0 or not dyn.has(abs):
+            raise newException(QpackError, "dynamic name index out of range")
+          name = dyn.get(abs)[0]
         var value: string
         decodeStr(buf, pos, endPos, 7, value)
-        headers.add (qpackStaticTable[idx][0], value)
-      elif (b and 0xe0) == 0x20:
-        # Literal with literal name (001NHXXX): 3-bit name length prefix.
+        headers.add (name, value)
+      elif (b and 0x20) != 0:
+        # Literal with literal name: 001 N H nameLen(3).
         var name, value: string
         decodeStr(buf, pos, endPos, 3, name)
         decodeStr(buf, pos, endPos, 7, value)
         headers.add (name, value)
+      elif (b and 0x10) != 0:
+        # Indexed field line with post-base index: 0001 index(4).
+        let idx = decodeInt(buf, pos, endPos, 4)
+        let abs = base + idx
+        if not dyn.has(abs):
+          raise newException(QpackError, "post-base index out of range")
+        headers.add dyn.get(abs)
       else:
-        # 0001xxxx / 0000xxxx: post-base forms (dynamic table only).
-        raise newException(QpackError, "post-base ref with capacity 0")
+        # Literal with post-base name reference: 0000 N index(3).
+        let idx = decodeInt(buf, pos, endPos, 3)
+        let abs = base + idx
+        if not dyn.has(abs):
+          raise newException(QpackError, "post-base name index out of range")
+        var value: string
+        decodeStr(buf, pos, endPos, 7, value)
+        headers.add (dyn.get(abs)[0], value)
   except HpackError as e:
     raise newException(QpackError, e.msg)
 

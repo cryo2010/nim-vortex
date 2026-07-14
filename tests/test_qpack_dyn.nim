@@ -102,4 +102,56 @@ suite "QPACK encoder-stream instructions":
     check t.decodeEncoderInstructions(buf, 4096) == 4
     check t.insertCount == 1
 
+suite "QPACK field-section decode":
+  test "static indexed (RIC 0) still decodes":
+    var t: QpackDynTable                   # empty = capacity-0 mode
+    var h: seq[(string, string)]
+    check decodeFieldSection("\x00\x00\xC0", 0, 3, h, t) == 0   # indexed static 0
+    check h == @[(":authority", "")]
+
+  test "dynamic indexed field line":
+    var t: QpackDynTable
+    t.setCapacity(200)
+    discard t.insert(":method", "GET")     # abs 0
+    var h: seq[(string, string)]
+    # prefix RIC=1 (enc 2), base=1 (S0,delta0); indexed dynamic index 0.
+    check decodeFieldSection("\x02\x00\x80", 0, 3, h, t) == 1
+    check h == @[(":method", "GET")]
+
+  test "post-base indexed field line":
+    var t: QpackDynTable
+    t.setCapacity(200)
+    discard t.insert(":method", "GET")     # abs 0
+    var h: seq[(string, string)]
+    # RIC=1, base=0 (S1,delta0); post-base index 0 -> abs 0.
+    check decodeFieldSection("\x02\x80\x10", 0, 3, h, t) == 1
+    check h == @[(":method", "GET")]
+
+  test "literal field line with dynamic name reference":
+    var t: QpackDynTable
+    t.setCapacity(200)
+    discard t.insert("x", "1")             # abs 0
+    var h: seq[(string, string)]
+    # RIC=1, base=1; literal w/ dynamic name index 0, value "2".
+    discard decodeFieldSection("\x02\x00\x40\x012", 0, 5, h, t)
+    check h == @[("x", "2")]
+
+  test "a dynamic reference with an empty table is an error":
+    var t: QpackDynTable                   # capacity 0
+    var h: seq[(string, string)]
+    expect QpackError:
+      discard decodeFieldSection("\x02\x00\x80", 0, 3, h, t)
+
+  test "static encoder round-trips through the decoder":
+    var enc = ""
+    addPrefix(enc)
+    encodeStatus(enc, 200)
+    encodeHeader(enc, "content-type", "text/plain")
+    encodeHeader(enc, "x-custom", "hi")
+    var h: seq[(string, string)]
+    var t: QpackDynTable
+    discard decodeFieldSection(enc, 0, enc.len, h, t)
+    check h == @[(":status", "200"), ("content-type", "text/plain"),
+                 ("x-custom", "hi")]
+
 echo "qpack dynamic table ok"
