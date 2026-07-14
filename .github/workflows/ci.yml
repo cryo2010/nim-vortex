@@ -202,3 +202,14 @@ jobs:
         # scan exits non-zero if a regression drops one of those headers. It
         # picks the x86_64 server base itself.
         run: sh conformance/zap/run.sh
+
+  h2load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load/stress smoke (h2load)
+        # run.sh builds a plaintext vortex server image and an nghttp2 h2load
+        # client image, then fires many concurrent h1 and h2c requests at it
+        # over a private docker network; it fails on any failed/errored/timed-out
+        # or non-2xx request. It picks the x86_64 server base itself.
+        run: sh conformance/h2load/run.sh
