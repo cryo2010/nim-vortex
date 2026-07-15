@@ -444,10 +444,15 @@ and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 ## Status
 
 Pre-1.0. Streaming request and response bodies (with backpressure) are
-supported on h1/h2/h3, shutdown is graceful, and HTTP/3 accepts QPACK
-dynamic-table-compressed request headers. Deferred (planned): QPACK dynamic
-encoding of responses, Windows. (h2c `Upgrade` is intentionally omitted: RFC
-9113 removed it; cleartext HTTP/2 uses prior knowledge.)
+supported on h1/h2/h3, shutdown is graceful, and HTTP/3 both accepts and emits
+QPACK dynamic-table-compressed headers. (h2c `Upgrade` is intentionally
+omitted: RFC 9113 removed it; cleartext HTTP/2 uses prior knowledge.)
+
+**Platform:** POSIX only (Linux and macOS), by design. The core is built on
+readiness-based `kqueue`/`epoll` and per-thread `SO_REUSEPORT` listeners, which
+have no direct Windows equivalent; a `select()`-backed Windows port would
+defeat the performance goal. On Windows, run vortex under WSL2 or a Linux
+container (Docker).
 
 ## Thanks
 
