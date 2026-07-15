@@ -19,8 +19,12 @@ FROM ${BASE}
 # harnesses; openssl is vortex's link dependency; zlib backs the
 # permessage-deflate (wsdeflate) target.
 # --disable-sandbox: pacman's Landlock sandbox cannot apply in a container.
-RUN pacman -Syu --noconfirm --needed --disable-sandbox \
-      nim gcc clang compiler-rt openssl zlib && \
+RUN for i in 1 2 3 4 5; do \
+      pacman -Syu --noconfirm --needed --disable-sandbox \
+        nim gcc clang compiler-rt openssl zlib && break; \
+      [ "$i" = 5 ] && exit 1; \
+      echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
+    done && \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
