@@ -18,6 +18,7 @@ import vortex/settings
 import vortex/request
 import vortex/server
 import vortex/router
+import vortex/streaming
 
 export httpcore
 export net.Port
@@ -25,3 +26,4 @@ export settings
 export request
 export server
 export router
+export streaming

@@ -262,3 +262,25 @@ proc head*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpHead, path, h)
 proc options*(r: Router, path: string, h: AsyncRequestHandler) =
   r.route(HttpOptions, path, h)
+
+# --- pull-loop sugar + SSE backpressure -------------------------------------
+
+template stream*(req: Request, chunk, body: untyped) =
+  ## Consume a streaming request body with a pull loop: `body` runs once with
+  ## `chunk: string` rebound each iteration, until end of body. The async twin
+  ## of the core `req.stream(chunk, last)` and the structural mirror of
+  ## `res.stream`. Use inside an async body (e.g. `req.doAsync:`); relies on
+  ## `await req.read()`.
+  ##
+  ##   req.doAsync:
+  ##     req.stream(chunk):
+  ##       sink.write(chunk)
+  ##     res.send(Http200, "stored\n")
+  while true:
+    let chunk = await read(req)
+    if chunk.len == 0: break
+    body
+
+proc drained*(s: SseStream): Future[void] = s.response.drained()
+  ## Await until the SSE stream's write backlog empties, so a producer can
+  ## resume after `s.send` reported backpressure (returned false).

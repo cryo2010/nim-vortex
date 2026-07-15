@@ -360,6 +360,29 @@ router.stream(HttpPost, "/upload", upload)
 start(router.toHandler, settings, router.streamPredicate)
 ```
 
+The `req.stream` template is the inbound mirror of `res.stream` (its block runs
+per chunk, resetting the response if it raises):
+
+```nim
+req.stream(chunk, last):
+  sink(chunk)
+  if last: res.send(Http200, "ok")
+```
+
+You don't need the router. `vortex/streaming` builds the same `streamRoute`
+predicate directly, so a router-free server (or one using a different
+dispatcher) can still stream:
+
+```nim
+import vortex/streaming
+start(handler, settings, streamRoute = streamPaths("/upload"))   # or streamAll(),
+                                                                 # streamWhen(pred),
+                                                                 # a StreamRoutes set
+```
+
+With an async adapter, `req.stream(chunk):` is a pull loop (`await req.read()`
+under the hood) that runs its block once, mirroring `res.stream` structurally.
+
 Works on HTTP/1.1 (Content-Length and chunked), HTTP/2, and HTTP/3 (`last` is
 true on the final chunk: the length boundary, the chunked terminator,
 END_STREAM, or FIN). Ordinary routes are unchanged and still get `req.body`;
@@ -377,6 +400,36 @@ consumer therefore throttles the sender end to end. In a plain (synchronous)
 `onBody` handler this is automatic (the callback holds the loop while it runs);
 `req.onBody(cb, manualAck = true)` + `req.ackBody(n)` expose the same control
 directly.
+
+### Server-Sent Events
+
+`res.sse` opens a `text/event-stream` response over the streaming primitives
+above, so it inherits chunked/streamed framing and backpressure. It needs no
+router and no `streamRoute` predicate (SSE is outbound-only), so it works from
+any handler:
+
+```nim
+proc events(req: Request, res: Response) {.gcsafe.} =
+  let s = res.sse(retry = 3000)               # sends the SSE headers
+  discard s.send("hi", event = "greet", id = req.lastEventId())
+  discard s.comment("keepalive")              # heartbeat; clients ignore it
+  s.close()
+```
+
+`send` emits one event (multi-line `data` splits into multiple `data:` fields;
+`event`/`id`/`retry` are optional), returns `false` under write backpressure
+(reuse `s.bufferedAmount` / `s.onDrain`, or `await s.drained()` with an
+adapter), and `s.alive` reports client disconnect. `req.lastEventId()` gives
+the `Last-Event-ID` a client echoes on reconnect. `res.withSse(s): body` is a
+block form that closes (or aborts on exception) for you:
+
+```nim
+res.withSse(s):
+  for row in report: s.send(row.toJson, event = "row", id = $row.id)
+```
+
+The response sets `Cache-Control: no-cache` and `X-Accel-Buffering: no` so
+intermediary proxies don't buffer the stream.
 
 ## Build flags
 

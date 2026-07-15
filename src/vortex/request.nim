@@ -664,6 +664,126 @@ template stream*(res: Response, code: HttpCode, contentType: string,
                  body: untyped) =
   res.stream(code, contentType, [], body)
 
+template stream*(req: Request, chunk, last, body: untyped) =
+  ## Consume a streaming request body: `body` runs on the loop thread for each
+  ## chunk as it arrives, with `chunk: openArray[char]` and `last: bool` in
+  ## scope. The inbound mirror of `res.stream` (which produces a body; this
+  ## consumes one). Sugar over `req.onBody`; use in a handler dispatched for a
+  ## streaming route. If `body` raises, the response is aborted (mirroring
+  ## `res.stream`) so a truncated upload isn't mistaken for a complete one.
+  ##
+  ##   req.stream(chunk, last):
+  ##     sink.write(chunk)
+  ##     if last: res.send(Http200, "stored\n")
+  block:
+    let capturedReq = req
+    capturedReq.onBody(proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+      try:
+        body
+      except CatchableError:
+        response(capturedReq).abort())
+
+# --- Server-Sent Events (text/event-stream) ---------------------------------
+
+type
+  SseStream* = object
+    ## A live Server-Sent Events response. Created by `res.sse(...)`, which
+    ## sends the SSE headers; push events with `send`, keep idle connections
+    ## warm with `comment`, end with `close`. Wraps a streaming `Response`, so
+    ## HTTP/1.1 uses chunked framing and HTTP/2/3 a streamed body, with the
+    ## same backpressure surface (`bufferedAmount` / `onDrain`).
+    res: Response
+
+proc response*(s: SseStream): Response = s.res
+  ## The underlying streaming response (e.g. for `await s.response.drained()`).
+
+proc sseSanitize(s: string): string =
+  ## SSE field values are single-line; drop CR/LF so a value can't inject a
+  ## second field or terminate the event early.
+  s.multiReplace(("\r", ""), ("\n", ""))
+
+proc sse*(res: Response, headers: openArray[(string, string)] = [],
+          retry = 0): SseStream {.raises: [].} =
+  ## Begin a Server-Sent Events stream: sends `200 text/event-stream` with
+  ## `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` (so
+  ## intermediary proxies don't buffer the stream), then returns a handle to
+  ## push events. Loop-thread only. `retry > 0` emits an initial `retry:` field
+  ## setting the client's reconnection delay (ms).
+  var h = @[("Cache-Control", "no-cache, no-transform"),
+            ("X-Accel-Buffering", "no")]
+  for kv in headers: h.add kv
+  res.sendHead(Http200, "text/event-stream", h)
+  result = SseStream(res: res)
+  if retry > 0:
+    discard res.write("retry: " & $retry & "\n\n")
+
+proc send*(s: SseStream, data: string, event = "", id = "",
+           retry = 0): bool {.discardable, raises: [].} =
+  ## Push one SSE event and flush. `data` may span multiple lines; each is
+  ## emitted as its own `data:` field per the spec. `event` sets the type
+  ## (client default "message"), `id` sets the client's `Last-Event-ID` (echoed
+  ## as the request header on reconnect), `retry` (ms) overrides the delay.
+  ## Returns false when the write backlog is full (see `bufferedAmount` /
+  ## `onDrain`); the producer should pause. A dead connection returns false.
+  var f = ""
+  if id.len > 0:    f.add "id: " & sseSanitize(id) & "\n"
+  if event.len > 0: f.add "event: " & sseSanitize(event) & "\n"
+  if retry > 0:     f.add "retry: " & $retry & "\n"
+  for line in data.splitLines:
+    f.add "data: " & line & "\n"
+  f.add "\n"                               # blank line terminates the event
+  s.res.write(f)
+
+proc comment*(s: SseStream, text = ""): bool {.discardable, raises: [].} =
+  ## Emit a comment line (`: text`). Clients ignore it; use it as a heartbeat
+  ## to keep idle connections and proxies from timing out. `s.comment()` is a
+  ## bare `:` ping.
+  s.res.write(": " & sseSanitize(text) & "\n\n")
+
+proc bufferedAmount*(s: SseStream): int = s.res.bufferedAmount
+  ## Bytes queued for the SSE stream but not yet written to the socket.
+
+proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
+  ## Fire `cb` (loop thread) when a backed-up SSE stream's write backlog
+  ## empties, so the producer can resume.
+  let captured = cb
+  s.res.onDrain(proc(r: Response) {.gcsafe.} = captured(SseStream(res: r)))
+
+proc alive*(s: SseStream): bool =
+  ## False once the client disconnects; the producer loop should stop. Use this
+  ## rather than `send` returning false, which is ambiguous (backpressure *or*
+  ## a dead connection).
+  Request(core: s.res.core, fd: s.res.fd, gen: s.res.gen,
+          stream: s.res.stream).isAlive
+
+proc close*(s: SseStream) {.raises: [].} = s.res.finish()
+  ## End the SSE stream cleanly and resume the connection.
+
+proc abort*(s: SseStream) {.raises: [].} = s.res.abort()
+  ## Cut the SSE stream short (truncation signal), for an error mid-stream.
+
+proc lastEventId*(req: Request): string = req.header("last-event-id")
+  ## The `Last-Event-ID` the client echoes when reconnecting an SSE stream (the
+  ## `id:` of the last event it saw). Empty on first connect; use it to resume.
+
+template withSse*(res: Response, s, body: untyped) =
+  ## Block form for a finite stream: opens an SSE stream bound to `s`, runs
+  ## `body`, then closes it (aborting on exception, like `res.stream`). Named
+  ## `withSse` (not `sse`) to avoid clashing with the `res.sse(...)` handle
+  ## constructor, following the `withLock`/`withFile` scoped-resource idiom.
+  ##
+  ##   res.withSse(s):
+  ##     for row in report: s.send(row.toJson, event = "row", id = $row.id)
+  block:
+    var s = res.sse()
+    var sseCompleted = false
+    try:
+      body
+      sseCompleted = true
+    finally:
+      if sseCompleted: s.close()
+      else: s.abort()
+
 # --- blocking dispatch ------------------------------------------------------
 
 type
