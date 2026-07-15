@@ -9,7 +9,12 @@
 ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
 
-RUN pacman -Syu --noconfirm --needed --disable-sandbox nim gcc && \
+RUN for i in 1 2 3 4 5; do \
+      pacman -Syu --noconfirm --needed --disable-sandbox \
+        nim gcc && break; \
+      [ "$i" = 5 ] && exit 1; \
+      echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
+    done && \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
