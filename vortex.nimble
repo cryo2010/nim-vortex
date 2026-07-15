@@ -16,6 +16,7 @@ task bench, "Build benchmark server with release flags":
 
 taskRequires "perf", "httpbeast >= 0.4.0"
 taskRequires "perf", "chronos >= 4.0.0"
+taskRequires "perf", "mummy >= 0.4.0"
 
 task perf, "Run the HTTP/1.1 throughput comparison benchmark":
   exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http1_1 bench/perf_http1_1.nim"

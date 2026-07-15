@@ -441,6 +441,14 @@ Rapid Reset, framing floods, decompression bombs, request smuggling,
 slowloris, and resource exhaustion are defended with configurable limits
 and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
 
+## Benchmarks
+
+On a trivial `/plaintext` handler vortex matches httpbeast (its architectural
+parent) and outruns the other Nim servers: ~1.5× `asynchttpserver`, ~1.7×
+mummy, ~2.3× chronos's HTTP server (loopback, no pipelining). HTTP/2 costs a
+few percent of pipelined HTTP/1.1 throughput. Methodology, full tables, and
+caveats are in [BENCHMARKS.md](BENCHMARKS.md); reproduce with `nimble perf`.
+
 ## Status
 
 Pre-1.0. Streaming request and response bodies (with backpressure) are
