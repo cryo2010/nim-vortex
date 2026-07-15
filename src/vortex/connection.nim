@@ -134,6 +134,9 @@ type
     nowSec*: int64            ## coarse monotonic seconds, updated per tick
     maxWsMessage*: int        ## largest inbound WebSocket message (bytes)
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
+    wsPongTimeout*: int       ## after a keepalive ping, seconds to wait for a reply
+    wsIdle*: seq[RootRef]     ## h2/h3 WebSocket streams tracked for idle keepalive
+                              ## (WsConn upcast; h1 uses the connection deadline wheel)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)

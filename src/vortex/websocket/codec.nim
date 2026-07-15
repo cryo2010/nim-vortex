@@ -52,7 +52,7 @@ type
     fragging: bool
     maxMessage: int
     closeSent: bool          ## a close frame has been queued
-    closeNotified: bool      ## onClose has been delivered
+    closeNotified*: bool     ## onClose has been delivered (the ws is finished)
     subprotocol: string      ## negotiated Sec-WebSocket-Protocol ("" = none)
     # Transport abstraction: the core appends serialized frames to `outBuf`
     # and sets `wantClose`; `flush` drains them (HTTP/1 -> c.wbuf, HTTP/2 ->
@@ -67,6 +67,10 @@ type
     blockingPinned*: bool    ## a per-stream ws.blocking worker holds this stream
     h2Pending*: int          ## h2/h3 outbound bytes queued but not yet on the wire
     h3conn*: RootRef         ## the H3Conn for an h3 stream (reach it + stream)
+    # Idle keepalive for h2/h3 streams (h1 uses the connection deadline wheel).
+    lastRx*: int64           ## nowSec of the last inbound frame (activity)
+    pingSent*: bool          ## a keepalive ping is outstanding, awaiting any frame
+    pingAt*: int64           ## nowSec the outstanding ping was sent
     when defined(wsDeflate):
       pmd: bool              ## permessage-deflate negotiated on this connection
       msgCompressed: bool    ## the in-progress message's first frame had RSV1
@@ -189,6 +193,12 @@ proc wsSetup*(core: ptr LoopCore, fd: int32, gen: uint32, maxMessage: int,
   ## HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) accept paths. `fd`/`gen`
   ## identify the handle so callbacks can be delivered without a `Connection`.
   let w = WsConn(maxMessage: maxMessage, stream: stream, fd: fd, gen: gen)
+  w.lastRx = core.nowSec
+  # h2 (stream != 0) and h3 (fd < 0) multiplex many WebSockets over one
+  # connection, so they can't use the per-connection deadline wheel h1 uses;
+  # register them for the loop's per-stream idle sweep instead.
+  if stream != 0 or fd < 0:
+    core.wsIdle.add w
   result.w = w
   let chosen = negotiateProtocol(protocolsOffer, serverProtocols)
   if chosen.len > 0:
@@ -468,6 +478,8 @@ proc wsFeed*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   ## `c` is the h2 connection, or nil for h3 (the flush reaches the stream
   ## through the WsConn).
   if data.len > 0:
+    w.lastRx = core.nowSec           # inbound frame(s): the peer is alive
+    w.pingSent = false               # any frame answers an outstanding ping
     let old = w.inBuf.len
     w.inBuf.setLen(old + data.len)
     copyMem(addr w.inBuf[old], unsafeAddr data[0], data.len)
@@ -511,6 +523,27 @@ proc wsPeerClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   w.wantClose = true
   if w.flush != nil:
     w.flush(core, c, w)
+
+proc wsSweepIdle*(core: ptr LoopCore, c: ptr Connection, w: WsConn): bool =
+  ## Per-stream WebSocket keepalive for h2/h3, called ~once a second by the loop
+  ## for each tracked WsConn. After `wsPingInterval` idle seconds it sends a
+  ## ping; if no frame arrives within `wsPongTimeout` after that, it closes the
+  ## stream (1011) as an unresponsive peer. Returns true when the caller should
+  ## stop tracking this ws (it timed out, or already closed). h1 uses the
+  ## connection deadline wheel instead. `c` is the h2 connection, nil for h3.
+  if w.closeNotified: return true            # already closed: reap
+  if core.wsPingInterval <= 0: return false  # keepalive disabled
+  if w.pingSent:
+    if core.nowSec - w.pingAt >= int64(core.wsPongTimeout):
+      failClose(core, c, w, 1011)            # no reply: peer is gone
+      if w.flush != nil: w.flush(core, c, w) # push the close / conclude the stream
+      return true
+  elif core.nowSec - w.lastRx >= int64(core.wsPingInterval):
+    w.outBuf.appendFrame(opPing, "")
+    w.pingSent = true
+    w.pingAt = core.nowSec
+    if w.flush != nil: w.flush(core, c, w)
+  false
 
 proc wsClosed*(core: ptr LoopCore, c: ptr Connection) =
   ## Called by the loop when an HTTP/1 connection is torn down.

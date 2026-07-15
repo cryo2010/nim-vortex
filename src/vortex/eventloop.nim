@@ -144,6 +144,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   result.core.serverHeader = settings.serverHeader
   result.core.maxWsMessage = settings.maxWsMessageSize
   result.core.wsPingInterval = settings.wsPingInterval
+  result.core.wsPongTimeout = settings.wsPongTimeout
   result.core.wsCompression = settings.wsCompression
   result.core.nowSec = monoSec()
   result.core.pool = pool
@@ -843,12 +844,36 @@ proc sweepTimeouts(loop: Loop) =
     else:
       loop.closeConn(c)            # includes dkWsPong: no reply, peer is gone
 
+proc sweepWsIdle(loop: Loop) =
+  ## Per-stream WebSocket keepalive for h2/h3 (h1 rides the deadline wheel
+  ## above). Runs once a second over the tracked WsConns: ping an idle stream,
+  ## close an unresponsive one, and drop closed ones from tracking.
+  if loop.core.wsIdle.len == 0: return
+  var survivors: seq[RootRef]
+  var h3Touched = false
+  for r in loop.core.wsIdle:
+    let w = WsConn(r)
+    # h2 ws (fd >= 0) needs its Connection to flush; h3 ws (fd < 0) reaches the
+    # stream through the WsConn. A vanished h2 connection means the ws is gone.
+    let c = if w.fd >= 0: conn(addr loop.core, w.fd, w.gen) else: nil
+    if w.fd >= 0 and c == nil: continue
+    let done = wsSweepIdle(addr loop.core, c, w)
+    if w.fd < 0: h3Touched = true
+    elif c != nil and pendingOut(c) > 0:
+      loop.flushOut(c)             # push the ping / close DATA to the socket
+    if not done: survivors.add r
+  loop.core.wsIdle = survivors
+  when not defined(plainHttp):
+    if h3Touched and loop.quicListener != nil:
+      loop.h3Drive()
+
 proc tick(loop: Loop) =
   let now = monoSec()
   if now != loop.core.nowSec:
     loop.core.nowSec = now
     loop.refreshDate()
     loop.sweepTimeouts()
+    loop.sweepWsIdle()
 
 # --- graceful shutdown ------------------------------------------------------
 
