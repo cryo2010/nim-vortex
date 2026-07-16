@@ -81,8 +81,15 @@ type
   TlsConfig* = object
     ## One per server; SSL_CTX is thread-safe for SSL_new. Lives in shared
     ## memory so loop threads can use it via pointer.
-    ctx*: SslCtxPtr
-    protos: string          ## ALPN preference list, wire format
+    ctx*: SslCtxPtr          ## active SSL_CTX; loop threads load it atomically
+                             ## so a certificate hot-reload can swap it in
+    retired: SslCtxPtr       ## the ctx displaced by the previous reload, freed
+                             ## at the next one (grace for in-flight SSL_new)
+    protos: string           ## ALPN preference list, wire format
+    meth: pointer            ## method the ctx was built with (rebuild on reload)
+    certFile, keyFile: string
+    minProtoVersion: clong
+    cipherList, cipherSuites: string
 
   TlsIo* = enum
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
@@ -108,9 +115,13 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
   else:
     SSL_TLSEXT_ERR_NOACK      # no overlap: proceed without ALPN (=> h1)
 
-proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
-                       protos: string, minProtoVersion: clong = 0,
-                       cipherList = "", cipherSuites = ""): ptr TlsConfig =
+proc buildTlsCtx(meth: pointer, certFile, keyFile: string,
+                 minProtoVersion: clong, cipherList, cipherSuites: string):
+                 SslCtxPtr =
+  ## Build a fully-configured SSL_CTX (min version, ciphers, cert/key). Raises
+  ## on any failure, freeing the partial ctx. The ALPN callback is set by the
+  ## caller, which owns the stable arg pointer. Shared by initial config and
+  ## certificate hot-reload.
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
@@ -144,10 +155,53 @@ proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
   discard SSL_CTX_ctrl(ctx, SSL_CTRL_MODE,
       SSL_MODE_ENABLE_PARTIAL_WRITE or SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
       nil)
+  ctx
+
+proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
+                       protos: string, minProtoVersion: clong = 0,
+                       cipherList = "", cipherSuites = ""): ptr TlsConfig =
+  let ctx = buildTlsCtx(meth, certFile, keyFile, minProtoVersion,
+                        cipherList, cipherSuites)
   result = createShared(TlsConfig)
   result.ctx = ctx
   result.protos = protos
+  result.meth = meth
+  result.certFile = certFile
+  result.keyFile = keyFile
+  result.minProtoVersion = minProtoVersion
+  result.cipherList = cipherList
+  result.cipherSuites = cipherSuites
   SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
+
+proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
+  ## Rebuild the SSL_CTX from `certFile`/`keyFile` (or, when empty, the paths
+  ## most recently loaded -- initially the configured ones -- e.g. after an
+  ## in-place renewal) and atomically install it, so subsequent TLS handshakes
+  ## present the new certificate while in-flight connections keep the old one.
+  ## Returns false and leaves the running ctx untouched if the new material is
+  ## missing/invalid/mismatched.
+  ##
+  ## Lock-free and safe: loop threads read `cfg.ctx` with an atomic load in
+  ## `newTlsSession`; the displaced ctx is not freed now but retired and freed
+  ## at the *next* reload. That gives any thread mid-`SSL_new` an effectively
+  ## unbounded grace window (reloads are seconds/hours apart, SSL_new is
+  ## microseconds), while capping retained ctxs at one. Call from a normal
+  ## thread, not a raw signal handler.
+  let cf = if certFile.len > 0: certFile else: cfg.certFile
+  let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
+  var newCtx: SslCtxPtr
+  try:
+    newCtx = buildTlsCtx(cfg.meth, cf, kf, cfg.minProtoVersion,
+                         cfg.cipherList, cfg.cipherSuites)
+  except CatchableError:
+    return false
+  SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
+  cfg.certFile = cf
+  cfg.keyFile = kf
+  let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
+  if cfg.retired != nil: SSL_CTX_free(cfg.retired)  # unreferenced since last reload
+  cfg.retired = old
+  true
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0,
@@ -158,11 +212,18 @@ proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
   SSL_CTX_free(cfg.ctx)
+  if cfg.retired != nil: SSL_CTX_free(cfg.retired)
   cfg.protos = ""
+  cfg.certFile = ""
+  cfg.keyFile = ""
+  cfg.cipherList = ""
+  cfg.cipherSuites = ""
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =
-  result = SSL_new(cfg.ctx)
+  # Atomic load: a concurrent certificate hot-reload may swap cfg.ctx.
+  let ctx = atomicLoadN(addr cfg.ctx, ATOMIC_ACQUIRE)
+  result = SSL_new(ctx)
   if result == nil: return nil
   if SSL_set_fd(result, fd) != 1:
     SSL_free(result)

@@ -120,6 +120,23 @@ proc close*(server: var Server) =
   requestShutdown()
   server.waitFor()
 
+proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
+  ## Hot-reload the TLS certificate/key for new HTTPS (HTTP/1.1 and HTTP/2)
+  ## connections, without a restart and without dropping in-flight ones. Pass
+  ## new paths, or leave empty to re-read the originally configured files (e.g.
+  ## after certbot renewed them in place). Returns false if TLS is not enabled,
+  ## or the new cert/key is missing/invalid/mismatched -- in which case the
+  ## running certificate is kept, so a bad renewal never takes the server down.
+  ##
+  ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
+  ## inside a raw signal handler. HTTP/3 (QUIC) keeps its certificate until
+  ## restart; only the TCP TLS path is hot-reloaded (see the transport docs).
+  when defined(plainHttp):
+    false
+  else:
+    if server.tls == nil: return false
+    reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile)
+
 proc run*(handler: RequestHandler, settings = initSettings(),
           streamRoute: StreamRouteCb = nil) =
   ## Start serving; blocks until SIGINT/SIGTERM or `requestShutdown`.
