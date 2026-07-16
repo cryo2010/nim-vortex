@@ -45,6 +45,7 @@ from ./perf_srv_std import serveHttpbeast, serveHttpbeastAsync,
                            serveAsynchttpserver
 from ./perf_srv_chronos import serveChronos
 from ./perf_srv_vortex_chronos import serveOursChronos
+from ./perf_srv_mummy import serveMummy
 
 const
   benchSeconds {.intdefine.} = 5
@@ -92,6 +93,7 @@ proc orchestrate() =
     (name: "vortex-chronos-await", port: 9111),
     (name: "httpbeast", port: 9103),
     (name: "httpbeast-async", port: 9109),
+    (name: "mummy", port: 9112),
     (name: "asynchttpserver", port: 9104),
     (name: "chronos", port: 9105),
   ]
@@ -130,6 +132,7 @@ when isMainModule:
     of "vortex-chronos-await": serveOursChronos(port, doAwait = true)
     of "httpbeast": serveHttpbeast(port)
     of "httpbeast-async": serveHttpbeastAsync(port)
+    of "mummy": serveMummy(port)
     of "asynchttpserver": serveAsynchttpserver(port)
     of "chronos": serveChronos(port)
     else: quit "unknown server: " & paramStr(2)
