@@ -203,6 +203,78 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   cfg.retired = old
   true
 
+# --- QUIC (HTTP/3) certificate reload ---------------------------------------
+#
+# A QUIC listener binds its SSL_CTX at creation, so the atomic pointer swap the
+# TCP path uses would not reach it. Instead each loop thread owns a private QUIC
+# ctx and updates it *in place* on its own thread (so no handshake on that
+# listener interleaves the update, and no other thread touches the ctx). New
+# connections read the ctx's current cert at accept time -- the same mechanism
+# as SSL_new on the TCP side -- while in-flight connections keep theirs.
+#
+# The main thread signals a reload through this plain-memory struct (fixed
+# buffers, never GC strings, so it is safe to read from the loop threads).
+
+const certPathMax = 1024
+
+type
+  CertReload* = object
+    gen: int                        ## bumped per request; read/written atomically
+    certPath: array[certPathMax, char]
+    keyPath: array[certPathMax, char]
+
+proc setPath(dst: var array[certPathMax, char], s: string) =
+  let n = min(s.len, certPathMax - 1)
+  for i in 0 ..< n: dst[i] = s[i]
+  dst[n] = '\0'
+
+proc getPath(src: array[certPathMax, char]): string =
+  var n = 0
+  while n < certPathMax and src[n] != '\0': inc n
+  result = newString(n)
+  for i in 0 ..< n: result[i] = src[i]
+
+proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string) =
+  ## Main thread: publish the paths for a QUIC certificate reload, then bump the
+  ## generation with a release store so the loop threads observe the paths
+  ## before the new generation. Empty paths mean "re-read the configured ones".
+  setPath(r.certPath, certFile)
+  setPath(r.keyPath, keyFile)
+  atomicStoreN(addr r.gen, atomicLoadN(addr r.gen, ATOMIC_RELAXED) + 1,
+               ATOMIC_RELEASE)
+
+proc pendingCertReload*(r: ptr CertReload, seen: var int,
+                        certFile, keyFile: var string): bool =
+  ## Loop thread: true (once) when a reload has been requested since `seen`.
+  ## Acquire load pairs with the release store in requestCertReload.
+  let g = atomicLoadN(addr r.gen, ATOMIC_ACQUIRE)
+  if g == seen: return false
+  seen = g
+  certFile = getPath(r.certPath)
+  keyFile = getPath(r.keyPath)
+  true
+
+proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
+  ## In-place certificate update on a per-loop QUIC ctx, called on the owning
+  ## loop thread. Validates the new material in a throwaway ctx first, so a bad
+  ## renewal never leaves the live ctx with a mismatched cert/key; only then
+  ## applies it (two calls that no handshake interleaves, since we are on the
+  ## listener's own thread). Returns false, ctx untouched, on bad material.
+  let cf = if certFile.len > 0: certFile else: cfg.certFile
+  let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
+  try:
+    SSL_CTX_free(buildTlsCtx(cfg.meth, cf, kf, cfg.minProtoVersion,
+                             cfg.cipherList, cfg.cipherSuites))  # probe only
+  except CatchableError:
+    return false
+  if SSL_CTX_use_certificate_chain_file(cfg.ctx, cf.cstring) != 1: return false
+  if SSL_CTX_use_PrivateKey_file(cfg.ctx, kf.cstring, SSL_FILETYPE_PEM) != 1:
+    return false
+  if SSL_CTX_check_private_key(cfg.ctx) != 1: return false
+  cfg.certFile = cf
+  cfg.keyFile = kf
+  true
+
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0,
                    cipherList = "", cipherSuites = ""): ptr TlsConfig =
