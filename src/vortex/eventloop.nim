@@ -45,6 +45,10 @@ type
     tls: pointer                 # ptr TlsConfig; nil = plaintext
     udpFd: int                   # -1 = no HTTP/3
     quicListener: pointer        # SSL* listener
+    quicOwnCfg: pointer          # ptr TlsConfig: this loop's private QUIC ctx
+                                 # (reloaded in place on this thread)
+    quicReload: pointer          # ptr CertReload: main-thread reload signal
+    quicReloadSeen: int          # last reload generation this loop applied
     h3Ready: seq[uint64]         # reused h3 dispatch buffer
     connCount: int               # live TCP connections (maxConnections cap)
     draining: bool               # graceful shutdown in progress
@@ -127,7 +131,8 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
               pool: pointer = nil, outbox: ptr Outbox = nil,
               tls: pointer = nil, quicCfg: pointer = nil,
               udpFd: SocketHandle = osInvalidSocket,
-              streamRoute: StreamRouteCb = nil): Loop =
+              streamRoute: StreamRouteCb = nil,
+              quicReload: pointer = nil): Loop =
   result = Loop(
     selector: newSelector[FdKind](),
     listenFd: int(listenFd),
@@ -156,8 +161,15 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
     result.selector.registerEvent(outbox.ev, fkWakeup)
   when not defined(plainHttp):
     if quicCfg != nil and udpFd != osInvalidSocket:
-      result.quicListener = newQuicListener(
-        cast[ptr TlsConfig](quicCfg), cint(udpFd))
+      # Build this loop's own QUIC ctx (from the same configured cert) so a
+      # certificate hot-reload can update it in place on this thread, with no
+      # cross-loop race and without dropping in-flight h3 connections. The
+      # shared `quicCfg` only signals that h3 is enabled (already validated).
+      let ownCfg = newQuicConfig(settings.certFile, settings.keyFile,
+                                 settings.tlsCipherSuites)
+      result.quicOwnCfg = cast[pointer](ownCfg)
+      result.quicReload = quicReload
+      result.quicListener = newQuicListener(ownCfg, cint(udpFd))
       if result.quicListener != nil:
         result.udpFd = int(udpFd)
         result.selector.registerHandle(udpFd, {Event.Read}, fkQuic)
@@ -867,6 +879,16 @@ proc sweepWsIdle(loop: Loop) =
     if h3Touched and loop.quicListener != nil:
       loop.h3Drive()
 
+proc applyQuicReload(loop: Loop) =
+  ## Loop thread: apply a pending QUIC certificate reload to this loop's private
+  ## ctx in place. New h3 handshakes present the new cert; in-flight keep theirs.
+  when not defined(plainHttp):
+    if loop.quicReload == nil or loop.quicOwnCfg == nil: return
+    var cf, kf: string
+    if pendingCertReload(cast[ptr CertReload](loop.quicReload),
+                         loop.quicReloadSeen, cf, kf):
+      discard reloadQuicCert(cast[ptr TlsConfig](loop.quicOwnCfg), cf, kf)
+
 proc tick(loop: Loop) =
   let now = monoSec()
   if now != loop.core.nowSec:
@@ -874,6 +896,7 @@ proc tick(loop: Loop) =
     loop.refreshDate()
     loop.sweepTimeouts()
     loop.sweepWsIdle()
+    loop.applyQuicReload()
 
 # --- graceful shutdown ------------------------------------------------------
 
@@ -1049,6 +1072,8 @@ proc run*(loop: Loop) =
         loop.core.h3slots[i].pinned = 0
         loop.h3FreeSlot(i)
       quicFree(loop.quicListener)
+      if loop.quicOwnCfg != nil:        # free after the listener drops its ref
+        freeTlsConfig(cast[ptr TlsConfig](loop.quicOwnCfg))
       discard posix.close(cint(loop.udpFd))
   loop.selector.close()
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
@@ -1069,9 +1094,10 @@ type LoopThreadArg* = tuple
   quicCfg: pointer
   udpFd: SocketHandle
   streamRoute: StreamRouteCb
+  quicReload: pointer
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
                      arg.pool, arg.outbox, arg.tls, arg.quicCfg, arg.udpFd,
-                     arg.streamRoute)
+                     arg.streamRoute, arg.quicReload)
   loop.run()

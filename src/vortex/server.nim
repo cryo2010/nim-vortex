@@ -28,6 +28,7 @@ type
     pool: ptr WorkerPool
     tls: pointer               ## ptr TlsConfig or nil
     quicCfg: pointer           ## ptr TlsConfig for QUIC or nil
+    quicReload: pointer        ## ptr CertReload: signals loops to reload h3 certs
     port*: Port                ## actual bound port (settings may say 0)
 
 proc start*(handler: RequestHandler, settings = initSettings(),
@@ -77,9 +78,12 @@ proc start*(handler: RequestHandler, settings = initSettings(),
     udpFds[i] = osInvalidSocket
   when not defined(plainHttp):
     if result.tls != nil and settings.http3:
+      # Validate the QUIC cert/method once up front (raises on failure); each
+      # loop then builds its own private ctx for in-place hot-reload.
       result.quicCfg = cast[pointer](
         newQuicConfig(settings.certFile, settings.keyFile,
                       cipherSuites = settings.tlsCipherSuites))
+      result.quicReload = createShared(CertReload)
       for i in 0 ..< numLoops:
         udpFds[i] = newUdpSocket(cfg)
 
@@ -93,7 +97,7 @@ proc start*(handler: RequestHandler, settings = initSettings(),
                   pool: cast[pointer](result.pool),
                   outbox: result.outboxes[i], tls: result.tls,
                   quicCfg: result.quicCfg, udpFd: udpFds[i],
-                  streamRoute: streamRoute))
+                  streamRoute: streamRoute, quicReload: result.quicReload))
 
 proc waitFor*(server: var Server) =
   ## Block until the loops exit (stop signal), then tear down workers.
@@ -114,6 +118,9 @@ proc waitFor*(server: var Server) =
     if server.quicCfg != nil:
       freeTlsConfig(cast[ptr TlsConfig](server.quicCfg))
       server.quicCfg = nil
+    if server.quicReload != nil:
+      deallocShared(server.quicReload)
+      server.quicReload = nil
 
 proc close*(server: var Server) =
   ## Stop and tear down.
@@ -129,13 +136,20 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
   ## running certificate is kept, so a bad renewal never takes the server down.
   ##
   ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
-  ## inside a raw signal handler. HTTP/3 (QUIC) keeps its certificate until
-  ## restart; only the TCP TLS path is hot-reloaded (see the transport docs).
+  ## inside a raw signal handler. Covers HTTP/1.1, HTTP/2, and (when enabled)
+  ## HTTP/3: each h3 loop updates its own QUIC ctx in place on its next tick, so
+  ## new h3 handshakes use the new certificate while in-flight ones keep theirs.
   when defined(plainHttp):
     false
   else:
     if server.tls == nil: return false
-    reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile)
+    let ok = reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile)
+    # Signal the h3 loops regardless; each validates the material itself and
+    # keeps its running cert on failure (the TCP result is what we report).
+    if server.quicReload != nil:
+      requestCertReload(cast[ptr CertReload](server.quicReload),
+                        certFile, keyFile)
+    ok
 
 proc run*(handler: RequestHandler, settings = initSettings(),
           streamRoute: StreamRouteCb = nil) =
