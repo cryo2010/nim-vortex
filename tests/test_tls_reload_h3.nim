@@ -37,6 +37,7 @@ except CatchableError:
 suite "QUIC cert reload signaling":
   test "request/pending carries paths and advances the generation":
     let r = createShared(CertReload)
+    defer: deallocShared(r)
     var seen = 0
     var cf, kf: string
     check not pendingCertReload(r, seen, cf, kf)        # nothing pending yet
@@ -47,7 +48,6 @@ suite "QUIC cert reload signaling":
     requestCertReload(r, "", "")                         # empty => configured
     check pendingCertReload(r, seen, cf, kf)
     check cf == "" and kf == ""
-    deallocShared(r)
 
 suite "reloadQuicCert (in-place update)":
   test "accepts a valid cert, rejects missing and mismatched":
@@ -56,14 +56,15 @@ suite "reloadQuicCert (in-place update)":
     else:
       let cfg = newQuicConfig(certA, keyA)
       check cfg != nil
-      let certB = dir / "b.pem"
-      let keyB = dir / "bkey.pem"
-      gen(certB, keyB, "bravo.vortex")
-      check reloadQuicCert(cfg, certB, keyB)             # valid swap
-      check not reloadQuicCert(cfg, dir / "nope.pem", dir / "nope.key")
-      check not reloadQuicCert(cfg, certA, keyB)         # cert/key mismatch
-      check reloadQuicCert(cfg, "", "")                  # re-read current paths
-      freeTlsConfig(cfg)
+      if cfg != nil:
+        defer: freeTlsConfig(cfg)
+        let certB = dir / "b.pem"
+        let keyB = dir / "bkey.pem"
+        gen(certB, keyB, "bravo.vortex")
+        check reloadQuicCert(cfg, certB, keyB)           # valid swap
+        check not reloadQuicCert(cfg, dir / "nope.pem", dir / "nope.key")
+        check not reloadQuicCert(cfg, certA, keyB)       # cert/key mismatch
+        check reloadQuicCert(cfg, "", "")                # re-read current paths
 
 suite "http3 server survives a certificate reload":
   test "TCP cert swaps and the server keeps serving with h3 enabled":
@@ -75,6 +76,7 @@ suite "http3 server survives a certificate reload":
                       initSettings(port = Port(0), numThreads = 2,
                                    certFile = certA, keyFile = keyA,
                                    http3 = true))
+      defer: srv.close()
       let port = $srv.port
       proc served(): bool =
         var c = newHttpClient(sslContext = newContext(verifyMode = CVerifyNone))
@@ -94,7 +96,6 @@ suite "http3 server survives a certificate reload":
       sleep(1500)                           # let the loop ticks apply the h3 swap
       check "charlie.vortex" in cn()         # TCP presents the new cert
       check served()                         # and the server is still up
-      srv.close()
 
 removeDir(dir)
 echo "h3 cert reload ok (quic=", quicOk, ")"
