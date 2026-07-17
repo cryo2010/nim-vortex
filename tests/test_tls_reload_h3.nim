@@ -37,16 +37,21 @@ except CatchableError:
 suite "QUIC cert reload signaling":
   test "request/pending carries paths and advances the generation":
     let r = createShared(CertReload)
-    defer: deallocShared(r)
+    initCertReload(r)
+    defer:
+      deinitCertReload(r)
+      deallocShared(r)
     var seen = 0
     var cf, kf: string
-    check not pendingCertReload(r, seen, cf, kf)        # nothing pending yet
+    check pendingCertReload(r, seen, cf, kf) == 0        # nothing pending yet
     requestCertReload(r, "/x/cert.pem", "/x/key.pem")
-    check pendingCertReload(r, seen, cf, kf)
+    let g1 = pendingCertReload(r, seen, cf, kf)
+    check g1 == 1
     check cf == "/x/cert.pem" and kf == "/x/key.pem"
-    check not pendingCertReload(r, seen, cf, kf)         # consumed once
+    seen = g1                                            # caller advances on act
+    check pendingCertReload(r, seen, cf, kf) == seen      # consumed, no change
     requestCertReload(r, "", "")                         # empty => configured
-    check pendingCertReload(r, seen, cf, kf)
+    check pendingCertReload(r, seen, cf, kf) == 2
     check cf == "" and kf == ""
 
 suite "reloadQuicCert (in-place update)":
@@ -58,11 +63,18 @@ suite "reloadQuicCert (in-place update)":
       check cfg != nil
       if cfg != nil:
         defer: freeTlsConfig(cfg)
+        # ctxCertSubject reads the cert actually installed on the QUIC ctx, so
+        # these assertions prove the in-place reload reached the ctx (new h3
+        # connections read that ctx at accept, the same way the TCP suite proves
+        # end to end via s_client).
+        check "alpha.vortex" in ctxCertSubject(cfg)      # initial cert
         let certB = dir / "b.pem"
         let keyB = dir / "bkey.pem"
         gen(certB, keyB, "bravo.vortex")
         check reloadQuicCert(cfg, certB, keyB)           # valid swap
+        check "bravo.vortex" in ctxCertSubject(cfg)      # ctx now holds it
         check not reloadQuicCert(cfg, dir / "nope.pem", dir / "nope.key")
+        check "bravo.vortex" in ctxCertSubject(cfg)      # unchanged on failure
         check not reloadQuicCert(cfg, certA, keyB)       # cert/key mismatch
         check reloadQuicCert(cfg, "", "")                # re-read current paths
 

@@ -129,7 +129,7 @@ proc refreshDate(loop: Loop) =
 proc newLoop*(settings: Settings, handler: RequestHandler,
               stopFlag: ptr Atomic[bool], listenFd: SocketHandle,
               pool: pointer = nil, outbox: ptr Outbox = nil,
-              tls: pointer = nil, quicCfg: pointer = nil,
+              tls: pointer = nil,
               udpFd: SocketHandle = osInvalidSocket,
               streamRoute: StreamRouteCb = nil,
               quicReload: pointer = nil): Loop =
@@ -160,11 +160,11 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   if outbox != nil:
     result.selector.registerEvent(outbox.ev, fkWakeup)
   when not defined(plainHttp):
-    if quicCfg != nil and udpFd != osInvalidSocket:
+    if udpFd != osInvalidSocket:
+      # A valid udpFd means the server enabled h3 and validated the QUIC cert.
       # Build this loop's own QUIC ctx (from the same configured cert) so a
       # certificate hot-reload can update it in place on this thread, with no
-      # cross-loop race and without dropping in-flight h3 connections. The
-      # shared `quicCfg` only signals that h3 is enabled (already validated).
+      # cross-loop race and without dropping in-flight h3 connections.
       let ownCfg = newQuicConfig(settings.certFile, settings.keyFile,
                                  settings.tlsCipherSuites)
       result.quicOwnCfg = cast[pointer](ownCfg)
@@ -882,12 +882,21 @@ proc sweepWsIdle(loop: Loop) =
 proc applyQuicReload(loop: Loop) =
   ## Loop thread: apply a pending QUIC certificate reload to this loop's private
   ## ctx in place. New h3 handshakes present the new cert; in-flight keep theirs.
+  ## A failed reload keeps the running cert and is logged (not silently dropped);
+  ## the generation is consumed either way, so a permanently-bad cert does not
+  ## spin -- the operator fixes the files and re-issues the reload.
   when not defined(plainHttp):
     if loop.quicReload == nil or loop.quicOwnCfg == nil: return
     var cf, kf: string
-    if pendingCertReload(cast[ptr CertReload](loop.quicReload),
-                         loop.quicReloadSeen, cf, kf):
-      discard reloadQuicCert(cast[ptr TlsConfig](loop.quicOwnCfg), cf, kf)
+    let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
+                                loop.quicReloadSeen, cf, kf)
+    if gen != loop.quicReloadSeen:
+      if not reloadQuicCert(cast[ptr TlsConfig](loop.quicOwnCfg), cf, kf):
+        try:
+          stderr.writeLine("vortex: HTTP/3 certificate reload failed; " &
+                           "keeping the current certificate on this loop")
+        except IOError, OSError: discard
+      loop.quicReloadSeen = gen
 
 proc tick(loop: Loop) =
   let now = monoSec()
@@ -1072,9 +1081,12 @@ proc run*(loop: Loop) =
         loop.core.h3slots[i].pinned = 0
         loop.h3FreeSlot(i)
       quicFree(loop.quicListener)
-      if loop.quicOwnCfg != nil:        # free after the listener drops its ref
-        freeTlsConfig(cast[ptr TlsConfig](loop.quicOwnCfg))
       discard posix.close(cint(loop.udpFd))
+    # Free the per-loop QUIC ctx even if the listener failed to create (the ctx
+    # is built first): otherwise it leaks on that error path. Ordered after the
+    # listener free above so the listener's ctx ref is already dropped.
+    if loop.quicOwnCfg != nil:
+      freeTlsConfig(cast[ptr TlsConfig](loop.quicOwnCfg))
   loop.selector.close()
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
     discard posix.close(cint(loop.listenFd))
@@ -1091,13 +1103,12 @@ type LoopThreadArg* = tuple
   pool: pointer
   outbox: ptr Outbox
   tls: pointer
-  quicCfg: pointer
   udpFd: SocketHandle
   streamRoute: StreamRouteCb
   quicReload: pointer
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
-                     arg.pool, arg.outbox, arg.tls, arg.quicCfg, arg.udpFd,
+                     arg.pool, arg.outbox, arg.tls, arg.udpFd,
                      arg.streamRoute, arg.quicReload)
   loop.run()
