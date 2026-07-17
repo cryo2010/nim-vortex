@@ -112,6 +112,12 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
     if h2.streams[sid].ws != nil:               # WebSocket aborted: onClose
       wsStreamClosed(h2.core, c, WsConn(h2.streams[sid].ws))
       h2.streams[sid].ws = nil
+    if h2.streams[sid].onBodyCb != nil:         # streaming request aborted: EOF
+      let cb = h2.streams[sid].onBodyCb
+      h2.streams[sid].onBodyCb = nil
+      var empty: string
+      try: cb(toOpenArray(empty, 0, -1), true)
+      except CatchableError: discard
     h2.streams.del(sid)
     dec h2.activeStreams
 
@@ -356,6 +362,21 @@ proc h2WsTeardownAll*(c: ptr Connection) =
     if st.ws != nil:
       wsStreamClosed(h2.core, c, WsConn(st.ws))
       st.ws = nil
+
+proc h2NotifyClosed*(c: ptr Connection) =
+  ## Deliver a final onBody(last=true) for every streaming request whose body
+  ## was still open when the connection died, so an async adapter suspended in
+  ## await req.read() resumes at end-of-body and its Future / reader-table entry
+  ## are released instead of leaking. Loop thread; called from closeConn.
+  if c.h2 == nil: return
+  let h2 = H2Conn(c.h2)
+  var empty: string
+  for sid, st in h2.streams.mpairs:
+    if st.onBodyCb != nil:
+      let cb = st.onBodyCb
+      st.onBodyCb = nil
+      try: cb(toOpenArray(empty, 0, -1), true)
+      except CatchableError: discard
 
 proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
                  extensionsOffer, protocolsOffer: string,

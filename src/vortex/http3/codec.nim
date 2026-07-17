@@ -330,6 +330,12 @@ proc failStream(conn: H3Conn, sid: uint64) =
   if st.ws != nil:                    # a WebSocket was aborted: onClose (1006)
     wsStreamClosed(conn.core, nil, WsConn(st.ws))
     st.ws = nil
+  if st.onBodyCb != nil:              # streaming request aborted: EOF the sink
+    let cb = st.onBodyCb
+    st.onBodyCb = nil
+    var empty: string
+    try: cb(toOpenArray(empty, 0, -1), true)
+    except CatchableError: discard
   quicFree(st.ssl)
   conn.streams.del(sid)
 
@@ -790,7 +796,16 @@ proc h3Goaway*(conn: H3Conn) =
 
 proc h3Free*(conn: H3Conn) =
   h3WsTeardownAll(conn)             # onClose for any RFC 9220 WebSocket streams
-  for sid, st in conn.streams:
+  var empty: string
+  for sid, st in conn.streams.mpairs:
+    if st.onBodyCb != nil:
+      # Streaming request still open (connection died mid-upload): deliver a
+      # final last=true so an async await req.read() resumes at end-of-body and
+      # releases its Future / reader-table entry instead of leaking.
+      let cb = st.onBodyCb
+      st.onBodyCb = nil
+      try: cb(toOpenArray(empty, 0, -1), true)
+      except CatchableError: discard
     quicFree(st.ssl)
   conn.streams.clear()
   for u in conn.unis:

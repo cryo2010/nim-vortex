@@ -208,9 +208,21 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     c.closeRequested = true
     c.state = csClosing
     return
+  if c.onBodyCb != nil:
+    # A streaming request's body sink is still open (the client disconnected
+    # mid-upload). Deliver a final last=true so an async adapter suspended in
+    # await req.read() resumes at end-of-body and its Future / reader-table
+    # entry are released instead of leaking forever (the entry is keyed by the
+    # about-to-be-bumped generation and would never be reused or deleted).
+    let cb = c.onBodyCb
+    c.onBodyCb = nil
+    var empty: string
+    try: cb(toOpenArray(empty, 0, -1), true)
+    except CatchableError: discard
   if c.ws != nil:
     wsClosed(addr loop.core, c)   # deliver onClose (1006 if no peer close)
   if c.h2 != nil:
+    h2NotifyClosed(c)             # last=true for every streaming request sink
     h2WsTeardownAll(c)            # onClose for every RFC 8441 WebSocket stream
   when not defined(plainHttp):
     if c.ssl != nil:
