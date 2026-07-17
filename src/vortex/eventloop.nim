@@ -190,6 +190,7 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
     of dkHeader: loop.settings.headerTimeout
     of dkBody: loop.settings.bodyTimeout
     of dkIdle: loop.settings.keepAliveTimeout
+    of dkResponse: loop.settings.responseTimeout
     of dkDrain: drainTimeoutSec
     of dkWsPing: loop.settings.wsPingInterval
     of dkWsPong: loop.settings.wsPongTimeout
@@ -534,6 +535,12 @@ proc processInput(loop: Loop, c: ptr Connection) =
       if not c.responded:
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
+        # Backstop a stuck/never-arriving deferred response with responseTimeout
+        # (opt-in, 0 = off), but not while pinned: a blocking: worker may take
+        # arbitrarily long and always responds (blockingTrampoline guarantees
+        # it), so timing it out would kill legitimate long jobs.
+        if c.pinned == 0 and loop.settings.responseTimeout > 0:
+          c.setDeadline(loop, dkResponse)
         return
       if c.respStreaming:
         # A streaming response is open (sendHead sent, not finished): pause
@@ -933,6 +940,12 @@ proc sweepTimeouts(loop: Loop) =
       continue
     if c.dlKind == dkWsPing:
       loop.sweepWsPing(c)          # idle: ping, then wait for the pong
+    elif c.dlKind == dkResponse and not c.responded and c.pinned == 0:
+      # A deferred/async response never arrived within responseTimeout: answer
+      # 503 and close instead of hanging. A late response arriving afterward is
+      # dropped by the generation check on the (by then torn-down) connection.
+      loop.respondError(c, Http503)
+      loop.flushOut(c)
     else:
       loop.closeConn(c)            # includes dkWsPong: no reply, peer is gone
 

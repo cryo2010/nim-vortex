@@ -19,6 +19,16 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     req.blocking:
       sleep(50)
       res.send(Http200, req.body, req.header("Content-Type"))
+  of "/noresp":
+    req.blocking:
+      sleep(20)                          # finishes without responding at all
+  of "/stream-in-worker":
+    req.blocking:
+      # The streaming API is loop-thread only, so these no-op on a worker; the
+      # trampoline must still emit a default response (and release the pin).
+      res.sendHead(Http200, "text/plain")
+      discard res.write("data")
+      res.finish()
   else:
     res.send(Http404)
 
@@ -68,6 +78,18 @@ suite "worker pool / blocking":
     defer: client.close()
     check client.get(base & "/slowboom").code == Http500
 
+  test "worker that never responds gives 500, not a hang":
+    var client = newHttpClient()
+    defer: client.close()
+    check client.get(base & "/noresp").code == Http500
+    check fetch("/") == "fast"          # server stays healthy (pin released)
+
+  test "streaming API misused from a worker gives 500, not a hang":
+    var client = newHttpClient()
+    defer: client.close()
+    check client.get(base & "/stream-in-worker").code == Http500
+    check fetch("/") == "fast"
+
   test "keep-alive works across a blocking response":
     var client = newHttpClient()
     defer: client.close()
@@ -93,4 +115,30 @@ suite "worker pool / blocking":
     check fetch("/slow") == "slow done"
 
 srv.close()
+
+# responseTimeout: a handler that returns without responding (and never defers a
+# real answer) must not hang the connection forever when the knob is set.
+proc hangHandler(req: Request, res: Response) {.gcsafe.} =
+  if req.path == "/hang":
+    discard                              # never responds
+  else:
+    res.send(Http200, "ok", "text/plain")
+
+var tsrv = start(RequestHandler(hangHandler),
+                 initSettings(port = Port(0), numThreads = 1,
+                              responseTimeout = 1))
+let tbase = "http://127.0.0.1:" & $tsrv.port
+
+suite "response timeout":
+  test "a never-responding handler is answered 503 within the timeout":
+    var client = newHttpClient(timeout = 4000)
+    defer: client.close()
+    check client.get(tbase & "/hang").code == Http503
+
+  test "a normal handler is unaffected":
+    var client = newHttpClient(timeout = 4000)
+    defer: client.close()
+    check client.getContent(tbase & "/ok") == "ok"
+
+tsrv.close()
 echo "server shut down cleanly"

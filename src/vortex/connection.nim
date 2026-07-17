@@ -45,6 +45,7 @@ type
 
   DeadlineKind* = enum
     dkNone, dkHeader, dkBody, dkIdle, dkDrain,
+    dkResponse, ## request fully read, waiting for a deferred/async response
     dkWsPing,   ## WebSocket idle: send a keepalive ping when it expires
     dkWsPong    ## ping sent: close the connection if it expires with no reply
 
