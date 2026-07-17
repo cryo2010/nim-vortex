@@ -338,6 +338,19 @@ proc h2Input(loop: Loop, c: ptr Connection) =
     except CatchableError:
       applyResponse(addr loop.core, c, sid, 500, "text/plain", [],
                     "500 Internal Server Error")
+    # A freshly-accepted RFC 8441 WebSocket may hold frames the client
+    # pipelined with the CONNECT handshake (buffered during accept). Pump them
+    # now that the handler has installed onMessage; deliver a deferred
+    # peer-close if the client half-closed before we accepted.
+    if c.pinned == 0 and h2StreamAlive(c, sid):
+      let w = wsConnForStream(addr loop.core, c, sid)
+      if w != nil and (w.inBuf.len > 0 or w.preAcceptFin):
+        if w.inBuf.len > 0:
+          wsFeed(addr loop.core, c, w, "")
+        if w.preAcceptFin and h2StreamAlive(c, sid):
+          w.preAcceptFin = false
+          wsPeerClosed(addr loop.core, c, w)
+        loop.flushOut(c)
   if c.state == csActive:
     if h2ActiveStreams(c) == 0:
       if c.dlKind != dkIdle:
@@ -416,6 +429,13 @@ proc processInput(loop: Loop, c: ptr Connection) =
     # buffered frames wait until it unpins (one message at a time).
     if c.pinned == 0:
       wsInput(addr loop.core, c)
+    else:
+      # We can't parse frames to observe the peer's pong while pinned, but this
+      # call is driven by inbound bytes, which prove the peer is alive. Refresh
+      # the idle-ping deadline so sweepWsPing's pong timeout can't close a
+      # healthy connection whose pong sits unparsed in rbuf. h2/h3 get this for
+      # free: wsFeed updates lastRx on raw bytes even while a worker holds it.
+      armWsPing(addr loop.core, c)
     return
   if c.h2 != nil:
     loop.h2Input(c)
@@ -487,6 +507,12 @@ proc processInput(loop: Loop, c: ptr Connection) =
           if not c.responded:
             loop.respondError(c, Http500)
             return
+          if c.respStreaming:
+            # Raised after sendHead: the chunked body can't be terminated and
+            # the connection can't be reused, so close after flushing the
+            # partial response rather than parking it forever (below).
+            c.respStreaming = false
+            c.closeAfterFlush = true
       if not c.responded:
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
@@ -520,6 +546,15 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
       if c.state != csFree and c.pendingOut > 0:
         loop.flushOut(c)
   elif c.closeAfterFlush:
+    c.state = csClosing
+    loop.flushOut(c)
+  elif c.respStreaming:
+    # The response was left mid-stream: a handler (or its async future) failed
+    # or completed without calling finish(). The chunked body was never
+    # terminated, so the connection cannot be safely reused -- reusing it would
+    # let the next response's bytes be read as chunk data of this one (response
+    # desync). Flush whatever is buffered and close instead of resetting.
+    c.respStreaming = false
     c.state = csClosing
     loop.flushOut(c)
   else:
@@ -770,20 +805,25 @@ proc processOutbox(loop: Loop) =
         if idx >= loop.core.h3slots.len: continue
         let slot = addr loop.core.h3slots[idx]
         # RFC 9220 WebSocket messages use per-stream pinning, not the slot
-        # pin, so they route ahead of the omHttp response path.
-        if slot.conn != nil and slot.gen == m.gen and
-            m.kind in {omWs, omWsClose, omWsDone}:
-          let conn = H3Conn(slot.conn)
-          if m.kind == omWsDone:
-            h3WsResume(addr loop.core, conn, uint64(m.stream))
-          else:
-            let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
-            if w != nil:
-              wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
-          h3Touched = true
+        # pin. Handle (or, when stale, drop) them entirely before the omHttp
+        # pin bookkeeping: a stale ws message must never fall through to the
+        # `dec slot.pinned` below and steal a pin the slot's *current*
+        # occupant took for an in-flight blocking: task (which would let the
+        # loop free the slot under that worker). Mirrors the h1 branch, which
+        # checks gen before touching the pin.
+        if m.kind in {omWs, omWsClose, omWsDone}:
+          if slot.conn != nil and slot.gen == m.gen:
+            let conn = H3Conn(slot.conn)
+            if m.kind == omWsDone:
+              h3WsResume(addr loop.core, conn, uint64(m.stream))
+            else:
+              let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
+              if w != nil:
+                wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
+            h3Touched = true
           continue
-        if slot.pinned > 0: dec slot.pinned
         if slot.gen != m.gen or slot.conn == nil: continue
+        if slot.pinned > 0: dec slot.pinned
         if slot.closeReq:
           if slot.pinned == 0: loop.h3FreeSlot(idx)
           continue

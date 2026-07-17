@@ -11,6 +11,11 @@
 
 import std/httpcore
 
+const tokenDelims = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
+                     '?', '@', '[', '\\', ']', '{', '}'}
+  ## RFC 9110 5.6.2 token separators: bytes that may not appear in a field
+  ## name (VCHARs outside this set are valid token characters).
+
 type
   ParseResult* = enum
     prNeedMore   ## incomplete input, read more bytes and call again
@@ -235,8 +240,13 @@ proc parseHeaderLine(p: var RequestParser, buf: openArray[char],
   if p.headers.len >= limits.maxHeaderCount: return p.fail(Http431)
   let colon = findByte(buf, p.pos, lineEnd, ':')
   if colon < 0 or colon == p.pos: return p.fail(Http400)
-  # Field name must not contain spaces (request smuggling guard).
-  if findByte(buf, p.pos, colon, ' ') >= 0: return p.fail(Http400)
+  # Field name must be a token (RFC 9110 5.1 / 5.6.2). Rejecting everything
+  # outside the token set closes smuggling via a bare CR, TAB, NUL, or space
+  # embedded in the name (a downstream proxy may re-split such a "name").
+  for i in p.pos ..< colon:
+    let b = uint8(buf[i])
+    if b <= 0x20'u8 or b >= 0x7f'u8 or char(b) in tokenDelims:
+      return p.fail(Http400)
   var vs = colon + 1
   while vs < lineEnd and buf[vs] in {' ', '\t'}: inc vs
   var ve = lineEnd

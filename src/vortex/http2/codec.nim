@@ -374,6 +374,14 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
                                 serverProtocols)
   w.flush = wsFlushH2
   st.ws = w
+  # Hand over any frames the client pipelined with the CONNECT handshake
+  # (buffered in st.body before acceptance). They are pumped once the handler
+  # installs onMessage (see h2Input), not here, so no message is dispatched
+  # into a nil callback.
+  if st.body.len > 0:
+    w.inBuf.add st.body
+    st.body.setLen(0)
+  w.preAcceptFin = st.endStreamSeen
   var hb = ""
   encodeStatus(hb, 200)
   if serverHeader.len > 0: encodeHeader(hb, "server", serverHeader)
@@ -506,6 +514,15 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       h2.connError(c, errProtocol)
       return
     st.endStreamSeen = true
+    if st.streamingReq and st.dispatched:
+      # A streaming route consumed the DATA via onBody as it arrived; the
+      # trailers carry no body, but the sink still needs its terminating
+      # last=true callback (otherwise the handler hangs and the stream leaks).
+      # h2DeliverBody may res.send and delete the stream, so return after.
+      h2.h2DeliverBody(c, sid, true)
+      return
+    # A buffered route falls through: the dispatch tail runs the handler now
+    # that endStreamSeen is set.
   else:
     var meth, path, scheme, protocol: string
     var hasAuthority = false
@@ -646,6 +663,17 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
           wsPeerClosed(h2.core, c, WsConn(h2.streams[sid].ws))
       elif st.body.len + dataLen > h2.maxBody:
         h2.streamError(c, sid, errRefusedStream)
+      elif st.isWsConnect:
+        # WebSocket frames can arrive in the same read batch as the Extended
+        # CONNECT HEADERS, before the handler runs acceptWebSocket. Buffer them
+        # in st.body (bounded by the maxBody check above); h2WsAccept moves them
+        # into the WsConn's inBuf, pumped once the handler installs onMessage.
+        if dataLen > 0:
+          let old = st.body.len
+          st.body.setLen(old + dataLen)
+          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+        if (fh.flags and flagEndStream) != 0:
+          st.endStreamSeen = true
       elif st.streamingReq:
         # Inbound streaming: hand DATA to onBody and clear (bounded memory);
         # no content-length reconciliation since the body is not retained. The
@@ -764,7 +792,14 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         let delta = int32(value) - h2.peerInitialWindow
         h2.peerInitialWindow = int32(value)
         for sid, st in h2.streams.mpairs:
-          st.sendWindow += delta
+          # A stream's send window may already be near 2^31-1 (raised by
+          # WINDOW_UPDATE); a positive delta must not push it past the signed
+          # 31-bit ceiling, and the accounting must not wrap int32 either.
+          # RFC 9113 6.9.2 makes an out-of-range result a FLOW_CONTROL_ERROR.
+          let nw = int64(st.sendWindow) + int64(delta)
+          if nw > 0x7fffffff'i64 or nw < -0x80000000'i64:
+            h2.connError(c, errFlowControl); return
+          st.sendWindow = int32(nw)
         initialWindowChanged = true
       of setMaxFrameSize:
         if value < 16384'u32 or value > 16777215'u32:

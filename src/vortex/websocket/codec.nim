@@ -64,6 +64,7 @@ type
     wantClose*: bool         ## close the transport once outBuf is flushed
     flush*: WsFlush
     inBuf*: string           ## h2/h3 inbound bytes accumulated from DATA frames
+    preAcceptFin*: bool      ## client half-closed (END_STREAM) before accept
     blockingPinned*: bool    ## a per-stream ws.blocking worker holds this stream
     h2Pending*: int          ## h2/h3 outbound bytes queued but not yet on the wire
     h3conn*: RootRef         ## the H3Conn for an h3 stream (reach it + stream)
