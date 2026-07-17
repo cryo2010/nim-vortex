@@ -8,15 +8,39 @@ when not defined(plainHttp):
   import ./transport/tls
   import ./transport/quic
 
-var stopRequested: Atomic[bool]
+# Each Server owns its own stop flag (shared memory, one per instance) so that
+# stopping or starting one server never disturbs another in the same process.
+# A small lock-free registry of the live flags lets a signal handler (and the
+# no-arg requestShutdown) fan a stop out to every server without a lock or
+# allocation, which a signal handler must avoid.
+const maxRegisteredServers = 256
+var serverFlags: array[maxRegisteredServers, Atomic[pointer]]  # ptr Atomic[bool]
+
+proc registerServerFlag(flag: ptr Atomic[bool]) =
+  for i in 0 ..< maxRegisteredServers:
+    var expected: pointer = nil
+    if serverFlags[i].compareExchange(expected, cast[pointer](flag)):
+      return
+  # Registry full (>256 live servers): the global/signal fan-out won't reach
+  # this one, but close(server) still stops it via its own flag.
+
+proc unregisterServerFlag(flag: ptr Atomic[bool]) =
+  for i in 0 ..< maxRegisteredServers:
+    var expected = cast[pointer](flag)
+    if serverFlags[i].compareExchange(expected, pointer(nil)):
+      return
 
 proc requestShutdown*() =
-  ## Ask all event loops to stop after their current tick.
-  stopRequested.store(true, moRelaxed)
+  ## Ask every running server's event loops to stop after their current tick.
+  ## Async-signal-safe (only atomic loads/stores, no lock or allocation).
+  for i in 0 ..< maxRegisteredServers:
+    let p = serverFlags[i].load(moRelaxed)
+    if p != nil:
+      cast[ptr Atomic[bool]](p)[].store(true, moRelaxed)
 
 proc installSignalHandlers() =
   proc onSignal(sig: cint) {.noconv.} =
-    stopRequested.store(true, moRelaxed)
+    requestShutdown()
   signal(SIGINT, onSignal)
   signal(SIGTERM, onSignal)
   signal(SIGPIPE, SIG_IGN)
@@ -26,9 +50,15 @@ type
     threads: seq[Thread[LoopThreadArg]]
     outboxes: seq[ptr Outbox]
     pool: ptr WorkerPool
+    stopFlag: ptr Atomic[bool]  ## this server's own stop signal (shared memory)
     tls: pointer               ## ptr TlsConfig or nil
     quicReload: pointer        ## ptr CertReload: signals loops to reload h3 certs
     port*: Port                ## actual bound port (settings may say 0)
+
+proc requestShutdown*(server: var Server) =
+  ## Ask just this server's event loops to stop after their current tick.
+  if server.stopFlag != nil:
+    server.stopFlag[].store(true, moRelaxed)
 
 proc start*(handler: RequestHandler, settings = initSettings(),
             streamRoute: StreamRouteCb = nil): Server =
@@ -36,7 +66,8 @@ proc start*(handler: RequestHandler, settings = initSettings(),
   ## Use `close` (or `waitFor` after installing your own stop signal)
   ## to shut down. `streamRoute` (e.g. `router.streamPredicate`) opts requests
   ## into inbound streaming; nil keeps every request buffered.
-  stopRequested.store(false, moRelaxed)
+  result.stopFlag = createShared(Atomic[bool])   # zero-init == false
+  registerServerFlag(result.stopFlag)
   var numLoops =
     if settings.numThreads > 0: settings.numThreads
     else: max(1, countProcessors())
@@ -93,7 +124,7 @@ proc start*(handler: RequestHandler, settings = initSettings(),
     result.outboxes[i] = newOutbox()
     createThread(result.threads[i], runLoopThread,
                  (settings: cfg, handler: handler,
-                  stopFlag: addr stopRequested, listenFd: fds[i],
+                  stopFlag: result.stopFlag, listenFd: fds[i],
                   pool: cast[pointer](result.pool),
                   outbox: result.outboxes[i], tls: result.tls,
                   udpFd: udpFds[i],
@@ -119,10 +150,14 @@ proc waitFor*(server: var Server) =
       deinitCertReload(cast[ptr CertReload](server.quicReload))
       deallocShared(server.quicReload)
       server.quicReload = nil
+  if server.stopFlag != nil:
+    unregisterServerFlag(server.stopFlag)
+    deallocShared(server.stopFlag)
+    server.stopFlag = nil
 
 proc close*(server: var Server) =
-  ## Stop and tear down.
-  requestShutdown()
+  ## Stop and tear down. Stops only this server, not others in the process.
+  server.requestShutdown()
   server.waitFor()
 
 proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
