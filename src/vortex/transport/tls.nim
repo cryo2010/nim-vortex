@@ -5,6 +5,8 @@
 ## Build with -d:plainHttp to exclude TLS (and the libssl runtime
 ## requirement) entirely.
 
+import std/locks
+
 const sslLibName {.strdefine.} =
   when defined(macosx):
     "(/opt/homebrew/opt/openssl@3/lib/|/usr/local/opt/openssl@3/lib/|)libssl.3.dylib"
@@ -69,12 +71,15 @@ proc SSL_get_error(ssl: SslPtr, ret: cint): cint
 proc SSL_shutdown(ssl: SslPtr): cint
 proc SSL_get0_alpn_selected(ssl: SslPtr, data: ptr ptr uint8, len: ptr cuint)
 proc SSL_pending(ssl: SslPtr): cint
+proc SSL_CTX_get0_certificate(ctx: SslCtxPtr): pointer   # X509* (borrowed)
 {.pop.}
 
 {.push importc, cdecl, dynlib: cryptoLibName.}
 proc ERR_clear_error()
 proc ERR_get_error(): culong
 proc ERR_error_string(e: culong, buf: cstring): cstring
+proc X509_get_subject_name(x: pointer): pointer          # X509_NAME* (borrowed)
+proc X509_NAME_oneline(name: pointer, buf: cstring, size: cint): cstring
 {.pop.}
 
 type
@@ -215,18 +220,27 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
 # The main thread signals a reload through this plain-memory struct (fixed
 # buffers, never GC strings, so it is safe to read from the loop threads).
 
-const certPathMax = 1024
+const certPathMax = 4096            # PATH_MAX on Linux; macOS is 1024
 
 type
   CertReload* = object
-    gen: int                        ## bumped per request; read/written atomically
+    ## Main-thread -> loop-thread signal for a QUIC certificate reload. A Lock
+    ## makes the {generation, paths} update atomic as a unit, so a loop can
+    ## never read a path spliced from two overlapping reloads. Paths are fixed
+    ## buffers (never GC strings), so they are safe to read from the loop
+    ## threads without ORC refcount races.
+    lock: Lock
+    gen: int
     certPath: array[certPathMax, char]
     keyPath: array[certPathMax, char]
 
+proc initCertReload*(r: ptr CertReload) = initLock(r.lock)
+proc deinitCertReload*(r: ptr CertReload) = deinitLock(r.lock)
+
 proc setPath(dst: var array[certPathMax, char], s: string) =
-  let n = min(s.len, certPathMax - 1)
-  for i in 0 ..< n: dst[i] = s[i]
-  dst[n] = '\0'
+  let n = min(s.len, certPathMax - 1)   # over-length paths truncate -> the
+  for i in 0 ..< n: dst[i] = s[i]        # reload then fails validation and is
+  dst[n] = '\0'                          # reported (not silently applied)
 
 proc getPath(src: array[certPathMax, char]): string =
   var n = 0
@@ -235,31 +249,42 @@ proc getPath(src: array[certPathMax, char]): string =
   for i in 0 ..< n: result[i] = src[i]
 
 proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string) =
-  ## Main thread: publish the paths for a QUIC certificate reload, then bump the
-  ## generation with a release store so the loop threads observe the paths
-  ## before the new generation. Empty paths mean "re-read the configured ones".
+  ## Main thread: publish the paths for a QUIC certificate reload and bump the
+  ## generation, as one locked update. Empty paths mean "re-read the configured
+  ## ones".
+  acquire(r.lock)
   setPath(r.certPath, certFile)
   setPath(r.keyPath, keyFile)
-  atomicStoreN(addr r.gen, atomicLoadN(addr r.gen, ATOMIC_RELAXED) + 1,
-               ATOMIC_RELEASE)
+  inc r.gen
+  release(r.lock)
 
-proc pendingCertReload*(r: ptr CertReload, seen: var int,
-                        certFile, keyFile: var string): bool =
-  ## Loop thread: true (once) when a reload has been requested since `seen`.
-  ## Acquire load pairs with the release store in requestCertReload.
-  let g = atomicLoadN(addr r.gen, ATOMIC_ACQUIRE)
-  if g == seen: return false
-  seen = g
-  certFile = getPath(r.certPath)
-  keyFile = getPath(r.keyPath)
-  true
+proc pendingCertReload*(r: ptr CertReload, seen: int,
+                        certFile, keyFile: var string): int =
+  ## Loop thread: returns the current reload generation. When it differs from
+  ## `seen`, fills `certFile`/`keyFile` with the requested paths (a consistent
+  ## snapshot under the lock). The caller advances its own `seen` once it has
+  ## acted on the result.
+  acquire(r.lock)
+  result = r.gen
+  if result != seen:
+    certFile = getPath(r.certPath)
+    keyFile = getPath(r.keyPath)
+  release(r.lock)
 
 proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
   ## In-place certificate update on a per-loop QUIC ctx, called on the owning
-  ## loop thread. Validates the new material in a throwaway ctx first, so a bad
-  ## renewal never leaves the live ctx with a mismatched cert/key; only then
-  ## applies it (two calls that no handshake interleaves, since we are on the
-  ## listener's own thread). Returns false, ctx untouched, on bad material.
+  ## loop thread (so no handshake on that listener interleaves the two apply
+  ## calls, and no other thread touches the ctx). Validates the new material in
+  ## a throwaway ctx first, then applies cert+key to the live ctx. Returns false
+  ## on bad material.
+  ##
+  ## Caveat: the probe and the apply each read the files, so a *concurrent*
+  ## replacement of the files between the two (a renewal racing this call) can
+  ## get past the probe and then fail the apply, briefly leaving the live ctx
+  ## with a mismatched cert/key. The caller reports the false result, and a
+  ## subsequent reload (retried against stable files) restores a consistent
+  ## ctx. New connections read the ctx's current cert at accept time (the same
+  ## mechanism as SSL_new on TCP); in-flight connections keep theirs.
   let cf = if certFile.len > 0: certFile else: cfg.certFile
   let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
   try:
@@ -274,6 +299,17 @@ proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
   cfg.certFile = cf
   cfg.keyFile = kf
   true
+
+proc ctxCertSubject*(cfg: ptr TlsConfig): string =
+  ## The subject line of the certificate currently installed on `cfg.ctx`, for
+  ## tests/introspection: proves an in-place reload actually reached the ctx.
+  ## "" if no certificate is set.
+  let x = SSL_CTX_get0_certificate(cfg.ctx)
+  if x == nil: return ""
+  var buf = newString(512)
+  let s = X509_NAME_oneline(X509_get_subject_name(x), buf.cstring, 512)
+  if s == nil: return ""
+  $s
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0,

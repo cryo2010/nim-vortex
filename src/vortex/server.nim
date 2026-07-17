@@ -27,7 +27,6 @@ type
     outboxes: seq[ptr Outbox]
     pool: ptr WorkerPool
     tls: pointer               ## ptr TlsConfig or nil
-    quicCfg: pointer           ## ptr TlsConfig for QUIC or nil
     quicReload: pointer        ## ptr CertReload: signals loops to reload h3 certs
     port*: Port                ## actual bound port (settings may say 0)
 
@@ -78,12 +77,13 @@ proc start*(handler: RequestHandler, settings = initSettings(),
     udpFds[i] = osInvalidSocket
   when not defined(plainHttp):
     if result.tls != nil and settings.http3:
-      # Validate the QUIC cert/method once up front (raises on failure); each
-      # loop then builds its own private ctx for in-place hot-reload.
-      result.quicCfg = cast[pointer](
-        newQuicConfig(settings.certFile, settings.keyFile,
-                      cipherSuites = settings.tlsCipherSuites))
+      # Validate the QUIC cert/method once up front (raises on failure), then
+      # discard the probe: each loop builds its own private ctx for in-place
+      # hot-reload, and a valid udpFd is the loops' "h3 enabled" signal.
+      freeTlsConfig(newQuicConfig(settings.certFile, settings.keyFile,
+                                  cipherSuites = settings.tlsCipherSuites))
       result.quicReload = createShared(CertReload)
+      initCertReload(cast[ptr CertReload](result.quicReload))
       for i in 0 ..< numLoops:
         udpFds[i] = newUdpSocket(cfg)
 
@@ -96,7 +96,7 @@ proc start*(handler: RequestHandler, settings = initSettings(),
                   stopFlag: addr stopRequested, listenFd: fds[i],
                   pool: cast[pointer](result.pool),
                   outbox: result.outboxes[i], tls: result.tls,
-                  quicCfg: result.quicCfg, udpFd: udpFds[i],
+                  udpFd: udpFds[i],
                   streamRoute: streamRoute, quicReload: result.quicReload))
 
 proc waitFor*(server: var Server) =
@@ -115,10 +115,8 @@ proc waitFor*(server: var Server) =
     if server.tls != nil:
       freeTlsConfig(cast[ptr TlsConfig](server.tls))
       server.tls = nil
-    if server.quicCfg != nil:
-      freeTlsConfig(cast[ptr TlsConfig](server.quicCfg))
-      server.quicCfg = nil
     if server.quicReload != nil:
+      deinitCertReload(cast[ptr CertReload](server.quicReload))
       deallocShared(server.quicReload)
       server.quicReload = nil
 
@@ -144,9 +142,11 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
   else:
     if server.tls == nil: return false
     let ok = reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile)
-    # Signal the h3 loops regardless; each validates the material itself and
-    # keeps its running cert on failure (the TCP result is what we report).
-    if server.quicReload != nil:
+    # Only signal the h3 loops when the TCP reload succeeded, so TCP and h3
+    # never end up on different certificates and the returned bool applies to
+    # both. A per-loop h3 apply failure (e.g. a transient bad read) is logged by
+    # the loop; re-issue reloadTls to retry it.
+    if ok and server.quicReload != nil:
       requestCertReload(cast[ptr CertReload](server.quicReload),
                         certFile, keyFile)
     ok
