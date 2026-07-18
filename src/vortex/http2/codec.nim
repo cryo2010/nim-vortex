@@ -49,7 +49,8 @@ type
     contEndStream*: bool
     headerBlock*: string
     lastStreamId*: uint32
-    goingAway*: bool
+    goingAway*: bool          ## our own drain: refuse new streams
+    peerGoneAway*: bool       ## peer sent GOAWAY (informational; no push)
     maxBody*: int
     maxHeaderList*: int
     activeStreams*: int
@@ -568,7 +569,9 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
         of ":scheme":
           if scheme.len > 0: h2.streamError(c, sid, errProtocol); return
           scheme = val
-        of ":authority": hasAuthority = true
+        of ":authority":
+          if hasAuthority: h2.streamError(c, sid, errProtocol); return
+          hasAuthority = true
         of ":protocol":                        # RFC 8441 Extended CONNECT
           if protocol.len > 0: h2.streamError(c, sid, errProtocol); return
           protocol = val
@@ -783,6 +786,12 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if h2.contStream == 0 or fh.streamId != h2.contStream:
       h2.connError(c, errProtocol)
       return
+    # Budget CONTINUATION fragments (CVE-2024-27316 class): a flood of
+    # zero-length CONTINUATION frames never grows headerBlock past the byte cap
+    # below, so count them against the control-frame budget, which resets only on
+    # real stream progress.
+    h2.noteControlFrame(c)
+    if c.state == csClosing: return
     if h2.headerBlock.len + fh.length > h2.maxHeaderList * 2:
       h2.connError(c, errEnhanceYourCalm)
       return
@@ -858,12 +867,20 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.streamId == 0:
       if int64(h2.connSendWindow) + int64(inc32) > 0x7fffffff'i64:
         h2.connError(c, errFlowControl); return
+      let wasBlocked = h2.connSendWindow <= 0
       h2.connSendWindow += int32(inc32)
-      # Connection window freed: retry every stream with pending data.
-      var retry: seq[uint32]
-      for sid, st in h2.streams:
-        if st.pendingBody.len - st.pendingPos > 0: retry.add sid
-      for sid in retry: h2ResumeSend(h2, c, sid)
+      if wasBlocked and h2.connSendWindow > 0:
+        # The connection window just went positive: retry stalled streams. Only
+        # scan on this transition, not on every WINDOW_UPDATE.
+        var retry: seq[uint32]
+        for sid, st in h2.streams:
+          if st.pendingBody.len - st.pendingPos > 0: retry.add sid
+        for sid in retry: h2ResumeSend(h2, c, sid)
+      else:
+        # A WINDOW_UPDATE that unblocked nothing is pure overhead; budget it so a
+        # flood trips ENHANCE_YOUR_CALM (the counter resets on real progress).
+        h2.noteControlFrame(c)
+        if c.state == csClosing: return
     elif fh.streamId in h2.streams:
       template st: H2Stream = h2.streams[fh.streamId]
       if int64(st.sendWindow) + int64(inc32) > 0x7fffffff'i64:
@@ -901,7 +918,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
 
   of ftGoaway:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
-    h2.goingAway = true
+    # A peer (client) GOAWAY is informational for a server that never pushes;
+    # record it separately from our own drain flag so we do not start refusing
+    # the client's own subsequent streams (which `goingAway` would do).
+    h2.peerGoneAway = true
 
   of ftPushPromise:
     h2.connError(c, errProtocol)     # clients cannot push
