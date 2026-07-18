@@ -1232,7 +1232,21 @@ type LoopThreadArg* = tuple
   quicReload: pointer
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
-  let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
-                     arg.pool, arg.outbox, arg.tls, arg.udpFd,
-                     arg.streamRoute, arg.quicReload)
-  loop.run()
+  # An unhandled exception escaping a thread proc aborts the whole process.
+  # newLoop can raise (fd exhaustion, a QUIC cert that changed since the probe),
+  # and run() is defended per-connection but not absolutely; contain both so one
+  # loop failing degrades the server instead of killing it. Close this loop's
+  # listeners so its share of connections isn't blackholed by a dead listener.
+  try:
+    let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
+                       arg.pool, arg.outbox, arg.tls, arg.udpFd,
+                       arg.streamRoute, arg.quicReload)
+    loop.run()
+  except CatchableError, Defect:
+    try: stderr.writeLine("vortex: event-loop thread exited on error: " &
+                          getCurrentExceptionMsg())
+    except IOError, OSError: discard
+    if arg.listenFd != osInvalidSocket:
+      discard posix.close(cint(arg.listenFd))
+    if arg.udpFd != osInvalidSocket:
+      discard posix.close(cint(arg.udpFd))

@@ -39,4 +39,19 @@ suite "multiple servers are independent":
     check get(b.port) == "ok"
     b.close()
 
+suite "settings validation":
+  test "keyFile without certFile is rejected (would serve plaintext)":
+    expect CatchableError:
+      var s = start(RequestHandler(handler),
+                    initSettings(port = Port(0), numThreads = 1,
+                                 keyFile = "/x/key.pem"))
+      s.close()
+
+  test "negative limits are rejected":
+    expect CatchableError:
+      var s = start(RequestHandler(handler),
+                    initSettings(port = Port(0), numThreads = 1,
+                                 maxBodySize = -1))
+      s.close()
+
 echo "multi-server ok"
