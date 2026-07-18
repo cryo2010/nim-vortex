@@ -205,6 +205,17 @@ suite "QPACK dynamic response encoder":
     discard decodeFieldSection(fs2, 0, fs2.len, h2, peer)
     check h2 == h1
 
+  test "an insert-count increment past our insertions is a decoder-stream error":
+    var enc: QpackEncoder
+    enc.setCapacity(4096)
+    discard enc.encodeSection(200, @[("server", "vortex")])  # 1 insertion
+    # Insert Count Increment of 1 is fine (we performed one insertion)...
+    enc.ackInsertions(1)
+    # ...but any increment past the insertions we performed is a protocol error
+    # (RFC 9204 4.4.3), not something to clamp.
+    expect QpackError:
+      enc.ackInsertions(5)
+
   test "capacity 0 falls back to static/literal (decodes with empty table)":
     var enc: QpackEncoder                  # no setCapacity: dynamic disabled
     let fs = enc.encodeSection(404, @[("x-app", "demo")])

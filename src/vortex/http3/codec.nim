@@ -200,7 +200,8 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   # QPACK dynamic encoding: references acknowledged entries and queues inserts
   # for repeated fields (a no-op fallback to static/literal until the peer's
   # capacity SETTING arrives). Send the encoder-stream inserts, then the frame.
-  let fs = conn.qpackEnc.encodeSection(code, hdrs)
+  let fs = conn.qpackEnc.encodeSection(code, hdrs,
+                                       maxEntries = conn.peerMaxCap div 32)
   conn.encBuf.add conn.qpackEnc.takeInstructions()
   conn.flushEncStream()
   template st: H3Stream = conn.streams[sid]
@@ -532,7 +533,8 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
         var ric = 0
         try:
           ric = decodeFieldSection(st.rbuf, pos, pos + st.frameLen,
-                                   st.headers, conn.qpackDec)
+                                   st.headers, conn.qpackDec,
+                                   maxEntries = qpackDecoderMaxCapacity div 32)
         except QpackError:
           # A field-section decode failure corrupts the shared QPACK state:
           # a connection error (RFC 9204 2.2).
