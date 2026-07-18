@@ -10,9 +10,10 @@
 # Run:
 #   docker run --rm nhs-bench                      # HTTP/1.1 comparison table
 #   docker run --rm nhs-bench ./bench/perf_http2   # HTTP/2 benchmark
-#   docker run --rm nhs-bench ./bench/perf_http3   # HTTP/3 benchmark
 #   docker run --rm nhs-bench nimble test          # test suite on epoll
 #   docker run --rm nhs-bench sh fuzz/run.sh        # fuzz the decoders
+# (HTTP/3 throughput is measured separately with a real QUIC client via
+#  `nimble h3load`; see conformance/h3load.)
 
 ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
@@ -34,8 +35,6 @@ RUN nimble install httpbeast chronos -y
 RUN nim c --mm:orc --threads:on -d:danger \
       -o:bench/perf_http1_1 bench/perf_http1_1.nim && \
     nim c --mm:orc --threads:on -d:danger \
-      -o:bench/perf_http2 bench/perf_http2.nim && \
-    nim c --mm:orc --threads:on -d:danger \
-      -o:bench/perf_http3 bench/perf_http3.nim
+      -o:bench/perf_http2 bench/perf_http2.nim
 
 CMD ["./bench/perf_http1_1"]

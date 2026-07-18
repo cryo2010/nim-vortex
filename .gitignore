@@ -6,7 +6,6 @@ demos/minimal
 .DS_Store
 .claude/settings.local.json
 bench/perf_http2
-bench/perf_http3
 tests/t*
 !tests/t*.nim
 tests/chronos_adapter

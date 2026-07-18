@@ -91,8 +91,14 @@ its own HTTP/1.1 on the same server. 32 connections, 64 concurrent streams,
 
 HTTP/2 framing costs a few percent over pipelined HTTP/1.1 for a trivial
 response — the multiplexing/flow-control bookkeeping in exchange for real
-concurrency and header compression. HTTP/3 (`bench/perf_http3.nim`,
-`nimble perf3`) runs the same shape over QUIC.
+concurrency and header compression.
+
+HTTP/3 throughput is measured separately with `nimble h3load`
+([conformance/h3load](conformance/h3load), Docker): it drives the vortex HTTP/3
+server with a real QUIC client — nghttp2's `h2load` built for HTTP/3 (ngtcp2 +
+nghttp3 on the same OpenSSL >= 3.5 QUIC API) — and prints req/s. An in-process
+hand-rolled QUIC client is client-bound and under-reports the server, so it is
+not used.
 
 ## Takeaways
 
@@ -112,7 +118,7 @@ concurrency and header compression. HTTP/3 (`bench/perf_http3.nim`,
 ```sh
 nimble perf     # HTTP/1.1: vortex vs httpbeast, mummy, asynchttpserver, chronos
 nimble perf2    # HTTP/2 (h2c) vs HTTP/1.1 on vortex
-nimble perf3    # HTTP/3 over QUIC vs HTTP/1.1 on vortex
+nimble h3load   # HTTP/3 over QUIC, real client (h2load-http3, Docker)
 ```
 
 Tunables are compile-time defines, e.g. a fair cross-server run:

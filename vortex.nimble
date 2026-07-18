@@ -24,8 +24,9 @@ task perf, "Run the HTTP/1.1 throughput comparison benchmark":
 task perf2, "Run the HTTP/2 throughput benchmark":
   exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http2 bench/perf_http2.nim"
 
-task perf3, "Run the HTTP/3 throughput benchmark":
-  exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http3 bench/perf_http3.nim"
+# HTTP/3 throughput is measured with a real QUIC client via `nimble h3load`
+# (conformance/h3load, Docker): an in-process hand-rolled QUIC client is
+# client-bound and under-reports the server, so there is no local perf3.
 
 taskRequires "testchronos", "chronos >= 4.0.0"
 
@@ -104,8 +105,8 @@ task h3load, "HTTP/3 (QUIC) throughput/stress via h2load-http3 (Docker)":
   # run.sh builds a vortex HTTP/3 server image and an h2load client image built
   # with HTTP/3 (ngtcp2 + nghttp3 on OpenSSL >= 3.5), then drives many concurrent
   # QUIC connections/streams at it, printing req/s and failing on any
-  # failed/errored/timed-out or non-2xx request. A real QUIC client (unlike
-  # bench/perf_http3's hand-rolled one), so the number reflects the server.
+  # failed/errored/timed-out or non-2xx request. A real QUIC client, so the
+  # number reflects the server -- the HTTP/3 throughput/regression measurement.
   exec "sh conformance/h3load/run.sh"
 
 task testssl, "TLS configuration scan via testssl.sh (Docker)":
