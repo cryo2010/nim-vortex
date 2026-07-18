@@ -81,6 +81,9 @@ type
     encPos: int
     peerMaxCap: int           ## peer's advertised QPACK_MAX_TABLE_CAPACITY
     encCapSet: bool           ## our encoder table capacity has been set
+    seenControlUni: bool      ## a peer control stream was already accepted
+    seenQpackEncUni: bool     ## a peer QPACK encoder stream was already accepted
+    seenQpackDecUni: bool     ## a peer QPACK decoder stream was already accepted
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -93,6 +96,19 @@ proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
 const qpackDecoderMaxCapacity = 4096
   ## Advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY: the peer's encoder may use a
   ## dynamic table up to this size for the request headers it sends us.
+
+const
+  maxUniStreamBuffer = 128 * 1024
+    ## Ceiling on a peer unidirectional (control / QPACK) stream's unparsed
+    ## buffer. Well-behaved control/QPACK traffic is consumed and trimmed each
+    ## pass, so this only trips on a peer that streams an unbounded/never-complete
+    ## frame or instruction -> h3ExcessiveLoad instead of unbounded growth.
+  maxControlFrameLen = 16 * 1024
+    ## Ceiling on a declared control-stream frame length (SETTINGS/GOAWAY/etc.
+    ## are tiny); guards against a huge declared length pinning the buffer.
+  maxFieldSectionSize = 128 * 1024
+    ## Advertised SETTINGS_MAX_FIELD_SECTION_SIZE and the enforced cap on a
+    ## decoded request field section (QPACK's decompression-bomb bound).
 
 proc newH3Conn*(core: ptr LoopCore, ssl: SslPtr, slot: int, maxBody,
                 maxConcurrentStreams: int): H3Conn =
@@ -110,6 +126,8 @@ proc newH3Conn*(core: ptr LoopCore, ssl: SslPtr, slot: int, maxBody,
     payload.addVarint uint64(qpackDecoderMaxCapacity)
     payload.addVarint h3SetQpackBlockedStreams
     payload.addVarint 0
+    payload.addVarint h3SetMaxFieldSectionSize     # decompression-bomb bound
+    payload.addVarint uint64(maxFieldSectionSize)
     payload.addVarint h3SetEnableConnectProtocol   # RFC 9220 WebSockets
     payload.addVarint 1
     result.ctrlBuf.addFrame(h3fSettings, payload)
@@ -169,6 +187,18 @@ proc flushStream(conn: H3Conn, sid: uint64): bool =
     elif ioSt == tlsWantWrite or ioSt == tlsWantRead:
       return false
     else:
+      # Write error: the stream is gone. Tear down its WebSocket / streaming
+      # sink first (mirror failStream) so onClose(1006) / onBody(last) fire and
+      # the zlib + wsIdle state is freed, rather than leaking.
+      if st.ws != nil:
+        wsStreamClosed(conn.core, nil, WsConn(st.ws))
+        st.ws = nil
+      if st.onBodyCb != nil:
+        let cb = st.onBodyCb
+        st.onBodyCb = nil
+        var empty: string
+        try: cb(toOpenArray(empty, 0, -1), true)
+        except CatchableError: discard
       quicFree(st.ssl)
       conn.streams.del(sid)
       return true
@@ -534,7 +564,8 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
         try:
           ric = decodeFieldSection(st.rbuf, pos, pos + st.frameLen,
                                    st.headers, conn.qpackDec,
-                                   maxEntries = qpackDecoderMaxCapacity div 32)
+                                   maxEntries = qpackDecoderMaxCapacity div 32,
+                                   maxDecoded = maxFieldSectionSize)
         except QpackError:
           # A field-section decode failure corrupts the shared QPACK state:
           # a connection error (RFC 9204 2.2).
@@ -576,10 +607,10 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
         if st.streamingReq:
           conn.h3DeliverBody(sid, false)   # to onBody (last comes on FIN)
           if sid notin conn.streams: return false
-    of h3fPushPromise, h3fCancelPush, h3fSettings, h3fGoaway:
+    of h3fPushPromise, h3fCancelPush, h3fSettings, h3fGoaway, h3fMaxPushId:
       # These frames never appear on a request stream (SETTINGS/GOAWAY/
-      # CANCEL_PUSH are control-stream only): H3_FRAME_UNEXPECTED (RFC 9114
-      # 7.2.x, a connection error).
+      # CANCEL_PUSH/MAX_PUSH_ID are control-stream only): H3_FRAME_UNEXPECTED
+      # (RFC 9114 7.2.x, a connection error).
       h3ConnError(conn, h3FrameUnexpected)
       return false
     else:
@@ -661,6 +692,8 @@ proc parseControlStream(conn: H3Conn, u: var H3UniStream) =
       var typ, length: uint64
       if getVarint(u.buf, p, u.buf.len, typ) != viOk: break
       if getVarint(u.buf, p, u.buf.len, length) != viOk: break
+      if length > uint64(maxControlFrameLen):    # huge declared control frame
+        h3ConnError(conn, h3ExcessiveLoad); return
       u.frameType = typ; u.frameLen = int(length); u.frameHdrDone = true
       pos = p
     if not u.settingsSeen and u.frameType != h3fSettings:
@@ -731,12 +764,27 @@ proc parseUniStream(conn: H3Conn, u: var H3UniStream) =
     of tlsClosed:
       u.finSeen = true; break
     else: break
+  if u.buf.len > maxUniStreamBuffer:           # unbounded/never-complete frame
+    h3ConnError(conn, h3ExcessiveLoad); return
   if u.typ < 0:                                # read the stream-type varint
     var p = 0
     var t: uint64
     if getVarint(u.buf, p, u.buf.len, t) != viOk: return
     u.typ = int64(t)
     u.buf = u.buf.substr(p)
+    # A second control / QPACK stream of the same type is a connection error
+    # (RFC 9114 6.2.1 / RFC 9204 4.2).
+    case u.typ
+    of int64(h3sControl):
+      if conn.seenControlUni: h3ConnError(conn, h3StreamCreationError); return
+      conn.seenControlUni = true
+    of int64(h3sQpackEncoder):
+      if conn.seenQpackEncUni: h3ConnError(conn, h3StreamCreationError); return
+      conn.seenQpackEncUni = true
+    of int64(h3sQpackDecoder):
+      if conn.seenQpackDecUni: h3ConnError(conn, h3StreamCreationError); return
+      conn.seenQpackDecUni = true
+    else: discard
   # A control or QPACK stream is critical: closing it is a connection error
   # (RFC 9114 6.2.1).
   if u.finSeen and u.typ in [int64(h3sControl), int64(h3sQpackEncoder),

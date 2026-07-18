@@ -133,7 +133,7 @@ proc decodeRequiredInsertCount(enc, totalInserts, maxEntries: int): int =
 proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
                          headers: var seq[(string, string)],
                          dyn: QpackDynTable = QpackDynTable(),
-                         maxEntries = -1): int
+                         maxEntries = -1, maxDecoded = 0): int
                         {.discardable.} =
   ## Decode a complete encoded field section (one HEADERS frame payload) against
   ## `dyn` (an empty table = capacity-0 mode, where any dynamic reference is out
@@ -158,6 +158,7 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
     let deltaBase = decodeInt(buf, pos, endPos, 7)
     let base = if sign: ric - deltaBase - 1 else: ric + deltaBase
     result = ric
+    var decoded = 0
     while pos < endPos:
       let b = uint8(buf[pos])
       if (b and 0x80) != 0:
@@ -212,6 +213,14 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
         var value: string
         decodeStr(buf, pos, endPos, 7, value)
         headers.add (dyn.get(abs)[0], value)
+      # Bound the decoded field-section size (RFC 9204's answer to the
+      # decompression bomb: a 1-byte reference can expand to a full header).
+      # Every branch above adds exactly one header this iteration.
+      if maxDecoded > 0:
+        let last = headers[^1]
+        decoded += last[0].len + last[1].len + 32   # RFC 9110 field-size estimate
+        if decoded > maxDecoded:
+          raise newException(QpackError, "field section exceeds the maximum size")
   except HpackError as e:
     raise newException(QpackError, e.msg)
 

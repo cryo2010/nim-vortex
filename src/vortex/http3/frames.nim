@@ -31,9 +31,11 @@ const
   h3NoError* = 0x0100'u64
   h3GeneralProtocolError* = 0x0101'u64
   h3InternalError* = 0x0102'u64
+  h3StreamCreationError* = 0x0103'u64
   h3ClosedCriticalStream* = 0x0104'u64
   h3FrameUnexpected* = 0x0105'u64
   h3FrameError* = 0x0106'u64
+  h3ExcessiveLoad* = 0x0107'u64
   h3IdError* = 0x0108'u64
   h3SettingsError* = 0x0109'u64
   h3MissingSettings* = 0x010a'u64
