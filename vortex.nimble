@@ -100,6 +100,14 @@ task h2load, "HTTP/1.1 + HTTP/2 load/stress smoke via h2load (Docker)":
   # docker network; it fails on any failed/errored/timed-out or non-2xx request.
   exec "sh conformance/h2load/run.sh"
 
+task h3load, "HTTP/3 (QUIC) throughput/stress via h2load-http3 (Docker)":
+  # run.sh builds a vortex HTTP/3 server image and an h2load client image built
+  # with HTTP/3 (ngtcp2 + nghttp3 on OpenSSL >= 3.5), then drives many concurrent
+  # QUIC connections/streams at it, printing req/s and failing on any
+  # failed/errored/timed-out or non-2xx request. A real QUIC client (unlike
+  # bench/perf_http3's hand-rolled one), so the number reflects the server.
+  exec "sh conformance/h3load/run.sh"
+
 task testssl, "TLS configuration scan via testssl.sh (Docker)":
   # run.sh builds a vortex TLS server image and runs drwetter/testssl.sh against
   # it over a private docker network, checking protocols/ciphers/vulnerabilities;

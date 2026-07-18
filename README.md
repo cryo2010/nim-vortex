@@ -481,6 +481,13 @@ build keeps its OpenSSL-only footprint.
   a vortex server with nghttp2's [h2load](https://nghttp2.org/) in Docker,
   failing on any failed/errored/non-2xx request. See
   [conformance/h2load/](conformance/h2load/).
+- HTTP/3 load/throughput: `nimble h3load` drives many concurrent QUIC
+  connections and streams at a vortex HTTP/3 server with an `h2load` built for
+  HTTP/3 (ngtcp2 + nghttp3 on OpenSSL >= 3.5) in Docker, printing req/s and
+  failing on any failed/errored/non-2xx request. Unlike `bench/perf_http3`
+  (whose hand-rolled QUIC client is the bottleneck), this uses a real QUIC
+  client stack, so the number reflects the server. See
+  [conformance/h3load/](conformance/h3load/).
 - Sanitizers: the CI `sanitize` job runs the whole suite under
   AddressSanitizer + UBSan (`NIM_SANITIZE=1 nimble test`).
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
