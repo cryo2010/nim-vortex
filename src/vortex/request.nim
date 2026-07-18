@@ -353,6 +353,13 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
     if h3c != nil:
       h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
 
+var workerResponded* {.threadvar.}: bool
+  ## On a worker thread, set by the worker-path `send` so blockingTrampoline can
+  ## tell whether the `blocking:` body produced a response. A body that finishes
+  ## without one (a bug, or a misuse of the loop-thread-only streaming API from a
+  ## worker) must still get a default response emitted, otherwise the outbox push
+  ## that releases the connection's pin never happens and it hangs forever.
+
 proc send*(res: Response, code: HttpCode, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   ## Queue the response. Safe to call once per request, from the handler,
@@ -363,6 +370,7 @@ proc send*(res: Response, code: HttpCode, body: openArray[char],
     push(res.core.outbox, OutMsg(
       fd: res.fd, gen: res.gen, stream: res.stream, code: int32(code),
       data: packResponse(contentType, headers, body)))
+    workerResponded = true
     return
   if res.fd < 0:
     h3Apply(res.core, res.fd, res.gen, res.stream, int(code), contentType,
@@ -796,12 +804,23 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, data: string) {.nimcall, gcsafe.} =
   discard data                 # HTTP bodies read the request via `req`
   let fn = cast[BlockingProc](user)
-  let req = Request(core: cast[ptr LoopCore](core), fd: fd, gen: gen,
-                    stream: stream)
+  let lc = cast[ptr LoopCore](core)
+  let req = Request(core: lc, fd: fd, gen: gen, stream: stream)
   let res = response(req)
+  # On the pool path this runs on a worker thread and holds the connection pin;
+  # the inline no-pool path runs on the loop thread with no pin. Only the worker
+  # path needs the "always respond" guard (and its send routes via the outbox).
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: workerResponded = false
   try:
     fn(req, res)
   except CatchableError:
+    res.send(Http500, "500 Internal Server Error", "text/plain")
+  if onWorker and not workerResponded:
+    # The body finished without a response (forgot res.send, or used the
+    # loop-thread-only streaming API from a worker, which no-ops here). Emit a
+    # default 500 so the client is answered and the outbox push releases the
+    # pin this task holds -- otherwise the connection stays pinned forever.
     res.send(Http500, "500 Internal Server Error", "text/plain")
 
 proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =

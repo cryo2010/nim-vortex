@@ -214,6 +214,19 @@ jobs:
         # or non-2xx request. It picks the x86_64 server base itself.
         run: sh conformance/h2load/run.sh
 
+  h3load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: HTTP/3 load/throughput (h2load-http3)
+        # run.sh builds a vortex HTTP/3 server image and an h2load client image
+        # built with HTTP/3 (ngtcp2 + nghttp3 on OpenSSL >= 3.5, from source),
+        # then drives many concurrent QUIC connections/streams at it, printing
+        # req/s (a real QUIC client, so the number reflects the server) and
+        # failing on any failed/errored/timed-out or non-2xx request. It picks
+        # the x86_64 base itself.
+        run: sh conformance/h3load/run.sh
+
   testssl:
     runs-on: ubuntu-latest
     steps:

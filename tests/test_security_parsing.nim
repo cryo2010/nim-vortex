@@ -5,6 +5,7 @@
 
 import std/[unittest, httpcore, strutils]
 import vortex/http1/parser
+import vortex/http1/codec
 import vortex/http2/hpack
 
 proc limits(maxHeaderSize = 16384, maxHeaderCount = 100,
@@ -51,6 +52,30 @@ suite "request smuggling should be rejected":
     let (res, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nBad Header: x\r\n\r\n")
     check res == prError
 
+  test "bare CR in a field name should be rejected (smuggling)":
+    # "Foo\rContent-Length: 10" is one line to us, but a proxy honoring bare CR
+    # as a terminator would re-split it. The name must be a token.
+    let (res, _) = parseAll(
+      "GET / HTTP/1.1\r\nHost: x\r\nFoo\rContent-Length: 10\r\n\r\n")
+    check res == prError
+
+  test "TAB in a field name should be rejected":
+    let (res, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nBad\tName: x\r\n\r\n")
+    check res == prError
+
+  test "NUL in a field name should be rejected":
+    let (res, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nBad\0Name: x\r\n\r\n")
+    check res == prError
+
+  test "a token field name with separators should be rejected":
+    let (res, _) = parseAll("GET / HTTP/1.1\r\nHost: x\r\nBad(Name): x\r\n\r\n")
+    check res == prError
+
+  test "a normal token field name should be accepted":
+    let (res, _) = parseAll(
+      "GET / HTTP/1.1\r\nHost: x\r\nX-Custom_Header.1: ok\r\n\r\n")
+    check res == prComplete
+
   test "obs-fold continuation line should be rejected":
     let (res, _) = parseAll(
       "GET / HTTP/1.1\r\nHost: x\r\nX-A: value\r\n folded: c\r\n\r\n")
@@ -79,6 +104,37 @@ suite "integer overflow should not wrap":
   test "non-numeric Content-Length should be rejected":
     let (res, _) = parseAll("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1e9\r\n\r\n")
     check res == prError
+
+suite "response header injection should be prevented":
+  proc serialize(headers: openArray[(string, string)],
+                 contentType = "text/plain"): string =
+    result = ""
+    result.appendResponse(Http200, "Sun, 06 Nov 1994 08:49:37 GMT", "",
+                          contentType, "ok", headers, keepAlive = true,
+                          skipBody = false)
+
+  test "CRLF in a header value cannot split the response":
+    let resp = serialize([("X-Echo", "a\r\nSet-Cookie: evil=1")])
+    check "\r\nSet-Cookie" notin resp       # not emitted as its own header line
+    check resp.count("\r\n\r\n") == 1       # exactly one header/body boundary
+
+  test "CRLF in a header name is stripped into one token":
+    let resp = serialize([("X-A\r\nInjected", "v")])
+    check "X-AInjected: v" in resp          # CR/LF removed, name joined
+    check "\r\nInjected" notin resp          # no injected header line
+
+  test "CRLF in the content-type cannot inject a header":
+    let resp = serialize([], contentType = "text/html\r\nSet-Cookie: evil=1")
+    check "\r\nSet-Cookie" notin resp       # not emitted as its own header line
+    check resp.count("\r\n\r\n") == 1
+
+  test "addField strips CR and LF but keeps other bytes":
+    var s = ""
+    s.addField("safe-value")
+    check s == "safe-value"
+    s.setLen(0)
+    s.addField("a\r\nb\rc\nd")
+    check s == "abcd"
 
 proc encodeInt7(buf: var string, value: int, firstByte: uint8) =
   ## HPACK integer with a 7-bit prefix, for building raw string lengths.

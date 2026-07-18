@@ -5,6 +5,23 @@
 
 import std/httpcore
 
+proc addField*(wbuf: var string, s: string) =
+  ## Append a handler-supplied header name or value with CR and LF removed,
+  ## so reflected user input can never inject a header or split the response
+  ## (RFC 9110 5.5). The common (clean) case bulk-copies; only a value that
+  ## actually contains CR/LF pays the per-byte strip.
+  var clean = true
+  for ch in s:
+    if ch == '\r' or ch == '\n':
+      clean = false
+      break
+  if clean:
+    wbuf.add s
+  else:
+    for ch in s:
+      if ch != '\r' and ch != '\n':
+        wbuf.add ch
+
 const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -86,7 +103,7 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
   wbuf.add "\r\n"
   if contentType.len > 0 and not bodiless:
     wbuf.add "Content-Type: "
-    wbuf.add contentType
+    wbuf.addField contentType
     wbuf.add "\r\n"
   if not bodiless:
     wbuf.add "Content-Length: "
@@ -102,9 +119,9 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
     wbuf.add altSvc
     wbuf.add "\r\n"
   for (name, val) in extraHeaders:
-    wbuf.add name
+    wbuf.addField name
     wbuf.add ": "
-    wbuf.add val
+    wbuf.addField val
     wbuf.add "\r\n"
   wbuf.add "\r\n"
   if body.len > 0 and not skipBody and not bodiless:
@@ -158,7 +175,7 @@ proc appendStreamHead*(wbuf: var string, code: HttpCode,
   wbuf.add "\r\n"
   if contentType.len > 0:
     wbuf.add "Content-Type: "
-    wbuf.add contentType
+    wbuf.addField contentType
     wbuf.add "\r\n"
   if chunked:
     wbuf.add "Transfer-Encoding: chunked\r\n"
@@ -171,9 +188,9 @@ proc appendStreamHead*(wbuf: var string, code: HttpCode,
     wbuf.add altSvc
     wbuf.add "\r\n"
   for (name, val) in extraHeaders:
-    wbuf.add name
+    wbuf.addField name
     wbuf.add ": "
-    wbuf.add val
+    wbuf.addField val
     wbuf.add "\r\n"
   wbuf.add "\r\n"
 
@@ -193,8 +210,8 @@ proc appendLastChunk*(wbuf: var string,
   ## Terminate a chunked body: the zero-length chunk plus optional trailers.
   wbuf.add "0\r\n"
   for (name, val) in trailers:
-    wbuf.add name
+    wbuf.addField name
     wbuf.add ": "
-    wbuf.add val
+    wbuf.addField val
     wbuf.add "\r\n"
   wbuf.add "\r\n"

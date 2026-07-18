@@ -155,6 +155,12 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   result.core.pool = pool
   result.core.outbox = outbox
   result.core.loopPtr = cast[pointer](result)
+  # Modestly preallocate the connection table so the common fd range never
+  # reallocates it (growing it moves every Connection, which would dangle a
+  # `addr core.conns[fd]` a blocking: worker holds -- see handleAccept, which
+  # refuses to grow while any slot is pinned). A large fd rlimit is NOT used as
+  # the size: preallocating millions of slots wastes memory and startup time.
+  result.core.conns = newSeq[Connection](1024)
   result.refreshDate()
   result.selector.registerHandle(listenFd, {Event.Read}, fkListen)
   if outbox != nil:
@@ -184,6 +190,7 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
     of dkHeader: loop.settings.headerTimeout
     of dkBody: loop.settings.bodyTimeout
     of dkIdle: loop.settings.keepAliveTimeout
+    of dkResponse: loop.settings.responseTimeout
     of dkDrain: drainTimeoutSec
     of dkWsPing: loop.settings.wsPingInterval
     of dkWsPong: loop.settings.wsPongTimeout
@@ -202,9 +209,21 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     c.closeRequested = true
     c.state = csClosing
     return
+  if c.onBodyCb != nil:
+    # A streaming request's body sink is still open (the client disconnected
+    # mid-upload). Deliver a final last=true so an async adapter suspended in
+    # await req.read() resumes at end-of-body and its Future / reader-table
+    # entry are released instead of leaking forever (the entry is keyed by the
+    # about-to-be-bumped generation and would never be reused or deleted).
+    let cb = c.onBodyCb
+    c.onBodyCb = nil
+    var empty: string
+    try: cb(toOpenArray(empty, 0, -1), true)
+    except CatchableError: discard
   if c.ws != nil:
     wsClosed(addr loop.core, c)   # deliver onClose (1006 if no peer close)
   if c.h2 != nil:
+    h2NotifyClosed(c)             # last=true for every streaming request sink
     h2WsTeardownAll(c)            # onClose for every RFC 8441 WebSocket stream
   when not defined(plainHttp):
     if c.ssl != nil:
@@ -338,6 +357,19 @@ proc h2Input(loop: Loop, c: ptr Connection) =
     except CatchableError:
       applyResponse(addr loop.core, c, sid, 500, "text/plain", [],
                     "500 Internal Server Error")
+    # A freshly-accepted RFC 8441 WebSocket may hold frames the client
+    # pipelined with the CONNECT handshake (buffered during accept). Pump them
+    # now that the handler has installed onMessage; deliver a deferred
+    # peer-close if the client half-closed before we accepted.
+    if c.pinned == 0 and h2StreamAlive(c, sid):
+      let w = wsConnForStream(addr loop.core, c, sid)
+      if w != nil and (w.inBuf.len > 0 or w.preAcceptFin):
+        if w.inBuf.len > 0:
+          wsFeed(addr loop.core, c, w, "")
+        if w.preAcceptFin and h2StreamAlive(c, sid):
+          w.preAcceptFin = false
+          wsPeerClosed(addr loop.core, c, w)
+        loop.flushOut(c)
   if c.state == csActive:
     if h2ActiveStreams(c) == 0:
       if c.dlKind != dkIdle:
@@ -416,6 +448,13 @@ proc processInput(loop: Loop, c: ptr Connection) =
     # buffered frames wait until it unpins (one message at a time).
     if c.pinned == 0:
       wsInput(addr loop.core, c)
+    else:
+      # We can't parse frames to observe the peer's pong while pinned, but this
+      # call is driven by inbound bytes, which prove the peer is alive. Refresh
+      # the idle-ping deadline so sweepWsPing's pong timeout can't close a
+      # healthy connection whose pong sits unparsed in rbuf. h2/h3 get this for
+      # free: wsFeed updates lastRx on raw bytes even while a worker holds it.
+      armWsPing(addr loop.core, c)
     return
   if c.h2 != nil:
     loop.h2Input(c)
@@ -487,9 +526,21 @@ proc processInput(loop: Loop, c: ptr Connection) =
           if not c.responded:
             loop.respondError(c, Http500)
             return
+          if c.respStreaming:
+            # Raised after sendHead: the chunked body can't be terminated and
+            # the connection can't be reused, so close after flushing the
+            # partial response rather than parking it forever (below).
+            c.respStreaming = false
+            c.closeAfterFlush = true
       if not c.responded:
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
+        # Backstop a stuck/never-arriving deferred response with responseTimeout
+        # (opt-in, 0 = off), but not while pinned: a blocking: worker may take
+        # arbitrarily long and always responds (blockingTrampoline guarantees
+        # it), so timing it out would kill legitimate long jobs.
+        if c.pinned == 0 and loop.settings.responseTimeout > 0:
+          c.setDeadline(loop, dkResponse)
         return
       if c.respStreaming:
         # A streaming response is open (sendHead sent, not finished): pause
@@ -520,6 +571,15 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
       if c.state != csFree and c.pendingOut > 0:
         loop.flushOut(c)
   elif c.closeAfterFlush:
+    c.state = csClosing
+    loop.flushOut(c)
+  elif c.respStreaming:
+    # The response was left mid-stream: a handler (or its async future) failed
+    # or completed without calling finish(). The chunked body was never
+    # terminated, so the connection cannot be safely reused -- reusing it would
+    # let the next response's bytes be read as chunk data of this one (response
+    # desync). Flush whatever is buffered and close instead of resetting.
+    c.respStreaming = false
     c.state = csClosing
     loop.flushOut(c)
   else:
@@ -583,6 +643,14 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         # single request head plus body. parseFrame rejects an oversized
         # frame from its length header before this cap is reached, so for
         # a WebSocket this is only a backstop.
+        if c.pinned > 0:
+          # A blocking: worker holds a Request into this connection and may be
+          # reading req.body/req.header, which are slices of c.rbuf. Growing it
+          # reallocates the buffer and moves those bytes, a use-after-free on the
+          # worker thread. Stop reading instead: the bytes stay in the kernel
+          # (backpressure) and are consumed once the worker unpins. The current
+          # request is already fully buffered; only the next pipelined one waits.
+          break
         let cap =
           if c.ws != nil: loop.settings.maxWsMessageSize + 1024
           else: loop.settings.maxHeaderSize + loop.settings.maxBodySize
@@ -685,6 +753,20 @@ proc handleAccept(loop: Loop) =
       discard posix.close(client)
       continue
     if fd >= loop.core.conns.len:
+      # Grow the table for a higher fd, but only when nothing is pinned: a
+      # realloc moves every Connection, and a blocking: worker may hold
+      # `addr core.conns[oldFd]`. If a slot is pinned, refuse this connection
+      # rather than dangle that pointer (a use-after-free). Rare in practice: a
+      # new high fd must coincide with a running worker, and after warmup the
+      # table stops growing. The scan is O(len) but only runs on a growth event.
+      var pinnedAny = false
+      for i in 0 ..< loop.core.conns.len:
+        if loop.core.conns[i].pinned > 0:
+          pinnedAny = true
+          break
+      if pinnedAny:
+        discard posix.close(client)
+        continue
       loop.core.conns.setLen(fd + 64)
     let c = addr loop.core.conns[fd]
     c.fd = int32(fd)
@@ -770,20 +852,25 @@ proc processOutbox(loop: Loop) =
         if idx >= loop.core.h3slots.len: continue
         let slot = addr loop.core.h3slots[idx]
         # RFC 9220 WebSocket messages use per-stream pinning, not the slot
-        # pin, so they route ahead of the omHttp response path.
-        if slot.conn != nil and slot.gen == m.gen and
-            m.kind in {omWs, omWsClose, omWsDone}:
-          let conn = H3Conn(slot.conn)
-          if m.kind == omWsDone:
-            h3WsResume(addr loop.core, conn, uint64(m.stream))
-          else:
-            let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
-            if w != nil:
-              wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
-          h3Touched = true
+        # pin. Handle (or, when stale, drop) them entirely before the omHttp
+        # pin bookkeeping: a stale ws message must never fall through to the
+        # `dec slot.pinned` below and steal a pin the slot's *current*
+        # occupant took for an in-flight blocking: task (which would let the
+        # loop free the slot under that worker). Mirrors the h1 branch, which
+        # checks gen before touching the pin.
+        if m.kind in {omWs, omWsClose, omWsDone}:
+          if slot.conn != nil and slot.gen == m.gen:
+            let conn = H3Conn(slot.conn)
+            if m.kind == omWsDone:
+              h3WsResume(addr loop.core, conn, uint64(m.stream))
+            else:
+              let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
+              if w != nil:
+                wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
+            h3Touched = true
           continue
-        if slot.pinned > 0: dec slot.pinned
         if slot.gen != m.gen or slot.conn == nil: continue
+        if slot.pinned > 0: dec slot.pinned
         if slot.closeReq:
           if slot.pinned == 0: loop.h3FreeSlot(idx)
           continue
@@ -853,6 +940,12 @@ proc sweepTimeouts(loop: Loop) =
       continue
     if c.dlKind == dkWsPing:
       loop.sweepWsPing(c)          # idle: ping, then wait for the pong
+    elif c.dlKind == dkResponse and not c.responded and c.pinned == 0:
+      # A deferred/async response never arrived within responseTimeout: answer
+      # 503 and close instead of hanging. A late response arriving afterward is
+      # dropped by the generation check on the (by then torn-down) connection.
+      loop.respondError(c, Http503)
+      loop.flushOut(c)
     else:
       loop.closeConn(c)            # includes dkWsPong: no reply, peer is gone
 
@@ -911,12 +1004,20 @@ proc tick(loop: Loop) =
 
 proc activeH3Conns(loop: Loop): int =
   when not defined(plainHttp):
-    for slot in loop.core.h3slots:
-      if slot.conn != nil: inc result
+    # Index-based nil check: a `for slot in h3slots` value copy would materialize
+    # slot.conn (an ORC ref) on every drainDone poll, racing an h3 worker that
+    # holds the same ref. A `!= nil` on the indexed field is a plain pointer read.
+    for i in 0 ..< loop.core.h3slots.len:
+      if loop.core.h3slots[i].conn != nil: inc result
 
 proc markDrain(loop: Loop, c: ptr Connection) =
   ## Signal one TCP connection to finish its in-flight work and close.
   if c.state != csActive: return
+  if c.pinned > 0: return
+    # A blocking: worker holds this connection. Don't touch its h2 ref here
+    # (h2Goaway materializes H2Conn(c.h2)) concurrently with the worker under
+    # ORC's non-atomic refcounts. It stays counted (connCount > 0) so the loop
+    # will not exit, and forceCloseAll closes it once the worker unpins.
   if c.h2 != nil:
     h2Goaway(c)                           # refuse new streams, send GOAWAY
     if h2ActiveStreams(c) == 0:
@@ -945,8 +1046,12 @@ proc beginDrain(loop: Loop) =
   for fd in 0 ..< loop.core.conns.len:
     loop.markDrain(addr loop.core.conns[fd])
   when not defined(plainHttp):
-    for slot in loop.core.h3slots:
-      if slot.conn != nil: h3Goaway(H3Conn(slot.conn))   # RFC 9114 GOAWAY
+    for i in 0 ..< loop.core.h3slots.len:
+      let slot = addr loop.core.h3slots[i]
+      # Skip a slot pinned by an h3 blocking: worker (see markDrain): touching
+      # H3Conn(slot.conn) here would race the worker's non-atomic ORC refcount.
+      if slot.pinned == 0 and slot.conn != nil:
+        h3Goaway(H3Conn(slot.conn))   # RFC 9114 GOAWAY
   let grace = max(0, loop.settings.shutdownGrace)
   loop.drainDeadline = loop.core.nowSec + int64(grace)
 
@@ -955,6 +1060,12 @@ proc drainSweep(loop: Loop) =
   for fd in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[fd]
     if c.state != csActive: continue
+    if c.pinned > 0: continue
+      # A pinned connection is not "finished" (a blocking: worker is running),
+      # so it never met the close conditions below anyway. Skipping it also
+      # avoids materializing its h2 ref here (H2Conn(c.h2)) concurrently with
+      # the worker, which under ORC's non-atomic refcounts would corrupt the
+      # count. forceCloseAll (deferred) closes it once the worker unpins.
     if c.h2 != nil:
       if h2Conn(c).goingAway and h2ActiveStreams(c) == 0:
         if c.pendingOut > 0: c.closeAfterFlush = true
@@ -964,19 +1075,27 @@ proc drainSweep(loop: Loop) =
   when not defined(plainHttp):
     for i in 0 ..< loop.core.h3slots.len:
       let slot = addr loop.core.h3slots[i]
+      # Skip a slot pinned by an h3 blocking: worker: h3FreeSlot would defer
+      # anyway, and this avoids materializing H3Conn(slot.conn) here while the
+      # worker holds the same ref (non-atomic ORC refcount race).
+      if slot.pinned > 0: continue
       if slot.conn != nil and H3Conn(slot.conn).h3StreamCount == 0:
         loop.h3FreeSlot(i)                # no in-flight request streams left
 
 proc forceCloseAll(loop: Loop) =
-  ## Grace expired: drop whatever is still open.
+  ## Grace expired: drop whatever is still open. A connection still pinned by a
+  ## running `blocking:` worker is NOT force-freed here: closeConn / h3FreeSlot
+  ## defer its teardown (unregister the fd, keep the slot) until the worker
+  ## unpins, because the worker is still reading request state and, for h2/h3,
+  ## the protocol object we would free. The run loop keeps spinning (still
+  ## processing the outbox) until those pins clear, so we never free a slot or
+  ## the loop itself under a worker. Idempotent, so re-calling each tick is fine.
   for fd in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[fd]
     if c.state != csFree:
-      c.pinned = 0
       loop.closeConn(c)
   when not defined(plainHttp):
     for i in 0 ..< loop.core.h3slots.len:
-      loop.core.h3slots[i].pinned = 0
       loop.h3FreeSlot(i)
 
 proc drainDone(loop: Loop): bool {.inline.} =
@@ -1074,7 +1193,12 @@ proc run*(loop: Loop) =
         break
       if loop.core.nowSec >= loop.drainDeadline:
         loop.forceCloseAll()          # grace expired: drop the rest
-        break
+        if loop.drainDone():
+          break
+        # Everything else is a connection still pinned by a running blocking:
+        # worker; forceCloseAll deferred its teardown. Keep the loop alive and
+        # processing the outbox until the workers finish and unpin, rather than
+        # freeing the loop's memory under them (use-after-free).
   when not defined(plainHttp):
     if loop.quicListener != nil:
       for i in 0 ..< loop.core.h3slots.len:

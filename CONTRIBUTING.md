@@ -133,17 +133,21 @@ automatically:
 ```sh
 nimble perf             # HTTP/1.1 throughput comparison table
 nimble perf2            # HTTP/2 throughput
-nimble perf3            # HTTP/3 throughput
+nimble h3load           # HTTP/3 throughput (real QUIC client, Docker)
 ```
 
-For representative Linux numbers, run them in Docker:
+`nimble h3load` drives the HTTP/3 server with a real QUIC client (h2load built
+with ngtcp2 + nghttp3); see [conformance/h3load](conformance/h3load). There is
+no in-process HTTP/3 benchmark -- a hand-rolled QUIC client is client-bound and
+under-reports the server.
+
+For representative Linux HTTP/1.1 and HTTP/2 numbers, run them in Docker:
 
 ```sh
 docker build -f bench/Dockerfile -t vortex-bench .
 # x86_64 hosts add: --build-arg BASE=archlinux:latest
 docker run --rm vortex-bench                     # HTTP/1.1 comparison table
 docker run --rm vortex-bench ./bench/perf_http2  # HTTP/2
-docker run --rm vortex-bench ./bench/perf_http3  # HTTP/3
 ```
 
 Emulated or shared environments are noisy: run a benchmark a few times
