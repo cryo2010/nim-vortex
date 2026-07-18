@@ -65,6 +65,25 @@ suite "router":
   test "405 for wrong method":
     check fetch("/users")[0] == HttpCode(405)   # only POST is routed
 
+  test "405 carries an Allow header":
+    var client = newHttpClient()
+    defer: client.close()
+    let resp = client.get(base & "/users")     # GET on a POST-only resource
+    check resp.code == HttpCode(405)
+    check resp.headers.hasKey("Allow")
+    check "POST" in resp.headers["Allow"]
+
+  test "HEAD falls back to GET":
+    var client = newHttpClient()
+    defer: client.close()
+    let resp = client.request(base & "/users/42", httpMethod = HttpHead)
+    check resp.code == Http200                  # no explicit HEAD route
+    check resp.body.len == 0                     # HEAD body suppressed
+
+  test "percent-encoded param is decoded":
+    check fetch("/users/a%2Fb") == (Http200, "user=a/b")
+    check fetch("/users/j%6Fhn") == (Http200, "user=john")
+
   test "params readable from a blocking: body":
     check fetch("/slow-users/9") == (Http200, "worker user=9")
 

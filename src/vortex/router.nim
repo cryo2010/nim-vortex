@@ -2,9 +2,20 @@
 ## and trailing `*` wildcard matching. Handlers run on the loop threads,
 ## so the router is built once before `start` and never mutated after.
 
-import std/[strutils, httpcore]
+import std/[strutils, httpcore, uri]
 import ./request
 import ./connection
+
+proc decodeSegment(s: string): string =
+  ## Percent-decode one path segment for matching and param capture (RFC 3986):
+  ## `/users/j%6Fhn` matches a literal `john` and `req.param` returns decoded
+  ## text. `+` is left as-is (it is form encoding, not path). The trailing `*`
+  ## wildcard is captured raw (see match): decoding it would silently turn an
+  ## encoded `%2F`/`%2e%2e` into path structure, a traversal footgun the app
+  ## must resolve deliberately.
+  if '%' notin s: return s          # fast path: nothing to decode
+  try: decodeUrl(s, decodePlus = false)
+  except CatchableError: s
 
 type
   RouteNode = ref object
@@ -90,7 +101,7 @@ proc match(node: RouteNode, path: string, start: int,
     return node
   var j = i
   while j < path.len and path[j] != '/': inc j
-  let seg = path.substr(i, j - 1)
+  let seg = decodeSegment(path.substr(i, j - 1))
   # Exact matches first.
   for child in node.children:
     if not child.isParam and not child.isWild and child.segment == seg:
@@ -104,7 +115,7 @@ proc match(node: RouteNode, path: string, start: int,
       params.setLen(params.len - 1)
   for child in node.children:
     if child.isWild:
-      params.add ("*", path.substr(i))
+      params.add ("*", path.substr(i))   # raw remainder (see decodeSegment)
       return child
   nil
 
@@ -119,18 +130,22 @@ proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
   if node == nil:
     router.notFound(req, res)
     return
-  let h = node.handlers[req.method]
+  var h = node.handlers[req.method]
+  if h == nil and req.method == HttpHead:
+    h = node.handlers[HttpGet]   # HEAD falls back to GET; the codec drops the body
   if h == nil:
-    # Path exists but not for this method.
-    var any = false
+    # Path exists but not for this method. RFC 9110 10.2.1 requires an Allow
+    # header listing the methods this resource does support.
+    var allow: seq[string]
     for m in HttpMethod:
-      if node.handlers[m] != nil:
-        any = true
-        break
-    if any:
-      res.send(HttpCode(405), "405 Method Not Allowed", "text/plain")
-    else:
+      if node.handlers[m] != nil: allow.add $m
+    if allow.len == 0:
       router.notFound(req, res)
+    else:
+      if node.handlers[HttpGet] != nil and "HEAD" notin allow:
+        allow.add "HEAD"                       # HEAD is served wherever GET is
+      res.send(HttpCode(405), "405 Method Not Allowed", "text/plain",
+               @{"Allow": allow.join(", ")})
     return
   if params.len > 0:
     req.setParams(move params)
