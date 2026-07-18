@@ -76,6 +76,26 @@ suite "request smuggling should be rejected":
       "GET / HTTP/1.1\r\nHost: x\r\nX-Custom_Header.1: ok\r\n\r\n")
     check res == prComplete
 
+  test "a control byte in the request target should be rejected":
+    let (res, _) = parseAll("GET /a\x01b HTTP/1.1\r\nHost: x\r\n\r\n")
+    check res == prError
+
+  test "an oversized chunk extension should be rejected":
+    let ext = ";" & repeat("a", 200)
+    let (res, _) = parseAll(
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
+      "5" & ext & "\r\nhello\r\n0\r\n\r\n")
+    check res == prError
+
+  test "unbounded trailer fields should be rejected":
+    var body = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
+               "5\r\nhello\r\n0\r\n"
+    for i in 0 ..< 5: body.add "x-t" & $i & ": v\r\n"   # 5 > maxHeaderCount 3
+    body.add "\r\n"
+    let (res, status) = parseAll(body, limits(maxHeaderCount = 3))
+    check res == prError
+    check status == Http431
+
   test "obs-fold continuation line should be rejected":
     let (res, _) = parseAll(
       "GET / HTTP/1.1\r\nHost: x\r\nX-A: value\r\n folded: c\r\n\r\n")
