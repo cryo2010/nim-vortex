@@ -193,6 +193,16 @@ proc h2WsPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
         w.onDrain(WebSocket(core: h2.core, fd: c.fd, gen: c.gen, stream: sid))
   else:
     w.backedUp = true
+    if w.wantClose and (st.sendWindow <= 0 or h2.connSendWindow <= 0):
+      # Closing, but the send window is exhausted so the close frame + END_STREAM
+      # can never drain gracefully. Rather than leave a zombie stream holding a
+      # slot (and, being active, stripping the connection's read deadline),
+      # RST_STREAM and tear it down.
+      c.wbuf.addRstStream(sid, errCancel)
+      wsStreamClosed(h2.core, c, w)
+      st.ws = nil
+      h2.streams.del(sid)
+      dec h2.activeStreams
 
 proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
                w: WsConn) {.nimcall, gcsafe.} =

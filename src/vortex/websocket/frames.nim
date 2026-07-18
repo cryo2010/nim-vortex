@@ -113,8 +113,12 @@ proc appendFrame*(dst: var string, opcode: WsOpcode,
 
 proc appendClose*(dst: var string, code: uint16, reason: openArray[char] = "") =
   ## A close frame: 2-byte big-endian status code, then an optional reason.
-  var payload = newStringOfCap(2 + reason.len)
+  ## A control frame's payload is capped at 125 bytes (RFC 6455 5.5); with the
+  ## 2-byte code that leaves 123 for the reason, so truncate rather than emit an
+  ## illegal oversized control frame.
+  let rlen = min(reason.len, 123)
+  var payload = newStringOfCap(2 + rlen)
   payload.add char(uint8((code shr 8) and 0xff))
   payload.add char(uint8(code and 0xff))
-  for c in reason: payload.add c
+  for i in 0 ..< rlen: payload.add reason[i]
   dst.appendFrame(opClose, payload)
