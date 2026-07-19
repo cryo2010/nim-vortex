@@ -1247,10 +1247,18 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   # loop failing degrades the server instead of killing it. Close this loop's
   # listeners so its share of connections isn't blackholed by a dead listener.
   try:
-    let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
-                       arg.pool, arg.outbox, arg.tls, arg.udpFd,
-                       arg.streamRoute, arg.quicReload)
-    loop.run()
+    block:
+      let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
+                         arg.pool, arg.outbox, arg.tls, arg.udpFd,
+                         arg.streamRoute, arg.quicReload)
+      loop.run()
+    # The Loop (and any async-dispatcher state) is now out of scope. Under ORC,
+    # a cyclic object decref'd here is only queued in this thread's cycle-root
+    # buffer; if the thread exits with it still queued, the process-exit
+    # collection on the main thread walks this (now-gone) thread's buffer and
+    # crashes. Force the collection here, on the owning thread, so nothing is
+    # left for teardown to trip over.
+    when defined(gcOrc): GC_fullCollect()
   except CatchableError, Defect:
     try: stderr.writeLine("vortex: event-loop thread exited on error: " &
                           getCurrentExceptionMsg())
