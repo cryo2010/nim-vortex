@@ -279,6 +279,13 @@ proc originAllowed*(req: Request, allowed: openArray[string],
     if a == o: return true
   false
 
+proc host*(req: Request): string =
+  ## The request's host: the :authority pseudo-header for HTTP/2 and HTTP/3, the
+  ## Host header for HTTP/1.1 ("" if absent). Use it to build an absolute URL,
+  ## e.g. a plaintext -> HTTPS redirect.
+  result = req.header(":authority")
+  if result.len == 0: result = req.header("host")
+
 proc contentLength*(req: Request): int =
   if req.fd < 0:
     when not defined(plainHttp):
@@ -469,6 +476,32 @@ proc send*(res: Response, code: HttpCode) =
 proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
+
+proc redirect*(res: Response, location: string, permanent = false,
+               extraHeaders: openArray[(string, string)] = []) =
+  ## Send a redirect to `location` (301 permanent / 302 temporary). For a
+  ## plaintext-listener -> HTTPS redirect: `res.redirect("https://" & req.host &
+  ## req.url.path, permanent = true)`. Serve HTTPS with HSTS (securityHeaders)
+  ## so subsequent requests skip the plaintext hop entirely.
+  var hdrs = @[("Location", location)]
+  for h in extraHeaders: hdrs.add h
+  send(res, (if permanent: Http301 else: Http302), "", "text/plain", hdrs)
+
+proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
+                secure = true, httpOnly = true,
+                sameSite = "Lax"): (string, string) =
+  ## Build a Set-Cookie header (as a (name, value) pair for res.send's headers)
+  ## with secure defaults: Secure, HttpOnly, SameSite=Lax (OWASP Session
+  ## Management). maxAge < 0 omits Max-Age (a session cookie). Set secure=false
+  ## only for local plaintext development. Emit several by passing several pairs.
+  var v = name & "=" & value
+  if path.len > 0: v.add "; Path=" & path
+  if domain.len > 0: v.add "; Domain=" & domain
+  if maxAge >= 0: v.add "; Max-Age=" & $maxAge
+  if secure: v.add "; Secure"
+  if httpOnly: v.add "; HttpOnly"
+  if sameSite.len > 0: v.add "; SameSite=" & sameSite
+  ("Set-Cookie", v)
 
 proc sendContinue*(req: Request) =
   ## Send a "100 Continue" interim response for a request that carried
