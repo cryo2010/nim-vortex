@@ -197,6 +197,28 @@ proc body*(req: Request): string =
       result = c.rbuf.substr(c.parser.bodyStart,
                              c.parser.bodyStart + c.parser.bodyLen - 1)
 
+proc remoteAddress*(req: Request): string =
+  ## The peer IP of the connection, captured at accept (access logging, rate
+  ## limiting, audit). This is the *direct* peer: behind a reverse proxy it is
+  ## the proxy's IP, so recover the origin client from a trusted X-Forwarded-For
+  ## policy (see forwardedFor), never from an untrusted header alone. Empty for
+  ## HTTP/3 (the QUIC peer address is not captured yet) and for a stale handle.
+  if req.fd < 0: return ""
+  let c = conn(req.core, req.fd, req.gen)
+  if c != nil: c.remoteAddr else: ""
+
+proc forwardedFor*(req: Request): seq[string] =
+  ## The X-Forwarded-For chain parsed left (origin client) to right (nearest
+  ## proxy), trimmed; empty if the header is absent. A client can forge this
+  ## header, so trust an entry only for the hops you actually control: combine
+  ## it with remoteAddress and a known-proxy policy before treating the leftmost
+  ## value as the client IP.
+  let xff = req.header("x-forwarded-for")
+  if xff.len == 0: return @[]
+  for part in xff.split(','):
+    let p = part.strip
+    if p.len > 0: result.add p
+
 proc contentLength*(req: Request): int =
   if req.fd < 0:
     when not defined(plainHttp):

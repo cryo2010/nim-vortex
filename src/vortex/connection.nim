@@ -72,6 +72,7 @@ type
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
     state*: ConnState
+    remoteAddr*: string       ## peer IP captured at accept (TCP; "" for HTTP/3)
     rbuf*: string             ## receive buffer (grows, reused)
     rlen*: int                ## valid bytes in rbuf
     wbuf*: string             ## pending output
@@ -281,6 +282,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
     c.wbuf.setLen(0)
     c.wbuf = ""
   c.wbuf.setLen(0)
+  c.remoteAddr = ""
   c.rlen = 0
   c.wpos = 0
   c.chunkBody.setLen(0)

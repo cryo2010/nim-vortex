@@ -780,6 +780,10 @@ proc handleAccept(loop: Loop) =
     let c = addr loop.core.conns[fd]
     c.fd = int32(fd)
     c[].clear(loop.settings.initialBufferSize)
+    # Record the peer IP for req.remoteAddress (access logging, rate limiting,
+    # audit). Best-effort: a formatting failure just leaves it empty.
+    try: c.remoteAddr = getAddrString(cast[ptr SockAddr](addr sa))
+    except CatchableError: discard
     inc loop.connCount
     when not defined(plainHttp):
       if loop.tls != nil:
