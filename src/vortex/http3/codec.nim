@@ -189,16 +189,20 @@ proc flushStream(conn: H3Conn, sid: uint64): bool =
     else:
       # Write error: the stream is gone. Tear down its WebSocket / streaming
       # sink first (mirror failStream) so onClose(1006) / onBody(last) fire and
-      # the zlib + wsIdle state is freed, rather than leaking.
-      if st.ws != nil:
-        wsStreamClosed(conn.core, nil, WsConn(st.ws))
-        st.ws = nil
-      if st.onBodyCb != nil:
-        let cb = st.onBodyCb
-        st.onBodyCb = nil
-        var empty: string
-        try: cb(toOpenArray(empty, 0, -1), true)
-        except CatchableError: discard
+      # the zlib + wsIdle state is freed, rather than leaking. These deliver user
+      # callbacks (Exception effect); contain them so flushStream -- which is on
+      # the response/send path -- stays effect-clean for strict async bodies.
+      try:
+        if st.ws != nil:
+          wsStreamClosed(conn.core, nil, WsConn(st.ws))
+          st.ws = nil
+        if st.onBodyCb != nil:
+          let cb = st.onBodyCb
+          st.onBodyCb = nil
+          var empty: string
+          cb(toOpenArray(empty, 0, -1), true)
+      except Exception:
+        discard
       quicFree(st.ssl)
       conn.streams.del(sid)
       return true
