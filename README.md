@@ -297,6 +297,13 @@ and HTTP/3 leave the stream open with DATA frames), `write` appends a chunk,
 and `finish` ends it (optionally with trailers over HTTP/1.1). The framing is
 identical across all three protocols.
 
+The streaming API (`sendHead`/`write`/`finish`/`res.sse`) is **loop-thread
+only** — call it from the handler or an async body, not from inside
+`req.blocking:` (a worker thread), where it does nothing and the request is
+answered with a 500. From a worker, use `res.send` (which is thread-safe) for a
+buffered response. A handler that returns without ever responding leaves the
+connection waiting until the client gives up; set `responseTimeout` to bound it.
+
 For the common "produce it all inline" case (a file download), the `res.stream`
 template brackets a block with `sendHead` and `finish` (and closes the stream
 even if the block raises):
@@ -428,8 +435,9 @@ res.withSse(s):
   for row in report: s.send(row.toJson, event = "row", id = $row.id)
 ```
 
-The response sets `Cache-Control: no-cache` and `X-Accel-Buffering: no` so
-intermediary proxies don't buffer the stream.
+The response sets `Cache-Control: no-cache, no-transform` and
+`X-Accel-Buffering: no` so intermediary proxies don't buffer or transform the
+stream.
 
 ## Build flags
 

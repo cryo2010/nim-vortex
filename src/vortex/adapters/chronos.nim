@@ -212,6 +212,10 @@ proc read*(req: Request): Future[string] =
     result.complete(r.take())
   elif r.eof:
     result.complete("")
+  elif r.waiter != nil and not r.waiter.finished:
+    # A read() is already pending: don't overwrite it (that would leak the first
+    # future forever). Concurrent reads of one body are unsupported.
+    result.fail(newException(ValueError, "concurrent req.read() not supported"))
   else:
     r.waiter = result
 

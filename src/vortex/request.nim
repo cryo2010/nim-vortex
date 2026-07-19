@@ -388,6 +388,23 @@ proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
 
+proc sendContinue*(req: Request) =
+  ## Send a "100 Continue" interim response for a request that carried
+  ## `Expect: 100-continue`, telling the client to proceed with the body. Only
+  ## needed when `settings.auto100Continue` is false (otherwise the loop sends it
+  ## automatically); call it from a streaming-route handler (which runs at
+  ## headers-complete, before the body) once you decide to accept the upload --
+  ## or answer 4xx instead to reject it before it is sent. Loop-thread only;
+  ## HTTP/1 only (HTTP/2 and HTTP/3 have no Expect flow), a no-op otherwise.
+  if req.fd < 0 or req.stream != 0: return
+  if currentThreadId() != req.core.threadId: return
+  let c = conn(req.core, req.fd, req.gen)
+  if c == nil or c.sent100 or c.responded or not c.parser.expectContinue: return
+  c.sent100 = true
+  c.wbuf.add continue100
+  try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+  except Exception: discard
+
 # --- streaming request bodies (inbound) -------------------------------------
 
 proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
@@ -814,7 +831,9 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   if onWorker: workerResponded = false
   try:
     fn(req, res)
-  except CatchableError:
+  except Exception:
+    # Exception (incl. a catchable Defect): answer 500 rather than let the
+    # worker thread abort. The trailing guard still releases the pin.
     res.send(Http500, "500 Internal Server Error", "text/plain")
   if onWorker and not workerResponded:
     # The body finished without a response (forgot res.send, or used the
@@ -953,8 +972,9 @@ proc wsRunBody(lc: ptr LoopCore, fn: WsBlockingProc, fd: int32, gen: uint32,
   let ws = WebSocket(core: lc, fd: fd, gen: gen, stream: stream)
   try:
     fn(ws, data)
-  except CatchableError:
-    discard                    # a WebSocket has no "500"; the app decides
+  except Exception:
+    discard                    # a WebSocket has no "500"; contain a Defect too
+                               # so the worker survives and still unpins below
 
 proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                           stream: uint32, data: string) {.nimcall, gcsafe.} =

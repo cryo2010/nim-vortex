@@ -1,4 +1,4 @@
-## vortex: a fast HTTP/1.1 (and, coming, HTTP/2 + HTTP/3) server.
+## vortex: a fast HTTP/1.1, HTTP/2, and HTTP/3 server.
 ##
 ## ```nim
 ## import vortex

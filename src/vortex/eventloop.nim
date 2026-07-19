@@ -398,7 +398,15 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
     if avail <= 0 and not last: return
     if avail > 0:
       cb(toOpenArray(c.chunkBody, c.bodyFed, c.chunkBody.len - 1), last)
-      c.bodyFed = c.chunkBody.len
+      # Drop the delivered bytes so a streaming chunked upload stays O(read
+      # burst) in memory, matching the Content-Length path. The parser keeps
+      # appending to the now-empty buffer; because it bounds chunkBody.len (not a
+      # running total) against maxBodySize, this also lifts that cap for a
+      # streaming route -- only the undelivered tail needs bounding. A buffered
+      # chunked request has no onBodyCb, so it is never truncated and stays
+      # capped.
+      c.chunkBody.setLen(0)
+      c.bodyFed = 0
     elif last:
       cb(toOpenArray(c.chunkBody, 0, -1), true)   # empty final chunk
   else:
@@ -481,7 +489,8 @@ proc processInput(loop: Loop, c: ptr Connection) =
     case res
     of prNeedMore:
       if c.parser.inBody:
-        if c.parser.expectContinue and not c.sent100:
+        if c.parser.expectContinue and not c.sent100 and
+            loop.settings.auto100Continue:
           c.sent100 = true
           c.wbuf.add continue100
         if c.dlKind != dkBody:
