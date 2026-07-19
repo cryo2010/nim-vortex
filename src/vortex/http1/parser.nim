@@ -51,6 +51,7 @@ type
     bodyStart*: int           ## valid when not chunked
     bodyLen*: int             ## non-chunked body length
     chunkRemaining: int64
+    trailerCount: int         ## trailer fields seen (bounded like headers)
     seenContentLength: bool
     seenHost: bool
     errorStatus*: HttpCode
@@ -111,6 +112,7 @@ proc reset*(p: var RequestParser, reqStart: int) =
   p.bodyStart = 0
   p.bodyLen = 0
   p.chunkRemaining = 0
+  p.trailerCount = 0
   p.seenContentLength = false
   p.seenHost = false
 
@@ -150,6 +152,12 @@ proc parseReqLine(p: var RequestParser, buf: openArray[char],
   if not p.parseMethod(buf, p.pos, sp1 - p.pos): return p.fail(Http501)
   let sp2 = findByte(buf, sp1 + 1, lineEnd, ' ')
   if sp2 < 0 or sp2 == sp1 + 1: return p.fail(Http400)
+  # Reject C0 controls / DEL in the request target (RFC 9112 3.2): a bare CR,
+  # NUL, or other control byte that later reaches a log line, a Location header,
+  # or a routing table is an injection / poisoning surface.
+  for i in sp1 + 1 ..< sp2:
+    let b = uint8(buf[i])
+    if b < 0x21'u8 or b == 0x7f'u8: return p.fail(Http400)
   p.pathStart = int32(sp1 + 1)
   p.pathLen = int32(sp2 - sp1 - 1)
   # Version: exactly "HTTP/1.0" or "HTTP/1.1"
@@ -325,6 +333,10 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
       if nl < 0:
         if dataEnd - p.pos > 128: return p.fail(Http400)
         return prNeedMore
+      # Bound the whole size line, including chunk extensions, even once the
+      # terminating LF is present (otherwise a megabyte of extension between ';'
+      # and CRLF is accepted, bounded only by the receive cap).
+      if nl - p.pos > 128: return p.fail(Http400)
       if nl == p.pos or buf[nl-1] != '\r': return p.fail(Http400)
       var size: int64 = 0
       var i = p.pos
@@ -379,7 +391,10 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
       if empty:
         p.phase = ppComplete
         return prComplete
-      # Trailer fields are discarded.
+      # Trailer fields are discarded, but still bounded: cap their number like
+      # header fields so a peer can't stream unbounded trailer lines.
+      inc p.trailerCount
+      if p.trailerCount > limits.maxHeaderCount: return p.fail(Http431)
 
     of ppComplete:
       return prComplete

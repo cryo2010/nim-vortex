@@ -132,7 +132,8 @@ proc decodeRequiredInsertCount(enc, totalInserts, maxEntries: int): int =
 
 proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
                          headers: var seq[(string, string)],
-                         dyn: QpackDynTable = QpackDynTable()): int
+                         dyn: QpackDynTable = QpackDynTable(),
+                         maxEntries = -1, maxDecoded = 0): int
                         {.discardable.} =
   ## Decode a complete encoded field section (one HEADERS frame payload) against
   ## `dyn` (an empty table = capacity-0 mode, where any dynamic reference is out
@@ -140,9 +141,15 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
   ## table was not referenced), for the caller's Section Acknowledgment.
   var pos = start
   try:
-    let maxEntries = dyn.capacity div 32
+    # MaxEntries is derived from the *advertised* SETTINGS_QPACK_MAX_TABLE_CAPACITY
+    # (RFC 9204 3.2.2), a connection constant the peer's encoder also uses -- not
+    # the live table capacity the peer selected, which can be smaller and would
+    # make us reject valid Required Insert Counts. The caller passes it; the -1
+    # default falls back to the live capacity for standalone/test use where the
+    # advertised max and live capacity coincide.
+    let me = if maxEntries >= 0: maxEntries else: dyn.capacity div 32
     let ric = decodeRequiredInsertCount(decodeInt(buf, pos, endPos, 8),
-                                        dyn.insertCount, maxEntries)
+                                        dyn.insertCount, me)
     if ric > dyn.insertCount:                # blocked reference (not supported)
       raise newException(QpackError, "required insert count exceeds inserts")
     if pos >= endPos:                        # Sign/Delta Base byte is required
@@ -151,6 +158,7 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
     let deltaBase = decodeInt(buf, pos, endPos, 7)
     let base = if sign: ric - deltaBase - 1 else: ric + deltaBase
     result = ric
+    var decoded = 0
     while pos < endPos:
       let b = uint8(buf[pos])
       if (b and 0x80) != 0:
@@ -205,6 +213,14 @@ proc decodeFieldSection*(buf: openArray[char], start, endPos: int,
         var value: string
         decodeStr(buf, pos, endPos, 7, value)
         headers.add (dyn.get(abs)[0], value)
+      # Bound the decoded field-section size (RFC 9204's answer to the
+      # decompression bomb: a 1-byte reference can expand to a full header).
+      # Every branch above adds exactly one header this iteration.
+      if maxDecoded > 0:
+        let last = headers[^1]
+        decoded += last[0].len + last[1].len + 32   # RFC 9110 field-size estimate
+        if decoded > maxDecoded:
+          raise newException(QpackError, "field section exceeds the maximum size")
   except HpackError as e:
     raise newException(QpackError, e.msg)
 
@@ -312,8 +328,12 @@ proc setCapacity*(e: var QpackEncoder, cap: int) =
   encodeInt(e.insts, cap, 5, 0x20)               # Set Dynamic Table Capacity
 
 proc ackInsertions*(e: var QpackEncoder, n: int) =
-  ## The peer acknowledged `n` more insertions (Insert Count Increment).
-  e.known = min(e.known + n, e.table.insertCount)
+  ## The peer acknowledged `n` more insertions (Insert Count Increment). An
+  ## increment past the number of insertions we have actually performed is a
+  ## QPACK_DECODER_STREAM_ERROR (RFC 9204 4.4.3), not something to clamp.
+  if e.known + n > e.table.insertCount:
+    raise newException(QpackError, "insert count increment exceeds insertions")
+  e.known += n
 
 proc takeInstructions*(e: var QpackEncoder): string =
   ## Move out the queued encoder-stream instructions. The field section is sent
@@ -350,7 +370,8 @@ proc cacheable(name: string): bool {.inline.} =
   name != "date" and name != "content-length"   # values vary every response
 
 proc encodeSection*(e: var QpackEncoder, status: int,
-                    hdrs: openArray[(string, string)]): string =
+                    hdrs: openArray[(string, string)],
+                    maxEntries = -1): string =
   ## Encode a response field section (`:status` first, then hdrs). Names must
   ## already be lowercase.
   type Kind = enum kStaticIdx, kDynIdx, kStaticNameLit, kLiteral
@@ -380,8 +401,14 @@ proc encodeSection*(e: var QpackEncoder, status: int,
     if sName2 >= 0: reps.add (kStaticNameLit, sName2, "", value)
     else: reps.add (kLiteral, 0, name, value)
   # Pass 2: prefix (RIC + base=RIC), :status, then the representations.
-  let maxEntries = if e.table.capacity > 0: e.table.capacity div 32 else: 0
-  encodeInt(result, encodeRequiredInsertCount(ric, maxEntries), 8, 0x00)
+  # MaxEntries must match what the peer's decoder uses: it is derived from the
+  # peer's advertised SETTINGS_QPACK_MAX_TABLE_CAPACITY (passed in), not our live
+  # encoder capacity (which is min(peerMax, ourMax) and can be smaller). The -1
+  # default falls back to the live capacity for standalone/test use.
+  let me = if maxEntries >= 0: maxEntries
+           elif e.table.capacity > 0: e.table.capacity div 32
+           else: 0
+  encodeInt(result, encodeRequiredInsertCount(ric, me), 8, 0x00)
   result.add '\0'                                # base = RIC: sign 0, delta 0
   encodeStatus(result, status)
   for r in reps:

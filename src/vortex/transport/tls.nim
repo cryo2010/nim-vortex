@@ -5,7 +5,12 @@
 ## Build with -d:plainHttp to exclude TLS (and the libssl runtime
 ## requirement) entirely.
 
-import std/locks
+import std/[locks, monotimes, times]
+
+const
+  ctxRetireSlots = 4     ## displaced SSL_CTXs kept during their grace window
+  ctxGraceSec = 5        ## free a retired ctx only this long after it was
+                         ## displaced (a thread mid-SSL_new keeps it valid)
 
 const sslLibName {.strdefine.} =
   when defined(macosx):
@@ -88,8 +93,8 @@ type
     ## memory so loop threads can use it via pointer.
     ctx*: SslCtxPtr          ## active SSL_CTX; loop threads load it atomically
                              ## so a certificate hot-reload can swap it in
-    retired: SslCtxPtr       ## the ctx displaced by the previous reload, freed
-                             ## at the next one (grace for in-flight SSL_new)
+    retired: array[ctxRetireSlots, SslCtxPtr]   ## displaced ctxs pending free
+    retiredAt: array[ctxRetireSlots, MonoTime]  ## when each was displaced
     protos: string           ## ALPN preference list, wire format
     meth: pointer            ## method the ctx was built with (rebuild on reload)
     certFile, keyFile: string
@@ -204,8 +209,26 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   cfg.certFile = cf
   cfg.keyFile = kf
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
-  if cfg.retired != nil: SSL_CTX_free(cfg.retired)  # unreferenced since last reload
-  cfg.retired = old
+  # Retire `old` with a time-based grace rather than freeing the previous
+  # retirement outright: freeing at the *next* reload alone is unsafe if two
+  # reloads land within a thread's load->SSL_new window (the ctx it loaded could
+  # be freed before it up-refs). Free only ctxs displaced at least ctxGraceSec
+  # ago; keep the rest in a small fixed ring.
+  let now = getMonoTime()
+  for i in 0 ..< ctxRetireSlots:
+    if cfg.retired[i] != nil and (now - cfg.retiredAt[i]).inSeconds >= ctxGraceSec:
+      SSL_CTX_free(cfg.retired[i]); cfg.retired[i] = nil
+  var placed = false
+  for i in 0 ..< ctxRetireSlots:
+    if cfg.retired[i] == nil:
+      cfg.retired[i] = old; cfg.retiredAt[i] = now; placed = true; break
+  if not placed:
+    # Ring full (many reloads within the grace window): evict the oldest.
+    var oldest = 0
+    for i in 1 ..< ctxRetireSlots:
+      if cfg.retiredAt[i] < cfg.retiredAt[oldest]: oldest = i
+    SSL_CTX_free(cfg.retired[oldest])
+    cfg.retired[oldest] = old; cfg.retiredAt[oldest] = now
   true
 
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
@@ -320,7 +343,8 @@ proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
   SSL_CTX_free(cfg.ctx)
-  if cfg.retired != nil: SSL_CTX_free(cfg.retired)
+  for i in 0 ..< ctxRetireSlots:
+    if cfg.retired[i] != nil: SSL_CTX_free(cfg.retired[i])
   cfg.protos = ""
   cfg.certFile = ""
   cfg.keyFile = ""

@@ -60,12 +60,30 @@ proc requestShutdown*(server: var Server) =
   if server.stopFlag != nil:
     server.stopFlag[].store(true, moRelaxed)
 
+proc validateSettings(s: Settings) =
+  ## Reject nonsensical/dangerous configurations up front rather than failing
+  ## silently at run time.
+  if s.keyFile.len > 0 and s.certFile.len == 0:
+    raise newException(CatchableError,
+      "keyFile is set but certFile is empty: this would serve plaintext. " &
+      "Set both to enable TLS, or neither for plain HTTP.")
+  if s.certFile.len > 0 and s.keyFile.len == 0:
+    raise newException(CatchableError, "certFile is set but keyFile is empty.")
+  if s.maxHeaderSize < 0 or s.maxBodySize < 0 or s.maxWsMessageSize < 0 or
+     s.headerTimeout < 0 or s.bodyTimeout < 0 or s.keepAliveTimeout < 0 or
+     s.responseTimeout < 0 or s.shutdownGrace < 0 or s.maxConnections < 0 or
+     s.numThreads < 0 or s.workerThreads < 0:
+    raise newException(CatchableError, "settings must not be negative")
+
 proc start*(handler: RequestHandler, settings = initSettings(),
             streamRoute: StreamRouteCb = nil): Server =
   ## Start loops and workers in the background; returns immediately.
   ## Use `close` (or `waitFor` after installing your own stop signal)
   ## to shut down. `streamRoute` (e.g. `router.streamPredicate`) opts requests
   ## into inbound streaming; nil keeps every request buffered.
+  validateSettings(settings)
+  signal(SIGPIPE, SIG_IGN)   # a mid-response client reset must not kill us
+                             # (OpenSSL's raw write on Linux has no MSG_NOSIGNAL)
   result.stopFlag = createShared(Atomic[bool])   # zero-init == false
   registerServerFlag(result.stopFlag)
   var numLoops =
@@ -96,39 +114,68 @@ proc start*(handler: RequestHandler, settings = initSettings(),
         "TLS requested but built with -d:plainHttp")
 
   var fds = newSeq[SocketHandle](numLoops)
-  fds[0] = newListenSocket(settings)
-  result.port = boundPort(fds[0])
-  var cfg = settings
-  cfg.port = result.port       # extra listeners bind the resolved port
-  for i in 1 ..< numLoops:
-    fds[i] = newListenSocket(cfg)
-
   var udpFds = newSeq[SocketHandle](numLoops)
   for i in 0 ..< numLoops:
+    fds[i] = osInvalidSocket
     udpFds[i] = osInvalidSocket
-  when not defined(plainHttp):
-    if result.tls != nil and settings.http3:
-      # Validate the QUIC cert/method once up front (raises on failure), then
-      # discard the probe: each loop builds its own private ctx for in-place
-      # hot-reload, and a valid udpFd is the loops' "h3 enabled" signal.
-      freeTlsConfig(newQuicConfig(settings.certFile, settings.keyFile,
-                                  cipherSuites = settings.tlsCipherSuites))
-      result.quicReload = createShared(CertReload)
-      initCertReload(cast[ptr CertReload](result.quicReload))
-      for i in 0 ..< numLoops:
-        udpFds[i] = newUdpSocket(cfg)
+  var madeThreads = 0
+  # Anything past the worker pool can fail (a taken port, fd exhaustion, a cert
+  # that changed since the probe, createThread). Unwind everything acquired so
+  # far so a caught-and-retried start() does not leak threads, fds, or memory.
+  try:
+    fds[0] = newListenSocket(settings)
+    result.port = boundPort(fds[0])
+    var cfg = settings
+    cfg.port = result.port     # extra listeners bind the resolved port
+    for i in 1 ..< numLoops:
+      fds[i] = newListenSocket(cfg)
 
-  result.threads = newSeq[Thread[LoopThreadArg]](numLoops)
-  result.outboxes = newSeq[ptr Outbox](numLoops)
-  for i in 0 ..< numLoops:
-    result.outboxes[i] = newOutbox()
-    createThread(result.threads[i], runLoopThread,
-                 (settings: cfg, handler: handler,
-                  stopFlag: result.stopFlag, listenFd: fds[i],
-                  pool: cast[pointer](result.pool),
-                  outbox: result.outboxes[i], tls: result.tls,
-                  udpFd: udpFds[i],
-                  streamRoute: streamRoute, quicReload: result.quicReload))
+    when not defined(plainHttp):
+      if result.tls != nil and settings.http3:
+        # Validate the QUIC cert/method once up front (raises on failure), then
+        # discard the probe: each loop builds its own private ctx for in-place
+        # hot-reload, and a valid udpFd is the loops' "h3 enabled" signal.
+        freeTlsConfig(newQuicConfig(settings.certFile, settings.keyFile,
+                                    cipherSuites = settings.tlsCipherSuites))
+        result.quicReload = createShared(CertReload)
+        initCertReload(cast[ptr CertReload](result.quicReload))
+        for i in 0 ..< numLoops:
+          udpFds[i] = newUdpSocket(cfg)
+
+    result.threads = newSeq[Thread[LoopThreadArg]](numLoops)
+    result.outboxes = newSeq[ptr Outbox](numLoops)
+    for i in 0 ..< numLoops:
+      result.outboxes[i] = newOutbox()
+      createThread(result.threads[i], runLoopThread,
+                   (settings: cfg, handler: handler,
+                    stopFlag: result.stopFlag, listenFd: fds[i],
+                    pool: cast[pointer](result.pool),
+                    outbox: result.outboxes[i], tls: result.tls,
+                    udpFd: udpFds[i],
+                    streamRoute: streamRoute, quicReload: result.quicReload))
+      inc madeThreads
+  except CatchableError:
+    # Stop and join any loops already started (they own their listen/udp fds and
+    # close them on exit), then free everything else and re-raise.
+    result.stopFlag[].store(true, moRelaxed)
+    for i in 0 ..< madeThreads: joinThread result.threads[i]
+    for i in madeThreads ..< numLoops:      # fds of loops that never started
+      if fds[i] != osInvalidSocket: discard posix.close(cint(fds[i]))
+      if udpFds[i] != osInvalidSocket: discard posix.close(cint(udpFds[i]))
+    for ob in result.outboxes:
+      if ob != nil: freeOutbox ob
+    result.outboxes.setLen(0)
+    result.threads.setLen(0)
+    result.pool.shutdown()
+    deallocShared result.pool
+    when not defined(plainHttp):
+      if result.tls != nil: freeTlsConfig(cast[ptr TlsConfig](result.tls))
+      if result.quicReload != nil:
+        deinitCertReload(cast[ptr CertReload](result.quicReload))
+        deallocShared result.quicReload
+    unregisterServerFlag(result.stopFlag)
+    deallocShared result.stopFlag
+    raise
 
 proc waitFor*(server: var Server) =
   ## Block until the loops exit (stop signal), then tear down workers.

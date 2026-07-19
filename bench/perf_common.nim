@@ -24,6 +24,13 @@ proc connectLocal*(port: int): SocketHandle =
   var one = cint(1)
   discard setsockopt(result, IPPROTO_TCP, TCP_NODELAY,
                      addr one, SockLen(sizeof(one)))
+  # Bound recv so a server that accepts but never answers as expected (e.g. a
+  # non-pipelining server fed a pipelined batch) can't block the client thread
+  # forever -- the client reconnects and re-checks the stop flag instead of the
+  # whole orchestrator hanging on joinThread.
+  var tv = Timeval(tv_sec: posix.Time(0), tv_usec: Suseconds(200_000))
+  discard setsockopt(result, cint(SOL_SOCKET), cint(SO_RCVTIMEO),
+                     addr tv, SockLen(sizeof(tv)))
 
 proc findSub*(hay: string, hayLen: int, start: int, needle: string): int =
   ## Naive substring search over hay[start..<hayLen]; -1 if absent.

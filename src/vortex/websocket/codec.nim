@@ -152,7 +152,11 @@ when defined(wsDeflate):
         of "server_max_window_bits":
           if val.len > 0:
             let n = (try: parseInt(val) except: -1)
-            if n in 8 .. 15: srvWin = n else: ok = false
+            # zlib raw deflate has no window below 9, so we cannot honor a
+            # request for 8 (advertising 8 while emitting a 9-bit window would
+            # violate RFC 7692 7.1.2.2): decline this offer rather than
+            # mis-advertise. 9..15 are honored.
+            if n in 9 .. 15: srvWin = n else: ok = false
         of "client_max_window_bits":
           if val.len > 0 and (try: parseInt(val) except: -1) notin 8 .. 15:
             ok = false                         # malformed value
@@ -362,9 +366,13 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
                  fr: WsFrame): bool =
   ## Process one parsed frame. Returns false when the connection should
   ## stop reading (a close was initiated).
+  if fr.rsv1 and fr.opcode.isControl:
+    failClose(core, c, w, 1002)  # RSV1 has no meaning on a control frame
+    return false
   case fr.opcode
   of opPing:
-    w.outBuf.appendFrame(opPong, fr.payload)
+    if not w.closeSent:                    # nothing may follow a sent close
+      w.outBuf.appendFrame(opPong, fr.payload)
     true
   of opPong:
     true                                   # unsolicited pong: ignore
@@ -439,6 +447,9 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   var pos = 0
   var open = true
   while open:
+    # Once onClose has been delivered (peer close, error, or teardown) the ws is
+    # finished: do not dispatch further frames onto freed handler state.
+    if w.closeNotified or w.wantClose: break
     var fr: WsFrame
     case parseFrame(buf, avail, pos, w.maxMessage, fr)
     of wpNeedMore:
@@ -609,8 +620,14 @@ proc wsFlushRaw*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
                  data: string, close: bool) =
   ## Enqueue an already-serialized frame from an off-loop sender and flush it
   ## through the transport; `close` marks the WebSocket closing afterward.
+  if w.closeSent:
+    # A close frame has already been queued; nothing may follow it (RFC 6455
+    # 5.5.1). Flush whatever is buffered but append nothing more (drops a
+    # send-after-close or a second close racing a peer close).
+    if w.flush != nil: w.flush(core, c, w)
+    return
   w.outBuf.add data
-  if close and not w.closeSent:
+  if close:
     w.closeSent = true
     w.wantClose = true
   if w.flush != nil:
@@ -630,7 +647,7 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
                                   stream: ws.stream, data: frame))
       return
     let (c, w) = wsConnOf(ws)
-    if w == nil: return
+    if w == nil or w.closeSent: return   # nothing may follow a sent close frame
     when defined(wsDeflate):
       # Compress data messages when permessage-deflate is negotiated; control
       # frames and empty messages go out uncompressed. (Off-loop sends above
@@ -654,8 +671,10 @@ proc send*(ws: WebSocket, data: openArray[char], kind = wsText) {.raises: [].} =
   sendFrame(ws, (if kind == wsBinary: opBinary else: opText), data)
 
 proc ping*(ws: WebSocket, data: openArray[char] = "") {.raises: [].} =
-  ## Send a ping; the peer should answer with a pong.
-  sendFrame(ws, opPing, data)
+  ## Send a ping; the peer should answer with a pong. A control frame's payload
+  ## is capped at 125 bytes (RFC 6455 5.5), so a longer one is truncated.
+  if data.len > 125: sendFrame(ws, opPing, data.toOpenArray(0, 124))
+  else: sendFrame(ws, opPing, data)
 
 proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.raises: [].} =
   ## Start the closing handshake: queue a close frame and close the transport
@@ -680,10 +699,17 @@ proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.raises: [].} =
     discard
 
 proc `onMessage=`*(ws: WebSocket, cb: WsMessageCb) =
+  ## Loop-thread only (set it from the accept handler). Off-loop it is a no-op:
+  ## resolving and mutating the WsConn ref from a worker would race the loop's
+  ## non-atomic ORC refcount. Cross-thread output uses send/close, which route
+  ## through the outbox.
+  if currentThreadId() != ws.core.threadId: return
   let (_, w) = wsConnOf(ws)
   if w != nil: w.onMessage = cb
 
 proc `onClose=`*(ws: WebSocket, cb: WsCloseCb) =
+  ## Loop-thread only (see onMessage=).
+  if currentThreadId() != ws.core.threadId: return
   let (_, w) = wsConnOf(ws)
   if w != nil: w.onClose = cb
 
@@ -691,7 +717,9 @@ proc `onDrain=`*(ws: WebSocket, cb: WsDrainCb) =
   ## Set a callback fired (on the loop thread) when the write backlog drains
   ## back to zero after send() was throttled by a slow peer. Pair it with
   ## `bufferedAmount` to stop sending while the backlog is high and resume
-  ## from here. No-op if the connection is gone.
+  ## from here. No-op if the connection is gone. Loop-thread only (see
+  ## onMessage=).
+  if currentThreadId() != ws.core.threadId: return
   let (_, w) = wsConnOf(ws)
   if w != nil: w.onDrain = cb
 
@@ -703,11 +731,15 @@ proc bufferedAmount*(ws: WebSocket): int =
   ## snapshot: read it from a handler callback (onMessage/onDrain), not
   ## another thread; off-loop sends queue on the outbox and are not counted
   ## until the loop picks them up.
+  if currentThreadId() != ws.core.threadId: return 0   # loop-thread only
   let (c, w) = wsConnOf(ws)
   if w == nil: return 0
   if ws.fd >= 0 and ws.stream == 0: c.pendingOut else: w.h2Pending
 
 proc isAlive*(ws: WebSocket): bool =
+  ## Loop-thread only; off-loop it conservatively reports false rather than
+  ## resolving the WsConn ref across threads.
+  if currentThreadId() != ws.core.threadId: return false
   let (_, w) = wsConnOf(ws)
   w != nil
 

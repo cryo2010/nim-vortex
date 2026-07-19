@@ -83,25 +83,32 @@ proc serveOursAsync(port: int, doAwait: bool) =
 # --- orchestration -----------------------------------------------------------
 
 proc orchestrate() =
+  # `pipelines`: whether the server does HTTP/1.1 pipelining. mummy,
+  # asynchttpserver, and chronos do not, so feeding them `benchDepth` pipelined
+  # requests is both unfair and, for mummy, wedges it (it never answers the
+  # batch as the client expects). They are driven at depth 1 -- the fair
+  # cross-server setting -- while vortex and httpbeast get the configured depth.
   let targets = [
-    (name: "vortex", port: 9101),
-    (name: "vortex-1thread", port: 9102),
-    (name: "vortex-minimal", port: 9106),
-    (name: "vortex-async", port: 9107),
-    (name: "vortex-async-await", port: 9108),
-    (name: "vortex-chronos", port: 9110),
-    (name: "vortex-chronos-await", port: 9111),
-    (name: "httpbeast", port: 9103),
-    (name: "httpbeast-async", port: 9109),
-    (name: "mummy", port: 9112),
-    (name: "asynchttpserver", port: 9104),
-    (name: "chronos", port: 9105),
+    (name: "vortex", port: 9101, pipelines: true),
+    (name: "vortex-1thread", port: 9102, pipelines: true),
+    (name: "vortex-minimal", port: 9106, pipelines: true),
+    (name: "vortex-async", port: 9107, pipelines: true),
+    (name: "vortex-async-await", port: 9108, pipelines: true),
+    (name: "vortex-chronos", port: 9110, pipelines: true),
+    (name: "vortex-chronos-await", port: 9111, pipelines: true),
+    (name: "httpbeast", port: 9103, pipelines: true),
+    (name: "httpbeast-async", port: 9109, pipelines: true),
+    (name: "mummy", port: 9112, pipelines: false),
+    (name: "asynchttpserver", port: 9104, pipelines: false),
+    (name: "chronos", port: 9105, pipelines: false),
   ]
   echo "HTTP/1.1 plaintext throughput: ", benchConns, " connections, ",
-       "pipeline depth ", benchDepth, ", ", benchSeconds, "s per server"
+       benchSeconds, "s per server; pipeline depth ", benchDepth,
+       " (non-pipelining servers: depth 1)"
   echo ""
   var results: seq[(string, float)]
   for t in targets:
+    let depth = if t.pipelines: benchDepth else: 1
     let p = startProcess(getAppFilename(),
                          args = ["serve", t.name, $t.port],
                          options = {poParentStreams})
@@ -110,8 +117,8 @@ proc orchestrate() =
       p.kill()
       p.close()
       continue
-    discard runLoad(h1ClientLoop, t.port, benchConns, 1, benchDepth) # warmup
-    let rps = runLoad(h1ClientLoop, t.port, benchConns, benchSeconds, benchDepth)
+    discard runLoad(h1ClientLoop, t.port, benchConns, 1, depth) # warmup
+    let rps = runLoad(h1ClientLoop, t.port, benchConns, benchSeconds, depth)
     results.add (t.name, rps)
     printRow(t.name, rps)
     p.kill()

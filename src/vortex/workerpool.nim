@@ -44,8 +44,11 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
       try:
         task.fn(task.user, task.core, task.fd, task.gen, task.stream,
                 move task.data)
-      except CatchableError:
-        discard                    # trampoline already responded 500
+      except Exception:
+        # Catch Defect too (where catchable, i.e. not --panics:on): a bug in a
+        # user blocking body must not take down the worker thread and the whole
+        # server. The trampoline already responded and released the pin.
+        discard
 
 proc start*(pool: ptr WorkerPool, n: int) =
   initLock pool.lock

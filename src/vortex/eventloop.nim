@@ -398,7 +398,15 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
     if avail <= 0 and not last: return
     if avail > 0:
       cb(toOpenArray(c.chunkBody, c.bodyFed, c.chunkBody.len - 1), last)
-      c.bodyFed = c.chunkBody.len
+      # Drop the delivered bytes so a streaming chunked upload stays O(read
+      # burst) in memory, matching the Content-Length path. The parser keeps
+      # appending to the now-empty buffer; because it bounds chunkBody.len (not a
+      # running total) against maxBodySize, this also lifts that cap for a
+      # streaming route -- only the undelivered tail needs bounding. A buffered
+      # chunked request has no onBodyCb, so it is never truncated and stays
+      # capped.
+      c.chunkBody.setLen(0)
+      c.bodyFed = 0
     elif last:
       cb(toOpenArray(c.chunkBody, 0, -1), true)   # empty final chunk
   else:
@@ -481,7 +489,8 @@ proc processInput(loop: Loop, c: ptr Connection) =
     case res
     of prNeedMore:
       if c.parser.inBody:
-        if c.parser.expectContinue and not c.sent100:
+        if c.parser.expectContinue and not c.sent100 and
+            loop.settings.auto100Continue:
           c.sent100 = true
           c.wbuf.add continue100
         if c.dlKind != dkBody:
@@ -1232,7 +1241,29 @@ type LoopThreadArg* = tuple
   quicReload: pointer
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
-  let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
-                     arg.pool, arg.outbox, arg.tls, arg.udpFd,
-                     arg.streamRoute, arg.quicReload)
-  loop.run()
+  # An unhandled exception escaping a thread proc aborts the whole process.
+  # newLoop can raise (fd exhaustion, a QUIC cert that changed since the probe),
+  # and run() is defended per-connection but not absolutely; contain both so one
+  # loop failing degrades the server instead of killing it. Close this loop's
+  # listeners so its share of connections isn't blackholed by a dead listener.
+  try:
+    block:
+      let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
+                         arg.pool, arg.outbox, arg.tls, arg.udpFd,
+                         arg.streamRoute, arg.quicReload)
+      loop.run()
+    # The Loop (and any async-dispatcher state) is now out of scope. Under ORC,
+    # a cyclic object decref'd here is only queued in this thread's cycle-root
+    # buffer; if the thread exits with it still queued, the process-exit
+    # collection on the main thread walks this (now-gone) thread's buffer and
+    # crashes. Force the collection here, on the owning thread, so nothing is
+    # left for teardown to trip over.
+    when defined(gcOrc): GC_fullCollect()
+  except CatchableError, Defect:
+    try: stderr.writeLine("vortex: event-loop thread exited on error: " &
+                          getCurrentExceptionMsg())
+    except IOError, OSError: discard
+    if arg.listenFd != osInvalidSocket:
+      discard posix.close(cint(arg.listenFd))
+    if arg.udpFd != osInvalidSocket:
+      discard posix.close(cint(arg.udpFd))
