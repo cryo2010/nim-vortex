@@ -219,6 +219,41 @@ proc forwardedFor*(req: Request): seq[string] =
     let p = part.strip
     if p.len > 0: result.add p
 
+proc isSecure*(req: Request): bool =
+  ## True if the request arrived over TLS (HTTPS, or HTTP/2 over TLS) or QUIC
+  ## (HTTP/3 is always encrypted). Use it to gate Secure cookies, HSTS, and a
+  ## plaintext->HTTPS redirect.
+  if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
+  let c = conn(req.core, req.fd, req.gen)
+  c != nil and c.ssl != nil
+
+proc securityHeaders*(hsts = false, hstsMaxAge = 63072000,
+                      hstsIncludeSubdomains = true, hstsPreload = false,
+                      frameOptions = "DENY",
+                      contentSecurityPolicy =
+                        "default-src 'none'; frame-ancestors 'none'",
+                      referrerPolicy = "no-referrer",
+                      permissionsPolicy = "",
+                      noSniff = true): seq[(string, string)] =
+  ## OWASP Secure Headers baseline as a header list to pass to `res.send`
+  ## (e.g. `res.send(Http200, body, "application/json", securityHeaders(hsts =
+  ## req.isSecure))`). Defaults suit an API/JSON endpoint (a locked-down CSP);
+  ## for an HTML page pass an appropriate `contentSecurityPolicy` and
+  ## `frameOptions`. Enable `hsts` only over TLS -- Strict-Transport-Security on
+  ## plain HTTP is ignored and misleading, so gate it on `req.isSecure`.
+  if noSniff: result.add ("X-Content-Type-Options", "nosniff")
+  if frameOptions.len > 0: result.add ("X-Frame-Options", frameOptions)
+  if contentSecurityPolicy.len > 0:
+    result.add ("Content-Security-Policy", contentSecurityPolicy)
+  if referrerPolicy.len > 0: result.add ("Referrer-Policy", referrerPolicy)
+  if permissionsPolicy.len > 0:
+    result.add ("Permissions-Policy", permissionsPolicy)
+  if hsts:
+    var v = "max-age=" & $hstsMaxAge
+    if hstsIncludeSubdomains: v.add "; includeSubDomains"
+    if hstsPreload: v.add "; preload"
+    result.add ("Strict-Transport-Security", v)
+
 proc contentLength*(req: Request): int =
   if req.fd < 0:
     when not defined(plainHttp):
