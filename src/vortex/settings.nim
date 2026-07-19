@@ -36,6 +36,7 @@ type
     keepAliveTimeout*: int    ## idle time between requests
     responseTimeout*: int     ## end of request to first response byte (0 disables)
     auto100Continue*: bool    ## auto-send 100 Continue for Expect (false: app decides)
+    securityHeaders*: bool    ## auto-add the OWASP baseline headers to responses
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
     wsPongTimeout*: int       ## close a WebSocket if no frame arrives this long after a ping
     shutdownGrace*: int       ## drain window on graceful shutdown
@@ -73,6 +74,7 @@ proc initSettings*(
     keepAliveTimeout = 60,
     responseTimeout = 0,
     auto100Continue = true,
+    securityHeaders = false,
     wsPingInterval = 30,
     wsPongTimeout = 10,
     shutdownGrace = 10,
@@ -98,6 +100,7 @@ proc initSettings*(
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
     responseTimeout: responseTimeout, auto100Continue: auto100Continue,
+    securityHeaders: securityHeaders,
     wsPingInterval: wsPingInterval, wsPongTimeout: wsPongTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
     certFile: certFile, keyFile: keyFile, http3: http3,

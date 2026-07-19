@@ -133,6 +133,9 @@ type
     altSvc*: string           ## advertised on h1/h2 responses when h3 is on
     dateStr*: string          ## cached RFC 7231 date, refreshed once/second
     serverHeader*: string
+    secHeaders*: seq[(string, string)]  ## OWASP baseline injected on responses
+                                        ## when settings.securityHeaders is set
+                                        ## (loop-thread only, precomputed once)
     nowSec*: int64            ## coarse monotonic seconds, updated per tick
     maxWsMessage*: int        ## largest inbound WebSocket message (bytes)
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
