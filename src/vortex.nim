@@ -19,6 +19,7 @@ import vortex/request
 import vortex/server
 import vortex/router
 import vortex/streaming
+import vortex/ratelimit
 
 export httpcore
 export net.Port
@@ -27,3 +28,4 @@ export request
 export server
 export router
 export streaming
+export ratelimit
