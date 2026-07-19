@@ -254,6 +254,31 @@ proc securityHeaders*(hsts = false, hstsMaxAge = 63072000,
     if hstsPreload: v.add "; preload"
     result.add ("Strict-Transport-Security", v)
 
+proc origin*(req: Request): string =
+  ## The request's Origin header ("" if absent). For a WebSocket upgrade this is
+  ## the site that initiated the connection; check it to defend cross-site
+  ## WebSocket hijacking (see originAllowed).
+  req.header("origin")
+
+proc originAllowed*(req: Request, allowed: openArray[string],
+                    allowMissing = false): bool =
+  ## True if the request's Origin exactly matches an entry in `allowed`. Gate a
+  ## WebSocket upgrade on this (OWASP WebSocket Security): a cross-site page
+  ## sends the attacker's Origin, which won't be in your allowlist. `allowMissing`
+  ## (default false = strict) decides requests with no Origin -- browsers always
+  ## send it for WebSockets, so a missing Origin is a non-browser client; set it
+  ## true to permit native/non-browser clients.
+  ##
+  ##   if req.isWebSocketUpgrade:
+  ##     if not req.originAllowed(@["https://app.example.com"]):
+  ##       res.send(Http403, "forbidden origin"); return
+  ##     let ws = req.acceptWebSocket()
+  let o = req.header("origin")
+  if o.len == 0: return allowMissing
+  for a in allowed:
+    if a == o: return true
+  false
+
 proc contentLength*(req: Request): int =
   if req.fd < 0:
     when not defined(plainHttp):
