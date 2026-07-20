@@ -20,6 +20,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
     res.send(Http200, "hello h3", "text/plain")
+  of "/whoami":
+    res.send(Http200, req.remoteAddress, "text/plain")
   of "/echo":
     res.send(Http200, req.body, req.header("Content-Type"),
                 headers = [("X-Proto", $req.httpVersion)])
@@ -130,6 +132,11 @@ suite "HTTP/3 (QUIC, via curl)":
     let (output, rc) = h3curl("--data-binary @" & tmp & " " & base & "/up")
     check rc == 0
     check output == "got " & $(300 * 1024)
+
+  test "remoteAddress reports the QUIC peer IP":
+    let (output, rc) = h3curl(base & "/whoami")
+    check rc == 0
+    check output in ["127.0.0.1", "::1"]
 
   test "alt-svc advertised on h1/h2":
     let (output, rc) = execCmdEx(
