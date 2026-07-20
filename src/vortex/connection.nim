@@ -72,6 +72,7 @@ type
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
     state*: ConnState
+    remoteAddr*: string       ## peer IP captured at accept (TCP; "" for HTTP/3)
     rbuf*: string             ## receive buffer (grows, reused)
     rlen*: int                ## valid bytes in rbuf
     wbuf*: string             ## pending output
@@ -132,6 +133,9 @@ type
     altSvc*: string           ## advertised on h1/h2 responses when h3 is on
     dateStr*: string          ## cached RFC 7231 date, refreshed once/second
     serverHeader*: string
+    secHeaders*: seq[(string, string)]  ## OWASP baseline injected on responses
+                                        ## when settings.securityHeaders is set
+                                        ## (loop-thread only, precomputed once)
     nowSec*: int64            ## coarse monotonic seconds, updated per tick
     maxWsMessage*: int        ## largest inbound WebSocket message (bytes)
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
@@ -281,6 +285,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
     c.wbuf.setLen(0)
     c.wbuf = ""
   c.wbuf.setLen(0)
+  c.remoteAddr = ""
   c.rlen = 0
   c.wpos = 0
   c.chunkBody.setLen(0)

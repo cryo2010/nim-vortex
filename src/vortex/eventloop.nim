@@ -147,6 +147,18 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
     udpFd: -1)
   result.core.streamRoute = streamRoute
   result.core.serverHeader = settings.serverHeader
+  if settings.securityHeaders:
+    # OWASP Secure Headers baseline auto-injected on every response (skipping any
+    # a handler set). CSP is deliberately excluded -- a forced content-security
+    # policy breaks apps; set it per response via securityHeaders() instead.
+    # HSTS only when this server terminates TLS (a whole listener is TLS or not).
+    result.core.secHeaders = @[
+      ("X-Content-Type-Options", "nosniff"),
+      ("X-Frame-Options", "DENY"),
+      ("Referrer-Policy", "no-referrer")]
+    if settings.certFile.len > 0:
+      result.core.secHeaders.add ("Strict-Transport-Security",
+                                  "max-age=63072000; includeSubDomains")
   result.core.maxWsMessage = settings.maxWsMessageSize
   result.core.wsPingInterval = settings.wsPingInterval
   result.core.wsPongTimeout = settings.wsPongTimeout
@@ -780,6 +792,10 @@ proc handleAccept(loop: Loop) =
     let c = addr loop.core.conns[fd]
     c.fd = int32(fd)
     c[].clear(loop.settings.initialBufferSize)
+    # Record the peer IP for req.remoteAddress (access logging, rate limiting,
+    # audit). Best-effort: a formatting failure just leaves it empty.
+    try: c.remoteAddr = getAddrString(cast[ptr SockAddr](addr sa))
+    except CatchableError: discard
     inc loop.connCount
     when not defined(plainHttp):
       if loop.tls != nil:

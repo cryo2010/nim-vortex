@@ -197,6 +197,95 @@ proc body*(req: Request): string =
       result = c.rbuf.substr(c.parser.bodyStart,
                              c.parser.bodyStart + c.parser.bodyLen - 1)
 
+proc remoteAddress*(req: Request): string =
+  ## The peer IP of the connection, captured at accept (access logging, rate
+  ## limiting, audit). This is the *direct* peer: behind a reverse proxy it is
+  ## the proxy's IP, so recover the origin client from a trusted X-Forwarded-For
+  ## policy (see forwardedFor), never from an untrusted header alone. Empty for
+  ## HTTP/3 (the QUIC peer address is not captured yet) and for a stale handle.
+  if req.fd < 0: return ""
+  let c = conn(req.core, req.fd, req.gen)
+  if c != nil: c.remoteAddr else: ""
+
+proc forwardedFor*(req: Request): seq[string] =
+  ## The X-Forwarded-For chain parsed left (origin client) to right (nearest
+  ## proxy), trimmed; empty if the header is absent. A client can forge this
+  ## header, so trust an entry only for the hops you actually control: combine
+  ## it with remoteAddress and a known-proxy policy before treating the leftmost
+  ## value as the client IP.
+  let xff = req.header("x-forwarded-for")
+  if xff.len == 0: return @[]
+  for part in xff.split(','):
+    let p = part.strip
+    if p.len > 0: result.add p
+
+proc isSecure*(req: Request): bool =
+  ## True if the request arrived over TLS (HTTPS, or HTTP/2 over TLS) or QUIC
+  ## (HTTP/3 is always encrypted). Use it to gate Secure cookies, HSTS, and a
+  ## plaintext->HTTPS redirect.
+  if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
+  let c = conn(req.core, req.fd, req.gen)
+  c != nil and c.ssl != nil
+
+proc securityHeaders*(hsts = false, hstsMaxAge = 63072000,
+                      hstsIncludeSubdomains = true, hstsPreload = false,
+                      frameOptions = "DENY",
+                      contentSecurityPolicy =
+                        "default-src 'none'; frame-ancestors 'none'",
+                      referrerPolicy = "no-referrer",
+                      permissionsPolicy = "",
+                      noSniff = true): seq[(string, string)] =
+  ## OWASP Secure Headers baseline as a header list to pass to `res.send`
+  ## (e.g. `res.send(Http200, body, "application/json", securityHeaders(hsts =
+  ## req.isSecure))`). Defaults suit an API/JSON endpoint (a locked-down CSP);
+  ## for an HTML page pass an appropriate `contentSecurityPolicy` and
+  ## `frameOptions`. Enable `hsts` only over TLS -- Strict-Transport-Security on
+  ## plain HTTP is ignored and misleading, so gate it on `req.isSecure`.
+  if noSniff: result.add ("X-Content-Type-Options", "nosniff")
+  if frameOptions.len > 0: result.add ("X-Frame-Options", frameOptions)
+  if contentSecurityPolicy.len > 0:
+    result.add ("Content-Security-Policy", contentSecurityPolicy)
+  if referrerPolicy.len > 0: result.add ("Referrer-Policy", referrerPolicy)
+  if permissionsPolicy.len > 0:
+    result.add ("Permissions-Policy", permissionsPolicy)
+  if hsts:
+    var v = "max-age=" & $hstsMaxAge
+    if hstsIncludeSubdomains: v.add "; includeSubDomains"
+    if hstsPreload: v.add "; preload"
+    result.add ("Strict-Transport-Security", v)
+
+proc origin*(req: Request): string =
+  ## The request's Origin header ("" if absent). For a WebSocket upgrade this is
+  ## the site that initiated the connection; check it to defend cross-site
+  ## WebSocket hijacking (see originAllowed).
+  req.header("origin")
+
+proc originAllowed*(req: Request, allowed: openArray[string],
+                    allowMissing = false): bool =
+  ## True if the request's Origin exactly matches an entry in `allowed`. Gate a
+  ## WebSocket upgrade on this (OWASP WebSocket Security): a cross-site page
+  ## sends the attacker's Origin, which won't be in your allowlist. `allowMissing`
+  ## (default false = strict) decides requests with no Origin -- browsers always
+  ## send it for WebSockets, so a missing Origin is a non-browser client; set it
+  ## true to permit native/non-browser clients.
+  ##
+  ##   if req.isWebSocketUpgrade:
+  ##     if not req.originAllowed(@["https://app.example.com"]):
+  ##       res.send(Http403, "forbidden origin"); return
+  ##     let ws = req.acceptWebSocket()
+  let o = req.header("origin")
+  if o.len == 0: return allowMissing
+  for a in allowed:
+    if a == o: return true
+  false
+
+proc host*(req: Request): string =
+  ## The request's host: the :authority pseudo-header for HTTP/2 and HTTP/3, the
+  ## Host header for HTTP/1.1 ("" if absent). Use it to build an absolute URL,
+  ## e.g. a plaintext -> HTTPS redirect.
+  result = req.header(":authority")
+  if result.len == 0: result = req.header("host")
+
 proc contentLength*(req: Request): int =
   if req.fd < 0:
     when not defined(plainHttp):
@@ -321,27 +410,45 @@ proc httpVersion*(req: Request): int =
 
 # --- responding -------------------------------------------------------------
 
+proc withSecHeaders*(core: ptr LoopCore,
+                     headers: openArray[(string, string)]): seq[(string, string)] =
+  ## Merge the loop's configured OWASP security-headers baseline into `headers`,
+  ## skipping any name the handler already set (case-insensitive, so the app
+  ## always wins). Only called when core.secHeaders is non-empty, so the default
+  ## (toggle-off) response path allocates nothing extra.
+  result = @headers
+  for (bn, bv) in core.secHeaders:
+    var present = false
+    for (an, _) in headers:
+      if cmpIgnoreCase(an, bn) == 0:
+        present = true
+        break
+    if not present: result.add (bn, bv)
+
 proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                     code: int, contentType: string,
                     headers: openArray[(string, string)],
                     body: openArray[char]) =
   ## Serialize a response into the connection's write buffer using the
   ## connection's protocol. Loop thread only.
-  if stream != 0:
-    h2Respond(c, code, stream, core.dateStr, core.serverHeader,
-              contentType, headers, body, core.altSvc)
-  else:
-    if c.responded: return
-    c.responded = true
-    appendResponse(c.wbuf, HttpCode(code), core.dateStr, core.serverHeader,
-                   contentType, body, headers,
-                   keepAlive = c.parser.keepAlive,
-                   skipBody = c.parser.httpMethod == HttpHead,
-                   announceKeepAlive = c.parser.keepAlive and
-                                       c.parser.minor == 0,
-                   altSvc = core.altSvc)
-    if not c.parser.keepAlive:
-      c.closeAfterFlush = true
+  template emit(h: openArray[(string, string)]) =
+    if stream != 0:
+      h2Respond(c, code, stream, core.dateStr, core.serverHeader,
+                contentType, h, body, core.altSvc)
+    else:
+      if c.responded: return
+      c.responded = true
+      appendResponse(c.wbuf, HttpCode(code), core.dateStr, core.serverHeader,
+                     contentType, body, h,
+                     keepAlive = c.parser.keepAlive,
+                     skipBody = c.parser.httpMethod == HttpHead,
+                     announceKeepAlive = c.parser.keepAlive and
+                                         c.parser.minor == 0,
+                     altSvc = core.altSvc)
+      if not c.parser.keepAlive:
+        c.closeAfterFlush = true
+  if core.secHeaders.len == 0: emit(headers)
+  else: emit(withSecHeaders(core, headers))
 
 proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
               code: int, contentType: string,
@@ -351,7 +458,11 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
   when not defined(plainHttp):
     let h3c = h3ConnOf(core, fd, gen)
     if h3c != nil:
-      h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
+      if core.secHeaders.len == 0:
+        h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
+      else:
+        h3Respond(core, h3c, uint64(stream), code, contentType,
+                  withSecHeaders(core, headers), body)
 
 var workerResponded* {.threadvar.}: bool
   ## On a worker thread, set by the worker-path `send` so blockingTrampoline can
@@ -387,6 +498,32 @@ proc send*(res: Response, code: HttpCode) =
 proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
+
+proc redirect*(res: Response, location: string, permanent = false,
+               extraHeaders: openArray[(string, string)] = []) =
+  ## Send a redirect to `location` (301 permanent / 302 temporary). For a
+  ## plaintext-listener -> HTTPS redirect: `res.redirect("https://" & req.host &
+  ## req.url.path, permanent = true)`. Serve HTTPS with HSTS (securityHeaders)
+  ## so subsequent requests skip the plaintext hop entirely.
+  var hdrs = @[("Location", location)]
+  for h in extraHeaders: hdrs.add h
+  send(res, (if permanent: Http301 else: Http302), "", "text/plain", hdrs)
+
+proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
+                secure = true, httpOnly = true,
+                sameSite = "Lax"): (string, string) =
+  ## Build a Set-Cookie header (as a (name, value) pair for res.send's headers)
+  ## with secure defaults: Secure, HttpOnly, SameSite=Lax (OWASP Session
+  ## Management). maxAge < 0 omits Max-Age (a session cookie). Set secure=false
+  ## only for local plaintext development. Emit several by passing several pairs.
+  var v = name & "=" & value
+  if path.len > 0: v.add "; Path=" & path
+  if domain.len > 0: v.add "; Domain=" & domain
+  if maxAge >= 0: v.add "; Max-Age=" & $maxAge
+  if secure: v.add "; Secure"
+  if httpOnly: v.add "; HttpOnly"
+  if sameSite.len > 0: v.add "; SameSite=" & sameSite
+  ("Set-Cookie", v)
 
 proc sendContinue*(req: Request) =
   ## Send a "100 Continue" interim response for a request that carried
@@ -478,18 +615,22 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
   ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
   try:
     if currentThreadId() != res.core.threadId: return
+    # Inject the security-headers baseline here too (a streaming response's head;
+    # merged once, not per chunk). The HEAD fallback below routes through
+    # applyResponse, which does its own merge, so it keeps the original headers.
+    let hdrs = withSecHeaders(res.core, headers)
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
           h3SendHead(res.core, h3c, uint64(res.stream), int(code),
-                     contentType, headers)
+                     contentType, hdrs)
       return
     let c = conn(res.core, res.fd, res.gen)
     if c == nil: return
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
-                 res.core.serverHeader, contentType, headers, res.core.altSvc)
+                 res.core.serverHeader, contentType, hdrs, res.core.altSvc)
       flushConn(res)
       return
     if c.responded: return
@@ -503,7 +644,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     let chunked = c.parser.minor >= 1     # HTTP/1.0 clients: close-delimited
     c.respChunked = chunked
     appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
-                     contentType, headers, chunked, keepAlive = ka,
+                     contentType, hdrs, chunked, keepAlive = ka,
                      announceKeepAlive = ka and c.parser.minor == 0,
                      altSvc = res.core.altSvc)
     flushConn(res)
