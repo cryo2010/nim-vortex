@@ -1018,6 +1018,54 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   except Exception:
     discard
 
+type
+  BlockingDataProc* = proc (req: Request, res: Response, data: string)
+                           {.nimcall, gcsafe.}
+    ## Like BlockingProc, but also receives a payload moved into the worker
+    ## task (config the capture-free body cannot close over). Used by static
+    ## file serving to carry the resolved path + options to the worker.
+
+proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
+                            stream: uint32, data: string) {.nimcall, gcsafe.} =
+  let fn = cast[BlockingDataProc](user)
+  let lc = cast[ptr LoopCore](core)
+  let req = Request(core: lc, fd: fd, gen: gen, stream: stream)
+  let res = response(req)
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: workerResponded = false
+  try:
+    fn(req, res, data)
+  except Exception:
+    res.send(Http500, "500 Internal Server Error", "text/plain")
+  if onWorker and not workerResponded:
+    res.send(Http500, "500 Internal Server Error", "text/plain")
+
+proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
+                           data: sink string) {.raises: [].} =
+  ## Like dispatchBlocking, but moves `data` into the worker task so the
+  ## capture-free `fn` can read per-request config from it. Call from the
+  ## owning loop thread. The pin/enqueue bookkeeping mirrors dispatchBlocking.
+  try:
+    if req.core.pool == nil:
+      blockingDataTrampoline(cast[pointer](fn), cast[pointer](req.core),
+                             req.fd, req.gen, req.stream, data)  # no pool: inline
+      return
+    if req.fd < 0:
+      let idx = int(-req.fd) - 2
+      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+        return
+      inc req.core.h3slots[idx].pinned
+    else:
+      let c = conn(req.core, req.fd, req.gen)
+      if c == nil: return
+      inc c.pinned
+    enqueue(cast[ptr WorkerPool](req.core.pool),
+            WorkerTask(fn: blockingDataTrampoline, user: cast[pointer](fn),
+                       core: cast[pointer](req.core), fd: req.fd,
+                       gen: req.gen, stream: req.stream, data: data))
+  except Exception:
+    discard
+
 template blocking*(request: Request, body: untyped) =
   ## Run `body` on the worker pool, where blocking calls (sync DB drivers,
   ## file IO, CPU work) are safe. Inside `body` the request and response

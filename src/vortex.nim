@@ -19,6 +19,7 @@ import vortex/request
 import vortex/server
 import vortex/router
 import vortex/streaming
+import vortex/staticfiles
 import vortex/ratelimit
 
 export httpcore
@@ -28,4 +29,5 @@ export request
 export server
 export router
 export streaming
+export staticfiles
 export ratelimit
