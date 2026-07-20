@@ -59,6 +59,7 @@ type
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore       ## owning loop core (for WebSocket callbacks)
     ssl*: SslPtr
+    remoteAddr*: string       ## peer IP captured at accept (numeric, no port)
     slot*: int
     streams*: Table[uint64, H3Stream]
     unis: seq[H3UniStream]    ## peer's unidirectional streams
@@ -113,7 +114,8 @@ const
 proc newH3Conn*(core: ptr LoopCore, ssl: SslPtr, slot: int, maxBody,
                 maxConcurrentStreams: int): H3Conn =
   result = H3Conn(core: core, ssl: ssl, slot: slot, maxBody: maxBody,
-                  maxConcurrentStreams: maxConcurrentStreams)
+                  maxConcurrentStreams: maxConcurrentStreams,
+                  remoteAddr: quicPeerAddr(ssl))
   result.scratch = newString(4096)
   # Our control stream: stream type + SETTINGS. We advertise a QPACK dynamic
   # table so peers can compress request headers; BLOCKED_STREAMS stays 0 so the
