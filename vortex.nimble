@@ -9,19 +9,41 @@ srcDir        = "src"
 
 # Dependencies
 
+import std/strutils
+
 requires "nim >= 2.2.10"
 
 task bench, "Build benchmark server with release flags":
   exec "nim c --mm:orc --threads:on -d:danger --passC:-flto -o:bench/handlers bench/handlers.nim"
+
+proc ensureNimblePath() =
+  ## The perf/testchronos tasks compile the third-party comparison servers
+  ## (httpbeast, chronos, mummy) with a raw `nim c`, which resolves them from
+  ## the global nimble package path. `nimble setup`/`install` regenerates
+  ## nimble.paths with `--noNimblePath`, which disables that path and breaks
+  ## the build (`cannot open file: pkg/chronos`); strip the line so the deps
+  ## resolve. nimble.paths is machine-local, so this only touches local state.
+  let p = "nimble.paths"
+  if not fileExists(p): return
+  var kept: seq[string]
+  var changed = false
+  for ln in readFile(p).splitLines():
+    if ln.strip() == "--noNimblePath": changed = true
+    elif ln.len > 0: kept.add ln
+  if changed: writeFile(p, kept.join("\n") & "\n")
 
 taskRequires "perf", "httpbeast >= 0.4.0"
 taskRequires "perf", "chronos >= 4.0.0"
 taskRequires "perf", "mummy >= 0.4.0"
 
 task perf, "Run the HTTP/1.1 throughput comparison benchmark":
+  ensureNimblePath()
   exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http1_1 bench/perf_http1_1.nim"
 
+taskRequires "perf2", "chronos >= 4.0.0"
+
 task perf2, "Run the HTTP/2 throughput benchmark":
+  ensureNimblePath()
   exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http2 bench/perf_http2.nim"
 
 # HTTP/3 throughput is measured with a real QUIC client via `nimble h3load`
@@ -31,6 +53,7 @@ task perf2, "Run the HTTP/2 throughput benchmark":
 taskRequires "testchronos", "chronos >= 4.0.0"
 
 task testchronos, "Test the chronos async adapter (needs chronos)":
+  ensureNimblePath()
   exec "nim c -r --mm:orc --threads:on -d:ssl -p:src " &
        "-o:tests/chronos_adapter tests/chronos_adapter.nim"
 

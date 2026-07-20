@@ -33,3 +33,6 @@ conformance/h2load/h2load_server
 conformance/testssl/testssl_server
 conformance/testssl/*.pem
 /demo
+nimble.develop
+nimble.paths
+nimbledeps
