@@ -204,7 +204,13 @@ proc tapRecv(b, msg: pointer, stride, num: csize_t, flags: uint64,
   result = BIO_recvmmsg(raw, msg, stride, num, flags, processed)
   if result != 1 or processed == nil: return
   for i in 0 ..< int(processed[]):
-    recordPeer(cast[ptr BioMsg](cast[uint](msg) + uint(i) * uint(stride)))
+    let m = cast[ptr BioMsg](cast[uint](msg) + uint(i) * uint(stride))
+    # Only long-header packets (high bit set) carry a parseable DCID. Short
+    # header 1-RTT data packets -- the steady-state bulk -- skip the call
+    # entirely; the DCID is captured from the handshake's long-header packets.
+    if m.data != nil and m.dataLen >= 6 and
+        (cast[ptr UncheckedArray[byte]](m.data)[0] and 0x80'u8) != 0:
+      recordPeer(m)
 
 proc tapMethod(): pointer =
   if tapMeth != nil: return tapMeth
