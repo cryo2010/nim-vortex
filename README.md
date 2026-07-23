@@ -478,12 +478,12 @@ let assets = staticHandler("public",
 r.get("/assets/*", assets)
 ```
 
-To serve one specific file from any handler, use `res.serveFile(path)` (a
+To serve one specific file from any handler, use `res.sendFile(path)` (a
 trusted path — no traversal resolution):
 
 ```nim
 r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
-  res.serveFile("public/favicon.ico"))
+  res.sendFile("public/favicon.ico"))
 ```
 
 Large full-file `GET` responses are **streamed** from the worker pool in bounded

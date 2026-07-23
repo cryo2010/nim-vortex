@@ -25,7 +25,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/whoami":
     res.send(Http200, req.remoteAddress, "text/plain")
   of "/bigfile":
-    res.serveFile(bigFilePath)   # > stream threshold: streams over h3
+    res.sendFile(bigFilePath)   # > stream threshold: streams over h3
   of "/echo":
     res.send(Http200, req.body, req.header("Content-Type"),
                 headers = [("X-Proto", $req.httpVersion)])

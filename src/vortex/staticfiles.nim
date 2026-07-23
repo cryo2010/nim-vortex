@@ -11,7 +11,7 @@
 ## r.get("/assets/*", assets)                # /assets/<path>
 ## # or serve one file from any handler (router-free):
 ## r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
-##   res.serveFile("public/favicon.ico"))
+##   res.sendFile("public/favicon.ico"))
 ## ```
 ##
 ## Large full-file GETs are streamed from the worker pool in bounded chunks
@@ -187,7 +187,7 @@ proc serveResolved(req: Request, res: Response, data: string)
                   {.nimcall, gcsafe.} =
   ## Worker body: `data` packs candidate\0rootReal\0index\0cacheControl\0flags
   ## (flags = <etag><lastModified> as '0'/'1'). rootReal "" = trusted path
-  ## (serveFile), skip the containment check.
+  ## (sendFile), skip the containment check.
   let f = data.split('\0')
   if f.len != 5: notFound(res); return
   let candidate = f[0]
@@ -294,10 +294,10 @@ proc pack(candidate, rootReal: string, opts: StaticOptions): string =
 
 # --- public API ------------------------------------------------------------
 
-proc serveFile*(res: Response, path: string, opts = staticOptions()) =
+proc sendFile*(res: Response, path: string, opts = staticOptions()) =
   ## Serve one specific file (a trusted path -- no traversal resolution) on the
   ## worker pool. Honors conditional requests and ranges. Call from a handler
-  ## (router-free): `res.serveFile("public/index.html")`. Request and Response
+  ## (router-free): `res.sendFile("public/index.html")`. Request and Response
   ## are the same handle; the worker rebuilds both from it.
   dispatchBlockingData(
     Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),

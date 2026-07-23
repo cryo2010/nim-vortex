@@ -20,13 +20,13 @@ writeFile(dir.parentDir / ("vortex_secret_" & $getCurrentProcessId()), "TOPSECRE
 
 proc oneFile(path: string): RequestHandler =
   proc (req: Request, res: Response) {.gcsafe.} =
-    res.serveFile(path)      # res.serveFile: a specific trusted file
+    res.sendFile(path)      # res.sendFile: a specific trusted file
 
 let r = newRouter()
 let sh = staticHandler(dir)
 r.get("/assets", sh)         # /assets and /assets/ -> directory index
 r.get("/assets/*", sh)       # /assets/<path>
-r.get("/one", oneFile(dir / "hello.txt"))   # res.serveFile
+r.get("/one", oneFile(dir / "hello.txt"))   # res.sendFile
 var srv = start(r.toHandler(),
                 initSettings(port = Port(0), numThreads = 1, workerThreads = 2))
 
@@ -79,7 +79,7 @@ suite "static file serving":
   test "MIME from extension":
     check raw("/assets/app.css").headerVal("Content-Type") == "text/css; charset=utf-8"
 
-  test "res.serveFile serves a specific file":
+  test "res.sendFile serves a specific file":
     let resp = raw("/one")
     check "200" in resp.status
     check resp.headerVal("Content-Type") == "text/plain; charset=utf-8"
