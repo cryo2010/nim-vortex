@@ -15,7 +15,9 @@ type
     omHttp,                   ## data is a packed HTTP response (see packResponse)
     omWs,                     ## data is a ready-to-write WebSocket frame
     omWsClose,                ## data is a WebSocket close frame; close after flush
-    omWsDone                  ## a ws.blocking worker finished: unpin and resume
+    omWsDone,                 ## a ws.blocking worker finished: unpin and resume
+    omFileStart,              ## begin a streamed file: head + first chunk
+    omFileChunk               ## one more chunk of a streamed file
 
   OutMsg* = object
     ## A message produced off-loop (worker thread), routed back to the
@@ -28,7 +30,14 @@ type
     gen*: uint32
     stream*: uint32           ## 0 for HTTP/1
     code*: int32
-    data*: string             ## packed response, or a full WS frame
+    data*: string             ## packed response, WS frame, or a file chunk
+    # File-streaming (omFileStart/omFileChunk): the loop-pull mechanism carries
+    # the next read request + the worker proc that services it, so the loop
+    # stays stateless between chunks.
+    aux*: string              ## next read request ("path\0off\0len\0remaining")
+    user*: pointer            ## the chunk-reader proc (a BlockingDataProc)
+    n64*: int64               ## total Content-Length (omFileStart)
+    last*: bool               ## this chunk completes the file
 
   Outbox* = object
     ## MPSC channel into an event loop: workers push, the loop drains on
@@ -107,6 +116,8 @@ type
     # h2/h3 keep their streaming flags on the per-stream struct.
     respStreaming*: bool      ## a chunked/close-delimited response is open
     respChunked*: bool        ## true = Transfer-Encoding: chunked framing
+    respCLDelimited*: bool     ## streaming with a known Content-Length (keep-alive
+                               ## survives finish; not close-delimited)
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
     onRespDrain*: RespDrainCb
     # Inbound streaming (req.onBody). A streaming route is dispatched at
@@ -269,6 +280,7 @@ proc resetForNextRequest*(c: var Connection) =
   c.awaitingResponse = false
   c.respStreaming = false
   c.respChunked = false
+  c.respCLDelimited = false
   c.respBackedUp = false
   c.onRespDrain = nil
   c.reqStreaming = false
@@ -310,6 +322,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.peerHalfClosed = false
   c.respStreaming = false
   c.respChunked = false
+  c.respCLDelimited = false
   c.respBackedUp = false
   c.onRespDrain = nil
   c.reqStreaming = false

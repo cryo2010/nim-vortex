@@ -1,7 +1,7 @@
 ## Static file serving over HTTP/1.1: raw sockets so status line, headers and
 ## body are checked exactly.
 
-import std/[unittest, net, os, strutils]
+import std/[unittest, net, os, strutils, osproc]
 import vortex/[settings, request, server, router, staticfiles]
 
 let dir = getTempDir() / "vortex_static_" & $getCurrentProcessId()
@@ -13,6 +13,8 @@ writeFile(dir / "app.css", "body{color:red}")
 writeFile(dir / "index.html", "<h1>root index</h1>")
 writeFile(dir / "sub" / "index.html", "<h1>sub index</h1>")
 writeFile(dir / "data.bin", "0123456789")            # 10 bytes
+const bigPattern = "0123456789ABCDEF"
+writeFile(dir / "big.dat", bigPattern.repeat(64 * 1024))   # 1 MiB, > stream threshold
 # a secret outside the served root, for the traversal test
 writeFile(dir.parentDir / ("vortex_secret_" & $getCurrentProcessId()), "TOPSECRET")
 
@@ -125,6 +127,43 @@ suite "static file serving":
     check "200" in resp.status
     check resp.headerVal("Content-Length") == "18"
     check resp.bodyOf.len == 0
+
+  test "large file streams with Content-Length, body intact, not chunked":
+    let resp = raw("/assets/big.dat")
+    check "200" in resp.status
+    check resp.headerVal("Content-Length") == "1048576"
+    check "chunked" notin resp.toLowerAscii            # length-delimited, not chunked
+    let body = resp.bodyOf
+    check body.len == 1048576
+    check body == bigPattern.repeat(64 * 1024)         # every byte correct
+
+  test "range on a large file stays buffered and correct":
+    let resp = raw("/assets/big.dat", "Range: bytes=1048570-1048575\r\n")
+    check "206" in resp.status
+    check resp.bodyOf == "ABCDEF"                       # the last 6 bytes
+
+  test "HEAD on a large file: Content-Length, no body":
+    let resp = rawHead("/assets/big.dat")
+    check resp.headerVal("Content-Length") == "1048576"
+    check resp.bodyOf.len == 0
+
+  test "keep-alive survives a streamed file (curl, one connection reused)":
+    # In-process raw-socket reads race the server threads for CPU under a tight
+    # timeout, so use curl (a separate process) for the reuse check. --next on
+    # the same host reuses the connection; num_connects tallies new TCP opens.
+    let curlBin = findExe("curl")
+    if curlBin.len == 0:
+      skip()
+    else:
+      let base = "http://127.0.0.1:" & $srv.port
+      let (outp, rc) = execCmdEx(curlBin & " -s --http1.1 " &
+        "-o /dev/null -w 'r1=%{size_download}|' " & base & "/assets/big.dat " &
+        "--next -o /dev/null -w 'r2=%{size_download}|conn=%{num_connects}' " &
+        base & "/assets/hello.txt")
+      check rc == 0
+      check "r1=1048576" in outp        # full streamed body
+      check "r2=18" in outp             # second request served on the same conn
+      check "conn=0" in outp            # no new TCP connection: the first was reused
 
   test "POST to a static path is 405 with Allow":
     let s = newSocket()

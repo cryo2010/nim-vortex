@@ -14,10 +14,10 @@
 ##   res.serveFile("public/favicon.ico"))
 ## ```
 ##
-## Notes: the whole file (or the requested range) is read into memory before
-## sending; this is aimed at assets, not multi-GB downloads. Ranges keep large
-## fetches bounded. sendfile(2) is intentionally not used -- it does not compose
-## with TLS or the readiness event loop.
+## Large full-file GETs are streamed from the worker pool in bounded chunks
+## (memory stays flat regardless of file size) with Content-Length preserved;
+## small files, ranges, and HEAD are read in one shot. sendfile(2) is
+## intentionally not used -- it does not compose with TLS or the readiness loop.
 
 import std/[os, times, strutils, uri, httpcore]
 import ./request
@@ -159,6 +159,30 @@ proc parseRange(hdr: string, size: int64): (bool, int64, int64) =
   if e >= size: e = size - 1
   (true, s, e)
 
+const
+  fileStreamChunk = 128 * 1024      ## bytes per worker read hop
+  fileStreamThreshold = 512 * 1024  ## stream full-file GETs larger than this
+
+proc readChunkTramp(req: Request, res: Response, data: string)
+                   {.nimcall, gcsafe.} =
+  ## Worker: read the next chunk (data = "path\0offset\0remaining") and hand it
+  ## to the loop, which pulls the following one once this flushes.
+  let f = data.split('\0')
+  if f.len != 3:
+    emitFileChunk(res, "", "", cast[pointer](readChunkTramp), true); return
+  let path = f[0]
+  let off = try: parseBiggestInt(f[1]) except CatchableError: 0'i64
+  let remaining = try: parseBiggestInt(f[2]) except CatchableError: 0'i64
+  let want = int(min(int64(fileStreamChunk), remaining))
+  var bytes: string
+  try: bytes = readSlice(path, int(off), want)
+  except CatchableError: bytes = ""
+  let got = int64(bytes.len)
+  let nextRemaining = remaining - got
+  let last = got == 0 or nextRemaining <= 0
+  let nextRead = if last: "" else: path & '\0' & $(off + got) & '\0' & $nextRemaining
+  emitFileChunk(res, bytes, nextRead, cast[pointer](readChunkTramp), last)
+
 proc serveResolved(req: Request, res: Response, data: string)
                   {.nimcall, gcsafe.} =
   ## Worker body: `data` packs candidate\0rootReal\0index\0cacheControl\0flags
@@ -236,6 +260,21 @@ proc serveResolved(req: Request, res: Response, data: string)
         s = rs; e = re; partial = true
 
   let mime = mimeType(real)
+  # Stream large full-file GETs so the whole file never sits in memory at once.
+  # HEAD, ranges, and small files stay buffered: a range is already bounded by
+  # the requested slice, and small files are cheaper to send in one shot.
+  if not partial and req.method != HttpHead and size > fileStreamThreshold:
+    var first: string
+    try: first = readSlice(real, 0, int(min(int64(fileStreamChunk), size)))
+    except CatchableError: notFound(res); return
+    let got = int64(first.len)
+    let remaining = size - got
+    let last = got == 0 or remaining <= 0
+    let nextRead = if last: "" else: real & '\0' & $got & '\0' & $remaining
+    emitFileStart(res, 200, mime, hdrs, size, first, nextRead,
+                  cast[pointer](readChunkTramp), last)
+    return
+
   let length = int(e - s + 1)
   var body: string
   try:

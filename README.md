@@ -486,10 +486,13 @@ r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
   res.serveFile("public/favicon.ico"))
 ```
 
-The file (or the requested range) is read into memory before sending, so this
-targets assets rather than multi-GB downloads; ranges keep large fetches
-bounded. `sendfile(2)` is intentionally not used — it composes with neither TLS
-nor the readiness event loop.
+Large full-file `GET` responses are **streamed** from the worker pool in bounded
+chunks — memory stays flat no matter how big the file is — with `Content-Length`
+preserved (length-delimited, keep-alive intact), so the loop-pull path backs off
+under write pressure via the same `onDrain` backpressure the streaming API uses.
+Small files, ranges, and `HEAD` are read in one shot (a range is already bounded
+by the requested slice). `sendfile(2)` is intentionally not used — it composes
+with neither TLS nor the readiness event loop.
 
 ## Build flags
 
