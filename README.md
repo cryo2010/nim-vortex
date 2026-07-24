@@ -62,7 +62,7 @@ proc getUser(req: Request, res: Response) {.gcsafe.} =
 
 var router = newRouter()
 router.get("/users/:id", getUser)
-router.get("/static/*", serveFile)
+router.get("/static/*", staticHandler("public"))
 run(router.toHandler, initSettings(port = Port(8080)))
 ```
 
@@ -438,6 +438,61 @@ res.withSse(s):
 The response sets `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no` so intermediary proxies don't buffer or transform the
 stream.
+
+## Static files
+
+`staticHandler(rootDir)` returns a handler that serves a directory, keyed off a
+route's trailing `*` wildcard. Register it on `/prefix/*` (and the bare
+`/prefix` for the directory index):
+
+```nim
+let r = newRouter()
+let assets = staticHandler("public")
+r.get("/assets", assets)     # /assets and /assets/ -> public/index.html
+r.get("/assets/*", assets)   # /assets/<path> -> public/<path>
+```
+
+`/assets/app.js` maps to `public/app.js`; `/assets/` and `/assets` serve the
+directory's `index.html` (configurable). It runs on the worker pool (file I/O
+blocks, so it never stalls the event loop), and the same code path serves over
+HTTP/1.1, /2 and /3, plaintext or TLS. Each response includes:
+
+- **Content-Type** from a built-in extension → MIME table (text types carry
+  `charset=utf-8`); unknown extensions get `application/octet-stream`.
+- **Conditional requests**: `ETag` + `Last-Modified`, answering `304 Not
+  Modified` to `If-None-Match` / `If-Modified-Since` without resending the body.
+- **Byte ranges**: `Range` yields `206 Partial Content` with `Content-Range`
+  (single range; `If-Range` honored), `416` when unsatisfiable, and
+  `Accept-Ranges: bytes` is always advertised.
+- **Traversal safety**: the request path is percent-decoded and normalized, any
+  `..` escape or NUL is refused, and the resolved path (symlinks included) must
+  stay within `rootDir`.
+
+Tune it with `staticOptions` (index file, `Cache-Control`, ETag/Last-Modified
+toggles):
+
+```nim
+let assets = staticHandler("public",
+                           staticOptions(index = "index.html",
+                                         cacheControl = "public, max-age=3600"))
+r.get("/assets/*", assets)
+```
+
+To serve one specific file from any handler, use `res.sendFile(path)` (a
+trusted path — no traversal resolution):
+
+```nim
+r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
+  res.sendFile("public/favicon.ico"))
+```
+
+Large full-file `GET` responses are **streamed** from the worker pool in bounded
+chunks — memory stays flat no matter how big the file is — with `Content-Length`
+preserved (length-delimited, keep-alive intact), so the loop-pull path backs off
+under write pressure via the same `onDrain` backpressure the streaming API uses.
+Small files, ranges, and `HEAD` are read in one shot (a range is already bounded
+by the requested slice). `sendfile(2)` is intentionally not used — it composes
+with neither TLS nor the readiness event loop.
 
 ## Build flags
 

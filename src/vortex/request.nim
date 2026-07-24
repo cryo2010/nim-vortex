@@ -611,18 +611,23 @@ proc kickConn(res: Response) {.raises: [].} =
   except Exception: discard
 
 proc sendHead*(res: Response, code: HttpCode, contentType = "",
-               headers: openArray[(string, string)] = []) {.raises: [].} =
+               headers: openArray[(string, string)] = [],
+               contentLength = -1) {.raises: [].} =
   ## Begin a streaming response: send the status line and headers, then emit
-  ## the body incrementally with `write` and terminate with `finish`. No
-  ## Content-Length is sent (HTTP/1.1 uses chunked framing). Loop-thread only
-  ## (call from the handler or an async/onDrain callback, not a worker).
+  ## the body incrementally with `write` and terminate with `finish`. With the
+  ## default `contentLength = -1` no length is sent (HTTP/1.1 uses chunked
+  ## framing); pass a known length to send `Content-Length` and a length-
+  ## delimited (keep-alive) body instead -- used by file serving. Loop-thread
+  ## only (call from the handler or an async/onDrain callback, not a worker).
   ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
   try:
     if currentThreadId() != res.core.threadId: return
     # Inject the security-headers baseline here too (a streaming response's head;
     # merged once, not per chunk). The HEAD fallback below routes through
     # applyResponse, which does its own merge, so it keeps the original headers.
-    let hdrs = withSecHeaders(res.core, headers)
+    var hdrs = withSecHeaders(res.core, headers)
+    if contentLength >= 0 and (res.fd < 0 or res.stream != 0):
+      hdrs.add ("content-length", $contentLength)   # h2/h3: informational header
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
@@ -645,12 +650,15 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
       return
     c.respStreaming = true
     let ka = c.parser.keepAlive
-    let chunked = c.parser.minor >= 1     # HTTP/1.0 clients: close-delimited
+    # Known length -> Content-Length + length-delimited keep-alive. Unknown ->
+    # chunked (HTTP/1.1) or close-delimited (HTTP/1.0).
+    let chunked = contentLength < 0 and c.parser.minor >= 1
     c.respChunked = chunked
+    c.respCLDelimited = contentLength >= 0
     appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
                      contentType, hdrs, chunked, keepAlive = ka,
                      announceKeepAlive = ka and c.parser.minor == 0,
-                     altSvc = res.core.altSvc)
+                     altSvc = res.core.altSvc, contentLength = contentLength)
     flushConn(res)
   except Exception:
     discard
@@ -717,9 +725,14 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
     c.respStreaming = false
     c.respBackedUp = false
     c.onRespDrain = nil
+    let clDelimited = c.respCLDelimited
+    c.respCLDelimited = false
     if c.respChunked and c.parser.httpMethod != HttpHead:
       appendLastChunk(c.wbuf, trailers)
-    if not c.parser.keepAlive or not c.respChunked or c.peerHalfClosed:
+    # Close-delimited (HTTP/1.0, neither chunked nor Content-Length) must close;
+    # chunked and Content-Length bodies keep the connection alive.
+    if not c.parser.keepAlive or c.peerHalfClosed or
+        not (c.respChunked or clDelimited):
       c.closeAfterFlush = true
     # kick resumes the paused pipeline when finish runs after the handler
     # returned (deferred); inline finish is a no-op here and the dispatch
@@ -1017,6 +1030,114 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
                        gen: req.gen, stream: req.stream))
   except Exception:
     discard
+
+type
+  BlockingDataProc* = proc (req: Request, res: Response, data: string)
+                           {.nimcall, gcsafe.}
+    ## Like BlockingProc, but also receives a payload moved into the worker
+    ## task (config the capture-free body cannot close over). Used by static
+    ## file serving to carry the resolved path + options to the worker.
+
+proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
+                            stream: uint32, data: string) {.nimcall, gcsafe.} =
+  let fn = cast[BlockingDataProc](user)
+  let lc = cast[ptr LoopCore](core)
+  let req = Request(core: lc, fd: fd, gen: gen, stream: stream)
+  let res = response(req)
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: workerResponded = false
+  try:
+    fn(req, res, data)
+  except Exception:
+    res.send(Http500, "500 Internal Server Error", "text/plain")
+  if onWorker and not workerResponded:
+    res.send(Http500, "500 Internal Server Error", "text/plain")
+
+proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
+                           data: sink string) {.raises: [].} =
+  ## Like dispatchBlocking, but moves `data` into the worker task so the
+  ## capture-free `fn` can read per-request config from it. Call from the
+  ## owning loop thread. The pin/enqueue bookkeeping mirrors dispatchBlocking.
+  try:
+    if req.core.pool == nil:
+      blockingDataTrampoline(cast[pointer](fn), cast[pointer](req.core),
+                             req.fd, req.gen, req.stream, data)  # no pool: inline
+      return
+    if req.fd < 0:
+      let idx = int(-req.fd) - 2
+      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+        return
+      inc req.core.h3slots[idx].pinned
+    else:
+      let c = conn(req.core, req.fd, req.gen)
+      if c == nil: return
+      inc c.pinned
+    enqueue(cast[ptr WorkerPool](req.core.pool),
+            WorkerTask(fn: blockingDataTrampoline, user: cast[pointer](fn),
+                       core: cast[pointer](req.core), fd: req.fd,
+                       gen: req.gen, stream: req.stream, data: data))
+  except Exception:
+    discard
+
+# --- file streaming (loop-pull; large static files, see staticfiles.nim) ----
+# The worker reads one chunk and hands it back via the outbox (emitFile*); the
+# loop writes it and pulls the next read (applyFile*), throttled by write
+# backpressure. Memory stays bounded to ~one chunk; state travels in the
+# messages, so the loop keeps no per-stream table.
+
+proc emitFileStart*(res: Response, status: int, contentType: string,
+                    headers: openArray[(string, string)], totalLen: int64,
+                    firstChunk: openArray[char], nextRead: string,
+                    reader: pointer, last: bool) =
+  ## Worker-side: send the head (with Content-Length) plus the first chunk back
+  ## to the loop. Marks the task as having responded (no fallback 500).
+  push(res.core.outbox, OutMsg(
+    kind: omFileStart, fd: res.fd, gen: res.gen, stream: res.stream,
+    code: int32(status), data: packResponse(contentType, headers, firstChunk),
+    aux: nextRead, user: reader, n64: totalLen, last: last))
+  workerResponded = true
+
+proc emitFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
+                    reader: pointer, last: bool) =
+  ## Worker-side: hand one more chunk back to the loop.
+  var d = newString(bytes.len)
+  if bytes.len > 0: copyMem(addr d[0], unsafeAddr bytes[0], bytes.len)
+  push(res.core.outbox, OutMsg(
+    kind: omFileChunk, fd: res.fd, gen: res.gen, stream: res.stream,
+    data: d, aux: nextRead, user: reader, last: last))
+  workerResponded = true
+
+proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
+  ## Loop-side: pin + enqueue the next chunk read; the worker calls
+  ## emitFileChunk when it lands.
+  dispatchBlockingData(
+    Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
+    cast[BlockingDataProc](reader), nextRead)
+
+proc applyFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
+                     reader: pointer, last: bool) =
+  ## Loop-side: write one chunk; finish on the last, else pull the next read now
+  ## (or after the write backlog drains).
+  let room = res.write(bytes)
+  if last:
+    res.finish()
+    return
+  if room:
+    dispatchNextRead(res, nextRead, reader)
+  else:
+    let held = nextRead
+    let r = reader
+    res.onDrain(proc(res2: Response) {.gcsafe.} =
+      dispatchNextRead(res2, held, r))
+
+proc applyFileStart*(res: Response, status: int, contentType: string,
+                     headers: openArray[(string, string)], totalLen: int64,
+                     firstChunk: openArray[char], nextRead: string,
+                     reader: pointer, last: bool) =
+  ## Loop-side: send the head (Content-Length = totalLen), then the first chunk.
+  res.sendHead(HttpCode(status), contentType, headers,
+               contentLength = int(totalLen))
+  applyFileChunk(res, firstChunk, nextRead, reader, last)
 
 template blocking*(request: Request, body: untyped) =
   ## Run `body` on the worker pool, where blocking calls (sync DB drivers,

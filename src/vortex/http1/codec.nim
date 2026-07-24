@@ -154,11 +154,13 @@ proc appendStreamHead*(wbuf: var string, code: HttpCode,
                        dateStr, serverHeader, contentType: string,
                        extraHeaders: openArray[(string, string)],
                        chunked: bool, keepAlive: bool,
-                       announceKeepAlive = false, altSvc = "") =
-  ## Serialize the head of a streaming response: no Content-Length. When
-  ## `chunked` the body is Transfer-Encoding: chunked (HTTP/1.1); otherwise
-  ## it is delimited by connection close (HTTP/1.0 clients) and the caller
-  ## must close after the final byte.
+                       announceKeepAlive = false, altSvc = "",
+                       contentLength = -1) =
+  ## Serialize the head of a streaming response. When `chunked` the body is
+  ## Transfer-Encoding: chunked (HTTP/1.1). When `contentLength >= 0` a
+  ## Content-Length is sent and the body is length-delimited (keep-alive
+  ## survives). Otherwise (neither) it is delimited by connection close
+  ## (HTTP/1.0 clients) and the caller must close after the final byte.
   let codeInt = int(code)
   if codeInt in 100 .. 599:
     wbuf.add statusLines[codeInt]
@@ -179,7 +181,12 @@ proc appendStreamHead*(wbuf: var string, code: HttpCode,
     wbuf.add "\r\n"
   if chunked:
     wbuf.add "Transfer-Encoding: chunked\r\n"
-  if not keepAlive or not chunked:
+  elif contentLength >= 0:
+    wbuf.add "Content-Length: "
+    wbuf.addInt contentLength
+    wbuf.add "\r\n"
+  let lengthDelimited = chunked or contentLength >= 0
+  if not keepAlive or not lengthDelimited:
     wbuf.add "Connection: close\r\n"
   elif announceKeepAlive:
     wbuf.add "Connection: keep-alive\r\n"

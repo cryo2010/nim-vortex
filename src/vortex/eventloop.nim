@@ -895,6 +895,22 @@ proc processOutbox(loop: Loop) =
             h3Touched = true
           continue
         if slot.gen != m.gen or slot.conn == nil: continue
+        if m.kind in {omFileStart, omFileChunk}:
+          if slot.pinned > 0: dec slot.pinned
+          if slot.closeReq:
+            if slot.pinned == 0: loop.h3FreeSlot(idx)
+            continue
+          let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
+                             stream: m.stream)
+          if m.kind == omFileStart:
+            let (ct, headers, bodyStart) = unpackResponse(m.data)
+            applyFileStart(res, int(m.code), ct, headers, m.n64,
+                           m.data.toOpenArray(bodyStart, m.data.len - 1),
+                           m.aux, m.user, m.last)
+          else:
+            applyFileChunk(res, m.data, m.aux, m.user, m.last)
+          h3Touched = true
+          continue
         if slot.pinned > 0: dec slot.pinned
         if slot.closeReq:
           if slot.pinned == 0: loop.h3FreeSlot(idx)
@@ -934,6 +950,26 @@ proc processOutbox(loop: Loop) =
           wsResume(addr loop.core, c, w)
           if c.state != csFree and c.pendingOut > 0:
             loop.flushOut(c)
+      continue
+    if m.kind in {omFileStart, omFileChunk}:
+      if c.pinned > 0: dec c.pinned
+      if c.closeRequested:
+        loop.closeConn(c)
+        continue
+      let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
+                         stream: m.stream)
+      if m.kind == omFileStart:
+        let (ct, headers, bodyStart) = unpackResponse(m.data)
+        applyFileStart(res, int(m.code), ct, headers, m.n64,
+                       m.data.toOpenArray(bodyStart, m.data.len - 1),
+                       m.aux, m.user, m.last)
+      else:
+        applyFileChunk(res, m.data, m.aux, m.user, m.last)
+      # The final chunk finished the response: reset and resume the pipeline
+      # (the blocking-dispatch path doesn't set awaitingResponse, so finish()'s
+      # kick is a no-op here -- mirror the buffered omHttp path explicitly).
+      if m.last and c.gen == m.gen and c.state != csFree:
+        loop.resumeAfterRespond(c, m.stream)
       continue
     if c.pinned > 0: dec c.pinned
     if c.closeRequested:

@@ -1,5 +1,5 @@
 import std/[unittest, net, httpcore, osproc, strutils, os]
-import vortex/[settings, request, server, connection]
+import vortex/[settings, request, server, connection, staticfiles]
 
 # HTTP/3 needs an h3-capable curl (Homebrew's links libnghttp3/ngtcp2).
 const h3curlBin = "/opt/homebrew/opt/curl/bin/curl"
@@ -15,6 +15,8 @@ doAssert execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
   keyFile & " -out " & certFile & " -days 2 -subj /CN=localhost")[1] == 0
 
 const bigBody = "0123456789abcdef".repeat(8 * 1024)   # 128 KiB
+const bigFilePath = "/tmp/nhs_h3_bigfile.dat"
+writeFile(bigFilePath, "0123456789abcdef".repeat(64 * 1024))  # 1 MiB, > stream threshold
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
@@ -22,6 +24,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.send(Http200, "hello h3", "text/plain")
   of "/whoami":
     res.send(Http200, req.remoteAddress, "text/plain")
+  of "/bigfile":
+    res.sendFile(bigFilePath)   # > stream threshold: streams over h3
   of "/echo":
     res.send(Http200, req.body, req.header("Content-Type"),
                 headers = [("X-Proto", $req.httpVersion)])
@@ -137,6 +141,11 @@ suite "HTTP/3 (QUIC, via curl)":
     let (output, rc) = h3curl(base & "/whoami")
     check rc == 0
     check output in ["127.0.0.1", "::1"]
+
+  test "large file streams over h3 (full body)":
+    let (output, rc) = h3curl("-o /dev/null -w '%{size_download}' " & base & "/bigfile")
+    check rc == 0
+    check output == "1048576"
 
   test "alt-svc advertised on h1/h2":
     let (output, rc) = execCmdEx(
