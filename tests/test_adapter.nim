@@ -40,6 +40,15 @@ proc hBlockingInside(req: Request, res: Response) {.async.} =
     sleep(50)
     res.send(Http200, "worker done", "text/plain")
 
+const streamChunk = "0123456789abcdef".repeat(1024)   # 16 KiB
+const streamCount = 100                                # 1.6 MiB, > respHighWater
+
+proc hStream(req: Request, res: Response) {.async.} =
+  # emit(chunk) writes and awaits the drain under backpressure automatically.
+  res.stream(Http200, "application/octet-stream", emit):
+    for i in 0 ..< streamCount:
+      emit(streamChunk)
+
 var appRouter = newRouter()
 appRouter.get("/", hRoot)
 appRouter.get("/delay", hDelay)
@@ -48,6 +57,7 @@ appRouter.get("/fan", hFanIn)
 appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
+appRouter.get("/stream", hStream)
 
 var srv = start(appRouter.toHandler,
                 initSettings(port = Port(0), numThreads = 1,
@@ -108,6 +118,11 @@ suite "asyncdispatch adapter":
 
   test "blocking: works inside an async handler":
     check fetch("/worker") == "worker done"
+
+  test "res.stream(emit) streams with backpressure, body intact":
+    let body = fetch("/stream")
+    check body.len == streamChunk.len * streamCount
+    check body == streamChunk.repeat(streamCount)
 
   test "async handler over HTTP/2":
     let (output, rc) = execCmdEx(

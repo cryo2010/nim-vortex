@@ -321,8 +321,27 @@ proc download(req: Request, res: Response) {.gcsafe.} =
 ```
 
 It takes an optional headers argument (`res.stream(Http200, ct, headers): ...`).
-For a backpressure-driven or async producer, drive `sendHead`/`write`/`finish`/
-`onDrain` directly instead.
+
+For an **async producer with automatic backpressure**, pass a fresh identifier as
+the third argument instead of headers: it is injected as an `emit(chunk)` that
+writes and `await`s the drain for you (needs an async adapter in scope and an
+`{.async.}` body):
+
+```nim
+proc download(req: Request, res: Response) {.async.} =
+  res.stream(Http200, "application/octet-stream", emit):
+    for chunk in source: emit(chunk)          # backpressure handled per chunk
+```
+
+That is sugar over the explicit loop, which is also fine if you prefer no
+injected identifier:
+
+```nim
+res.sendHead(Http200, "application/octet-stream")
+for chunk in source:
+  if not res.write(chunk): await res.drained()   # `res.drained` from the adapter
+res.finish()
+```
 
 If the block raises, the template calls `res.abort()` rather than `finish` (and
 re-raises). Because the status and headers are already committed once `sendHead`

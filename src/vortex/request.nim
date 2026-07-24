@@ -821,20 +821,32 @@ proc abort*(res: Response) {.raises: [].} =
     discard
 
 template stream*(res: Response, code: HttpCode, contentType: string,
-                 headers: openArray[(string, string)], body: untyped) =
-  ## A block form of a streamed response: sends the head, runs `body` (which
-  ## calls `res.write(...)` for each chunk), and terminates the stream
-  ## afterwards even if `body` raises. Best for producing the whole body inline
-  ## (e.g. a file download loop); for a backpressure-driven or async producer,
-  ## drive `sendHead`/`write`/`finish`/`onDrain` directly.
+                 headersOrEmit, body: untyped) =
+  ## Block form of a streamed response: sends the head, runs `body`, and
+  ## terminates the stream afterwards -- or aborts it if `body` raises, so the
+  ## client sees an incomplete transfer rather than a well-formed truncation
+  ## (the exception propagates). The 4th argument is one of two things:
   ##
-  ##   res.stream(Http200, "text/plain"):
-  ##     for chunk in chunks: res.write(chunk)
+  ## * **response headers** (`openArray[(string, string)]`) -- the body writes
+  ##   chunks itself with `res.write(...)`:
   ##
-  ## If `body` raises, the stream is aborted (not finished) so the client sees
-  ## an incomplete transfer rather than a well-formed but truncated body, and
-  ## the exception propagates.
-  sendHead(res, code, contentType, headers)
+  ##       res.stream(Http200, "text/plain", @[("X-K", "v")]):
+  ##         for chunk in chunks: res.write(chunk)
+  ##
+  ## * **a fresh identifier** -- injected as an auto-draining `emit(chunk)`: it
+  ##   writes and `await`s the drain under backpressure for you. This form needs
+  ##   an async adapter in scope (for `res.drained`) and an `{.async.}` body:
+  ##
+  ##       res.stream(Http200, "application/octet-stream", emit):
+  ##         for chunk in source: emit(chunk)
+  ##
+  ## (The no-headers `res.stream(code, ct): body` form delegates to the first.)
+  when compiles(sendHead(res, code, contentType, headersOrEmit)):
+    sendHead(res, code, contentType, headersOrEmit)
+  else:
+    sendHead(res, code, contentType)
+    template headersOrEmit(chunk: untyped) =   # injected as the caller's ident
+      if not res.write(chunk): await res.drained()
   var streamCompleted = false
   try:
     body

@@ -43,6 +43,11 @@ proc hStream(req: Request, res: Response) {.async.} =
       await res.drained()
   res.finish()
 
+proc hStreamEmit(req: Request, res: Response) {.async.} =
+  # res.stream(..., emit): the block form with auto-draining emit.
+  res.stream(Http200, "text/plain", emit):
+    for i in 0 ..< 50: emit("chunk")
+
 proc hBoom(req: Request, res: Response) {.async.} =
   await sleepAsync(10.milliseconds)
   raise newException(ValueError, "async exploded")
@@ -76,6 +81,7 @@ appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
 appRouter.stream(HttpPost, "/upload", hUpload)
 appRouter.get("/stream", hStream)
+appRouter.get("/streamemit", hStreamEmit)
 
 var srv = start(appRouter.toHandler,
                 initSettings(port = Port(0), numThreads = 1,
@@ -133,6 +139,9 @@ suite "chronos adapter":
 
   test "await res.drained() streams an outbound body":
     check fetch("/stream") == "chunk".repeat(50)
+
+  test "res.stream(emit) block form streams an outbound body":
+    check fetch("/streamemit") == "chunk".repeat(50)
 
   test "await req.read() streams a request body":
     let body = "z".repeat(200 * 1024)
