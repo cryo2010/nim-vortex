@@ -175,6 +175,33 @@ ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
     ws.send(user.toJson)
 ```
 
+For an `await`-per-message flow instead of the two callbacks, the async adapter
+gives `ws.messages(msg): body` — a loop over incoming messages (the WebSocket
+twin of `req.stream`, sugar over `await ws.receive()`). Write a plain `{.async.}`
+handler and register it with `router.ws` (a WS handshake is a GET, but `ws` uses
+WebSocket completion semantics — a raised exception closes the socket with
+`1011`, whereas `router.get` would answer with an HTTP 500 written into the
+socket):
+
+```nim
+import vortex/adapters/asyncdispatch   # or vortex/adapters/chronos
+
+proc chat(req: Request, res: Response) {.async.} =
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):                    # runs per message until the peer closes
+    let user = await db.getUser(msg)   # await mid-stream; loop keeps serving
+    ws.send(user.toJson)
+
+router.ws("/chat", chat)
+```
+
+`msg` is the message text (`ws.messages(msg, kind):` also binds `kind:
+WsKind`); the loop ends when the peer closes. For the close code/reason, drop to
+`await ws.receive()` and inspect the returned `WsMessage` (`.closed`, `.code`,
+`.reason`). Nim has no `async for`, so this template is the idiomatic
+async-iterator form. (`ws.messages` also works inside `ws.doAsync:` from a plain
+handler if you aren't using `router.ws`.)
+
 When you push faster than a peer can read, `ws.send` parks the overflow in
 the connection's write buffer. `ws.bufferedAmount` reports that backlog in
 bytes (queued but not yet written to the socket, like the browser

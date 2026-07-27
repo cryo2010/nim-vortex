@@ -70,8 +70,14 @@ proc hWs(req: Request, res: Response) {.gcsafe.} =
       await sleepAsync(15.milliseconds)     # chronos await, loop keeps serving
       ws.send("async: " & data)
 
+proc hWsMsg(req: Request, res: Response) {.async.} =
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):                          # async iterator over messages
+    ws.send("echo: " & msg)
+
 var appRouter = newRouter()
 appRouter.get("/ws", hWs)
+appRouter.ws("/wsmsg", hWsMsg)
 appRouter.get("/", hRoot)
 appRouter.get("/delay", hDelay)
 appRouter.get("/hello/:name", hCapture)
@@ -108,6 +114,21 @@ proc wsRecvFrame(s: Socket): tuple[op: int, payload: string] =
   if ln == 126:
     let e = wsRecvN(s, 2); ln = (int(uint8(e[0])) shl 8) or int(uint8(e[1]))
   ((int(uint8(h[0])) and 0x0f), (if ln > 0: wsRecvN(s, ln) else: ""))
+
+proc openWsMsg(): Socket =
+  result = newSocket(buffered = false)
+  result.connect("127.0.0.1", srv.port)
+  result.send("GET /wsmsg HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" &
+              "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" &
+              "Sec-WebSocket-Version: 13\r\n\r\n")
+  result.setRecvTimeout(2000)
+  var hdr = ""
+  var one = newString(1)
+  while not hdr.endsWith("\r\n\r\n"):
+    let k = recv(result.getFd, addr one[0], 1, cint(0))
+    if k <= 0: break
+    hdr.add one[0]
+  doAssert "101" in hdr, hdr
 
 proc openWsChat(): Socket =
   result = newSocket(buffered = false)
@@ -219,6 +240,20 @@ suite "chronos adapter":
     let r = s.wsRecvFrame()
     check r.op == 0x1
     check r.payload == "async: howdy"
+
+  test "ws.messages: async iterator loop echoes each message":
+    let s = openWsMsg()
+    defer: s.close()
+    proc sendMasked(sock: Socket, msg: string) =
+      var f = "\x81" & char(0x80 or msg.len)
+      let mask = [0x11'u8, 0x22, 0x33, 0x44]
+      for m in mask: f.add char(m)
+      for i in 0 ..< msg.len: f.add char(uint8(msg[i]) xor mask[i and 3])
+      sock.send(f)
+    s.sendMasked("one")
+    check s.wsRecvFrame().payload == "echo: one"
+    s.sendMasked("two")
+    check s.wsRecvFrame().payload == "echo: two"
 
 srv.close()
 echo "server shut down cleanly"
