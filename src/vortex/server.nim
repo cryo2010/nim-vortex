@@ -73,6 +73,9 @@ proc validateSettings(s: Settings) =
       "Set both (file or PEM) to enable TLS, or neither for plain HTTP.")
   if hasCert and not hasKey:
     raise newException(CatchableError, "a certificate is set but no private key.")
+  if s.minTlsVersion == tlsV13 and s.maxTlsVersion == tlsMax12:
+    raise newException(CatchableError,
+      "maxTlsVersion (TLS 1.2) is below minTlsVersion (TLS 1.3).")
   if s.maxHeaderSize < 0 or s.maxBodySize < 0 or s.maxWsMessageSize < 0 or
      s.headerTimeout < 0 or s.bodyTimeout < 0 or s.keepAliveTimeout < 0 or
      s.responseTimeout < 0 or s.shutdownGrace < 0 or s.maxConnections < 0 or
@@ -118,7 +121,9 @@ proc start*(handler: RequestHandler, settings = initSettings(),
                      verify = tlsVerifyMode(settings.verifyClient),
                      clientCaFile = settings.clientCaFile,
                      clientCaPem = settings.clientCaPem,
-                     sni = toSniCerts(settings)))
+                     sni = toSniCerts(settings),
+                     maxProtoVersion = tlsMaxVer(settings.maxTlsVersion),
+                     ocsp = ocspBytes(settings)))
   else:
     if settings.hasTls:
       raise newException(CatchableError,
@@ -156,7 +161,8 @@ proc start*(handler: RequestHandler, settings = initSettings(),
                                     verify = tlsVerifyMode(settings.verifyClient),
                                     clientCaFile = settings.clientCaFile,
                                     clientCaPem = settings.clientCaPem,
-                                    sni = toSniCerts(settings)))
+                                    sni = toSniCerts(settings),
+                                    ocsp = ocspBytes(settings)))
         result.quicReload = createShared(CertReload)
         initCertReload(cast[ptr CertReload](result.quicReload))
         for i in 0 ..< numLoops:

@@ -5,6 +5,11 @@ type
     tlsV12,   ## TLS 1.2 minimum (default; disallows the insecure 1.0/1.1)
     tlsV13    ## TLS 1.3 only
 
+  TlsMaxVersion* = enum
+    tlsMaxNone,  ## no explicit cap (default; up to the newest supported)
+    tlsMax12,    ## cap at TLS 1.2 (disable 1.3)
+    tlsMax13     ## cap at TLS 1.3
+
   ClientVerify* = enum
     cvNone,      ## no client certificate requested (default)
     cvOptional,  ## request a client cert; if presented it must verify (mTLS)
@@ -73,6 +78,9 @@ type
     sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
     minTlsVersion*: TlsMinVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
+    maxTlsVersion*: TlsMaxVersion  ## highest accepted TLS version (TCP; default = no cap)
+    ocspFile*: string         ## DER OCSP response to staple (file; default cert)
+    ocspResponse*: string     ## DER OCSP response to staple (in-memory bytes)
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
     tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default)
 
@@ -115,6 +123,9 @@ proc initSettings*(
     clientCaFile = "",
     clientCaPem = "",
     sni: seq[SniCertEntry] = @[],
+    maxTlsVersion = tlsMaxNone,
+    ocspFile = "",
+    ocspResponse = "",
     http3 = true,
     minTlsVersion = tlsV12,
     tlsCipherList = "",
@@ -140,7 +151,8 @@ proc initSettings*(
     certFile: certFile, keyFile: keyFile, certPem: certPem, keyPem: keyPem,
     keyPassword: keyPassword, pkcs12File: pkcs12File, pkcs12: pkcs12,
     verifyClient: verifyClient, clientCaFile: clientCaFile,
-    clientCaPem: clientCaPem, sni: sni, http3: http3,
+    clientCaPem: clientCaPem, sni: sni, maxTlsVersion: maxTlsVersion,
+    ocspFile: ocspFile, ocspResponse: ocspResponse, http3: http3,
     minTlsVersion: minTlsVersion, tlsCipherList: tlsCipherList,
     tlsCipherSuites: tlsCipherSuites
   )
