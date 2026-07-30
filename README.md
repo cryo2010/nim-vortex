@@ -54,6 +54,23 @@ run(handler, initSettings(port = Port(8443),
                           certFile = "cert.pem", keyFile = "key.pem"))
 ```
 
+The cert and key can also come **from memory** instead of files — pass the PEM
+directly (e.g. loaded from a secret manager), and supply `keyPassword` for an
+encrypted key:
+
+```nim
+run(handler, initSettings(port = Port(8443),
+                          certPem = vault.get("tls/cert"),
+                          keyPem = vault.get("tls/key"),
+                          keyPassword = vault.get("tls/key-pass")))
+```
+
+`certPem`/`keyPem` take precedence over `certFile`/`keyFile`; either source works
+for HTTP/1.1, /2 and /3, and both compose with `server.reloadTls`. Any key type
+OpenSSL accepts (RSA, ECDSA, Ed25519) is supported. `keyPassword` applies to a
+file or in-memory key; without it, an encrypted key fails to start (rather than
+prompting).
+
 Router:
 
 ```nim
