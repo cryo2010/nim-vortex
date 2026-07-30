@@ -614,6 +614,14 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 permessage-deflate compression via zlib. Off by default so the standard
 build keeps its OpenSSL-only footprint.
 
+`-d:httpGzip` (link with `--passL:-lz`) enables **gzip response compression**.
+Turn it on per server with `settings.compress`: an eligible buffered response
+(the client sent `Accept-Encoding: gzip`, a compressible content-type, over
+~1400 bytes, and no existing `Content-Encoding`) is gzip-compressed with
+`Content-Encoding: gzip` + `Vary: Accept-Encoding`. Streaming responses
+(`sendHead`/`write`) are sent uncompressed. Off by default, so the standard and
+`-d:plainHttp` builds link no zlib.
+
 ## Verification
 
 - `nimble test`: parser/HPACK/QPACK unit tests (RFC vectors) plus
@@ -659,6 +667,12 @@ build keeps its OpenSSL-only footprint.
   failing on any failed/errored/non-2xx request. A real QUIC client stack, so
   the number reflects the server (the HTTP/3 throughput/regression measurement).
   See [conformance/h3load/](conformance/h3load/).
+- Cross-client interop: `nimble interop` drives the server with real clients
+  from five ecosystems (Node `http2`, Python `httpx`, Go `net/http`, Rust
+  `reqwest`, Java `HttpClient`) over HTTP/2 + TLS with gzip, exercising every
+  method, and an optional mTLS mode (`INTEROP_MTLS=1`). Each client asserts h2
+  negotiation and a gzip round-trip; the run fails if any backend errors. See
+  [conformance/interop/](conformance/interop/).
 - Sanitizers: the CI `sanitize` job runs the whole suite under
   AddressSanitizer + UBSan (`NIM_SANITIZE=1 nimble test`).
 - `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.

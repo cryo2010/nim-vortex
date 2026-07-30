@@ -203,6 +203,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   result.core.wsPingInterval = settings.wsPingInterval
   result.core.wsPongTimeout = settings.wsPongTimeout
   result.core.wsCompression = settings.wsCompression
+  result.core.compress = settings.compress
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox

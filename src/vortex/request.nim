@@ -20,6 +20,8 @@ export wscodec
 when not defined(plainHttp):
   import ./http3/codec as h3codec
   import ./transport/tls as tlscodec
+when defined(httpGzip):
+  import ./gzip
 
 type
   Request* = object
@@ -490,11 +492,8 @@ var workerResponded* {.threadvar.}: bool
   ## worker) must still get a default response emitted, otherwise the outbox push
   ## that releases the connection's pin never happens and it hangs forever.
 
-proc send*(res: Response, code: HttpCode, body: openArray[char],
-           contentType = "", headers: openArray[(string, string)] = []) =
-  ## Queue the response. Safe to call once per request, from the handler,
-  ## later (deferred), or from a worker thread inside `blocking:`; no-op
-  ## if the connection is already gone.
+proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
+             contentType: string, headers: openArray[(string, string)]) =
   if currentThreadId() != res.core.threadId:
     # Worker thread: pack protocol-neutrally; the loop serializes.
     push(res.core.outbox, OutMsg(
@@ -510,6 +509,49 @@ proc send*(res: Response, code: HttpCode, body: openArray[char],
   if c != nil:
     applyResponse(res.core, c, res.stream, int(code), contentType,
                   headers, body)
+
+when defined(httpGzip):
+  const gzipMinSize = 1400   # not worth compressing below ~one MTU
+
+  proc compressibleType(ct: string): bool =
+    if ct.len == 0: return false
+    let t = ct.toLowerAscii
+    t.startsWith("text/") or t.startsWith("application/json") or
+      t.startsWith("application/javascript") or t.startsWith("application/xml") or
+      t.startsWith("image/svg+xml") or t.startsWith("application/wasm") or
+      ("+json" in t) or ("+xml" in t)
+
+  proc hasContentEncoding(headers: openArray[(string, string)]): bool =
+    for (n, _) in headers:
+      if cmpIgnoreCase(n, "content-encoding") == 0: return true
+    false
+
+  proc acceptsGzip(req: Request): bool =
+    for part in req.header("accept-encoding").split(','):
+      if part.strip.toLowerAscii.startsWith("gzip"): return true
+    false
+
+proc send*(res: Response, code: HttpCode, body: openArray[char],
+           contentType = "", headers: openArray[(string, string)] = []) =
+  ## Queue the response. Safe to call once per request, from the handler,
+  ## later (deferred), or from a worker thread inside `blocking:`; no-op
+  ## if the connection is already gone. With `-d:httpGzip` and
+  ## `settings.compress`, an eligible body is gzip-compressed when the client
+  ## sent `Accept-Encoding: gzip`.
+  when defined(httpGzip):
+    if res.core.compress and body.len >= gzipMinSize and
+        compressibleType(contentType) and not hasContentEncoding(headers) and
+        acceptsGzip(Request(core: res.core, fd: res.fd, gen: res.gen,
+                            stream: res.stream)):
+      let gz = gzip(body)
+      if gz.len > 0 and gz.len < body.len:
+        var hh = newSeqOfCap[(string, string)](headers.len + 2)
+        for h in headers: hh.add h
+        hh.add ("content-encoding", "gzip")
+        hh.add ("vary", "accept-encoding")
+        sendRaw(res, code, gz, contentType, hh)
+        return
+  sendRaw(res, code, body, contentType, headers)
 
 proc send*(res: Response, code: HttpCode) =
   send(res, code, "", "")

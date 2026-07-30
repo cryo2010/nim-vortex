@@ -261,3 +261,23 @@ jobs:
         # fails on any HIGH/CRITICAL finding. It picks the x86_64 server base
         # itself.
         run: sh conformance/testssl/run.sh
+
+  interop:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mtls: [0, 1]
+    name: interop (mtls=${{ matrix.mtls }})
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cross-client interop (Node/Python/Go/Rust/Java)
+        # run.sh mints a shared CA, builds a vortex TLS+gzip server image and
+        # five language-client images, then drives every HTTP method from each
+        # client over HTTP/2 with gzip (sequentially), asserting h2 + gzip
+        # round-trip; it fails if any backend errors. mtls=1 additionally
+        # requires + presents client certs and checks /whoami. It picks the
+        # x86_64 server base itself; short runtime keeps CI quick.
+        run: >-
+          INTEROP_RUNTIME=3 INTEROP_CLIENTS=5 INTEROP_MTLS=${{ matrix.mtls }}
+          sh conformance/interop/run.sh
