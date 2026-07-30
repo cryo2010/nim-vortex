@@ -41,6 +41,7 @@ type
     initialBufferSize*: int   ## per-connection read/write buffer starting size
     maxWsMessageSize*: int    ## largest inbound WebSocket message (close 1009 over it)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
+    compress*: bool           ## gzip eligible buffered responses (only with -d:httpGzip)
 
     # DoS budgets (0 disables the check)
     maxConnections*: int          ## live connections per loop thread
@@ -97,6 +98,7 @@ proc initSettings*(
     initialBufferSize = 8 * 1024,
     maxWsMessageSize = 1024 * 1024,
     wsCompression = true,
+    compress = false,
     maxConnections = 65536,
     maxConcurrentStreams = 256,
     maxResetStreams = 512,
@@ -138,6 +140,7 @@ proc initSettings*(
     maxHeaderCount: maxHeaderCount, maxBodySize: maxBodySize,
     initialBufferSize: initialBufferSize,
     maxWsMessageSize: maxWsMessageSize, wsCompression: wsCompression,
+    compress: compress,
     maxConnections: maxConnections,
     maxConcurrentStreams: maxConcurrentStreams,
     maxResetStreams: maxResetStreams, maxControlFrames: maxControlFrames,

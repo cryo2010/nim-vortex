@@ -64,6 +64,10 @@ task testdeflate, "Test WebSocket permessage-deflate (needs zlib)":
   exec "nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src " &
        "-o:tests/test_http2_websocket tests/test_http2_websocket.nim"
 
+task testgzip, "Test gzip response compression (needs zlib)":
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip --passL:-lz -p:src " &
+       "-o:tests/test_compression tests/test_compression.nim"
+
 task fuzz, "Fuzz the parser/HPACK/QPACK decoders in Docker (needs docker)":
   # The Dockerfile bundles clang + the libFuzzer runtime; the image's
   # default base is arm64, so override it on x86_64 hosts. Fuzzes each

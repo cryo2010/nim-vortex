@@ -614,6 +614,14 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 permessage-deflate compression via zlib. Off by default so the standard
 build keeps its OpenSSL-only footprint.
 
+`-d:httpGzip` (link with `--passL:-lz`) enables **gzip response compression**.
+Turn it on per server with `settings.compress`: an eligible buffered response
+(the client sent `Accept-Encoding: gzip`, a compressible content-type, over
+~1400 bytes, and no existing `Content-Encoding`) is gzip-compressed with
+`Content-Encoding: gzip` + `Vary: Accept-Encoding`. Streaming responses
+(`sendHead`/`write`) are sent uncompressed. Off by default, so the standard and
+`-d:plainHttp` builds link no zlib.
+
 ## Verification
 
 - `nimble test`: parser/HPACK/QPACK unit tests (RFC vectors) plus
