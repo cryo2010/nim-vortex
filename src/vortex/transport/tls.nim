@@ -28,6 +28,12 @@ type
   SslPtr* = pointer
 
 const
+  # Public client-verification modes (map settings.ClientVerify -> these).
+  TlsVerifyNone* = cint(0)
+  TlsVerifyOptional* = cint(1)          ## SSL_VERIFY_PEER
+  TlsVerifyRequire* = cint(3)           ## PEER | FAIL_IF_NO_PEER_CERT
+
+const
   SSL_FILETYPE_PEM = cint(1)
   SSL_ERROR_WANT_READ = cint(2)
   SSL_ERROR_WANT_WRITE = cint(3)
@@ -35,8 +41,16 @@ const
   SSL_ERROR_ZERO_RETURN = cint(6)
   SSL_CTRL_MODE = cint(33)
   SSL_CTRL_EXTRA_CHAIN_CERT = cint(14)     # append a cert to the chain (add0)
+  SSL_CTRL_CHAIN_CERT = cint(89)           # add0/add1 a chain cert
   SSL_CTRL_CLEAR_CHAIN_CERTS = cint(88)    # drop the built chain (for in-place reload)
   SSL_CTRL_SET_MIN_PROTO_VERSION = cint(123)
+  SSL_VERIFY_NONE = cint(0)
+  SSL_VERIFY_PEER = cint(1)
+  SSL_VERIFY_FAIL_IF_NO_PEER_CERT = cint(2)
+  SSL_CTRL_SET_TLSEXT_SERVERNAME_CB = cint(53)
+  SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG = cint(54)
+  TLSEXT_NAMETYPE_host_name = cint(0)
+  X509_V_OK = clong(0)
   SSL_MODE_ENABLE_PARTIAL_WRITE = clong(1)
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
 
@@ -89,6 +103,14 @@ proc SSL_shutdown(ssl: SslPtr): cint
 proc SSL_get0_alpn_selected(ssl: SslPtr, data: ptr ptr uint8, len: ptr cuint)
 proc SSL_pending(ssl: SslPtr): cint
 proc SSL_CTX_get0_certificate(ctx: SslCtxPtr): pointer   # X509* (borrowed)
+proc SSL_CTX_set_verify(ctx: SslCtxPtr, mode: cint, cb: pointer)
+proc SSL_CTX_load_verify_locations(ctx: SslCtxPtr, caFile, caPath: cstring): cint
+proc SSL_CTX_get_cert_store(ctx: SslCtxPtr): pointer     # X509_STORE* (borrowed)
+proc SSL_get1_peer_certificate(ssl: SslPtr): pointer     # X509* (owned; free it)
+proc SSL_get_verify_result(ssl: SslPtr): clong
+proc SSL_get_servername(ssl: SslPtr, typ: cint): cstring
+proc SSL_set_SSL_CTX(ssl: SslPtr, ctx: SslCtxPtr): SslCtxPtr
+proc SSL_CTX_callback_ctrl(ctx: SslCtxPtr, cmd: cint, fp: pointer): clong
 {.pop.}
 
 {.push importc, cdecl, dynlib: cryptoLibName.}
@@ -105,6 +127,14 @@ proc PEM_read_bio_PrivateKey(bio: pointer, x: ptr pointer,
                              cb: PemPasswordCb, u: pointer): pointer
 proc X509_free(x: pointer)
 proc EVP_PKEY_free(pkey: pointer)
+proc X509_STORE_add_cert(store, x: pointer): cint        # up-refs x
+proc d2i_PKCS12_bio(bio: pointer, p12: ptr pointer): pointer
+proc PKCS12_parse(p12: pointer, pass: cstring,
+                  pkey, cert, ca: ptr pointer): cint
+proc PKCS12_free(p12: pointer)
+proc OPENSSL_sk_num(st: pointer): cint
+proc OPENSSL_sk_value(st: pointer, i: cint): pointer
+proc OPENSSL_sk_pop_free(st: pointer, freefn: proc (p: pointer) {.cdecl.})
 {.pop.}
 
 proc passwdCb(buf: cstring, size: cint, rwflag: cint,
@@ -151,6 +181,20 @@ proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   EVP_PKEY_free(pkey)
 
 type
+  TlsMaterial* = object
+    ## Where a cert + private key come from. Provide one source: a PKCS#12
+    ## bundle (file or bytes), in-memory PEM (certPem/keyPem), or PEM files
+    ## (certFile/keyFile). keyPassword decrypts an encrypted PEM key or the p12.
+    certFile*, keyFile*: string
+    certPem*, keyPem*: string
+    pkcs12File*, pkcs12*: string
+    keyPassword*: string
+
+  SniCert* = object
+    ## A per-hostname certificate for SNI: `host` selects `material`.
+    host*: string
+    material*: TlsMaterial
+
   TlsConfig* = object
     ## One per server; SSL_CTX is thread-safe for SSL_new. Lives in shared
     ## memory so loop threads can use it via pointer.
@@ -160,10 +204,13 @@ type
     retiredAt: array[ctxRetireSlots, MonoTime]  ## when each was displaced
     protos: string           ## ALPN preference list, wire format
     meth: pointer            ## method the ctx was built with (rebuild on reload)
-    certFile, keyFile: string
-    certPem, keyPem, keyPassword: string   ## in-memory material / passphrase
+    material: TlsMaterial    ## the default cert/key source (reloaded in place)
+    verify: cint             ## client-cert verification mode (SSL_VERIFY_*)
+    clientCaFile, clientCaPem: string   ## CA to verify client certs (mTLS)
     minProtoVersion: clong
     cipherList, cipherSuites: string
+    sniHosts: seq[string]              ## per-host SNI: hostnames...
+    sniCtx: seq[SslCtxPtr]             ## ...and their ctxs (parallel to sniHosts)
 
   TlsIo* = enum
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
@@ -189,15 +236,107 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
   else:
     SSL_TLSEXT_ERR_NOACK      # no overlap: proceed without ALPN (=> h1)
 
-proc buildTlsCtx(meth: pointer, certFile, keyFile, certPem, keyPem,
-                 keyPassword: string, minProtoVersion: clong,
+proc cstrEq(cs: cstring, s: string): bool =
+  ## Compare a NUL-terminated C string to a Nim string without allocating (the
+  ## SNI callback runs on a loop thread; avoid ORC ops on the shared config).
+  var i = 0
+  while i < s.len:
+    if cs[i] == '\0' or cs[i] != s[i]: return false
+    inc i
+  cs[i] == '\0'
+
+proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
+  ## SNI: switch the connection to the ctx whose host matches the requested
+  ## server name; fall through to the default ctx when none matches.
+  let cfg = cast[ptr TlsConfig](arg)
+  let name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
+  if name != nil:
+    for i in 0 ..< cfg.sniHosts.len:
+      if cstrEq(name, cfg.sniHosts[i]):
+        discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[i])
+        break
+  SSL_TLSEXT_ERR_OK
+
+proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
+  ## Load cert + key (+ any bundled CA chain) from PKCS#12 (.pfx/.p12) bytes.
+  if data.len == 0: return false
+  let bio = BIO_new_mem_buf(unsafeAddr data[0], cint(data.len))
+  if bio == nil: return false
+  defer: discard BIO_free(bio)
+  let p12 = d2i_PKCS12_bio(bio, nil)
+  if p12 == nil: return false
+  defer: PKCS12_free(p12)
+  var pkey, cert, ca: pointer
+  if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, addr ca) != 1:
+    return false
+  result = cert != nil and pkey != nil and
+           SSL_CTX_use_certificate(ctx, cert) == 1 and
+           SSL_CTX_use_PrivateKey(ctx, pkey) == 1
+  if result and ca != nil:
+    for i in 0 ..< OPENSSL_sk_num(ca):
+      # add1 (up-ref) so the whole stack is freed uniformly below
+      if SSL_CTX_ctrl(ctx, SSL_CTRL_CHAIN_CERT, 1, OPENSSL_sk_value(ca, i)) != 1:
+        result = false
+        break
+  if cert != nil: X509_free(cert)
+  if pkey != nil: EVP_PKEY_free(pkey)
+  if ca != nil: OPENSSL_sk_pop_free(ca, X509_free)
+
+proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
+  ## Add PEM CA cert(s) from memory to the ctx trust store (client verification).
+  let store = SSL_CTX_get_cert_store(ctx)
+  if store == nil or pem.len == 0: return false
+  let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
+  if bio == nil: return false
+  defer: discard BIO_free(bio)
+  var added = 0
+  while true:
+    let x = PEM_read_bio_X509(bio, nil, nil, nil)
+    if x == nil:
+      ERR_clear_error()
+      break
+    let ok = X509_STORE_add_cert(store, x) == 1     # up-refs x
+    X509_free(x)
+    if not ok: return false
+    inc added
+  added > 0
+
+proc applyClientVerify(ctx: SslCtxPtr, verify: cint,
+                       caFile, caPem: string): bool =
+  ## Configure mTLS: load the client-cert CA (if any) and set the verify mode.
+  if verify == SSL_VERIFY_NONE: return true
+  if caPem.len > 0:
+    if not loadCaMem(ctx, caPem): return false
+  elif caFile.len > 0:
+    if SSL_CTX_load_verify_locations(ctx, caFile.cstring, nil) != 1: return false
+  SSL_CTX_set_verify(ctx, verify, nil)   # nil cb: OpenSSL's default chain check
+  true
+
+proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
+  ## Load the server cert + key from a PKCS#12 bundle, in-memory PEM, or files.
+  if m.pkcs12.len > 0 or m.pkcs12File.len > 0:
+    let data = if m.pkcs12.len > 0: m.pkcs12
+               else:
+                 try: readFile(m.pkcs12File)
+                 except CatchableError: return false
+    return loadPkcs12(ctx, data, m.keyPassword)
+  if m.keyPassword.len > 0:
+    SSL_CTX_set_default_passwd_cb(ctx, passwdCb)
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, m.keyPassword.cstring)
+  let certOk = if m.certPem.len > 0: loadCertChainMem(ctx, m.certPem)
+               else: SSL_CTX_use_certificate_chain_file(ctx, m.certFile.cstring) == 1
+  if not certOk: return false
+  if m.keyPem.len > 0: loadKeyMem(ctx, m.keyPem, m.keyPassword)
+  else: SSL_CTX_use_PrivateKey_file(ctx, m.keyFile.cstring, SSL_FILETYPE_PEM) == 1
+
+proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
+                 clientCaFile, clientCaPem: string, minProtoVersion: clong,
                  cipherList, cipherSuites: string): SslCtxPtr =
-  ## Build a fully-configured SSL_CTX (min version, ciphers, cert/key). The cert
-  ## and key each come from memory (certPem/keyPem) when set, otherwise from a
-  ## file (certFile/keyFile); keyPassword decrypts an encrypted key. Raises on
-  ## any failure, freeing the partial ctx. The ALPN callback is set by the
-  ## caller, which owns the stable arg pointer. Shared by initial config and
-  ## certificate hot-reload.
+  ## Build a fully-configured SSL_CTX: min version, ciphers, the cert/key from
+  ## `m` (PKCS#12, in-memory PEM, or files), and client-cert verification
+  ## (mTLS). Raises on any failure, freeing the partial ctx. The ALPN callback
+  ## is set by the caller, which owns the stable arg pointer. Shared by initial
+  ## config and certificate hot-reload.
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
@@ -215,56 +354,54 @@ proc buildTlsCtx(meth: pointer, certFile, keyFile, certPem, keyPem,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "invalid TLS 1.3 cipher suites: " & lastErrorMsg())
-  # Passphrase for an encrypted key: used by both the file and memory loaders.
-  if keyPassword.len > 0:
-    SSL_CTX_set_default_passwd_cb(ctx, passwdCb)
-    SSL_CTX_set_default_passwd_cb_userdata(ctx, keyPassword.cstring)
-  let certOk = if certPem.len > 0: loadCertChainMem(ctx, certPem)
-               else: SSL_CTX_use_certificate_chain_file(ctx, certFile.cstring) == 1
-  if not certOk:
+  if not loadCertKey(ctx, m):
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
-      "cannot load certificate " &
-      (if certPem.len > 0: "(in-memory)" else: "'" & certFile & "'") &
-      ": " & lastErrorMsg())
-  let keyOk = if keyPem.len > 0: loadKeyMem(ctx, keyPem, keyPassword)
-              else: SSL_CTX_use_PrivateKey_file(ctx, keyFile.cstring,
-                                                SSL_FILETYPE_PEM) == 1
-  if not keyOk:
-    SSL_CTX_free(ctx)
-    raise newException(CatchableError,
-      "cannot load private key " &
-      (if keyPem.len > 0: "(in-memory)" else: "'" & keyFile & "'") &
-      ": " & lastErrorMsg())
+      "cannot load TLS certificate/key: " & lastErrorMsg())
   if SSL_CTX_check_private_key(ctx) != 1:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "certificate/key mismatch: " & lastErrorMsg())
+  if not applyClientVerify(ctx, verify, clientCaFile, clientCaPem):
+    SSL_CTX_free(ctx)
+    raise newException(CatchableError,
+      "cannot configure client verification / load client CA: " & lastErrorMsg())
   # Partial writes with a moving buffer match our flushOut retry pattern.
   discard SSL_CTX_ctrl(ctx, SSL_CTRL_MODE,
       SSL_MODE_ENABLE_PARTIAL_WRITE or SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
       nil)
   ctx
 
-proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
-                       protos: string, minProtoVersion: clong = 0,
-                       cipherList = "", cipherSuites = "",
-                       certPem = "", keyPem = "", keyPassword = ""): ptr TlsConfig =
-  let ctx = buildTlsCtx(meth, certFile, keyFile, certPem, keyPem, keyPassword,
+proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
+                       minProtoVersion: clong = 0, cipherList = "",
+                       cipherSuites = "", verify: cint = 0,
+                       clientCaFile = "", clientCaPem = "",
+                       sni: openArray[SniCert] = []): ptr TlsConfig =
+  let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
                         minProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
   result.ctx = ctx
   result.protos = protos
   result.meth = meth
-  result.certFile = certFile
-  result.keyFile = keyFile
-  result.certPem = certPem
-  result.keyPem = keyPem
-  result.keyPassword = keyPassword
+  result.material = m
+  result.verify = verify
+  result.clientCaFile = clientCaFile
+  result.clientCaPem = clientCaPem
   result.minProtoVersion = minProtoVersion
   result.cipherList = cipherList
   result.cipherSuites = cipherSuites
   SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
+  # SNI: one ctx per host, selected by the servername callback on the default.
+  for sc in sni:
+    let hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
+                           minProtoVersion, cipherList, cipherSuites)
+    SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, result)
+    result.sniHosts.add sc.host
+    result.sniCtx.add hctx
+  if sni.len > 0:
+    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+                                  cast[pointer](servernameCb))
+    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, result)
 
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   ## Rebuild the SSL_CTX from `certFile`/`keyFile` (or, when empty, the paths
@@ -280,23 +417,22 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   ## unbounded grace window (reloads are seconds/hours apart, SSL_new is
   ## microseconds), while capping retained ctxs at one. Call from a normal
   ## thread, not a raw signal handler.
-  # Explicit file paths override any stored in-memory material; empty means
-  # "reuse what was last loaded" (files or PEM).
-  let cf = if certFile.len > 0: certFile else: cfg.certFile
-  let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
-  let cp = if certFile.len > 0: "" else: cfg.certPem
-  let kp = if keyFile.len > 0: "" else: cfg.keyPem
+  # Explicit file paths override any stored in-memory/PKCS#12 material; empty
+  # means "reuse what was last loaded" (files, PEM, or p12).
+  var m = cfg.material
+  if certFile.len > 0:
+    m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
+  if keyFile.len > 0:
+    m.keyFile = keyFile; m.keyPem = ""
   var newCtx: SslCtxPtr
   try:
-    newCtx = buildTlsCtx(cfg.meth, cf, kf, cp, kp, cfg.keyPassword,
-                         cfg.minProtoVersion, cfg.cipherList, cfg.cipherSuites)
+    newCtx = buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
+                         cfg.clientCaPem, cfg.minProtoVersion,
+                         cfg.cipherList, cfg.cipherSuites)
   except CatchableError:
     return false
   SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
-  cfg.certFile = cf
-  cfg.keyFile = kf
-  cfg.certPem = cp
-  cfg.keyPem = kp
+  cfg.material = m
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
   # Retire `old` with a time-based grace rather than freeing the previous
   # retirement outright: freeing at the *next* reload alone is unsafe if two
@@ -397,33 +533,21 @@ proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
   ## subsequent reload (retried against stable files) restores a consistent
   ## ctx. New connections read the ctx's current cert at accept time (the same
   ## mechanism as SSL_new on TCP); in-flight connections keep theirs.
-  let cf = if certFile.len > 0: certFile else: cfg.certFile
-  let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
-  let cp = if certFile.len > 0: "" else: cfg.certPem
-  let kp = if keyFile.len > 0: "" else: cfg.keyPem
+  var m = cfg.material
+  if certFile.len > 0:
+    m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
+  if keyFile.len > 0:
+    m.keyFile = keyFile; m.keyPem = ""
   try:
-    SSL_CTX_free(buildTlsCtx(cfg.meth, cf, kf, cp, kp, cfg.keyPassword,
-                             cfg.minProtoVersion, cfg.cipherList,
-                             cfg.cipherSuites))  # probe only
+    SSL_CTX_free(buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
+                             cfg.clientCaPem, cfg.minProtoVersion,
+                             cfg.cipherList, cfg.cipherSuites))  # probe only
   except CatchableError:
     return false
-  if cfg.keyPassword.len > 0:
-    SSL_CTX_set_default_passwd_cb(cfg.ctx, passwdCb)
-    SSL_CTX_set_default_passwd_cb_userdata(cfg.ctx, cfg.keyPassword.cstring)
-  if cp.len > 0:
-    discard SSL_CTX_ctrl(cfg.ctx, SSL_CTRL_CLEAR_CHAIN_CERTS, 0, nil)  # replace
-    if not loadCertChainMem(cfg.ctx, cp): return false
-  elif SSL_CTX_use_certificate_chain_file(cfg.ctx, cf.cstring) != 1:
-    return false
-  if kp.len > 0:
-    if not loadKeyMem(cfg.ctx, kp, cfg.keyPassword): return false
-  elif SSL_CTX_use_PrivateKey_file(cfg.ctx, kf.cstring, SSL_FILETYPE_PEM) != 1:
-    return false
+  discard SSL_CTX_ctrl(cfg.ctx, SSL_CTRL_CLEAR_CHAIN_CERTS, 0, nil)  # replace chain
+  if not loadCertKey(cfg.ctx, m): return false
   if SSL_CTX_check_private_key(cfg.ctx) != 1: return false
-  cfg.certFile = cf
-  cfg.keyFile = kf
-  cfg.certPem = cp
-  cfg.keyPem = kp
+  cfg.material = m
   true
 
 proc ctxCertSubject*(cfg: ptr TlsConfig): string =
@@ -438,23 +562,42 @@ proc ctxCertSubject*(cfg: ptr TlsConfig): string =
   $s
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
-                   minProtoVersion: clong = 0,
-                   cipherList = "", cipherSuites = "",
-                   certPem = "", keyPem = "", keyPassword = ""): ptr TlsConfig =
-  newTlsConfigWith(TLS_server_method(), certFile, keyFile,
+                   minProtoVersion: clong = 0, cipherList = "", cipherSuites = "",
+                   certPem = "", keyPem = "", keyPassword = "",
+                   pkcs12File = "", pkcs12 = "", verify: cint = 0,
+                   clientCaFile = "", clientCaPem = "",
+                   sni: openArray[SniCert] = []): ptr TlsConfig =
+  let m = TlsMaterial(certFile: certFile, keyFile: keyFile, certPem: certPem,
+                      keyPem: keyPem, pkcs12File: pkcs12File, pkcs12: pkcs12,
+                      keyPassword: keyPassword)
+  newTlsConfigWith(TLS_server_method(), m,
     (if enableH2: "\x02h2\x08http/1.1" else: "\x08http/1.1"),
-    minProtoVersion, cipherList, cipherSuites, certPem, keyPem, keyPassword)
+    minProtoVersion, cipherList, cipherSuites, verify, clientCaFile,
+    clientCaPem, sni)
+
+proc peerCertSubject*(ssl: SslPtr): string =
+  ## Subject DN of the peer's (client's) certificate, "" if none was presented.
+  ## In SSL_VERIFY_PEER mode OpenSSL has already verified any presented cert
+  ## during the handshake, so a non-empty result is a verified client cert.
+  if ssl == nil: return ""
+  let x = SSL_get1_peer_certificate(ssl)
+  if x == nil: return ""
+  defer: X509_free(x)
+  var buf = newString(512)
+  let s = X509_NAME_oneline(X509_get_subject_name(x), buf.cstring, 512)
+  if s == nil: "" else: $s
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
   SSL_CTX_free(cfg.ctx)
   for i in 0 ..< ctxRetireSlots:
     if cfg.retired[i] != nil: SSL_CTX_free(cfg.retired[i])
+  for c in cfg.sniCtx: SSL_CTX_free(c)
+  cfg.sniCtx = @[]
+  cfg.sniHosts = @[]
   cfg.protos = ""
-  cfg.certFile = ""
-  cfg.keyFile = ""
-  cfg.certPem = ""
-  cfg.keyPem = ""
-  cfg.keyPassword = ""
+  cfg.material = TlsMaterial()
+  cfg.clientCaFile = ""
+  cfg.clientCaPem = ""
   cfg.cipherList = ""
   cfg.cipherSuites = ""
   deallocShared(cfg)

@@ -17,6 +17,21 @@ when not defined(plainHttp):
   import ./transport/quic
   import ./http3/codec as h3codec
 
+  proc tlsVerifyMode*(v: ClientVerify): cint =
+    ## Map the public verify enum to OpenSSL's SSL_VERIFY_* mode.
+    case v
+    of cvNone: TlsVerifyNone
+    of cvOptional: TlsVerifyOptional
+    of cvRequire: TlsVerifyRequire
+
+  proc toSniCerts*(s: Settings): seq[SniCert] =
+    ## Convert the plain-data SNI entries into TLS-layer SniCerts.
+    for e in s.sni:
+      result.add SniCert(host: e.host, material: TlsMaterial(
+        certFile: e.certFile, keyFile: e.keyFile, certPem: e.certPem,
+        keyPem: e.keyPem, pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
+        keyPassword: e.keyPassword))
+
 when defined(macosx):
   const SO_NOSIGPIPE = cint(0x1022)
 when defined(linux):
@@ -187,7 +202,13 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
                                  settings.tlsCipherSuites,
                                  certPem = settings.certPem,
                                  keyPem = settings.keyPem,
-                                 keyPassword = settings.keyPassword)
+                                 keyPassword = settings.keyPassword,
+                                 pkcs12File = settings.pkcs12File,
+                                 pkcs12 = settings.pkcs12,
+                                 verify = tlsVerifyMode(settings.verifyClient),
+                                 clientCaFile = settings.clientCaFile,
+                                 clientCaPem = settings.clientCaPem,
+                                 sni = toSniCerts(settings))
       result.quicOwnCfg = cast[pointer](ownCfg)
       result.quicReload = quicReload
       result.quicListener = newQuicListener(ownCfg, cint(udpFd))

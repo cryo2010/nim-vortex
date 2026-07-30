@@ -5,6 +5,20 @@ type
     tlsV12,   ## TLS 1.2 minimum (default; disallows the insecure 1.0/1.1)
     tlsV13    ## TLS 1.3 only
 
+  ClientVerify* = enum
+    cvNone,      ## no client certificate requested (default)
+    cvOptional,  ## request a client cert; if presented it must verify (mTLS)
+    cvRequire    ## require a valid client cert or refuse the handshake (mTLS)
+
+  SniCertEntry* = object
+    ## A per-hostname certificate for SNI. `host` selects it; the cert/key come
+    ## from one source (files, in-memory PEM, or PKCS#12), like the defaults.
+    host*: string
+    certFile*, keyFile*: string
+    certPem*, keyPem*: string
+    pkcs12File*, pkcs12*: string
+    keyPassword*: string
+
   Settings* = object
     port*: Port
     address*: string          ## bind address; "" = all interfaces, dual-stack
@@ -50,7 +64,13 @@ type
     keyFile*: string
     certPem*: string          ## in-memory PEM cert chain (instead of certFile)
     keyPem*: string           ## in-memory PEM private key (instead of keyFile)
-    keyPassword*: string      ## passphrase for an encrypted key ("" = none)
+    keyPassword*: string      ## passphrase for an encrypted key/PKCS#12 ("" = none)
+    pkcs12File*: string       ## PKCS#12 (.pfx) bundle file (cert + key + chain)
+    pkcs12*: string           ## PKCS#12 bundle bytes (in-memory)
+    verifyClient*: ClientVerify   ## mTLS: request/require a client certificate
+    clientCaFile*: string     ## CA (PEM file) to verify client certs against
+    clientCaPem*: string      ## CA (in-memory PEM) to verify client certs against
+    sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
     minTlsVersion*: TlsMinVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
@@ -89,6 +109,12 @@ proc initSettings*(
     certPem = "",
     keyPem = "",
     keyPassword = "",
+    pkcs12File = "",
+    pkcs12 = "",
+    verifyClient = cvNone,
+    clientCaFile = "",
+    clientCaPem = "",
+    sni: seq[SniCertEntry] = @[],
     http3 = true,
     minTlsVersion = tlsV12,
     tlsCipherList = "",
@@ -112,11 +138,14 @@ proc initSettings*(
     wsPingInterval: wsPingInterval, wsPongTimeout: wsPongTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
     certFile: certFile, keyFile: keyFile, certPem: certPem, keyPem: keyPem,
-    keyPassword: keyPassword, http3: http3,
+    keyPassword: keyPassword, pkcs12File: pkcs12File, pkcs12: pkcs12,
+    verifyClient: verifyClient, clientCaFile: clientCaFile,
+    clientCaPem: clientCaPem, sni: sni, http3: http3,
     minTlsVersion: minTlsVersion, tlsCipherList: tlsCipherList,
     tlsCipherSuites: tlsCipherSuites
   )
 
 proc hasTls*(s: Settings): bool =
-  ## True when TLS material is configured, from files or in memory.
-  s.certFile.len > 0 or s.certPem.len > 0
+  ## True when TLS material is configured (files, in-memory PEM, or PKCS#12).
+  s.certFile.len > 0 or s.certPem.len > 0 or
+    s.pkcs12File.len > 0 or s.pkcs12.len > 0

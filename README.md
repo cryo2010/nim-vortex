@@ -71,6 +71,37 @@ OpenSSL accepts (RSA, ECDSA, Ed25519) is supported. `keyPassword` applies to a
 file or in-memory key; without it, an encrypted key fails to start (rather than
 prompting).
 
+**PKCS#12 (.pfx/.p12)** bundles the cert, key, and chain in one blob — pass the
+file or the bytes, with `keyPassword` as the bundle passphrase:
+
+```nim
+initSettings(pkcs12File = "server.p12", keyPassword = "…")   # or pkcs12 = bytes
+```
+
+**mTLS (client certificates)**: request or require a client cert and verify it
+against a CA. `verifyClient = cvOptional` accepts connections with no cert but
+validates any that is presented; `cvRequire` refuses the handshake without a
+valid one. Inside a handler, `req.clientCertSubject` gives the verified client's
+subject DN ("" if none):
+
+```nim
+initSettings(certFile = "cert.pem", keyFile = "key.pem",
+             verifyClient = cvRequire, clientCaFile = "client-ca.pem")
+# ... req.clientCertSubject -> e.g. "/CN=service-a"
+```
+
+(`clientCaPem` takes an in-memory CA instead of a file.)
+
+**SNI (per-hostname certificates)**: serve different certs by requested host. The
+default `certFile`/`certPem`/`pkcs12` is the fallback; `sni` adds host-specific
+certs (each from files, PEM, or PKCS#12):
+
+```nim
+initSettings(certFile = "default.pem", keyFile = "default.key",
+             sni = @[SniCertEntry(host: "api.example.com",
+                                  certFile: "api.pem", keyFile: "api.key")])
+```
+
 Router:
 
 ```nim

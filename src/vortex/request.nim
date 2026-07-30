@@ -19,6 +19,7 @@ import ./websocket/codec as wscodec
 export wscodec
 when not defined(plainHttp):
   import ./http3/codec as h3codec
+  import ./transport/tls as tlscodec
 
 type
   Request* = object
@@ -210,6 +211,20 @@ proc remoteAddress*(req: Request): string =
     return ""
   let c = conn(req.core, req.fd, req.gen)
   if c != nil: c.remoteAddr else: ""
+
+proc clientCertSubject*(req: Request): string =
+  ## The client certificate's subject DN for an mTLS connection, or "" if none
+  ## was presented. Needs `settings.verifyClient = cvOptional`/`cvRequire`; in
+  ## those modes OpenSSL has already validated a presented cert during the
+  ## handshake, so a non-empty result is a trusted client cert. Always "" over
+  ## plaintext (or a -d:plainHttp build).
+  when not defined(plainHttp):
+    if req.fd < 0:
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil: return tlscodec.peerCertSubject(h3c.ssl)
+    else:
+      let c = conn(req.core, req.fd, req.gen)
+      if c != nil and c.ssl != nil: return tlscodec.peerCertSubject(c.ssl)
 
 proc forwardedFor*(req: Request): seq[string] =
   ## The X-Forwarded-For chain parsed left (origin client) to right (nearest
