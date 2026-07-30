@@ -136,6 +136,15 @@ task h3load, "HTTP/3 (QUIC) throughput/stress via h2load-http3 (Docker)":
   # number reflects the server -- the HTTP/3 throughput/regression measurement.
   exec "sh conformance/h3load/run.sh"
 
+task interop, "Cross-client interop test (Node/Python/Go/Rust/Java) (Docker)":
+  # run.sh mints a shared CA, builds a vortex TLS server (h1/h2, gzip) image and
+  # five language-client images, then drives every HTTP method from each client
+  # over HTTP/2 with gzip (sequentially, so runtime x 5 backends). Each client
+  # asserts h2 + gzip round-trip; INTEROP_MTLS=1 adds mutual-TLS with a
+  # client-cert subject check. Fails if any backend errors. Needs docker +
+  # host openssl. Knobs: INTEROP_RUNTIME / INTEROP_CLIENTS / INTEROP_MTLS.
+  exec "sh conformance/interop/run.sh"
+
 task testssl, "TLS configuration scan via testssl.sh (Docker)":
   # run.sh builds a vortex TLS server image and runs drwetter/testssl.sh against
   # it over a private docker network, checking protocols/ciphers/vulnerabilities;
