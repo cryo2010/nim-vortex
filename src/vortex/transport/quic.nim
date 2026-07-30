@@ -257,16 +257,17 @@ proc newQuicConfig*(certFile, keyFile: string, cipherSuites = "",
                     certPem = "", keyPem = "", keyPassword = "",
                     pkcs12File = "", pkcs12 = "", verify: cint = 0,
                     clientCaFile = "", clientCaPem = "",
-                    sni: openArray[SniCert] = []): ptr TlsConfig =
+                    sni: openArray[SniCert] = [], ocsp = ""): ptr TlsConfig =
   ## SSL_CTX for the QUIC server; ALPN offers h3 only. QUIC mandates
-  ## TLS 1.3, so only the 1.3 cipher suites are configurable.
+  ## TLS 1.3, so only the 1.3 cipher suites are configurable (and the version
+  ## is fixed at 1.3, so there is no min/max knob here).
   let m = TlsMaterial(certFile: certFile, keyFile: keyFile, certPem: certPem,
                       keyPem: keyPem, pkcs12File: pkcs12File, pkcs12: pkcs12,
                       keyPassword: keyPassword)
   newTlsConfigWith(OSSL_QUIC_server_method(), m, "\x02h3",
                    cipherSuites = cipherSuites, verify = verify,
                    clientCaFile = clientCaFile, clientCaPem = clientCaPem,
-                   sni = sni)
+                   sni = sni, ocsp = ocsp)
 
 proc newQuicListener*(cfg: ptr TlsConfig, udpFd: cint): SslPtr =
   result = SSL_new_listener(cfg.ctx, 0)

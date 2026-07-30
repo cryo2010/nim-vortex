@@ -94,12 +94,27 @@ initSettings(certFile = "cert.pem", keyFile = "key.pem",
 
 **SNI (per-hostname certificates)**: serve different certs by requested host. The
 default `certFile`/`certPem`/`pkcs12` is the fallback; `sni` adds host-specific
-certs (each from files, PEM, or PKCS#12):
+certs (each from files, PEM, or PKCS#12). A `host` of `*.example.com` matches a
+single leading label (`api.example.com`, not `example.com` or `a.b.example.com`);
+an exact host wins over a wildcard:
 
 ```nim
 initSettings(certFile = "default.pem", keyFile = "default.key",
-             sni = @[SniCertEntry(host: "api.example.com",
-                                  certFile: "api.pem", keyFile: "api.key")])
+             sni = @[SniCertEntry(host: "*.example.com",
+                                  certFile: "wild.pem", keyFile: "wild.key")])
+```
+
+**TLS version range**: `minTlsVersion` (default `tlsV12`) floors it; `maxTlsVersion`
+(default `tlsMaxNone` = no cap) ceils it, e.g. `maxTlsVersion = tlsMax12` to keep
+a client on 1.2. (QUIC/HTTP/3 is always 1.3.)
+
+**OCSP stapling**: hand clients a cached OCSP response in the handshake so they
+don't query the responder. Provide the DER bytes (refresh them out-of-band and
+`reloadTls`); vortex doesn't fetch OCSP itself:
+
+```nim
+initSettings(certFile = "cert.pem", keyFile = "key.pem",
+             ocspFile = "ocsp.der")        # or ocspResponse = derBytes
 ```
 
 Router:

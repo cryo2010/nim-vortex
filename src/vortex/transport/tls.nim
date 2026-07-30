@@ -44,6 +44,10 @@ const
   SSL_CTRL_CHAIN_CERT = cint(89)           # add0/add1 a chain cert
   SSL_CTRL_CLEAR_CHAIN_CERTS = cint(88)    # drop the built chain (for in-place reload)
   SSL_CTRL_SET_MIN_PROTO_VERSION = cint(123)
+  SSL_CTRL_SET_MAX_PROTO_VERSION = cint(124)
+  SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB = cint(63)
+  SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG = cint(64)
+  SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP = cint(71)
   SSL_VERIFY_NONE = cint(0)
   SSL_VERIFY_PEER = cint(1)
   SSL_VERIFY_FAIL_IF_NO_PEER_CERT = cint(2)
@@ -111,6 +115,7 @@ proc SSL_get_verify_result(ssl: SslPtr): clong
 proc SSL_get_servername(ssl: SslPtr, typ: cint): cstring
 proc SSL_set_SSL_CTX(ssl: SslPtr, ctx: SslCtxPtr): SslCtxPtr
 proc SSL_CTX_callback_ctrl(ctx: SslCtxPtr, cmd: cint, fp: pointer): clong
+proc SSL_ctrl(ssl: SslPtr, cmd: cint, larg: clong, parg: pointer): clong
 {.pop.}
 
 {.push importc, cdecl, dynlib: cryptoLibName.}
@@ -135,6 +140,7 @@ proc PKCS12_free(p12: pointer)
 proc OPENSSL_sk_num(st: pointer): cint
 proc OPENSSL_sk_value(st: pointer, i: cint): pointer
 proc OPENSSL_sk_pop_free(st: pointer, freefn: proc (p: pointer) {.cdecl.})
+proc CRYPTO_malloc(num: csize_t, file: cstring, line: cint): pointer
 {.pop.}
 
 proc passwdCb(buf: cstring, size: cint, rwflag: cint,
@@ -207,8 +213,9 @@ type
     material: TlsMaterial    ## the default cert/key source (reloaded in place)
     verify: cint             ## client-cert verification mode (SSL_VERIFY_*)
     clientCaFile, clientCaPem: string   ## CA to verify client certs (mTLS)
-    minProtoVersion: clong
+    minProtoVersion, maxProtoVersion: clong
     cipherList, cipherSuites: string
+    ocsp: string             ## DER OCSP response to staple (immutable; "" = off)
     sniHosts: seq[string]              ## per-host SNI: hostnames...
     sniCtx: seq[SslCtxPtr]             ## ...and their ctxs (parallel to sniHosts)
 
@@ -245,16 +252,46 @@ proc cstrEq(cs: cstring, s: string): bool =
     inc i
   cs[i] == '\0'
 
+proc wildMatch(name: cstring, pat: string): bool =
+  ## `*.example.com` matches exactly one leading label: `foo.example.com` yes,
+  ## `example.com` no, `a.b.example.com` no. No allocation (loop-thread cb).
+  if pat.len < 3 or pat[0] != '*' or pat[1] != '.': return false
+  var dot = 0
+  while name[dot] != '\0' and name[dot] != '.': inc dot
+  if dot == 0 or name[dot] != '.': return false     # need a label then a dot
+  var i = dot                                        # name[dot..] == pat[1..]
+  var j = 1                                          # (both include the dot)
+  while j < pat.len:
+    if name[i] == '\0' or name[i] != pat[j]: return false
+    inc i; inc j
+  name[i] == '\0'
+
 proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
   ## SNI: switch the connection to the ctx whose host matches the requested
-  ## server name; fall through to the default ctx when none matches.
+  ## server name (exact match preferred over a wildcard); fall through to the
+  ## default ctx when none matches.
   let cfg = cast[ptr TlsConfig](arg)
   let name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
   if name != nil:
+    var idx = -1
     for i in 0 ..< cfg.sniHosts.len:
-      if cstrEq(name, cfg.sniHosts[i]):
-        discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[i])
-        break
+      if cstrEq(name, cfg.sniHosts[i]): idx = i; break
+    if idx < 0:
+      for i in 0 ..< cfg.sniHosts.len:
+        if wildMatch(name, cfg.sniHosts[i]): idx = i; break
+    if idx >= 0: discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[idx])
+  SSL_TLSEXT_ERR_OK
+
+proc statusCb(ssl: SslPtr, arg: pointer): cint {.cdecl.} =
+  ## OCSP stapling: hand the client a copy of the configured DER OCSP response
+  ## (OpenSSL frees the copy after sending). NOACK when none is set.
+  let cfg = cast[ptr TlsConfig](arg)
+  if cfg == nil or cfg.ocsp.len == 0: return SSL_TLSEXT_ERR_NOACK
+  let n = cfg.ocsp.len
+  let buf = CRYPTO_malloc(csize_t(n), nil, 0)
+  if buf == nil: return SSL_TLSEXT_ERR_NOACK
+  copyMem(buf, unsafeAddr cfg.ocsp[0], n)
+  discard SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP, clong(n), buf)
   SSL_TLSEXT_ERR_OK
 
 proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
@@ -330,7 +367,8 @@ proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
   else: SSL_CTX_use_PrivateKey_file(ctx, m.keyFile.cstring, SSL_FILETYPE_PEM) == 1
 
 proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
-                 clientCaFile, clientCaPem: string, minProtoVersion: clong,
+                 clientCaFile, clientCaPem: string,
+                 minProtoVersion, maxProtoVersion: clong,
                  cipherList, cipherSuites: string): SslCtxPtr =
   ## Build a fully-configured SSL_CTX: min version, ciphers, the cert/key from
   ## `m` (PKCS#12, in-memory PEM, or files), and client-cert verification
@@ -346,6 +384,12 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
       SSL_CTX_free(ctx)
       raise newException(CatchableError,
         "cannot set minimum TLS version: " & lastErrorMsg())
+  if maxProtoVersion != 0:
+    if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION,
+                    maxProtoVersion, nil) != 1:
+      SSL_CTX_free(ctx)
+      raise newException(CatchableError,
+        "cannot set maximum TLS version: " & lastErrorMsg())
   if cipherList.len > 0 and SSL_CTX_set_cipher_list(ctx, cipherList) != 1:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
@@ -376,9 +420,10 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        minProtoVersion: clong = 0, cipherList = "",
                        cipherSuites = "", verify: cint = 0,
                        clientCaFile = "", clientCaPem = "",
-                       sni: openArray[SniCert] = []): ptr TlsConfig =
+                       sni: openArray[SniCert] = [], maxProtoVersion: clong = 0,
+                       ocsp = ""): ptr TlsConfig =
   let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
-                        minProtoVersion, cipherList, cipherSuites)
+                        minProtoVersion, maxProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
   result.ctx = ctx
   result.protos = protos
@@ -388,13 +433,20 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   result.clientCaFile = clientCaFile
   result.clientCaPem = clientCaPem
   result.minProtoVersion = minProtoVersion
+  result.maxProtoVersion = maxProtoVersion
   result.cipherList = cipherList
   result.cipherSuites = cipherSuites
+  result.ocsp = ocsp
   SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
+  if ocsp.len > 0:   # OCSP stapling for the default cert
+    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB,
+                                  cast[pointer](statusCb))
+    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, result)
   # SNI: one ctx per host, selected by the servername callback on the default.
   for sc in sni:
     let hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
-                           minProtoVersion, cipherList, cipherSuites)
+                           minProtoVersion, maxProtoVersion, cipherList,
+                           cipherSuites)
     SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, result)
     result.sniHosts.add sc.host
     result.sniCtx.add hctx
@@ -428,10 +480,14 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   try:
     newCtx = buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
                          cfg.clientCaPem, cfg.minProtoVersion,
-                         cfg.cipherList, cfg.cipherSuites)
+                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
   except CatchableError:
     return false
   SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
+  if cfg.ocsp.len > 0:   # re-attach OCSP stapling to the rebuilt ctx
+    discard SSL_CTX_callback_ctrl(newCtx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB,
+                                  cast[pointer](statusCb))
+    discard SSL_CTX_ctrl(newCtx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, cfg)
   cfg.material = m
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
   # Retire `old` with a time-based grace rather than freeing the previous
@@ -541,7 +597,8 @@ proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
   try:
     SSL_CTX_free(buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
                              cfg.clientCaPem, cfg.minProtoVersion,
-                             cfg.cipherList, cfg.cipherSuites))  # probe only
+                             cfg.maxProtoVersion, cfg.cipherList,
+                             cfg.cipherSuites))  # probe only
   except CatchableError:
     return false
   discard SSL_CTX_ctrl(cfg.ctx, SSL_CTRL_CLEAR_CHAIN_CERTS, 0, nil)  # replace chain
@@ -566,14 +623,15 @@ proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    certPem = "", keyPem = "", keyPassword = "",
                    pkcs12File = "", pkcs12 = "", verify: cint = 0,
                    clientCaFile = "", clientCaPem = "",
-                   sni: openArray[SniCert] = []): ptr TlsConfig =
+                   sni: openArray[SniCert] = [], maxProtoVersion: clong = 0,
+                   ocsp = ""): ptr TlsConfig =
   let m = TlsMaterial(certFile: certFile, keyFile: keyFile, certPem: certPem,
                       keyPem: keyPem, pkcs12File: pkcs12File, pkcs12: pkcs12,
                       keyPassword: keyPassword)
   newTlsConfigWith(TLS_server_method(), m,
     (if enableH2: "\x02h2\x08http/1.1" else: "\x08http/1.1"),
     minProtoVersion, cipherList, cipherSuites, verify, clientCaFile,
-    clientCaPem, sni)
+    clientCaPem, sni, maxProtoVersion, ocsp)
 
 proc peerCertSubject*(ssl: SslPtr): string =
   ## Subject DN of the peer's (client's) certificate, "" if none was presented.
@@ -600,6 +658,7 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.clientCaPem = ""
   cfg.cipherList = ""
   cfg.cipherSuites = ""
+  cfg.ocsp = ""
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =

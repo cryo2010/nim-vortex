@@ -32,6 +32,20 @@ when not defined(plainHttp):
         keyPem: e.keyPem, pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
         keyPassword: e.keyPassword))
 
+  proc tlsMaxVer*(v: TlsMaxVersion): clong =
+    ## Map the max-version enum to an OpenSSL version number (0 = no cap).
+    case v
+    of tlsMaxNone: 0
+    of tlsMax12: TLS1_2_VERSION
+    of tlsMax13: TLS1_3_VERSION
+
+  proc ocspBytes*(s: Settings): string =
+    ## The DER OCSP response to staple: in-memory bytes, else the file, else "".
+    if s.ocspResponse.len > 0: s.ocspResponse
+    elif s.ocspFile.len > 0:
+      try: readFile(s.ocspFile) except CatchableError: ""
+    else: ""
+
 when defined(macosx):
   const SO_NOSIGPIPE = cint(0x1022)
 when defined(linux):
@@ -208,7 +222,8 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
                                  verify = tlsVerifyMode(settings.verifyClient),
                                  clientCaFile = settings.clientCaFile,
                                  clientCaPem = settings.clientCaPem,
-                                 sni = toSniCerts(settings))
+                                 sni = toSniCerts(settings),
+                                 ocsp = ocspBytes(settings))
       result.quicOwnCfg = cast[pointer](ownCfg)
       result.quicReload = quicReload
       result.quicListener = newQuicListener(ownCfg, cint(udpFd))
