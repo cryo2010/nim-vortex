@@ -585,10 +585,10 @@ proc parseStreamFrames(conn: H3Conn, sid: uint64,
           h3StreamError(conn, sid, h3MessageError)
           return false
         st.headersDone = true
-        if not st.isWsConnect and conn.core.streamRoute != nil and
-            conn.core.streamRoute(conn.core, int32(-(conn.slot + 2)),
-                                  conn.core.h3slots[conn.slot].gen,
-                                  uint32(sid)):
+        if not st.isWsConnect and hasStreamRoute(conn.core) and
+            callStreamRoute(conn.core, int32(-(conn.slot + 2)),
+                            conn.core.h3slots[conn.slot].gen,
+                            uint32(sid)):
           st.streamingReq = true      # dispatch on headers; DATA -> onBody
       # else: trailers (discarded)
     of h3fData:

@@ -101,6 +101,30 @@ jobs:
         # from the default nimble test.
         run: nimble testdeflate -y
 
+  testrace:
+    runs-on: ubuntu-latest
+    # Privileged to lower the host's mmap randomization for ThreadSanitizer's
+    # shadow mapping (same reason as the sanitize job); arch for a modern gcc.
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      - name: Lower ASLR entropy for ThreadSanitizer
+        run: sysctl -w vm.mmap_rnd_bits=28 || true
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git
+      - uses: actions/checkout@v7
+      - name: ThreadSanitizer handler-race regression
+        # Builds the start()/shutdown stress under TSan; TSan aborts on any data
+        # race, failing the job. Guards the handler/stream-route closure being
+        # stored as a raw (proc, env) pair instead of a traced ref that would
+        # race its ORC refcount across loop threads.
+        env:
+          TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
+        run: nimble testrace -y
+
   # The REDbot and fuzz checks ship as Docker images (bundling REDbot and
   # the libFuzzer runtime). These jobs run on the plain runner, where
   # Docker is available, so they exercise the images themselves. The image

@@ -64,6 +64,14 @@ task testdeflate, "Test WebSocket permessage-deflate (needs zlib)":
   exec "nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src " &
        "-o:tests/test_http2_websocket tests/test_http2_websocket.nim"
 
+task testrace, "ThreadSanitizer regression for the handler thread race":
+  # Builds the start()/shutdown stress under TSan; TSan aborts the process on
+  # any data race, failing the task. -d:plainHttp keeps OpenSSL out of the
+  # report; -d:useMalloc lets TSan see all allocations.
+  exec "nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc " &
+       "--passC:-fsanitize=thread --passL:-fsanitize=thread --debugger:native " &
+       "-p:src -o:tests/test_thread_race tests/test_thread_race.nim"
+
 task fuzz, "Fuzz the parser/HPACK/QPACK decoders in Docker (needs docker)":
   # The Dockerfile bundles clang + the libFuzzer runtime; the image's
   # default base is arm64, so override it on x86_64 hosts. Fuzzes each

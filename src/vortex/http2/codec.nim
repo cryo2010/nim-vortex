@@ -634,8 +634,8 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
     st.isHead = meth == "HEAD"
     if endStream:
       st.endStreamSeen = true
-    if not st.isWsConnect and h2.core.streamRoute != nil and
-        h2.core.streamRoute(h2.core, c.fd, c.gen, sid):
+    if not st.isWsConnect and hasStreamRoute(h2.core) and
+        callStreamRoute(h2.core, c.fd, c.gen, sid):
       st.streamingReq = true          # dispatch on headers; DATA -> onBody
   if st.isWsConnect and not st.dispatched:
     # Dispatch as soon as the headers are in; DATA becomes WebSocket framing.

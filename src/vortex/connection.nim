@@ -77,6 +77,21 @@ type
     ## per loop from the router / start; nil = every request is buffered (the
     ## default, zero cost). Reconstructs a Request from the handle words.
 
+  RawClosure* = tuple[prc, env: pointer]
+    ## A closure's ABI (its proc + environment) captured as plain, untraced
+    ## pointers. `start()` copies its handler/stream-route into every per-core
+    ## loop thread; holding those as traced closures would incref/decref one
+    ## shared environment concurrently across threads, racing its non-atomic
+    ## ORC refcount (TSan-confirmed) -- the same reason the adapter hooks above
+    ## are `nimcall` proc pointers, not closures. Storing the raw pair on the
+    ## loop instead keeps all refcounting off the loop threads; the environment
+    ## stays alive for the server's lifetime via the traced copy in
+    ## LoopThreadArg, which is refcounted only on the main thread. A closure is
+    ## exactly `tuple[prc, env]` at the ABI level, so `cast` reinterprets it
+    ## without a refcount, and calling `prc` with `env` as the trailing
+    ## argument is precisely how the compiler invokes a closure. `prc == nil`
+    ## means unset.
+
   Connection* = object
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
@@ -181,10 +196,25 @@ type
       ## Resolve an HTTP/3 (RFC 9220) WebSocket stream's WsConn. Set by the h3
       ## codec. h3 handles have `fd < 0` (an h3 slot, not a `ptr Connection`),
       ## so this takes the whole handle rather than a connection pointer.
-    streamRoute*: StreamRouteCb
-      ## Opt-in inbound-streaming predicate (see StreamRouteCb). nil unless the
-      ## server was started with streaming routes; the loop only consults it
-      ## when non-nil, so the buffered path pays nothing.
+    streamRouteRaw*: RawClosure
+      ## Opt-in inbound-streaming predicate (see StreamRouteCb), stored as a
+      ## raw closure (see RawClosure) so it doesn't refcount across loop
+      ## threads. `prc == nil` unless the server was started with streaming
+      ## routes; the loop only consults it when set, so the buffered path pays
+      ## nothing.
+
+proc hasStreamRoute*(core: ptr LoopCore): bool {.inline.} =
+  ## True when a streaming predicate is configured (see streamRouteRaw).
+  core.streamRouteRaw.prc != nil
+
+proc callStreamRoute*(core: ptr LoopCore, fd: int32, gen: uint32,
+                      stream: uint32): bool {.inline.} =
+  ## Invoke the streaming predicate from its raw (proc, env) pair -- exactly how
+  ## the compiler calls a closure -- without touching any refcount. See
+  ## RawClosure. Only call when hasStreamRoute(core).
+  cast[proc (core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
+             env: pointer): bool {.nimcall, gcsafe.}](
+    core.streamRouteRaw.prc)(core, fd, gen, stream, core.streamRouteRaw.env)
 
 proc newOutbox*(): ptr Outbox =
   result = createShared(Outbox)

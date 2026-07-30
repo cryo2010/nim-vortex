@@ -65,7 +65,10 @@ type
     core*: LoopCore
     settings*: Settings
     limits: ParserLimits
-    handler: RequestHandler
+    handlerRaw: RawClosure       # the request handler as a raw (proc, env) pair
+                                 # so it never refcounts across loop threads
+                                 # (see RawClosure); kept alive by the traced
+                                 # copy in LoopThreadArg.
     stopFlag: ptr Atomic[bool]
     lastWallSec: int64
     pumpCap: int                 # adapter-suggested selector timeout cap
@@ -85,6 +88,14 @@ type
 
 proc monoSec(): int64 {.inline.} =
   getMonoTime().ticks div 1_000_000_000
+
+proc callHandler(loop: Loop, req: Request, res: Response) {.inline.} =
+  ## Invoke the request handler from its raw (proc, env) pair. This is exactly
+  ## how the compiler calls a closure -- prc(args..., env) -- so it works for
+  ## both a capturing closure (router.toHandler) and a bare top-level proc
+  ## (nil env, ignored), without touching any refcount. See RawClosure.
+  cast[proc (req: Request, res: Response, env: pointer) {.nimcall, gcsafe.}](
+    loop.handlerRaw.prc)(req, res, loop.handlerRaw.env)
 
 proc openBoundSocket(host: string, port: Port, sockType: SockType,
                      proto: Protocol, reusePort: bool): SocketHandle =
@@ -170,11 +181,11 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
       maxHeaderSize: settings.maxHeaderSize,
       maxHeaderCount: settings.maxHeaderCount,
       maxBodySize: settings.maxBodySize),
-    handler: handler,
+    handlerRaw: cast[RawClosure](handler),   # raw pair: no cross-thread refcount
     stopFlag: stopFlag,
     tls: tls,
     udpFd: -1)
-  result.core.streamRoute = streamRoute
+  result.core.streamRouteRaw = cast[RawClosure](streamRoute)
   result.core.serverHeader = settings.serverHeader
   if settings.securityHeaders:
     # OWASP Secure Headers baseline auto-injected on every response (skipping any
@@ -404,7 +415,7 @@ proc h2Input(loop: Loop, c: ptr Connection) =
                       stream: sid)
     try:
       {.gcsafe.}:
-        loop.handler(req, response(req))
+        loop.callHandler(req, response(req))
     except CatchableError:
       applyResponse(addr loop.core, c, sid, 500, "text/plain", [],
                     "500 Internal Server Error")
@@ -487,13 +498,13 @@ proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   ## Dispatch a streaming route's handler at headers-complete so it can
   ## register `req.onBody` before the body arrives. Handles both
   ## Content-Length and chunked (Transfer-Encoding) request bodies.
-  if not loop.core.streamRoute(addr loop.core, c.fd, c.gen, 0): return
+  if not callStreamRoute(addr loop.core, c.fd, c.gen, 0): return
   c.reqStreaming = true
   c.bodyFed = 0
   let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
   try:
     {.gcsafe.}:
-      loop.handler(req, response(req))
+      loop.callHandler(req, response(req))
   except CatchableError:
     if not c.responded:
       loop.respondError(c, Http500)
@@ -548,7 +559,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
           c.setDeadline(loop, dkBody)
         # Streaming route: dispatch at headers-complete, then feed the body
         # incrementally to onBody instead of waiting for the whole request.
-        if loop.core.streamRoute != nil and not c.reqStreaming and
+        if hasStreamRoute(addr loop.core) and not c.reqStreaming and
             not c.responded:
           loop.startStreamingDispatch(c)
         if c.reqStreaming:
@@ -572,7 +583,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
       # A whole streaming request that arrived in one read never hit the
       # prNeedMore path, so try to dispatch it here (startStreamingDispatch
       # evaluates the predicate and sets reqStreaming only for a stream route).
-      if not c.reqStreaming and loop.core.streamRoute != nil:
+      if not c.reqStreaming and hasStreamRoute(addr loop.core):
         loop.startStreamingDispatch(c)
       if c.reqStreaming:
         # Streaming handler already ran (early or just now): deliver the tail.
@@ -581,7 +592,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
         let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
         try:
           {.gcsafe.}:
-            loop.handler(req, response(req))
+            loop.callHandler(req, response(req))
         except CatchableError:
           if not c.responded:
             loop.respondError(c, Http500)
@@ -899,7 +910,7 @@ when not defined(plainHttp):
                           gen: slot.gen, stream: uint32(sid))
         try:
           {.gcsafe.}:
-            loop.handler(req, response(req))
+            loop.callHandler(req, response(req))
         except CatchableError:
           h3Apply(addr loop.core, int32(-(idx + 2)), slot.gen, uint32(sid),
                   500, "text/plain", [], "500 Internal Server Error")
