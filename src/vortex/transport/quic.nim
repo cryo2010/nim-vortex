@@ -253,12 +253,13 @@ proc quicPeerAddr*(conn: SslPtr): string =
     result = qcPeers[key]
     qcPeers.del(key)   # consumed once, at accept
 
-proc newQuicConfig*(certFile, keyFile: string,
-                    cipherSuites = ""): ptr TlsConfig =
+proc newQuicConfig*(certFile, keyFile: string, cipherSuites = "",
+                    certPem = "", keyPem = "", keyPassword = ""): ptr TlsConfig =
   ## SSL_CTX for the QUIC server; ALPN offers h3 only. QUIC mandates
   ## TLS 1.3, so only the 1.3 cipher suites are configurable.
   newTlsConfigWith(OSSL_QUIC_server_method(), certFile, keyFile, "\x02h3",
-                   cipherSuites = cipherSuites)
+                   cipherSuites = cipherSuites, certPem = certPem,
+                   keyPem = keyPem, keyPassword = keyPassword)
 
 proc newQuicListener*(cfg: ptr TlsConfig, udpFd: cint): SslPtr =
   result = SSL_new_listener(cfg.ctx, 0)

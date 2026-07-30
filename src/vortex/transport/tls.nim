@@ -34,6 +34,8 @@ const
   SSL_ERROR_SYSCALL = cint(5)
   SSL_ERROR_ZERO_RETURN = cint(6)
   SSL_CTRL_MODE = cint(33)
+  SSL_CTRL_EXTRA_CHAIN_CERT = cint(14)     # append a cert to the chain (add0)
+  SSL_CTRL_CLEAR_CHAIN_CERTS = cint(88)    # drop the built chain (for in-place reload)
   SSL_CTRL_SET_MIN_PROTO_VERSION = cint(123)
   SSL_MODE_ENABLE_PARTIAL_WRITE = clong(1)
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
@@ -46,6 +48,12 @@ const
   SSL_TLSEXT_ERR_NOACK = cint(3)
   OPENSSL_NPN_NEGOTIATED = cint(1)
 
+type
+  PemPasswordCb = proc (buf: cstring, size: cint, rwflag: cint,
+                        u: pointer): cint {.cdecl.}
+    ## OpenSSL pem_password_cb: fill `buf` (up to `size`) with the passphrase
+    ## for an encrypted key, return its length.
+
 {.push importc, cdecl, dynlib: sslLibName.}
 proc TLS_server_method(): pointer
 proc SSL_CTX_new(m: pointer): SslCtxPtr
@@ -53,6 +61,10 @@ proc SSL_CTX_free(ctx: SslCtxPtr)
 proc SSL_CTX_use_certificate_chain_file(ctx: SslCtxPtr, file: cstring): cint
 proc SSL_CTX_use_PrivateKey_file(ctx: SslCtxPtr, file: cstring,
                                  typ: cint): cint
+proc SSL_CTX_use_certificate(ctx: SslCtxPtr, x: pointer): cint   # up-refs x
+proc SSL_CTX_use_PrivateKey(ctx: SslCtxPtr, pkey: pointer): cint # up-refs pkey
+proc SSL_CTX_set_default_passwd_cb(ctx: SslCtxPtr, cb: PemPasswordCb)
+proc SSL_CTX_set_default_passwd_cb_userdata(ctx: SslCtxPtr, u: pointer)
 proc SSL_CTX_check_private_key(ctx: SslCtxPtr): cint
 proc SSL_CTX_ctrl(ctx: SslCtxPtr, cmd: cint, larg: clong,
                   parg: pointer): clong
@@ -85,7 +97,58 @@ proc ERR_get_error(): culong
 proc ERR_error_string(e: culong, buf: cstring): cstring
 proc X509_get_subject_name(x: pointer): pointer          # X509_NAME* (borrowed)
 proc X509_NAME_oneline(name: pointer, buf: cstring, size: cint): cstring
+proc BIO_new_mem_buf(buf: pointer, len: cint): pointer   # read-only mem BIO
+proc BIO_free(bio: pointer): cint
+proc PEM_read_bio_X509(bio: pointer, x: ptr pointer,
+                       cb: PemPasswordCb, u: pointer): pointer
+proc PEM_read_bio_PrivateKey(bio: pointer, x: ptr pointer,
+                             cb: PemPasswordCb, u: pointer): pointer
+proc X509_free(x: pointer)
+proc EVP_PKEY_free(pkey: pointer)
 {.pop.}
+
+proc passwdCb(buf: cstring, size: cint, rwflag: cint,
+              u: pointer): cint {.cdecl.} =
+  ## Copy the NUL-terminated passphrase at `u` into `buf` (bounded by `size`).
+  if u == nil: return 0
+  let src = cast[cstring](u)
+  var n = 0
+  while n < int(size) and src[n] != '\0': inc n
+  if n > 0: copyMem(buf, u, n)
+  cint(n)
+
+proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
+  ## Load a PEM certificate chain (leaf first, then intermediates) from memory.
+  let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
+  if bio == nil: return false
+  defer: discard BIO_free(bio)
+  let leaf = PEM_read_bio_X509(bio, nil, nil, nil)
+  if leaf == nil: return false
+  let used = SSL_CTX_use_certificate(ctx, leaf) == 1   # up-refs leaf
+  X509_free(leaf)
+  if not used: return false
+  while true:
+    let extra = PEM_read_bio_X509(bio, nil, nil, nil)
+    if extra == nil:
+      ERR_clear_error()          # expected: end of PEM data
+      break
+    # SSL_CTX_add_extra_chain_cert takes ownership; do not free on success.
+    if SSL_CTX_ctrl(ctx, SSL_CTRL_EXTRA_CHAIN_CERT, 0, extra) != 1:
+      X509_free(extra)
+      return false
+  true
+
+proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
+  ## Load a PEM private key from memory, decrypting with `password` if set.
+  let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
+  if bio == nil: return false
+  defer: discard BIO_free(bio)
+  let cb = if password.len > 0: passwdCb else: nil
+  let ud = if password.len > 0: cast[pointer](password.cstring) else: nil
+  let pkey = PEM_read_bio_PrivateKey(bio, nil, cb, ud)
+  if pkey == nil: return false
+  result = SSL_CTX_use_PrivateKey(ctx, pkey) == 1      # up-refs pkey
+  EVP_PKEY_free(pkey)
 
 type
   TlsConfig* = object
@@ -98,6 +161,7 @@ type
     protos: string           ## ALPN preference list, wire format
     meth: pointer            ## method the ctx was built with (rebuild on reload)
     certFile, keyFile: string
+    certPem, keyPem, keyPassword: string   ## in-memory material / passphrase
     minProtoVersion: clong
     cipherList, cipherSuites: string
 
@@ -125,11 +189,13 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
   else:
     SSL_TLSEXT_ERR_NOACK      # no overlap: proceed without ALPN (=> h1)
 
-proc buildTlsCtx(meth: pointer, certFile, keyFile: string,
-                 minProtoVersion: clong, cipherList, cipherSuites: string):
-                 SslCtxPtr =
-  ## Build a fully-configured SSL_CTX (min version, ciphers, cert/key). Raises
-  ## on any failure, freeing the partial ctx. The ALPN callback is set by the
+proc buildTlsCtx(meth: pointer, certFile, keyFile, certPem, keyPem,
+                 keyPassword: string, minProtoVersion: clong,
+                 cipherList, cipherSuites: string): SslCtxPtr =
+  ## Build a fully-configured SSL_CTX (min version, ciphers, cert/key). The cert
+  ## and key each come from memory (certPem/keyPem) when set, otherwise from a
+  ## file (certFile/keyFile); keyPassword decrypts an encrypted key. Raises on
+  ## any failure, freeing the partial ctx. The ALPN callback is set by the
   ## caller, which owns the stable arg pointer. Shared by initial config and
   ## certificate hot-reload.
   let ctx = SSL_CTX_new(meth)
@@ -149,14 +215,27 @@ proc buildTlsCtx(meth: pointer, certFile, keyFile: string,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "invalid TLS 1.3 cipher suites: " & lastErrorMsg())
-  if SSL_CTX_use_certificate_chain_file(ctx, certFile.cstring) != 1:
+  # Passphrase for an encrypted key: used by both the file and memory loaders.
+  if keyPassword.len > 0:
+    SSL_CTX_set_default_passwd_cb(ctx, passwdCb)
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, keyPassword.cstring)
+  let certOk = if certPem.len > 0: loadCertChainMem(ctx, certPem)
+               else: SSL_CTX_use_certificate_chain_file(ctx, certFile.cstring) == 1
+  if not certOk:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
-      "cannot load certificate '" & certFile & "': " & lastErrorMsg())
-  if SSL_CTX_use_PrivateKey_file(ctx, keyFile.cstring, SSL_FILETYPE_PEM) != 1:
+      "cannot load certificate " &
+      (if certPem.len > 0: "(in-memory)" else: "'" & certFile & "'") &
+      ": " & lastErrorMsg())
+  let keyOk = if keyPem.len > 0: loadKeyMem(ctx, keyPem, keyPassword)
+              else: SSL_CTX_use_PrivateKey_file(ctx, keyFile.cstring,
+                                                SSL_FILETYPE_PEM) == 1
+  if not keyOk:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
-      "cannot load private key '" & keyFile & "': " & lastErrorMsg())
+      "cannot load private key " &
+      (if keyPem.len > 0: "(in-memory)" else: "'" & keyFile & "'") &
+      ": " & lastErrorMsg())
   if SSL_CTX_check_private_key(ctx) != 1:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
@@ -169,15 +248,19 @@ proc buildTlsCtx(meth: pointer, certFile, keyFile: string,
 
 proc newTlsConfigWith*(meth: pointer, certFile, keyFile: string,
                        protos: string, minProtoVersion: clong = 0,
-                       cipherList = "", cipherSuites = ""): ptr TlsConfig =
-  let ctx = buildTlsCtx(meth, certFile, keyFile, minProtoVersion,
-                        cipherList, cipherSuites)
+                       cipherList = "", cipherSuites = "",
+                       certPem = "", keyPem = "", keyPassword = ""): ptr TlsConfig =
+  let ctx = buildTlsCtx(meth, certFile, keyFile, certPem, keyPem, keyPassword,
+                        minProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
   result.ctx = ctx
   result.protos = protos
   result.meth = meth
   result.certFile = certFile
   result.keyFile = keyFile
+  result.certPem = certPem
+  result.keyPem = keyPem
+  result.keyPassword = keyPassword
   result.minProtoVersion = minProtoVersion
   result.cipherList = cipherList
   result.cipherSuites = cipherSuites
@@ -197,17 +280,23 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   ## unbounded grace window (reloads are seconds/hours apart, SSL_new is
   ## microseconds), while capping retained ctxs at one. Call from a normal
   ## thread, not a raw signal handler.
+  # Explicit file paths override any stored in-memory material; empty means
+  # "reuse what was last loaded" (files or PEM).
   let cf = if certFile.len > 0: certFile else: cfg.certFile
   let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
+  let cp = if certFile.len > 0: "" else: cfg.certPem
+  let kp = if keyFile.len > 0: "" else: cfg.keyPem
   var newCtx: SslCtxPtr
   try:
-    newCtx = buildTlsCtx(cfg.meth, cf, kf, cfg.minProtoVersion,
-                         cfg.cipherList, cfg.cipherSuites)
+    newCtx = buildTlsCtx(cfg.meth, cf, kf, cp, kp, cfg.keyPassword,
+                         cfg.minProtoVersion, cfg.cipherList, cfg.cipherSuites)
   except CatchableError:
     return false
   SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
   cfg.certFile = cf
   cfg.keyFile = kf
+  cfg.certPem = cp
+  cfg.keyPem = kp
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
   # Retire `old` with a time-based grace rather than freeing the previous
   # retirement outright: freeing at the *next* reload alone is unsafe if two
@@ -310,17 +399,31 @@ proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
   ## mechanism as SSL_new on TCP); in-flight connections keep theirs.
   let cf = if certFile.len > 0: certFile else: cfg.certFile
   let kf = if keyFile.len > 0: keyFile else: cfg.keyFile
+  let cp = if certFile.len > 0: "" else: cfg.certPem
+  let kp = if keyFile.len > 0: "" else: cfg.keyPem
   try:
-    SSL_CTX_free(buildTlsCtx(cfg.meth, cf, kf, cfg.minProtoVersion,
-                             cfg.cipherList, cfg.cipherSuites))  # probe only
+    SSL_CTX_free(buildTlsCtx(cfg.meth, cf, kf, cp, kp, cfg.keyPassword,
+                             cfg.minProtoVersion, cfg.cipherList,
+                             cfg.cipherSuites))  # probe only
   except CatchableError:
     return false
-  if SSL_CTX_use_certificate_chain_file(cfg.ctx, cf.cstring) != 1: return false
-  if SSL_CTX_use_PrivateKey_file(cfg.ctx, kf.cstring, SSL_FILETYPE_PEM) != 1:
+  if cfg.keyPassword.len > 0:
+    SSL_CTX_set_default_passwd_cb(cfg.ctx, passwdCb)
+    SSL_CTX_set_default_passwd_cb_userdata(cfg.ctx, cfg.keyPassword.cstring)
+  if cp.len > 0:
+    discard SSL_CTX_ctrl(cfg.ctx, SSL_CTRL_CLEAR_CHAIN_CERTS, 0, nil)  # replace
+    if not loadCertChainMem(cfg.ctx, cp): return false
+  elif SSL_CTX_use_certificate_chain_file(cfg.ctx, cf.cstring) != 1:
+    return false
+  if kp.len > 0:
+    if not loadKeyMem(cfg.ctx, kp, cfg.keyPassword): return false
+  elif SSL_CTX_use_PrivateKey_file(cfg.ctx, kf.cstring, SSL_FILETYPE_PEM) != 1:
     return false
   if SSL_CTX_check_private_key(cfg.ctx) != 1: return false
   cfg.certFile = cf
   cfg.keyFile = kf
+  cfg.certPem = cp
+  cfg.keyPem = kp
   true
 
 proc ctxCertSubject*(cfg: ptr TlsConfig): string =
@@ -336,10 +439,11 @@ proc ctxCertSubject*(cfg: ptr TlsConfig): string =
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0,
-                   cipherList = "", cipherSuites = ""): ptr TlsConfig =
+                   cipherList = "", cipherSuites = "",
+                   certPem = "", keyPem = "", keyPassword = ""): ptr TlsConfig =
   newTlsConfigWith(TLS_server_method(), certFile, keyFile,
     (if enableH2: "\x02h2\x08http/1.1" else: "\x08http/1.1"),
-    minProtoVersion, cipherList, cipherSuites)
+    minProtoVersion, cipherList, cipherSuites, certPem, keyPem, keyPassword)
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
   SSL_CTX_free(cfg.ctx)
@@ -348,6 +452,9 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.protos = ""
   cfg.certFile = ""
   cfg.keyFile = ""
+  cfg.certPem = ""
+  cfg.keyPem = ""
+  cfg.keyPassword = ""
   cfg.cipherList = ""
   cfg.cipherSuites = ""
   deallocShared(cfg)

@@ -43,9 +43,14 @@ type
 
     serverHeader*: string     ## "" disables the Server header
 
-    # TLS (both must be set to enable; PEM format)
+    # TLS (a cert + key enables it; PEM format). Provide either files
+    # (certFile/keyFile) or in-memory PEM (certPem/keyPem); keyPassword
+    # decrypts an encrypted key.
     certFile*: string
     keyFile*: string
+    certPem*: string          ## in-memory PEM cert chain (instead of certFile)
+    keyPem*: string           ## in-memory PEM private key (instead of keyFile)
+    keyPassword*: string      ## passphrase for an encrypted key ("" = none)
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
     minTlsVersion*: TlsMinVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
@@ -81,6 +86,9 @@ proc initSettings*(
     serverHeader = "vortex",
     certFile = "",
     keyFile = "",
+    certPem = "",
+    keyPem = "",
+    keyPassword = "",
     http3 = true,
     minTlsVersion = tlsV12,
     tlsCipherList = "",
@@ -103,7 +111,12 @@ proc initSettings*(
     securityHeaders: securityHeaders,
     wsPingInterval: wsPingInterval, wsPongTimeout: wsPongTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,
-    certFile: certFile, keyFile: keyFile, http3: http3,
+    certFile: certFile, keyFile: keyFile, certPem: certPem, keyPem: keyPem,
+    keyPassword: keyPassword, http3: http3,
     minTlsVersion: minTlsVersion, tlsCipherList: tlsCipherList,
     tlsCipherSuites: tlsCipherSuites
   )
+
+proc hasTls*(s: Settings): bool =
+  ## True when TLS material is configured, from files or in memory.
+  s.certFile.len > 0 or s.certPem.len > 0

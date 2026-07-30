@@ -156,7 +156,7 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
       ("X-Content-Type-Options", "nosniff"),
       ("X-Frame-Options", "DENY"),
       ("Referrer-Policy", "no-referrer")]
-    if settings.certFile.len > 0:
+    if settings.hasTls:
       result.core.secHeaders.add ("Strict-Transport-Security",
                                   "max-age=63072000; includeSubDomains")
   result.core.maxWsMessage = settings.maxWsMessageSize
@@ -184,7 +184,10 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
       # certificate hot-reload can update it in place on this thread, with no
       # cross-loop race and without dropping in-flight h3 connections.
       let ownCfg = newQuicConfig(settings.certFile, settings.keyFile,
-                                 settings.tlsCipherSuites)
+                                 settings.tlsCipherSuites,
+                                 certPem = settings.certPem,
+                                 keyPem = settings.keyPem,
+                                 keyPassword = settings.keyPassword)
       result.quicOwnCfg = cast[pointer](ownCfg)
       result.quicReload = quicReload
       result.quicListener = newQuicListener(ownCfg, cint(udpFd))

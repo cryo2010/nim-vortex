@@ -63,12 +63,14 @@ proc requestShutdown*(server: var Server) =
 proc validateSettings(s: Settings) =
   ## Reject nonsensical/dangerous configurations up front rather than failing
   ## silently at run time.
-  if s.keyFile.len > 0 and s.certFile.len == 0:
+  let hasCert = s.certFile.len > 0 or s.certPem.len > 0
+  let hasKey = s.keyFile.len > 0 or s.keyPem.len > 0
+  if hasKey and not hasCert:
     raise newException(CatchableError,
-      "keyFile is set but certFile is empty: this would serve plaintext. " &
-      "Set both to enable TLS, or neither for plain HTTP.")
-  if s.certFile.len > 0 and s.keyFile.len == 0:
-    raise newException(CatchableError, "certFile is set but keyFile is empty.")
+      "a private key is set but no certificate: this would serve plaintext. " &
+      "Set both (file or PEM) to enable TLS, or neither for plain HTTP.")
+  if hasCert and not hasKey:
+    raise newException(CatchableError, "a certificate is set but no private key.")
   if s.maxHeaderSize < 0 or s.maxBodySize < 0 or s.maxWsMessageSize < 0 or
      s.headerTimeout < 0 or s.bodyTimeout < 0 or s.keepAliveTimeout < 0 or
      s.responseTimeout < 0 or s.shutdownGrace < 0 or s.maxConnections < 0 or
@@ -99,7 +101,7 @@ proc start*(handler: RequestHandler, settings = initSettings(),
   result.pool.start(numWorkers)
 
   when not defined(plainHttp):
-    if settings.certFile.len > 0:
+    if settings.hasTls:
       let minVer = case settings.minTlsVersion
                    of tlsV12: TLS1_2_VERSION
                    of tlsV13: TLS1_3_VERSION
@@ -107,9 +109,11 @@ proc start*(handler: RequestHandler, settings = initSettings(),
         newTlsConfig(settings.certFile, settings.keyFile, enableH2 = true,
                      minProtoVersion = minVer,
                      cipherList = settings.tlsCipherList,
-                     cipherSuites = settings.tlsCipherSuites))
+                     cipherSuites = settings.tlsCipherSuites,
+                     certPem = settings.certPem, keyPem = settings.keyPem,
+                     keyPassword = settings.keyPassword))
   else:
-    if settings.certFile.len > 0:
+    if settings.hasTls:
       raise newException(CatchableError,
         "TLS requested but built with -d:plainHttp")
 
@@ -136,7 +140,10 @@ proc start*(handler: RequestHandler, settings = initSettings(),
         # discard the probe: each loop builds its own private ctx for in-place
         # hot-reload, and a valid udpFd is the loops' "h3 enabled" signal.
         freeTlsConfig(newQuicConfig(settings.certFile, settings.keyFile,
-                                    cipherSuites = settings.tlsCipherSuites))
+                                    cipherSuites = settings.tlsCipherSuites,
+                                    certPem = settings.certPem,
+                                    keyPem = settings.keyPem,
+                                    keyPassword = settings.keyPassword))
         result.quicReload = createShared(CertReload)
         initCertReload(cast[ptr CertReload](result.quicReload))
         for i in 0 ..< numLoops:
