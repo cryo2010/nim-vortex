@@ -154,6 +154,7 @@ type
     wsIdle*: seq[RootRef]     ## h2/h3 WebSocket streams tracked for idle keepalive
                               ## (WsConn upcast; h1 uses the connection deadline wheel)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
+    compress*: bool           ## gzip eligible buffered responses (only with -d:httpGzip)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox

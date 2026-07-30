@@ -1,0 +1,6 @@
+# Generated per-run by run.sh (shared CA + server/client certs).
+certs/
+# Build/runtime artefacts from the language clients.
+clients/python/__pycache__/
+clients/rust/target/
+clients/go/client
