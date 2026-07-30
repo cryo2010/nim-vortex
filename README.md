@@ -624,6 +624,9 @@ Turn it on per server with `settings.compress`: an eligible buffered response
 
 ## Verification
 
+See [TESTING.md](TESTING.md) for a full registry of every test (CI and local)
+and what each verifies.
+
 - `nimble test`: parser/HPACK/QPACK unit tests (RFC vectors) plus
   integration suites for h1, h2 (curl), h3 (h3-capable curl), TLS,
   worker pool, and router.
