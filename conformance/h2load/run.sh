@@ -7,6 +7,12 @@
 #
 # Usage:  sh conformance/h2load/run.sh        (or `nimble h2load`)
 # Needs: docker.
+#
+# Env knobs:
+#   H2LOAD_REQUESTS  total requests (default 50000; ignored when a duration set)
+#   H2LOAD_CONNS     concurrent client connections (default 50)
+#   H2LOAD_DURATION  run time-based for N seconds instead of a fixed request
+#                    count (default 0 = off; passes h2load -D)
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -17,6 +23,16 @@ simg=vortex-h2load-server-img
 cimg=vortex-h2load-client-img
 reqs=${H2LOAD_REQUESTS:-50000}
 conns=${H2LOAD_CONNS:-50}
+dur=${H2LOAD_DURATION:-0}
+
+# Time-based (-D) when a duration is set, otherwise a fixed request count (-n).
+if [ "$dur" -gt 0 ]; then
+  loadctl="-c $conns -D $dur"
+  loaddesc="${dur}s x $conns connections"
+else
+  loadctl="-c $conns -n $reqs"
+  loaddesc="$reqs requests x $conns connections"
+fi
 
 if [ "$(uname -m)" = "x86_64" ]; then
   basearg="--build-arg BASE=archlinux:latest"
@@ -54,7 +70,7 @@ run_load() {
   desc="$1"; shift
   echo "=== $desc ==="
   out=$(docker run --rm --network "$net" "$cimg" \
-        h2load "$@" -n "$reqs" -c "$conns" http://server:8080/ 2>&1)
+        h2load "$@" $loadctl http://server:8080/ 2>&1)
   echo "$out" | grep -E "requests:|status codes:|finished in" || true
   if echo "$out" | grep -qE "[1-9][0-9]* (failed|errored|timeout)"; then
     echo "RESULT: $desc had failed/errored/timed-out requests." >&2
@@ -71,4 +87,4 @@ run_load "HTTP/2 (h2c prior knowledge)" -m 20
 run_load "HTTP/1.1" --h1
 
 echo
-echo "RESULT: h2load passed ($reqs requests x $conns connections, all 2xx)."
+echo "RESULT: h2load passed ($loaddesc, all 2xx)."
