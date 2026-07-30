@@ -7,6 +7,8 @@ import ./settings, ./request, ./eventloop, ./connection, ./workerpool
 when not defined(plainHttp):
   import ./transport/tls
   import ./transport/quic
+  # tlsVerifyMode / toSniCerts come from eventloop (shared with the per-loop
+  # QUIC config there).
 
 # Each Server owns its own stop flag (shared memory, one per instance) so that
 # stopping or starting one server never disturbs another in the same process.
@@ -111,7 +113,12 @@ proc start*(handler: RequestHandler, settings = initSettings(),
                      cipherList = settings.tlsCipherList,
                      cipherSuites = settings.tlsCipherSuites,
                      certPem = settings.certPem, keyPem = settings.keyPem,
-                     keyPassword = settings.keyPassword))
+                     keyPassword = settings.keyPassword,
+                     pkcs12File = settings.pkcs12File, pkcs12 = settings.pkcs12,
+                     verify = tlsVerifyMode(settings.verifyClient),
+                     clientCaFile = settings.clientCaFile,
+                     clientCaPem = settings.clientCaPem,
+                     sni = toSniCerts(settings)))
   else:
     if settings.hasTls:
       raise newException(CatchableError,
@@ -143,7 +150,13 @@ proc start*(handler: RequestHandler, settings = initSettings(),
                                     cipherSuites = settings.tlsCipherSuites,
                                     certPem = settings.certPem,
                                     keyPem = settings.keyPem,
-                                    keyPassword = settings.keyPassword))
+                                    keyPassword = settings.keyPassword,
+                                    pkcs12File = settings.pkcs12File,
+                                    pkcs12 = settings.pkcs12,
+                                    verify = tlsVerifyMode(settings.verifyClient),
+                                    clientCaFile = settings.clientCaFile,
+                                    clientCaPem = settings.clientCaPem,
+                                    sni = toSniCerts(settings)))
         result.quicReload = createShared(CertReload)
         initCertReload(cast[ptr CertReload](result.quicReload))
         for i in 0 ..< numLoops:
