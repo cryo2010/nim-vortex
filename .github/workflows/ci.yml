@@ -40,7 +40,11 @@ jobs:
         run: nim --version
 
       - name: Run unit tests
-        run: nimble test -y
+        # Run the suite directly (not `nimble test`): nimble does not reliably
+        # propagate a task's exit code (nim-lang/nimble#1802), so a failing test
+        # would still exit 0 and report green. tests/run.sh runs `nim c -r` per
+        # suite under `set -e`, so the first failure fails the job.
+        run: bash tests/run.sh
 
       - name: Build zero-dependency variant
         run: >-
@@ -72,8 +76,9 @@ jobs:
       - name: Run the test suite under ASan + UBSan
         # Extends the fuzzer's ASan coverage from the parser targets to the whole
         # server (event loop, h2/h3 codecs, worker pool). A memory or UB error
-        # fails the job.
-        run: nimble test -y
+        # fails the job. Direct via tests/run.sh (not `nimble test`) so a failure
+        # is not masked by nim-lang/nimble#1802.
+        run: bash tests/run.sh
 
   testchronos:
     runs-on: ubuntu-latest
@@ -85,9 +90,15 @@ jobs:
           nim gcc git curl openssl
       - uses: actions/checkout@v7
       - name: Test the chronos adapter
-        # chronos is an opt-in dependency kept out of the default nimble
-        # test; this installs it and runs the adapter's own suite (orc).
-        run: nimble testchronos -y
+        # chronos is an opt-in dependency kept out of the default suite; install
+        # it, then build/run the adapter's suite directly (orc). Not via
+        # `nimble testchronos`: a failure there would be masked by
+        # nim-lang/nimble#1802. The raw `nim c` resolves chronos from the global
+        # nimble package path.
+        run: |
+          nimble install -y "chronos@>= 4.0.0"
+          nim c -r --mm:orc --threads:on -d:ssl -p:src \
+            -o:tests/chronos_adapter tests/chronos_adapter.nim
 
   testdeflate:
     runs-on: ubuntu-latest
@@ -100,8 +111,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test WebSocket permessage-deflate
         # Opt-in -d:wsDeflate feature (links zlib), so its suite is separate
-        # from the default nimble test.
-        run: nimble testdeflate -y
+        # from the default suite. Built/run directly (not `nimble testdeflate`)
+        # so a failure is not masked by nim-lang/nimble#1802. The h2 (RFC 8441)
+        # suite gains a permessage-deflate case under the flag.
+        run: |
+          nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src \
+            -o:tests/websocket_deflate tests/websocket_deflate.nim
+          nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src \
+            -o:tests/test_http2_websocket tests/test_http2_websocket.nim
 
   teststreamcomp:
     runs-on: ubuntu-latest
@@ -117,7 +134,12 @@ jobs:
       - name: Test streaming response compression (gzip + brotli)
         # res.sendHead/write/finish (SSE, file streaming) compressed with gzip
         # and brotli over HTTP/1.1 (chunked) and h2c; byte-exact round-trip.
-        run: nimble teststreamcomp -y
+        # Built/run directly (not `nimble teststreamcomp`) so a failure is not
+        # masked by nim-lang/nimble#1802.
+        run: >-
+          nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli
+          --passL:-lz --passL:"-lbrotlienc -lbrotlicommon" -p:src
+          -o:tests/test_streaming_compression tests/test_streaming_compression.nim
 
   testreqdecomp:
     runs-on: ubuntu-latest
@@ -131,8 +153,12 @@ jobs:
       - name: Test request-body decompression (gzip + brotli)
         # Inbound gzip/br request bodies decoded into req.body, bounded by
         # maxBodySize: decode round-trips over h1 + h2c, a bomb -> 413, corrupt
-        # -> 400.
-        run: nimble testreqdecomp -y
+        # -> 400. Built/run directly (not `nimble testreqdecomp`) so a failure is
+        # not masked by nim-lang/nimble#1802.
+        run: >-
+          nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli
+          --passL:-lz --passL:"-lbrotlienc -lbrotlidec -lbrotlicommon" -p:src
+          -o:tests/test_request_decompression tests/test_request_decompression.nim
 
   testzstd:
     runs-on: ubuntu-latest
@@ -146,8 +172,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test zstd response compression
         # Buffered + streamed zstd over HTTP/1.1 and h2c, plus br/zstd/gzip
-        # Accept-Encoding negotiation; byte-exact round-trip.
-        run: nimble testzstd -y
+        # Accept-Encoding negotiation; byte-exact round-trip. Built/run directly
+        # (not `nimble testzstd`) so a failure is not masked by
+        # nim-lang/nimble#1802.
+        run: >-
+          nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli
+          -d:httpZstd --passL:-lz --passL:"-lbrotlienc -lbrotlicommon"
+          --passL:-lzstd -p:src
+          -o:tests/test_zstd_compression tests/test_zstd_compression.nim
 
   testrace:
     runs-on: ubuntu-latest
@@ -165,13 +197,21 @@ jobs:
           nim gcc git
       - uses: actions/checkout@v7
       - name: ThreadSanitizer handler-race regression
-        # Builds the start()/shutdown stress under TSan; TSan aborts on any data
-        # race, failing the job. Guards the handler/stream-route closure being
-        # stored as a raw (proc, env) pair instead of a traced ref that would
-        # race its ORC refcount across loop threads.
+        # Builds the start()/shutdown and blocking-request stress under TSan;
+        # TSan aborts on any data race, failing the job. Guards the
+        # handler/stream-route closure being stored as a raw (proc, env) pair
+        # instead of a traced ref that would race its ORC refcount across loop
+        # threads. -d:plainHttp keeps OpenSSL out of the report; -d:useMalloc
+        # lets TSan see all allocations. Built/run directly (not
+        # `nimble testrace`) so a failure is not masked by nim-lang/nimble#1802.
         env:
           TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
-        run: nimble testrace -y
+        run: |
+          for t in test_thread_race test_blocking_race; do
+            nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc \
+              --passC:-fsanitize=thread --passL:-fsanitize=thread \
+              --debugger:native -p:src -o:tests/$t tests/$t.nim
+          done
 
   # The REDbot and fuzz checks ship as Docker images (bundling REDbot and
   # the libFuzzer runtime). These jobs run on the plain runner, where
