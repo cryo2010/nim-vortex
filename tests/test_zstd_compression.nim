@@ -4,6 +4,10 @@
 ## skips under a build without -d:httpZstd. curl fetches; the gzip/brotli/zstd
 ## CLIs decode, verifying framing and a byte-exact round-trip.
 
+# The test body after the compile-time skip below is intentionally unreachable
+# when the flag is absent (the SKIP path quits).
+{.warning[UnreachableCode]: off.}
+
 when not defined(httpZstd):
   echo "SKIP: zstd compression needs -d:httpZstd"
   quit 0

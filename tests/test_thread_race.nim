@@ -15,7 +15,6 @@
 ## startup/shutdown refcount windows.
 
 import vortex
-import std/os
 
 proc ok(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "ok", "text/plain")

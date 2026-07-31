@@ -3,7 +3,7 @@
 ## connection is closed promptly; a request already being handled still gets
 ## its full response.
 
-import std/[unittest, net, posix, strutils, httpcore, os]
+import std/[unittest, net, strutils, httpcore, os]
 import vortex/[settings, request, server]
 import ./helper
 

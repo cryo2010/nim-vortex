@@ -5,7 +5,7 @@
 ## requests across several loop threads + the worker pool; built under TSan by
 ## `nimble testrace`, TSan aborts on any data race.
 
-import std/[net, os, atomics]
+import std/[net, atomics]
 import vortex
 import ./h2client
 from vortex/http2/frames import FrameType, ftHeaders

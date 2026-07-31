@@ -106,8 +106,11 @@ suite "HTTP/2 flood defenses":
       sid += 2
     c.sendRaw(burst)
     # Stop as soon as all n responses arrive (deterministic) rather than
-    # waiting out a quiet period, which is timing-sensitive under load.
-    let frames = c.readFrames(3000,
+    # waiting out a quiet period, which is timing-sensitive under load. The
+    # timeout is only an upper bound for a slow/loaded CI runner: the `until`
+    # returns the instant all n are in, so a generous cap never slows the
+    # common case but keeps the 1000-response round-trip from tripping it.
+    let frames = c.readFrames(15000,
       until = proc(f: seq[Frame]): bool = f.count(ftHeaders) >= n)
     c.close()
     check frames.goawayError() == -1

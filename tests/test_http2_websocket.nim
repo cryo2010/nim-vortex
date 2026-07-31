@@ -2,7 +2,7 @@
 ## server with the raw h2 test client: an Extended CONNECT opens a WebSocket
 ## on a stream, then DATA frames carry WebSocket framing both ways.
 
-import std/[unittest, net, httpcore, strutils, os, atomics, tables]
+import std/[unittest, net, httpcore, os, atomics, tables, strutils]
 import vortex/[settings, request, server]
 import vortex/http2/frames
 import ./h2client

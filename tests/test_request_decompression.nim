@@ -3,6 +3,10 @@
 ## so a decompression bomb is rejected with 413 (corrupt -> 400). Run via
 ## `nimble testreqdecomp`; skips under a build without a compression flag.
 
+# The test body after the compile-time skip below is intentionally unreachable
+# when the flags are absent (the SKIP path quits).
+{.warning[UnreachableCode]: off.}
+
 when not defined(httpGzip) and not defined(httpBrotli):
   echo "SKIP: request decompression needs -d:httpGzip and/or -d:httpBrotli"
   quit 0

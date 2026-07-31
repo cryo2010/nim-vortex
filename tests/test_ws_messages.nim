@@ -2,7 +2,7 @@
 ## `{.async.}` handler registered with `router.ws`. Raw frames so the wire is
 ## checked exactly.
 
-import std/[unittest, net, httpcore, posix, strutils]
+import std/[unittest, net, posix, strutils]
 import vortex/[settings, request, server, router]
 import vortex/adapters/asyncdispatch
 import ./helper
