@@ -1,7 +1,7 @@
 ## On graceful shutdown, an open HTTP/1.1 WebSocket receives a server-initiated
 ## close frame with code 1001 (going away).
 
-import std/[unittest, net, posix, strutils, httpcore, os]
+import std/[unittest, net, posix, strutils, os]
 import vortex/[settings, request, server]
 import ./helper
 

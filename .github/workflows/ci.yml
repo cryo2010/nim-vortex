@@ -15,9 +15,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # Arch Linux ships OpenSSL 3.6; the TLS/HTTP2/HTTP3 tests need OpenSSL
-    # >= 3.5 for the QUIC server API, which stock Ubuntu runners lack. The
-    # HTTP/3 integration tests skip themselves when no HTTP/3-capable curl
-    # is present, so they are effectively h1 + h2 + TLS here.
+    # >= 3.5 for the QUIC server API, which stock Ubuntu runners lack. Arch's
+    # curl also has HTTP/3, so the h3 integration tests run here too.
     container: archlinux:latest
     strategy:
       fail-fast: false
@@ -25,13 +24,15 @@ jobs:
         mm: [orc, arc]         # memory managers; orc is the recommended one
     env:
       NIM_MM: ${{ matrix.mm }}   # tests/config.nims reads this
+      NIM_COMPRESS: "1"          # build gzip/brotli/zstd so those tests run
     steps:
       - name: Install toolchain
         # --disable-sandbox: pacman's Landlock sandbox cannot apply in a
-        # container.
+        # container. zlib/brotli/zstd provide the compression libs + CLIs the
+        # compression tests link and decode with.
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc git curl openssl
+          nim gcc git curl openssl zlib brotli zstd
 
       - uses: actions/checkout@v7
 
@@ -55,6 +56,7 @@ jobs:
       options: --privileged
     env:
       NIM_SANITIZE: "1"          # tests/config.nims adds -fsanitize=address,undefined
+      NIM_COMPRESS: "1"          # ASan-cover the gzip/brotli/zstd paths too
       ASAN_OPTIONS: detect_leaks=0:detect_container_overflow=0
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
@@ -65,7 +67,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc git curl openssl
+          nim gcc git curl openssl zlib brotli zstd
       - uses: actions/checkout@v7
       - name: Run the test suite under ASan + UBSan
         # Extends the fuzzer's ASan coverage from the parser targets to the whole

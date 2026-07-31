@@ -1132,12 +1132,16 @@ template stream*(res: Response, code: HttpCode, contentType: string,
     template headersOrEmit(chunk: untyped) =   # injected as the caller's ident
       if not res.write(chunk): await res.drained()
   var streamCompleted = false
+  # `streamCompleted = true` is unreachable when the caller's `body` ends in a
+  # `return` (a legitimate way to end a stream), so silence that here.
+  {.push warning[UnreachableCode]: off.}
   try:
     body
     streamCompleted = true
   finally:
     if streamCompleted: finish(res)
     else: abort(res)
+  {.pop.}
 
 template stream*(res: Response, code: HttpCode, contentType: string,
                  body: untyped) =

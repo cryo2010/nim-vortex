@@ -42,10 +42,14 @@ nimble bench perf perf2   # benchmarks (not pass/fail)
 Compiles and runs every `tests/test_*.nim`. In CI it runs twice in the **`test`**
 job (memory-manager matrix: `orc` and `arc`) and again in the **`sanitize`** job
 under AddressSanitizer + UBSanitizer (`NIM_SANITIZE=1`, which also switches to
-`-d:useMalloc`). All of the tests below are covered by those three CI runs.
+`-d:useMalloc`). Both jobs set `NIM_COMPRESS=1` (and install zlib/brotli/zstd), so
+the compression tests build with the codecs and **run** here (rather than
+skipping) -- gzip/brotli/zstd get orc, arc, and ASan coverage. All of the tests
+below are covered by those three CI runs.
 
 Configuration lives in `tests/config.nims` (adds `src` to the path, `--threads:on`,
-`-d:ssl`, and reads `NIM_MM` / `NIM_SANITIZE`). Shared helpers: `tests/helper.nim`
+`-d:ssl`, and reads `NIM_MM` / `NIM_SANITIZE` / `NIM_COMPRESS`). Shared helpers:
+`tests/helper.nim`
 (raw-socket client with faithful recv), `tests/h2client.nim` (minimal HTTP/2
 client).
 
@@ -148,11 +152,13 @@ client).
 | `test_security_headers_toggle.nim` | `settings.securityHeaders` auto-inject toggle |
 | `test_ratelimit.nim` | Per-client token-bucket rate limiting (SEC3, OWASP API4:2023) |
 
-> `test_compression.nim` and `test_thread_race.nim` are compiled by the default
-> suite too (they match the `tests/t*` glob), but only carry weight under their
-> dedicated tasks: `test_compression.nim` skips itself without `-d:httpGzip`, and
-> `test_thread_race.nim` only detects the race when built with ThreadSanitizer.
-> Both have their own tasks (see [Opt-in feature tests](#opt-in-feature-tests)).
+> The compression tests (`test_compression`, `test_streaming_compression`,
+> `test_request_decompression`, `test_zstd_compression`) and `test_thread_race`
+> match the default `tests/t*` glob but only carry weight with the right build:
+> the compression tests skip without their `-d:http*` flags (CI's `NIM_COMPRESS=1`
+> supplies them; a plain local `nimble test` skips them), and `test_thread_race`
+> only detects the race under ThreadSanitizer. All have dedicated tasks too (see
+> [Opt-in feature tests](#opt-in-feature-tests)).
 
 ---
 

@@ -4,6 +4,10 @@
 ## a compression flag. curl fetches (h1 chunked and h2c) and the gzip/brotli
 ## CLIs decode, so we verify the framing and a byte-exact round-trip.
 
+# The test body after the compile-time skip below is intentionally unreachable
+# when the flags are absent (the SKIP path quits).
+{.warning[UnreachableCode]: off.}
+
 when not defined(httpGzip) and not defined(httpBrotli):
   echo "SKIP: streaming compression needs -d:httpGzip and/or -d:httpBrotli"
   quit 0

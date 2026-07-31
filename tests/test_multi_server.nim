@@ -2,7 +2,7 @@
 ## starting one must not stop the other or make a waitFor hang (regression for
 ## the former single process-global stop flag).
 
-import std/[unittest, net, httpcore, os]
+import std/[unittest, net, httpcore]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 

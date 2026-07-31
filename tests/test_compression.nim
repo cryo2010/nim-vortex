@@ -2,6 +2,10 @@
 ## `nimble testgzip`; under the default build it skips (the feature is compiled
 ## out). curl handles the gzip round-trip.
 
+# The test body after the compile-time skip below is intentionally unreachable
+# when the flag is absent (the SKIP path quits).
+{.warning[UnreachableCode]: off.}
+
 when not defined(httpGzip):
   echo "SKIP: gzip response compression needs -d:httpGzip"
   quit 0

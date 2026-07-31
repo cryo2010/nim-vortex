@@ -1,10 +1,22 @@
 import std/[unittest, net, httpcore, osproc, strutils, os]
 import vortex/[settings, request, server, connection, staticfiles]
 
-# HTTP/3 needs an h3-capable curl (Homebrew's links libnghttp3/ngtcp2).
-const h3curlBin = "/opt/homebrew/opt/curl/bin/curl"
-if not fileExists(h3curlBin):
-  echo "SKIP: no HTTP/3-capable curl at ", h3curlBin
+# HTTP/3 needs a curl built with HTTP/3 (libnghttp3/ngtcp2 or OpenSSL QUIC).
+# Prefer any system curl that advertises HTTP3; fall back to Homebrew's path.
+proc findH3Curl(): string =
+  var cands: seq[string]
+  let sys = findExe("curl")
+  if sys.len > 0: cands.add sys
+  cands.add "/opt/homebrew/opt/curl/bin/curl"
+  for exe in cands:
+    if fileExists(exe):
+      let (ver, rc) = execCmdEx(exe & " --version")
+      if rc == 0 and "HTTP3" in ver.toUpperAscii: return exe
+  ""
+
+let h3curlBin = findH3Curl()
+if h3curlBin.len == 0:
+  echo "SKIP: no HTTP/3-capable curl found"
   quit 0
 
 let certDir = getTempDir() / "nhs_h3_certs_" & $getCurrentProcessId()
