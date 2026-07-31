@@ -92,13 +92,17 @@ task testzstd, "Test zstd response compression (needs zstd + zlib + brotli)":
        "--passL:-lzstd -p:src " &
        "-o:tests/test_zstd_compression tests/test_zstd_compression.nim"
 
-task testrace, "ThreadSanitizer regression for the handler thread race":
-  # Builds the start()/shutdown stress under TSan; TSan aborts the process on
-  # any data race, failing the task. -d:plainHttp keeps OpenSSL out of the
-  # report; -d:useMalloc lets TSan see all allocations.
-  exec "nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc " &
-       "--passC:-fsanitize=thread --passL:-fsanitize=thread --debugger:native " &
-       "-p:src -o:tests/test_thread_race tests/test_thread_race.nim"
+task testrace, "ThreadSanitizer regressions for the cross-thread races":
+  # Two TSan stress tests; TSan aborts the process on any data race, failing the
+  # task. -d:plainHttp keeps OpenSSL out of the report; -d:useMalloc lets TSan
+  # see all allocations.
+  #  - test_thread_race: start()/shutdown handler-closure refcount race.
+  #  - test_blocking_race: a req.blocking: worker reading a snapshot, not live
+  #    h2 state (C3 / IMP2) -- concurrent h2c blocking requests.
+  for t in ["test_thread_race", "test_blocking_race"]:
+    exec "nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc " &
+         "--passC:-fsanitize=thread --passL:-fsanitize=thread --debugger:native " &
+         "-p:src -o:tests/" & t & " tests/" & t & ".nim"
 
 task fuzz, "Fuzz the parser/HPACK/QPACK decoders in Docker (needs docker)":
   # The Dockerfile bundles clang + the libFuzzer runtime; the image's

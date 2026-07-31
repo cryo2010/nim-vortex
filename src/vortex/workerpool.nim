@@ -8,9 +8,27 @@
 ## here: ORC's cycle-collector registry is thread-local, so destroying a
 ## closure on a foreign thread corrupts it.
 
-import std/[locks, deques]
+import std/[locks, deques, httpcore]
 
 type
+  ReqSnapshot* = object
+    ## A plain-data copy of a request, captured on the loop thread at
+    ## dispatch and carried into a `blocking:` worker task (IMP2, closing C3).
+    ## Every field is a value type -- no GC refs -- so it crosses to the worker
+    ## by move, and the worker reads it instead of live loop memory (which would
+    ## race the loop's non-atomic ORC refcounts on H2Conn/H3Conn). `present`
+    ## marks a task that actually carries one (HTTP blocking bodies do; the
+    ## WebSocket/file trampolines don't).
+    present*: bool
+    httpMethod*: HttpMethod
+    target*: string                    ## raw request-target (path + query)
+    headers*: seq[(string, string)]    ## all request headers, pseudo-headers kept
+    body*: string
+    params*: seq[(string, string)]     ## route params captured by the router
+    remoteAddr*: string
+    secure*: bool
+    clientSubject*: string             ## mTLS client-cert subject ("" if none)
+
   WorkerTask* = object
     ## `fn` is a trampoline (see request.dispatchBlocking) that rebuilds
     ## the Request/WebSocket from the handle words and runs the user's body.
@@ -22,6 +40,11 @@ type
     gen*: uint32
     stream*: uint32           ## HTTP/2 stream id, 0 for HTTP/1
     data*: string             ## moved-in payload (a WebSocket message); "" for HTTP
+    snap*: ReqSnapshot        ## request snapshot for an HTTP blocking body
+
+  # Set by the worker loop to the running task's snapshot, so a blocking
+  # trampoline can point its Request at it without changing the trampoline ABI.
+  # nil on the loop thread (the inline no-pool path reads live memory instead).
 
   WorkerPool* = object
     lock: Lock
@@ -29,6 +52,9 @@ type
     tasks: Deque[WorkerTask]
     stopping: bool
     threads: seq[Thread[ptr WorkerPool]]
+
+var workerSnapshot* {.threadvar.}: ptr ReqSnapshot
+  ## The current task's snapshot on a worker thread (see ReqSnapshot).
 
 proc workerLoop(pool: ptr WorkerPool) {.thread.} =
   while true:
@@ -40,6 +66,7 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
       return                       # stopping and drained
     var task = pool.tasks.popFirst()
     release pool.lock
+    workerSnapshot = addr task.snap   # the trampoline reads this (nil off-pool)
     {.gcsafe.}:
       try:
         task.fn(task.user, task.core, task.fd, task.gen, task.stream,
@@ -49,6 +76,7 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
         # user blocking body must not take down the worker thread and the whole
         # server. The trampoline already responded and released the pin.
         discard
+    workerSnapshot = nil            # don't dangle at a freed task between runs
 
 proc start*(pool: ptr WorkerPool, n: int) =
   initLock pool.lock

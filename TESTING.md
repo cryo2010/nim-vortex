@@ -25,7 +25,7 @@ nimble teststreamcomp  # streaming (sendHead/write/SSE) gzip+brotli (needs zlib+
 nimble testreqdecomp   # inbound request-body gzip/br decode (needs zlib+brotli)
 nimble testzstd        # zstd response compression + negotiation (needs zstd+brotli+zlib)
 nimble testdeflate     # WebSocket permessage-deflate (needs zlib)
-nimble testrace        # handler thread-race regression (ThreadSanitizer)
+nimble testrace        # cross-thread race regressions (ThreadSanitizer)
 nimble testchronos     # chronos async adapter (needs chronos)
 
 # Docker conformance / load (each builds images and exits non-zero on failure):
@@ -167,7 +167,7 @@ Separate `nimble` tasks because they need a build flag or an extra dependency.
 | `nimble testreqdecomp` | **yes** (`testreqdecomp`) | Inbound request-body decompression (`settings.decompressRequest`): gzip/br bodies decoded into `req.body` over h1 + h2c, a decompression bomb rejected with 413, a corrupt body with 400. |
 | `nimble testzstd` | **yes** (`testzstd`) | Zstd response compression, buffered + streamed over HTTP/1.1 and h2c, plus br/zstd/gzip Accept-Encoding negotiation (q-values + tie-break); byte-exact round-trip via the zstd/brotli/gzip CLIs. |
 | `nimble testdeflate` | **yes** (`testdeflate`) | WebSocket permessage-deflate (RFC 7692, `-d:wsDeflate`, links zlib) over a live server, plus the h2 (RFC 8441) deflate case. |
-| `nimble testrace` | **yes** (`testrace`) | ThreadSanitizer regression for the handler / stream-route closure race: stresses `start()` + shutdown with a middleware-wrapped router handler across many loop threads; TSan aborts on any data race. |
+| `nimble testrace` | **yes** (`testrace`) | Two ThreadSanitizer regressions: (1) the handler/stream-route closure refcount race across loop threads at `start()`/shutdown; (2) C3/IMP2 -- a `req.blocking:` worker reading a request snapshot rather than live h2 state, under concurrent h2c blocking requests. TSan aborts on any data race. |
 | `nimble testchronos` | **yes** (`testchronos`) | The chronos async adapter (`chronos_adapter.nim`); chronos is opt-in so it is kept out of the default suite. |
 
 ---
