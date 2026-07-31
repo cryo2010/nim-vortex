@@ -33,6 +33,9 @@ type
     fd*: int32
     gen*: uint32
     stream*: uint32           ## HTTP/2 stream id, 0 for HTTP/1
+    snap*: ptr ReqSnapshot    ## non-nil on a blocking: worker: read this
+                              ## value snapshot instead of live loop memory
+                              ## (IMP2 / C3). nil on the loop thread.
 
   Response* = object
     ## The write half of a request/response pair: the same four handle
@@ -52,6 +55,7 @@ proc response*(req: Request): Response =
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream)
 
 proc isAlive*(req: Request): bool =
+  if req.snap != nil: return true    # pinned for the blocking body's duration
   if req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -119,6 +123,7 @@ proc `method`*(req: Request): HttpMethod =
   ## valid after a dot, so plain `req.method` works at call sites; only
   ## this declaration (and UFCS/standalone uses) needs backticks.
   result = HttpGet
+  if req.snap != nil: return req.snap.httpMethod
   if req.fd < 0:
     when not defined(plainHttp):
       result = parseMethodStr(h3FieldOf(req, ":method"))
@@ -130,6 +135,7 @@ proc `method`*(req: Request): HttpMethod =
       result = c.parser.httpMethod
 
 proc path*(req: Request): string =
+  if req.snap != nil: return req.snap.target
   if req.fd < 0:
     when not defined(plainHttp):
       result = h3FieldOf(req, ":path")
@@ -144,32 +150,41 @@ proc path*(req: Request): string =
 iterator headers*(req: Request): (string, string) =
   ## Yields (name, value) pairs. HTTP/2 and /3 names are lowercase on the
   ## wire; pseudo-headers are skipped.
-  if req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
+  if req.snap != nil:
+    for (n, v) in req.snap.headers:
+      if n.len > 0 and n[0] != ':': yield (n, v)
+  else:
+    if req.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(req.core, req.fd, req.gen)
+        if h3c != nil:
+          let st = h3StreamPtr(h3c, uint64(req.stream))
+          if st != nil:
+            for (n, v) in st.headers:
+              if n.len > 0 and n[0] != ':':
+                yield (n, v)
+    let c = if req.fd < 0: nil else: conn(req.core, req.fd, req.gen)
+    if c != nil:
+      if req.stream != 0:
+        let st = h2Stream(c, req.stream)
         if st != nil:
           for (n, v) in st.headers:
             if n.len > 0 and n[0] != ':':
               yield (n, v)
-  let c = if req.fd < 0: nil else: conn(req.core, req.fd, req.gen)
-  if c != nil:
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil:
-        for (n, v) in st.headers:
-          if n.len > 0 and n[0] != ':':
-            yield (n, v)
-    else:
-      for h in c.parser.headers:
-        yield (c.rbuf.substr(int(h.nameStart),
-                             int(h.nameStart + h.nameLen) - 1),
-               c.rbuf.substr(int(h.valStart),
-                             int(h.valStart + h.valLen) - 1))
+      else:
+        for h in c.parser.headers:
+          yield (c.rbuf.substr(int(h.nameStart),
+                               int(h.nameStart + h.nameLen) - 1),
+                 c.rbuf.substr(int(h.valStart),
+                               int(h.valStart + h.valLen) - 1))
 
 proc header*(req: Request, name: string): string =
   ## Case-insensitive single-header lookup; "" when absent.
+  if req.snap != nil:
+    let want = name.toLowerAscii
+    for (n, v) in req.snap.headers:
+      if n.toLowerAscii == want: return v
+    return ""
   if req.fd < 0:
     when not defined(plainHttp):
       result = h3FieldOf(req, name.toLowerAscii)
@@ -189,6 +204,7 @@ proc header*(req: Request, name: string): string =
                                int(h.valStart + h.valLen) - 1)
 
 proc body*(req: Request): string =
+  if req.snap != nil: return req.snap.body
   if req.fd < 0:
     when not defined(plainHttp):
       withH3(req, st):
@@ -215,6 +231,7 @@ proc remoteAddress*(req: Request): string =
   ## trusted proxy, this is already the real client IP from the PROXY header.
   ## Empty for a stale handle (and, over HTTP/3, if OpenSSL can't report the QUIC
   ## peer).
+  if req.snap != nil: return req.snap.remoteAddr
   if req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -229,6 +246,7 @@ proc clientCertSubject*(req: Request): string =
   ## those modes OpenSSL has already validated a presented cert during the
   ## handshake, so a non-empty result is a trusted client cert. Always "" over
   ## plaintext (or a -d:plainHttp build).
+  if req.snap != nil: return req.snap.clientSubject
   when not defined(plainHttp):
     if req.fd < 0:
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -253,6 +271,7 @@ proc isSecure*(req: Request): bool =
   ## True if the request arrived over TLS (HTTPS, or HTTP/2 over TLS) or QUIC
   ## (HTTP/3 is always encrypted). Use it to gate Secure cookies, HSTS, and a
   ## plaintext->HTTPS redirect.
+  if req.snap != nil: return req.snap.secure
   if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
   let c = conn(req.core, req.fd, req.gen)
   c != nil and c.ssl != nil
@@ -317,6 +336,7 @@ proc host*(req: Request): string =
   if result.len == 0: result = req.header("host")
 
 proc contentLength*(req: Request): int =
+  if req.snap != nil: return req.snap.body.len
   if req.fd < 0:
     when not defined(plainHttp):
       withH3(req, st):
@@ -347,6 +367,7 @@ template lazyQuery(store: untyped, rawQuery: string):
 proc url*(req: Request): Uri =
   ## The request target parsed as a Uri (so `req.url.path` excludes the
   ## query string). Parsed lazily on first access, cached per request.
+  if req.snap != nil: return parseUri(req.snap.target)  # no live cache to reuse
   if req.fd < 0:
     when not defined(plainHttp):
       withH3(req, st):
@@ -365,6 +386,9 @@ proc query*(req: Request): Table[string, string] =
   ## Decoded query parameters, built lazily on first access and cached
   ## per request. Duplicate keys keep the last value; use
   ## `decodeQuery(req.url.query)` directly if you need every occurrence.
+  if req.snap != nil:
+    for (k, v) in decodeQuery(parseUri(req.snap.target).query): result[k] = v
+    return
   if req.fd < 0:
     when not defined(plainHttp):
       withH3(req, st):
@@ -406,6 +430,7 @@ proc params*(req: Request): PathParams =
   ## Route parameters captured by the router ("/users/:id" etc.); empty
   ## when no router matched. Valid from any thread holding the handle,
   ## same as req.body.
+  if req.snap != nil: return req.snap.params
   if req.fd < 0:
     when not defined(plainHttp):
       withH3(req, st):
@@ -420,6 +445,7 @@ proc params*(req: Request): PathParams =
 
 proc param*(req: Request, name: string): string =
   ## Single path-parameter lookup; "" when absent.
+  if req.snap != nil: return req.snap.params.param(name)
   if req.fd < 0:
     when not defined(plainHttp):
       withH3(req, st):
@@ -1245,12 +1271,45 @@ type
     ## cross threads under ORC. Request data is read through `req`, which
     ## stays valid (the connection is pinned) until the body sends.
 
+proc snapshotRequest(req: Request): ReqSnapshot =
+  ## Capture everything a handler reads, on the loop thread, so a blocking:
+  ## worker reads this value copy instead of live loop memory (IMP2 / C3). Uses
+  ## the live accessors (safe here -- called on the loop thread, req.snap == nil).
+  result.present = true
+  result.httpMethod = req.method
+  result.target = req.path
+  result.body = req.body
+  result.params = req.params
+  result.remoteAddr = req.remoteAddress
+  result.secure = req.isSecure
+  result.clientSubject = req.clientCertSubject
+  # All headers, pseudo-headers kept (so header(":authority") etc. still work).
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        for (n, v) in st.headers: result.headers.add (n, v)
+  else:
+    withConn(req, c):
+      if req.stream != 0:
+        let st = h2Stream(c, req.stream)
+        if st != nil:
+          for (n, v) in st.headers: result.headers.add (n, v)
+      else:
+        for (n, v) in req.headers: result.headers.add (n, v)  # h1: no pseudo
+
+proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32): Request =
+  ## Build the worker's Request, pointing it at the task snapshot when present
+  ## (pool path); nil snapshot on the inline loop-thread path (live reads).
+  var snap: ptr ReqSnapshot = nil
+  if workerSnapshot != nil and workerSnapshot.present: snap = workerSnapshot
+  Request(core: lc, fd: fd, gen: gen, stream: stream, snap: snap)
+
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, data: string) {.nimcall, gcsafe.} =
   discard data                 # HTTP bodies read the request via `req`
   let fn = cast[BlockingProc](user)
   let lc = cast[ptr LoopCore](core)
-  let req = Request(core: lc, fd: fd, gen: gen, stream: stream)
+  let req = workerReq(lc, fd, gen, stream)
   let res = response(req)
   # On the pool path this runs on a worker thread and holds the connection pin;
   # the inline no-pool path runs on the loop thread with no pin. Only the worker
@@ -1297,7 +1356,8 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
     enqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
-                       gen: req.gen, stream: req.stream))
+                       gen: req.gen, stream: req.stream,
+                       snap: snapshotRequest(req)))
   except Exception:
     discard
 
@@ -1312,7 +1372,7 @@ proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
                             stream: uint32, data: string) {.nimcall, gcsafe.} =
   let fn = cast[BlockingDataProc](user)
   let lc = cast[ptr LoopCore](core)
-  let req = Request(core: lc, fd: fd, gen: gen, stream: stream)
+  let req = workerReq(lc, fd, gen, stream)
   let res = response(req)
   let onWorker = currentThreadId() != lc.threadId
   if onWorker: workerResponded = false
@@ -1345,7 +1405,8 @@ proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
     enqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingDataTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
-                       gen: req.gen, stream: req.stream, data: data))
+                       gen: req.gen, stream: req.stream, data: data,
+                       snap: snapshotRequest(req)))
   except Exception:
     discard
 
