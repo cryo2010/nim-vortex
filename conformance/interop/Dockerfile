@@ -1,6 +1,7 @@
 # Builds the vortex server under test for the cross-client interop test
-# (conformance/interop/run.sh, `nimble interop`). Built with -d:httpGzip so
-# gzip response compression is available (settings.compress = true) and with
+# (conformance/interop/run.sh, `nimble interop` / `nimble brotli`). Built with
+# -d:httpGzip AND -d:httpBrotli so the server can compress with either encoding
+# (settings.compress = true; the client's Accept-Encoding selects one), and with
 # OpenSSL for TLS/ALPN (h1 + h2). archlinux ships a recent OpenSSL; the base
 # defaults to arm64 and is overridden to archlinux:latest on x86_64 hosts.
 #
@@ -13,7 +14,7 @@ FROM ${BASE}
 
 RUN for i in 1 2 3 4 5; do \
       pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc openssl zlib && break; \
+        nim gcc openssl zlib brotli && break; \
       [ "$i" = 5 ] && exit 1; \
       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
     done && \
@@ -22,7 +23,8 @@ RUN for i in 1 2 3 4 5; do \
 WORKDIR /vortex
 COPY src ./src
 COPY conformance/interop/interop_server.nim ./interop_server.nim
-RUN nim c --mm:orc --threads:on -d:release -d:ssl -d:httpGzip --passL:-lz \
+RUN nim c --mm:orc --threads:on -d:release -d:ssl -d:httpGzip -d:httpBrotli \
+      --passL:-lz --passL:"-lbrotlienc -lbrotlicommon" \
       -p:src -o:interop_server interop_server.nim
 
 EXPOSE 8443/tcp

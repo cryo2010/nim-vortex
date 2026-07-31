@@ -153,6 +153,14 @@ task interop, "Cross-client interop test (Node/Python/Go/Rust/Java) (Docker)":
   # host openssl. Knobs: INTEROP_RUNTIME / INTEROP_CLIENTS / INTEROP_MTLS.
   exec "sh conformance/interop/run.sh"
 
+task brotli, "Cross-client brotli interop test (Node/Python/Go/Rust/Java) (Docker)":
+  # Same harness as `interop`, but every client requests and asserts
+  # Content-Encoding: br (INTEROP_ENCODING=br). The server image is built with
+  # -d:httpBrotli, and each client decodes brotli with its ecosystem's library
+  # (Node zlib, Python brotli, Go andybalholm/brotli, Rust brotli, Java
+  # org.brotli.dec). Needs docker + host openssl.
+  exec "INTEROP_ENCODING=br sh conformance/interop/run.sh"
+
 task testssl, "TLS configuration scan via testssl.sh (Docker)":
   # run.sh builds a vortex TLS server image and runs drwetter/testssl.sh against
   # it over a private docker network, checking protocols/ciphers/vulnerabilities;

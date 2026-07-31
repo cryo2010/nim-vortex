@@ -1,9 +1,10 @@
 // Node.js interop client for the vortex cross-client test. Uses the built-in
 // http2 module (so every request is genuinely HTTP/2) over TLS, trusting the
-// shared CA, exercising every method against /echo, and gunzipping the gzip
-// responses itself to prove the compression path end-to-end.
+// shared CA, exercising every method against /echo, and decoding the compressed
+// responses itself (gzip or brotli) to prove the compression path end-to-end.
 //
-// Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1).
+// Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1),
+//      INTEROP_ENCODING (gzip|br).
 // Certs: /certs/ca.pem, and for mTLS /certs/client.pem + /certs/client.key.
 
 'use strict';
@@ -15,6 +16,7 @@ const URL = process.env.INTEROP_URL || 'https://server:8443';
 const RUNTIME = parseInt(process.env.INTEROP_RUNTIME || '5', 10);
 const CLIENTS = Math.max(1, parseInt(process.env.INTEROP_CLIENTS || '1', 10));
 const MTLS = process.env.INTEROP_MTLS === '1';
+const ENC = process.env.INTEROP_ENCODING || 'gzip';
 const NAME = 'node';
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 
@@ -29,6 +31,13 @@ function fail(reason) {
   process.exit(1);
 }
 
+function decode(buf, encoding) {
+  if (!buf.length) return buf;
+  if (encoding === 'gzip') return zlib.gunzipSync(buf);
+  if (encoding === 'br') return zlib.brotliDecompressSync(buf);
+  return buf;
+}
+
 // One request on an established session. Resolves with {status, headers, body}.
 function request(session, method, path, body) {
   return new Promise((resolve, reject) => {
@@ -36,7 +45,7 @@ function request(session, method, path, body) {
       ':method': method,
       ':path': path,
       'x-api-key': 'interop',
-      'accept-encoding': 'gzip',
+      'accept-encoding': ENC,
     };
     if (body) headers['content-type'] = 'text/plain';
     const req = session.request(headers);
@@ -46,11 +55,9 @@ function request(session, method, path, body) {
     req.on('data', (c) => chunks.push(c));
     req.on('error', reject);
     req.on('end', () => {
-      let buf = Buffer.concat(chunks);
-      if (resHeaders && resHeaders['content-encoding'] === 'gzip' && buf.length) {
-        try { buf = zlib.gunzipSync(buf); }
-        catch (e) { return reject(new Error('gunzip failed: ' + e.message)); }
-      }
+      let buf;
+      try { buf = decode(Buffer.concat(chunks), resHeaders['content-encoding']); }
+      catch (e) { return reject(new Error('decode failed: ' + e.message)); }
       resolve({
         status: resHeaders[':status'],
         headers: resHeaders,
@@ -58,14 +65,6 @@ function request(session, method, path, body) {
       });
     });
     if (body) req.end(body); else req.end();
-  });
-}
-
-function connect() {
-  return new Promise((resolve, reject) => {
-    const s = http2.connect(URL, tls);
-    s.on('error', reject);
-    s.on('connect', () => resolve(s));
   });
 }
 
@@ -78,6 +77,8 @@ async function worker(deadline, counter) {
           ? `hello from ${NAME}` : null;
         const r = await request(session, m, '/echo', body);
         if (r.status !== 200) throw new Error(`${m} status ${r.status}`);
+        if (r.headers['content-encoding'] !== ENC)
+          throw new Error(`${m} not ${ENC}-encoded (got ${r.headers['content-encoding']})`);
         if (m === 'HEAD') {
           if (r.headers['x-echo-method'] !== 'HEAD')
             throw new Error('HEAD missing x-echo-method');
@@ -98,6 +99,14 @@ async function worker(deadline, counter) {
   }
 }
 
+function connect() {
+  return new Promise((resolve, reject) => {
+    const s = http2.connect(URL, tls);
+    s.on('error', reject);
+    s.on('connect', () => resolve(s));
+  });
+}
+
 (async () => {
   const deadline = Date.now() + RUNTIME * 1000;
   const counter = { n: 0 };
@@ -108,5 +117,5 @@ async function worker(deadline, counter) {
     fail(e.message);
   }
   console.log(`INTEROP OK ${NAME}: requests=${counter.n} ` +
-    `(clients=${CLIENTS}, runtime=${RUNTIME}s, mtls=${MTLS ? 1 : 0})`);
+    `(clients=${CLIENTS}, runtime=${RUNTIME}s, mtls=${MTLS ? 1 : 0}, enc=${ENC})`);
 })();

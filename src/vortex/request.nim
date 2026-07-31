@@ -22,6 +22,8 @@ when not defined(plainHttp):
   import ./transport/tls as tlscodec
 when defined(httpGzip):
   import ./gzip
+when defined(httpBrotli):
+  import ./brotli
 
 type
   Request* = object
@@ -513,8 +515,8 @@ proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
     applyResponse(res.core, c, res.stream, int(code), contentType,
                   headers, body)
 
-when defined(httpGzip):
-  const gzipMinSize = 1400   # not worth compressing below ~one MTU
+when defined(httpGzip) or defined(httpBrotli):
+  const compressMinSize = 1400   # not worth compressing below ~one MTU
 
   proc compressibleType(ct: string): bool =
     if ct.len == 0: return false
@@ -529,30 +531,60 @@ when defined(httpGzip):
       if cmpIgnoreCase(n, "content-encoding") == 0: return true
     false
 
-  proc acceptsGzip(req: Request): bool =
+  proc chooseEncoding(req: Request): string =
+    ## Pick the best Content-Encoding we can produce from the client's
+    ## Accept-Encoding, honoring q-values (q=0 disables an encoding); brotli wins
+    ## a tie. Returns "br", "gzip", or "" (send identity).
+    var brQ, gzQ = -1.0
     for part in req.header("accept-encoding").split(','):
-      if part.strip.toLowerAscii.startsWith("gzip"): return true
-    false
+      let tok = part.strip
+      if tok.len == 0: continue
+      var name = tok
+      var q = 1.0
+      let semi = tok.find(';')
+      if semi >= 0:
+        name = tok[0 ..< semi].strip
+        let low = tok.toLowerAscii
+        let qpos = low.find("q=")
+        if qpos >= 0:
+          try: q = parseFloat(low[qpos + 2 .. ^1].strip)
+          except ValueError: q = 0.0
+      case name.toLowerAscii
+      of "br": brQ = q
+      of "gzip": gzQ = q
+      of "*":
+        if brQ < 0: brQ = q
+        if gzQ < 0: gzQ = q
+      else: discard
+    when not defined(httpBrotli): brQ = -1.0     # can't produce it
+    when not defined(httpGzip): gzQ = -1.0
+    if brQ > 0 and brQ >= gzQ: "br"
+    elif gzQ > 0: "gzip"
+    else: ""
 
 proc send*(res: Response, code: HttpCode, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   ## Queue the response. Safe to call once per request, from the handler,
   ## later (deferred), or from a worker thread inside `blocking:`; no-op
-  ## if the connection is already gone. With `-d:httpGzip` and
-  ## `settings.compress`, an eligible body is gzip-compressed when the client
-  ## sent `Accept-Encoding: gzip`.
-  when defined(httpGzip):
-    if res.core.compress and body.len >= gzipMinSize and
-        compressibleType(contentType) and not hasContentEncoding(headers) and
-        acceptsGzip(Request(core: res.core, fd: res.fd, gen: res.gen,
-                            stream: res.stream)):
-      let gz = gzip(body)
-      if gz.len > 0 and gz.len < body.len:
+  ## if the connection is already gone. With `settings.compress` and a
+  ## compression build (`-d:httpBrotli` and/or `-d:httpGzip`), an eligible body
+  ## is compressed with the best encoding the client accepts (brotli preferred).
+  when defined(httpGzip) or defined(httpBrotli):
+    if res.core.compress and body.len >= compressMinSize and
+        compressibleType(contentType) and not hasContentEncoding(headers):
+      let enc = chooseEncoding(Request(core: res.core, fd: res.fd,
+                                       gen: res.gen, stream: res.stream))
+      var packed = ""
+      when defined(httpBrotli):
+        if enc == "br": packed = brotli(body)
+      when defined(httpGzip):
+        if enc == "gzip": packed = gzip(body)
+      if packed.len > 0 and packed.len < body.len:
         var hh = newSeqOfCap[(string, string)](headers.len + 2)
         for h in headers: hh.add h
-        hh.add ("content-encoding", "gzip")
+        hh.add ("content-encoding", enc)
         hh.add ("vary", "accept-encoding")
-        sendRaw(res, code, gz, contentType, hh)
+        sendRaw(res, code, packed, contentType, hh)
         return
   sendRaw(res, code, body, contentType, headers)
 

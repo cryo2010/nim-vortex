@@ -15,6 +15,8 @@
 #                    backends (default 10 -> 2 each; min 1 each)
 #   INTEROP_MTLS     1 = require + present client certs and check the subject
 #                    via /whoami (default 0)
+#   INTEROP_ENCODING content-encoding the clients request and assert: gzip
+#                    (default) or br (brotli). `nimble brotli` sets br.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -27,6 +29,7 @@ certs="$here/certs"
 runtime=${INTEROP_RUNTIME:-5}
 total=${INTEROP_CLIENTS:-10}
 mtls=${INTEROP_MTLS:-0}
+enc=${INTEROP_ENCODING:-gzip}
 
 backends="node python go rust java"
 per=$(( total / 5 ))
@@ -91,8 +94,8 @@ until docker logs "$srvc" 2>&1 | grep -q "listening"; do
 done
 echo "vortex server up (mtls=$mtls)"
 
-# --- independent gzip + HTTP/2 assertion via curl --------------------------
-echo "=== verifying HTTP/2 + gzip with curl ==="
+# --- independent encoding + HTTP/2 assertion via curl -----------------------
+echo "=== verifying HTTP/2 + $enc with curl ==="
 curlcert=""
 [ "$mtls" = "1" ] && curlcert="--cert /certs/client.pem --key /certs/client.key"
 # -sS (not -s) so curl prints its error; capture stderr and the exit code
@@ -102,23 +105,23 @@ hdrs=$(docker run --rm --network "$net" -v "$certs":/certs:ro \
   curlimages/curl:latest -sS -D - -o /dev/null --http2 \
   --retry 5 --retry-connrefused --retry-all-errors --connect-timeout 5 \
   --cacert /certs/ca.pem $curlcert \
-  -H 'x-api-key: interop' -H 'accept-encoding: gzip' \
+  -H 'x-api-key: interop' -H "accept-encoding: $enc" \
   https://server:8443/echo 2>&1)
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
   # curl couldn't complete the request. This is an auxiliary confirmation using
   # a different TLS stack than the five language clients (which assert the same
-  # HTTP/2 + gzip round-trip themselves), so don't gate the job on a curl-image
-  # quirk -- warn and let the real clients be the source of truth.
+  # HTTP/2 + encoding round-trip themselves), so don't gate the job on a
+  # curl-image quirk -- warn and let the real clients be the source of truth.
   echo "WARNING: curl check could not run (exit $rc); relying on the clients." >&2
   echo "$hdrs" >&2
 else
   echo "$hdrs" | grep -qiE "^HTTP/2 200" || {
     echo "RESULT: server did not answer HTTP/2 200" >&2; echo "$hdrs" >&2; exit 1; }
-  echo "$hdrs" | grep -qi "^content-encoding: gzip" || {
-    echo "RESULT: response was not gzip-compressed" >&2; echo "$hdrs" >&2; exit 1; }
-  echo "curl confirmed HTTP/2 + gzip"
+  echo "$hdrs" | grep -qi "^content-encoding: $enc" || {
+    echo "RESULT: response was not $enc-compressed" >&2; echo "$hdrs" >&2; exit 1; }
+  echo "curl confirmed HTTP/2 + $enc"
 fi
 
 # --- run each backend sequentially -----------------------------------------
@@ -130,6 +133,7 @@ for b in $backends; do
       -e INTEROP_RUNTIME="$runtime" \
       -e INTEROP_CLIENTS="$per" \
       -e INTEROP_MTLS="$mtls" \
+      -e INTEROP_ENCODING="$enc" \
       "vortex-interop-$b-img"; then
     :
   else
@@ -140,8 +144,8 @@ done
 
 echo
 if [ "$fails" -gt 0 ]; then
-  echo "RESULT: interop FAILED ($fails/5 backends)." >&2
+  echo "RESULT: interop FAILED ($fails/5 backends, enc=$enc)." >&2
   docker logs "$srvc" | tail -20 >&2
   exit 1
 fi
-echo "RESULT: interop passed (5/5 backends, mtls=$mtls, ${runtime}s each, $per client(s) each)."
+echo "RESULT: interop passed (5/5 backends, enc=$enc, mtls=$mtls, ${runtime}s each, $per client(s) each)."

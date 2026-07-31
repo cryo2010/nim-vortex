@@ -27,7 +27,7 @@ nimble testchronos     # chronos async adapter (needs chronos)
 
 # Docker conformance / load (each builds images and exits non-zero on failure):
 nimble h1spec h2spec h3spec h3websocket autobahn redbot \
-       zap testssl h2load h3load interop fuzz
+       zap testssl h2load h3load interop brotli fuzz
 
 nimble bench perf perf2   # benchmarks (not pass/fail)
 ```
@@ -185,6 +185,7 @@ finding or failure. All need Docker; `interop` also needs host `openssl`.
 | `nimble h2load` | **yes** (`h2load`) | [h2load](https://nghttp2.org/) | h1 + h2c load/stress smoke; fails on any failed/errored/non-2xx |
 | `nimble h3load` | **yes** (`h3load`) | h2load (HTTP/3) | QUIC throughput/stress with a real QUIC client; fails on any failed/errored/non-2xx |
 | `nimble interop` | **yes** (`interop`, matrix `mtls=0` and `mtls=1`) | Node / Python / Go / Rust / Java clients | Cross-client HTTP/2 + TLS + gzip over every method; asserts h2 negotiation and gzip round-trip; mTLS mode checks the client-cert subject |
+| `nimble brotli` | **yes** (`brotli`) | Node / Python / Go / Rust / Java clients | Same harness with `INTEROP_ENCODING=br`: every client requests and asserts `Content-Encoding: br` and decodes it with its ecosystem's brotli library |
 
 Details for each live in the matching `conformance/<name>/README.md`.
 

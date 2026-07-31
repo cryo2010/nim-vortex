@@ -9,7 +9,11 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-reqwest = { version = "0.12", default-features = true, features = ["gzip", "http2", "native-tls", "native-tls-alpn"] }
+# No gzip/brotli reqwest features: we set Accept-Encoding and decode ourselves
+# (flate2 + brotli) so the client can request and assert a specific encoding.
+reqwest = { version = "0.12", default-features = true, features = ["http2", "native-tls", "native-tls-alpn"] }
+flate2 = "1"
+brotli = "7"
 
 [profile.release]
 opt-level = 2

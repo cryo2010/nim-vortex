@@ -1,13 +1,16 @@
 // Rust interop client for the vortex cross-client test. Uses reqwest (tokio),
 // which negotiates HTTP/2 over TLS via ALPN (asserted through resp.version()),
-// trusting the shared CA and exercising every method against /echo. The "gzip"
-// feature transparently requests and decompresses gzip, so a correct
-// round-trip proves the compression path.
+// trusting the shared CA and exercising every method against /echo. It sets
+// Accept-Encoding itself and decodes the response (gzip via flate2, brotli via
+// the brotli crate), checking Content-Encoding, so it can test a specific
+// encoding rather than letting reqwest auto-negotiate.
 //
-// Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1).
+// Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1),
+//      INTEROP_ENCODING (gzip|br).
 // Certs: /certs/ca.pem, and for mTLS /certs/client.p12 (password "changeit").
 
 use std::env;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,11 +25,28 @@ fn fail(reason: String) -> ! {
     std::process::exit(1);
 }
 
+fn decode(encoding: &str, data: &[u8]) -> Result<String, String> {
+    match encoding {
+        "gzip" => {
+            let mut d = flate2::read::GzDecoder::new(data);
+            let mut s = String::new();
+            d.read_to_string(&mut s).map_err(|e| e.to_string())?;
+            Ok(s)
+        }
+        "br" => {
+            let mut d = brotli::Decompressor::new(data, 4096);
+            let mut s = String::new();
+            d.read_to_string(&mut s).map_err(|e| e.to_string())?;
+            Ok(s)
+        }
+        _ => String::from_utf8(data.to_vec()).map_err(|e| e.to_string()),
+    }
+}
+
 fn build_client(mtls: bool) -> Result<Client, Box<dyn std::error::Error>> {
     let ca = std::fs::read("/certs/ca.pem")?;
     let mut builder = Client::builder()
         .add_root_certificate(Certificate::from_pem(&ca)?)
-        .gzip(true)
         .timeout(Duration::from_secs(30));
     if mtls {
         // reqwest's native-tls backend takes the client identity as PKCS#12 DER
@@ -37,13 +57,14 @@ fn build_client(mtls: bool) -> Result<Client, Box<dyn std::error::Error>> {
     Ok(builder.build()?)
 }
 
-async fn one(client: &Client, base: &str, method: &str, mtls: bool)
+async fn one(client: &Client, base: &str, method: &str, enc: &str, mtls: bool)
     -> Result<(), String>
 {
     let m = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let mut req = client
         .request(m, format!("{}/echo", base))
-        .header("x-api-key", "interop");
+        .header("x-api-key", "interop")
+        .header("accept-encoding", enc);
     if matches!(method, "POST" | "PUT" | "PATCH") {
         req = req.header("content-type", "text/plain")
             .body(format!("hello from {}", NAME));
@@ -55,13 +76,19 @@ async fn one(client: &Client, base: &str, method: &str, mtls: bool)
     if resp.version() != Version::HTTP_2 {
         return Err(format!("{} not HTTP/2: {:?}", method, resp.version()));
     }
-    if method == "HEAD" {
-        match resp.headers().get("x-echo-method") {
-            Some(v) if v == "HEAD" => return Ok(()),
-            _ => return Err("HEAD missing x-echo-method".into()),
-        }
+    let ce = resp.headers().get("content-encoding")
+        .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    if ce != enc {
+        return Err(format!("{} not {}-encoded: {:?}", method, enc, ce));
     }
-    let body = resp.text().await.map_err(|e| e.to_string())?;
+    if method == "HEAD" {
+        return match resp.headers().get("x-echo-method") {
+            Some(v) if v == "HEAD" => Ok(()),
+            _ => Err("HEAD missing x-echo-method".into()),
+        };
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let body = decode(enc, &bytes)?;
     if !body.contains(&format!("method={}", method)) {
         return Err(format!("{} body did not echo method", method));
     }
@@ -86,6 +113,7 @@ async fn main() {
     let clients: u64 = env::var("INTEROP_CLIENTS").ok()
         .and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
     let mtls = env::var("INTEROP_MTLS").ok().as_deref() == Some("1");
+    let enc = env::var("INTEROP_ENCODING").unwrap_or_else(|_| "gzip".into());
 
     let client = build_client(mtls).unwrap_or_else(|e| fail(e.to_string()));
     let deadline = Instant::now() + Duration::from_secs(runtime);
@@ -95,13 +123,14 @@ async fn main() {
     for _ in 0..clients {
         let client = client.clone();
         let base = base.clone();
+        let enc = enc.clone();
         let count = count.clone();
         handles.push(tokio::spawn(async move {
             while Instant::now() < deadline {
                 for m in METHODS {
                     // On mTLS runs, exercise /whoami once per method cycle.
                     let check_mtls = mtls && m == "GET";
-                    one(&client, &base, m, check_mtls).await?;
+                    one(&client, &base, m, &enc, check_mtls).await?;
                     count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -116,8 +145,8 @@ async fn main() {
         }
     }
     println!(
-        "INTEROP OK {}: requests={} (clients={}, runtime={}s, mtls={})",
+        "INTEROP OK {}: requests={} (clients={}, runtime={}s, mtls={}, enc={})",
         NAME, count.load(Ordering::Relaxed), clients, runtime,
-        if mtls { 1 } else { 0 }
+        if mtls { 1 } else { 0 }, enc
     );
 }
