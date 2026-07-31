@@ -76,6 +76,13 @@ task teststreamcomp, "Test streaming response compression (needs zlib + brotli)"
        "--passL:-lz --passL:\"-lbrotlienc -lbrotlicommon\" -p:src " &
        "-o:tests/test_streaming_compression tests/test_streaming_compression.nim"
 
+task testreqdecomp, "Test request-body decompression (needs zlib + brotli)":
+  # Inbound gzip/br request bodies decoded into req.body (settings.
+  # decompressRequest), bounded by maxBodySize: over-cap -> 413, corrupt -> 400.
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli " &
+       "--passL:-lz --passL:\"-lbrotlienc -lbrotlidec -lbrotlicommon\" -p:src " &
+       "-o:tests/test_request_decompression tests/test_request_decompression.nim"
+
 task testrace, "ThreadSanitizer regression for the handler thread race":
   # Builds the start()/shutdown stress under TSan; TSan aborts the process on
   # any data race, failing the task. -d:plainHttp keeps OpenSSL out of the

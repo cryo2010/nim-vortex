@@ -648,6 +648,13 @@ are compressed incrementally (the compressed body is chunked, no
 `Content-Length`). Off by default, so the standard and `-d:plainHttp` builds link
 no zlib/brotli.
 
+The **inbound** direction is opt-in with `settings.decompressRequest`: a request
+whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
+`req.body`. It is bounded by `maxBodySize` so a decompression bomb can't exhaust
+memory -- a body that would exceed the cap is rejected with `413`, a corrupt one
+with `400` -- and the handler never runs for either. (Buffered bodies;
+inbound-streaming routes still see the raw encoded chunks.)
+
 ## Verification
 
 See [TESTING.md](TESTING.md) for a full registry of every test (CI and local)

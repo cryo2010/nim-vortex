@@ -103,6 +103,8 @@ type
     wpos*: int                ## bytes of wbuf already written to the socket
     parser*: RequestParser
     chunkBody*: string        ## decoded chunked request body (reused)
+    bodyDecoded*: string      ## decompressed request body (Content-Encoding); used
+    bodyDecodedSet*: bool     ## when set, req.body returns it instead of rbuf
     ssl*: pointer             ## SSL* for TLS connections, nil for plaintext
     handshaking*: bool        ## TLS handshake still in progress
     awaitingProxy*: bool      ## reading a PROXY-protocol header before TLS/HTTP
@@ -174,7 +176,9 @@ type
     wsIdle*: seq[RootRef]     ## h2/h3 WebSocket streams tracked for idle keepalive
                               ## (WsConn upcast; h1 uses the connection deadline wheel)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
-    compress*: bool           ## gzip eligible buffered responses (only with -d:httpGzip)
+    compress*: bool           ## gzip/brotli eligible responses (needs the flags)
+    decompressRequest*: bool  ## decode gzip/br request bodies into req.body
+    maxDecompressedBody*: int ## cap on a decoded request body (decompression bomb)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox
@@ -324,6 +328,8 @@ proc resetForNextRequest*(c: var Connection) =
   c.reqStreaming = false
   c.bodyFed = 0
   c.onBodyCb = nil
+  c.bodyDecoded.setLen(0)
+  c.bodyDecodedSet = false
   c.parser.reset(0)
 
 proc clear*(c: var Connection, initialBufSize: int) =
@@ -339,6 +345,8 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.rlen = 0
   c.wpos = 0
   c.chunkBody.setLen(0)
+  c.bodyDecoded.setLen(0)
+  c.bodyDecodedSet = false
   c.ssl = nil                # owner (closeConn) frees before recycling
   c.handshaking = false
   c.awaitingProxy = false
