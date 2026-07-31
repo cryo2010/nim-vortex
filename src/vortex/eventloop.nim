@@ -95,6 +95,11 @@ proc callHandler(loop: Loop, req: Request, res: Response) {.inline.} =
   ## how the compiler calls a closure -- prc(args..., env) -- so it works for
   ## both a capturing closure (router.toHandler) and a bare top-level proc
   ## (nil env, ignored), without touching any refcount. See RawClosure.
+  when defined(httpGzip) or defined(httpBrotli):
+    # Transparently decode a gzip/br request body (opt-in) before dispatch; a
+    # bomb/corrupt body is rejected (413/400) without running the handler. No-op
+    # for streaming routes (their body isn't buffered here).
+    if not decodeRequestBody(req, res): return
   cast[proc (req: Request, res: Response, env: pointer) {.nimcall, gcsafe.}](
     loop.handlerRaw.prc)(req, res, loop.handlerRaw.env)
 
@@ -205,6 +210,8 @@ proc newLoop*(settings: Settings, handler: RequestHandler,
   result.core.wsPongTimeout = settings.wsPongTimeout
   result.core.wsCompression = settings.wsCompression
   result.core.compress = settings.compress
+  result.core.decompressRequest = settings.decompressRequest
+  result.core.maxDecompressedBody = settings.maxBodySize
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox

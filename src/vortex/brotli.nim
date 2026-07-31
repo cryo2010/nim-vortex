@@ -112,3 +112,55 @@ proc compress*(s: BrotliStream, data: openArray[char], last: bool): string =
       result.add chunk[0 ..< produced]
     if brotliEncoderHasMoreOutput(s.state) != brTrue and availIn == 0:
       break
+
+# --- bounded brotli decode (inbound request-body decompression) --------------
+# Decompress a brotli request body, capped at `maxOut` bytes so a decompression
+# bomb can't exhaust memory. Returns (false, "") on a corrupt stream or an
+# over-cap body. Links libbrotlidec.
+
+{.passL: "-lbrotlidec".}
+
+const
+  # BROTLI_DECODER_RESULT_*: 0 = ERROR (the `else` branch), 1/2/3 below.
+  brDecoderSuccess = cint(1)       # BROTLI_DECODER_RESULT_SUCCESS
+  brDecoderNeedInput = cint(2)     # BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT
+  brDecoderNeedOutput = cint(3)    # BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT
+
+proc brotliDecoderCreateInstance(alloc, free, opaque: pointer): pointer
+  {.importc: "BrotliDecoderCreateInstance", cdecl.}
+proc brotliDecoderDestroyInstance(s: pointer)
+  {.importc: "BrotliDecoderDestroyInstance", cdecl.}
+proc brotliDecoderDecompressStream(s: pointer, availIn: ptr csize_t,
+                                   nextIn: ptr ptr uint8, availOut: ptr csize_t,
+                                   nextOut: ptr ptr uint8,
+                                   totalOut: ptr csize_t): cint
+  {.importc: "BrotliDecoderDecompressStream", cdecl.}
+
+proc brotliDecode*(data: openArray[char], maxOut: int):
+    tuple[ok: bool, tooLarge: bool, data: string] =
+  ## `tooLarge` distinguishes an over-cap body (-> 413) from a corrupt one.
+  if maxOut <= 0: return (false, false, "")
+  let s = brotliDecoderCreateInstance(nil, nil, nil)
+  if s == nil: return (false, false, "")
+  defer: brotliDecoderDestroyInstance(s)
+  var availIn = csize_t(data.len)
+  var nextIn =
+    if data.len > 0: cast[ptr uint8](unsafeAddr data[0]) else: nil
+  var res = newString(min(maxOut, max(1024, data.len * 4)))
+  var total = 0
+  while true:
+    if total == res.len:
+      if res.len >= maxOut: return (false, true, "")   # over the cap (bomb)
+      res.setLen(min(maxOut, res.len * 2))
+    var availOut = csize_t(res.len - total)
+    var nextOut = cast[ptr uint8](addr res[total])
+    let rc = brotliDecoderDecompressStream(s, addr availIn, addr nextIn,
+                                           addr availOut, addr nextOut, nil)
+    total = res.len - int(availOut)
+    case rc
+    of brDecoderSuccess: break
+    of brDecoderNeedOutput: continue                   # grow at the loop top
+    of brDecoderNeedInput: return (false, false, "")   # truncated
+    else: return (false, false, "")                    # brDecoderError
+  res.setLen(total)
+  (true, false, res)
