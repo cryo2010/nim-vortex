@@ -28,6 +28,7 @@ type
 const
   zOk = cint(0)
   zStreamEnd = cint(1)
+  zNoFlush = cint(0)
   zFinish = cint(4)
   zDeflated = cint(8)
   zDefaultStrategy = cint(0)
@@ -41,6 +42,10 @@ proc deflateInit2(strm: ptr ZStream, level, meth, windowBits, memLevel,
                   streamSize: cint): cint {.importc: "deflateInit2_", cdecl.}
 proc deflate(strm: ptr ZStream, flush: cint): cint {.importc, cdecl.}
 proc deflateEnd(strm: ptr ZStream): cint {.importc, cdecl.}
+proc inflateInit2(strm: ptr ZStream, windowBits: cint, version: cstring,
+                  streamSize: cint): cint {.importc: "inflateInit2_", cdecl.}
+proc inflate(strm: ptr ZStream, flush: cint): cint {.importc, cdecl.}
+proc inflateEnd(strm: ptr ZStream): cint {.importc, cdecl.}
 
 proc gzip*(data: openArray[char]): string =
   ## gzip-compress `data` in one shot; "" on failure (caller sends uncompressed).
@@ -122,3 +127,38 @@ proc compress*(s: GzipStream, data: openArray[char], last: bool): string =
       if s.strm.availOut != 0: break     # all input consumed and flushed
   outbuf.setLen(total)
   outbuf
+
+# --- bounded gunzip (inbound request-body decompression) ---------------------
+# Decompress a gzip (or zlib) request body, capped at `maxOut` bytes so a
+# decompression bomb (a tiny body inflating to gigabytes) can't exhaust memory:
+# it stops and fails the moment the output would exceed the cap. Returns
+# (false, "") on a corrupt stream or an over-cap body; the caller rejects it.
+
+const inflateAutoWindowBits = cint(15 + 32)   # auto-detect gzip/zlib headers
+
+proc gunzip*(data: openArray[char], maxOut: int):
+    tuple[ok: bool, tooLarge: bool, data: string] =
+  ## `tooLarge` distinguishes an over-cap body (-> 413) from a corrupt one.
+  if maxOut <= 0: return (false, false, "")
+  var strm: ZStream
+  if inflateInit2(addr strm, inflateAutoWindowBits, zlibVersion(),
+                  cint(sizeof(ZStream))) != zOk:
+    return (false, false, "")
+  defer: discard inflateEnd(addr strm)
+  if data.len > 0:
+    strm.nextIn = cast[ptr uint8](unsafeAddr data[0])
+  strm.availIn = cuint(data.len)
+  var res = newString(min(maxOut, max(1024, data.len * 4)))
+  var total = 0
+  while true:
+    if total == res.len:
+      if res.len >= maxOut: return (false, true, "")   # exceeds the cap (bomb)
+      res.setLen(min(maxOut, res.len * 2))
+    strm.nextOut = cast[ptr uint8](addr res[total])
+    strm.availOut = cuint(res.len - total)
+    let rc = inflate(addr strm, zNoFlush)
+    total = res.len - int(strm.availOut)
+    if rc == zStreamEnd: break
+    if rc != zOk: return (false, false, "")            # corrupt/truncated
+  res.setLen(total)
+  (true, false, res)

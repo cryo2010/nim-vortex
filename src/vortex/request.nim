@@ -198,6 +198,8 @@ proc body*(req: Request): string =
     if req.stream != 0:
       let st = h2Stream(c, req.stream)
       if st != nil: result = st.body
+    elif c.bodyDecodedSet:
+      result = c.bodyDecoded          # decompressed request body (see decodeRequestBody)
     elif c.parser.chunked:
       result = c.chunkBody
     elif c.parser.bodyLen > 0:
@@ -635,6 +637,52 @@ proc send*(res: Response, code: HttpCode) =
 proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
+
+when defined(httpGzip) or defined(httpBrotli):
+  proc decodeRequestBody*(req: Request, res: Response): bool =
+    ## Transparently decode a gzip/br request body into `req.body` when
+    ## settings.decompressRequest is set. Bounded by maxBodySize so a
+    ## decompression bomb can't exhaust memory. Returns false (having sent 413
+    ## for an over-cap body or 400 for a corrupt one) to skip the handler; true
+    ## otherwise (including the no-op cases: feature off, no/other encoding,
+    ## empty body). Called once at dispatch (loop thread) before the handler.
+    if not req.core.decompressRequest: return true
+    let enc = req.header("content-encoding").strip.toLowerAscii
+    var isGzip, isBr = false
+    when defined(httpGzip):
+      if enc == "gzip": isGzip = true
+    when defined(httpBrotli):
+      if enc == "br": isBr = true
+    if not (isGzip or isBr): return true
+    let raw = req.body
+    if raw.len == 0: return true
+    let cap = if req.core.maxDecompressedBody > 0: req.core.maxDecompressedBody
+              else: 512 * 1024 * 1024      # hard ceiling when maxBodySize=0
+    var r: tuple[ok: bool, tooLarge: bool, data: string]
+    when defined(httpGzip):
+      if isGzip: r = gunzip(raw, cap)
+    when defined(httpBrotli):
+      if isBr: r = brotliDecode(raw, cap)
+    if not r.ok:
+      if r.tooLarge:
+        res.send(HttpCode(413), "413 Payload Too Large", "text/plain")
+      else:
+        res.send(HttpCode(400), "400 Bad Request", "text/plain")
+      return false
+    # Store the decoded body so req.body returns it (h2/h3 overwrite st.body;
+    # h1 uses a dedicated field since its body is a slice of the read buffer).
+    if req.fd < 0:
+      when not defined(plainHttp):
+        withH3(req, st): st.body = r.data
+    else:
+      withConn(req, c):
+        if req.stream != 0:
+          let st = h2Stream(c, req.stream)
+          if st != nil: st.body = r.data
+        else:
+          c.bodyDecoded = r.data
+          c.bodyDecodedSet = true
+    true
 
 proc redirect*(res: Response, location: string, permanent = false,
                extraHeaders: openArray[(string, string)] = []) =

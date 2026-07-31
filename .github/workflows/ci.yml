@@ -117,6 +117,21 @@ jobs:
         # and brotli over HTTP/1.1 (chunked) and h2c; byte-exact round-trip.
         run: nimble teststreamcomp -y
 
+  testreqdecomp:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc openssl zlib brotli curl
+      - uses: actions/checkout@v7
+      - name: Test request-body decompression (gzip + brotli)
+        # Inbound gzip/br request bodies decoded into req.body, bounded by
+        # maxBodySize: decode round-trips over h1 + h2c, a bomb -> 413, corrupt
+        # -> 400.
+        run: nimble testreqdecomp -y
+
   testzstd:
     runs-on: ubuntu-latest
     container: archlinux:latest
