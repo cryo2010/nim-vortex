@@ -117,6 +117,26 @@ initSettings(certFile = "cert.pem", keyFile = "key.pem",
              ocspFile = "ocsp.der")        # or ocspResponse = derBytes
 ```
 
+**Client address behind a proxy**: `req.remoteAddress` is the direct peer. Behind
+an L7 proxy, recover the origin client from `req.forwardedFor` (the parsed
+`X-Forwarded-For` chain) under a trust policy you control. Behind an **L4 /
+TLS-passthrough** load balancer (AWS NLB, HAProxy in TCP mode) where
+`X-Forwarded-For` isn't available, enable the **PROXY protocol**: the balancer
+prepends the real client address, and vortex uses it for `req.remoteAddress`
+(v1 and v2, TCP over IPv4/IPv6). Only honored from a trusted peer:
+
+```nim
+initSettings(certFile = "cert.pem", keyFile = "key.pem",
+             proxyProtocol = ppRequire,               # or ppOptional
+             trustedProxies = @["10.0.0.0/8"])        # IPs/CIDRs; empty = any peer
+```
+
+`ppRequire` drops a connection without a valid header from a trusted peer;
+`ppOptional` uses the header when present and otherwise treats the peer as a
+direct client. An empty `trustedProxies` trusts any direct peer, so use it only
+when the listener is not publicly reachable. A header from an untrusted peer is
+never believed.
+
 Router:
 
 ```nim

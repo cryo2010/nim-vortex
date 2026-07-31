@@ -133,6 +133,7 @@ client).
 | `test_graceful_shutdown.nim` | `requestShutdown()` drains in-flight requests, frees the port |
 | `test_multi_server.nim` | Multiple `Server` instances in one process are independent |
 | `test_remote_address.nim` | `req.remoteAddress` (peer IP) and `req.forwardedFor` (SEC1) |
+| `test_proxy_protocol.nim` | PROXY protocol v1/v2 parsing + trust gating; overrides `req.remoteAddress` (SEC1) |
 
 ### Security
 

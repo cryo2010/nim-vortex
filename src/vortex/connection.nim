@@ -105,6 +105,7 @@ type
     chunkBody*: string        ## decoded chunked request body (reused)
     ssl*: pointer             ## SSL* for TLS connections, nil for plaintext
     handshaking*: bool        ## TLS handshake still in progress
+    awaitingProxy*: bool      ## reading a PROXY-protocol header before TLS/HTTP
     alpn*: string             ## negotiated protocol ("" until known)
     h2*: RootRef              ## http2.codec.H2Conn; nil = HTTP/1 (loop-only)
     ws*: RootRef              ## websocket.codec.WsConn; nil = not upgraded
@@ -334,6 +335,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.chunkBody.setLen(0)
   c.ssl = nil                # owner (closeConn) frees before recycling
   c.handshaking = false
+  c.awaitingProxy = false
   c.alpn = ""
   c.h2 = nil
   c.ws = nil

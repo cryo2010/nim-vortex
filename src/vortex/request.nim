@@ -204,8 +204,11 @@ proc remoteAddress*(req: Request): string =
   ## The peer IP of the connection, captured at accept (access logging, rate
   ## limiting, audit). This is the *direct* peer: behind a reverse proxy it is
   ## the proxy's IP, so recover the origin client from a trusted X-Forwarded-For
-  ## policy (see forwardedFor), never from an untrusted header alone. Empty for a
-  ## stale handle (and, over HTTP/3, if OpenSSL can't report the QUIC peer).
+  ## policy (see forwardedFor), never from an untrusted header alone. When the
+  ## listener has `settings.proxyProtocol` enabled and the connection came from a
+  ## trusted proxy, this is already the real client IP from the PROXY header.
+  ## Empty for a stale handle (and, over HTTP/3, if OpenSSL can't report the QUIC
+  ## peer).
   if req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)

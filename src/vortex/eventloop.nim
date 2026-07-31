@@ -7,6 +7,7 @@ import std/[selectors, net, nativesockets, posix, httpcore, times, monotimes,
 import ./settings
 import ./connection
 import ./request
+import ./proxyprotocol
 import ./http1/parser as h1parser
 import ./http1/codec as h1codec
 import ./http2/codec as h2codec
@@ -800,6 +801,17 @@ when not defined(plainHttp):
     of tlsClosed, tlsError:
       loop.closeConn(c)
 
+proc startTls(loop: Loop, c: ptr Connection): bool =
+  ## Begin TLS for a TLS listener (leave plaintext otherwise). Returns false if
+  ## the session could not be created. Called at accept, or after a PROXY header
+  ## is consumed when proxyProtocol is enabled.
+  when not defined(plainHttp):
+    if loop.tls != nil:
+      c.ssl = newTlsSession(cast[ptr TlsConfig](loop.tls), cint(c.fd))
+      if c.ssl == nil: return false
+      c.handshaking = true
+  true
+
 proc handleAccept(loop: Loop) =
   while true:
     var sa: Sockaddr_storage
@@ -848,19 +860,81 @@ proc handleAccept(loop: Loop) =
     try: c.remoteAddr = getAddrString(cast[ptr SockAddr](addr sa))
     except CatchableError: discard
     inc loop.connCount
-    when not defined(plainHttp):
-      if loop.tls != nil:
-        c.ssl = newTlsSession(cast[ptr TlsConfig](loop.tls), cint(fd))
-        if c.ssl == nil:
-          discard posix.close(client)
-          inc c.gen
-          c.state = csFree
-          dec loop.connCount
-          continue
-        c.handshaking = true
+    if loop.settings.proxyProtocol != ppDisabled:
+      # Read (and strip) the PROXY header from the raw socket before starting
+      # TLS or HTTP; the transport is set up in handleProxyHeader once done.
+      c.awaitingProxy = true
+    elif not loop.startTls(c):
+      discard posix.close(client)
+      inc c.gen
+      c.state = csFree
+      dec loop.connCount
+      continue
     c.setDeadline(loop, dkHeader)   # handshake counts toward header timeout
     loop.selector.registerHandle(client, {Event.Read}, fkClient)
     c.registered = true
+
+proc beginAfterProxy(loop: Loop, c: ptr Connection) =
+  ## The PROXY phase is done (parsed, skipped, or absent): start the transport
+  ## and process whatever bytes are already buffered in the socket.
+  c.awaitingProxy = false
+  if not loop.startTls(c):
+    loop.closeConn(c)
+    return
+  when not defined(plainHttp):
+    if c.handshaking:
+      loop.driveHandshake(c)
+      return
+  loop.handleRead(c)
+
+proc handleProxyHeader(loop: Loop, c: ptr Connection) =
+  ## Peek the PROXY-protocol header (MSG_PEEK leaves the bytes in the kernel so
+  ## the untouched TLS ClientHello / HTTP request that follows is read normally),
+  ## and on a trusted peer consume exactly the header and override remoteAddr.
+  var buf: array[536, char]
+  let n = recv(SocketHandle(c.fd), addr buf[0], buf.len, cint(MSG_PEEK))
+  if n == 0:
+    loop.closeConn(c); return
+  if n < 0:
+    let err = cint(osLastError())
+    if err == EAGAIN or err == EWOULDBLOCK or err == EINTR: return
+    loop.closeConn(c); return
+
+  let directPeer = c.remoteAddr    # the accept peer, before any override
+  let trusted = isTrustedProxy(directPeer, loop.settings.trustedProxies)
+  let require = loop.settings.proxyProtocol == ppRequire
+  let res = parseProxyHeader(toOpenArray(buf, 0, n - 1))
+
+  case res.kind
+  of ppNeedMore:
+    if n >= buf.len: loop.closeConn(c)   # over-long header: give up
+    return
+  of ppError:
+    loop.closeConn(c); return
+  of ppNotPresent:
+    # No PROXY header. Mandatory under ppRequire; otherwise a direct client.
+    if require: loop.closeConn(c)
+    else: loop.beginAfterProxy(c)
+    return
+  of ppLocal, ppProxy:
+    if not trusted:
+      # A header from an untrusted source: never believe it. Require -> drop;
+      # optional -> ignore it and treat the peer as a direct client (do NOT
+      # consume, the bytes are the client's own data).
+      if require: loop.closeConn(c)
+      else: loop.beginAfterProxy(c)
+      return
+    # Trusted: consume exactly the header off the socket, then override.
+    var scratch: array[536, char]
+    var got = 0
+    while got < res.consumed:
+      let m = recv(SocketHandle(c.fd), addr scratch[0],
+                   min(res.consumed - got, scratch.len), cint(0))
+      if m <= 0: loop.closeConn(c); return
+      got += m
+    if res.kind == ppProxy and res.src.len > 0:
+      c.remoteAddr = res.src           # the real client IP for req.remoteAddress
+    loop.beginAfterProxy(c)
 
 when not defined(plainHttp):
   proc h3FreeSlot(loop: Loop, idx: int) =
@@ -1266,6 +1340,9 @@ proc run*(loop: Loop) =
         loop.handleDrain(c)      # read-discard until EOF/deadline, then close
         continue
       try:
+        if c.awaitingProxy:
+          loop.handleProxyHeader(c)   # read the PROXY header before TLS/HTTP
+          continue
         when not defined(plainHttp):
           if c.handshaking:
             loop.driveHandshake(c)
