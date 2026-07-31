@@ -101,6 +101,22 @@ jobs:
         # from the default nimble test.
         run: nimble testdeflate -y
 
+  teststreamcomp:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        # brotli provides libbrotlienc/dec + the brotli CLI; curl (with brotli)
+        # and the CLIs decode the streamed responses.
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc openssl zlib brotli curl
+      - uses: actions/checkout@v7
+      - name: Test streaming response compression (gzip + brotli)
+        # res.sendHead/write/finish (SSE, file streaming) compressed with gzip
+        # and brotli over HTTP/1.1 (chunked) and h2c; byte-exact round-trip.
+        run: nimble teststreamcomp -y
+
   testrace:
     runs-on: ubuntu-latest
     # Privileged to lower the host's mmap randomization for ThreadSanitizer's

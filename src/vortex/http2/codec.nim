@@ -28,6 +28,9 @@ type
     pendingPos*: int
     pendingIsLast*: bool
     streaming*: bool                 ## res.sendHead opened a streamed body
+    respComp*: RootRef               ## streaming compressor (Gzip/BrotliStream);
+                                     ## =destroy frees it on streams.del
+    respEnc*: string                 ## "gzip"/"br" for respComp
     respBackedUp*: bool              ## write() hit the window; onDrain pending
     onRespDrain*: RespDrainCb        ## streamed-response drain callback
     streamingReq*: bool              ## router.stream route: dispatch on headers

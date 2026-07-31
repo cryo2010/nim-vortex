@@ -21,6 +21,7 @@ NIM_MM=arc nimble test # same suite under the arc memory manager
 NIM_SANITIZE=1 nimble test   # same suite under AddressSanitizer + UBSan
 
 nimble testgzip        # gzip response compression (needs zlib)
+nimble teststreamcomp  # streaming (sendHead/write/SSE) gzip+brotli (needs zlib+brotli)
 nimble testdeflate     # WebSocket permessage-deflate (needs zlib)
 nimble testrace        # handler thread-race regression (ThreadSanitizer)
 nimble testchronos     # chronos async adapter (needs chronos)
@@ -160,6 +161,7 @@ Separate `nimble` tasks because they need a build flag or an extra dependency.
 | Task | CI | Verifies |
 |------|----|----------|
 | `nimble testgzip` | local | gzip response compression (`settings.compress`, `-d:httpGzip`, links zlib). Runs `test_compression.nim` (compressible body round-trips; identity without `Accept-Encoding`; small bodies and non-compressible types skipped). Gzip is *also* exercised in CI through the `interop` job. |
+| `nimble teststreamcomp` | **yes** (`teststreamcomp`) | Streaming response compression: `res.sendHead`/`write`/`finish` (thus SSE and file streaming) compressed with gzip + brotli, over HTTP/1.1 (chunked) and h2c; curl + the gzip/brotli CLIs verify framing and a byte-exact round-trip. |
 | `nimble testdeflate` | **yes** (`testdeflate`) | WebSocket permessage-deflate (RFC 7692, `-d:wsDeflate`, links zlib) over a live server, plus the h2 (RFC 8441) deflate case. |
 | `nimble testrace` | **yes** (`testrace`) | ThreadSanitizer regression for the handler / stream-route closure race: stresses `start()` + shutdown with a middleware-wrapped router handler across many loop threads; TSan aborts on any data race. |
 | `nimble testchronos` | **yes** (`testchronos`) | The chronos async adapter (`chronos_adapter.nim`); chronos is opt-in so it is kept out of the default suite. |

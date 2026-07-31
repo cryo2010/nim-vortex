@@ -34,6 +34,9 @@ type
     outPos: int
     concludeAfterFlush: bool
     streaming*: bool                 ## res.sendHead opened a streamed body
+    respComp*: RootRef               ## streaming compressor (Gzip/BrotliStream);
+                                     ## =destroy frees it on streams.del
+    respEnc*: string                 ## "gzip"/"br" for respComp
     respBackedUp: bool               ## flush hit QUIC backpressure; onDrain due
     onRespDrain*: RespDrainCb        ## streamed-response drain callback
     streamingReq*: bool              ## router.stream route: dispatch on headers
@@ -301,6 +304,19 @@ proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
   conn.h3StreamDrained(sid)
   if sid notin conn.streams: return 0
   st.outBuf.len - st.outPos
+
+proc h3RespComp*(conn: H3Conn, sid: uint64): RootRef =
+  ## The stream's streaming compressor (nil if none / stream gone).
+  if sid in conn.streams: conn.streams[sid].respComp else: nil
+
+proc h3RespEnc*(conn: H3Conn, sid: uint64): string =
+  if sid in conn.streams: conn.streams[sid].respEnc else: ""
+
+proc h3SetRespComp*(conn: H3Conn, sid: uint64, comp: RootRef, enc: string) =
+  ## Attach a streaming compressor to the stream (freed with the stream).
+  if sid in conn.streams:
+    conn.streams[sid].respComp = comp
+    conn.streams[sid].respEnc = enc
 
 proc h3StreamFinish*(conn: H3Conn, sid: uint64) =
   ## Terminate a streamed response: FIN the QUIC stream once the backlog drains.

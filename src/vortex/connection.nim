@@ -134,6 +134,10 @@ type
     respChunked*: bool        ## true = Transfer-Encoding: chunked framing
     respCLDelimited*: bool     ## streaming with a known Content-Length (keep-alive
                                ## survives finish; not close-delimited)
+    respComp*: RootRef        ## streaming compressor (Gzip/BrotliStream upcast);
+                               ## nil = identity. Its =destroy frees the codec
+                               ## state when the connection is reset/closed.
+    respEnc*: string          ## "gzip"/"br" for respComp (empty = none)
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
     onRespDrain*: RespDrainCb
     # Inbound streaming (req.onBody). A streaming route is dispatched at
@@ -313,6 +317,8 @@ proc resetForNextRequest*(c: var Connection) =
   c.respStreaming = false
   c.respChunked = false
   c.respCLDelimited = false
+  c.respComp = nil            # frees the streaming codec state (=destroy)
+  c.respEnc = ""
   c.respBackedUp = false
   c.onRespDrain = nil
   c.reqStreaming = false
@@ -356,6 +362,8 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.respStreaming = false
   c.respChunked = false
   c.respCLDelimited = false
+  c.respComp = nil
+  c.respEnc = ""
   c.respBackedUp = false
   c.onRespDrain = nil
   c.reqStreaming = false

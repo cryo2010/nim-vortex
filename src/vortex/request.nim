@@ -562,6 +562,34 @@ when defined(httpGzip) or defined(httpBrotli):
     elif gzQ > 0: "gzip"
     else: ""
 
+  # --- streaming compression (res.sendHead/write/finish, SSE, file streaming) --
+  proc negotiateStreamEnc(res: Response, contentType: string,
+                          headers: openArray[(string, string)]): string =
+    ## The encoding to stream a sendHead body with, or "" for identity. Same
+    ## eligibility as send() minus the size threshold (the length is unknown).
+    if not res.core.compress or not compressibleType(contentType) or
+        hasContentEncoding(headers):
+      return ""
+    chooseEncoding(Request(core: res.core, fd: res.fd, gen: res.gen,
+                           stream: res.stream))
+
+  proc makeStreamComp(enc: string): RootRef =
+    ## A streaming compressor for `enc` (upcast to RootRef), or nil.
+    when defined(httpBrotli):
+      if enc == "br": return newBrotliStream()
+    when defined(httpGzip):
+      if enc == "gzip": return newGzipStream()
+    nil
+
+  proc compChunk(comp: RootRef, enc: string, data: openArray[char],
+                 last: bool): string =
+    ## Feed a chunk to `comp` and return the bytes to emit (may be "").
+    when defined(httpBrotli):
+      if enc == "br": return BrotliStream(comp).compress(data, last)
+    when defined(httpGzip):
+      if enc == "gzip": return GzipStream(comp).compress(data, last)
+    ""
+
 proc send*(res: Response, code: HttpCode, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   ## Queue the response. Safe to call once per request, from the handler,
@@ -718,20 +746,38 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # merged once, not per chunk). The HEAD fallback below routes through
     # applyResponse, which does its own merge, so it keeps the original headers.
     var hdrs = withSecHeaders(res.core, headers)
-    if contentLength >= 0 and (res.fd < 0 or res.stream != 0):
-      hdrs.add ("content-length", $contentLength)   # h2/h3: informational header
+    # Negotiate streaming compression up front: it drops Content-Length (the
+    # compressed size is unknown -> chunked) and adds Content-Encoding + Vary.
+    var enc = ""
+    when defined(httpGzip) or defined(httpBrotli):
+      enc = negotiateStreamEnc(res, contentType, headers)
+      if enc.len > 0:
+        hdrs.add ("content-encoding", enc)
+        hdrs.add ("vary", "accept-encoding")
+    let effLen = if enc.len > 0: -1 else: contentLength
+    if effLen >= 0 and (res.fd < 0 or res.stream != 0):
+      hdrs.add ("content-length", $effLen)   # h2/h3: informational header
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
           h3SendHead(res.core, h3c, uint64(res.stream), int(code),
                      contentType, hdrs)
+          when defined(httpGzip) or defined(httpBrotli):
+            if enc.len > 0:
+              h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
       return
     let c = conn(res.core, res.fd, res.gen)
     if c == nil: return
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
                  res.core.serverHeader, contentType, hdrs, res.core.altSvc)
+      when defined(httpGzip) or defined(httpBrotli):
+        if enc.len > 0:
+          let st = h2Stream(c, res.stream)
+          if st != nil and not st.isHead:
+            st.respComp = makeStreamComp(enc)
+            st.respEnc = enc
       flushConn(res)
       return
     if c.responded: return
@@ -744,13 +790,17 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     let ka = c.parser.keepAlive
     # Known length -> Content-Length + length-delimited keep-alive. Unknown ->
     # chunked (HTTP/1.1) or close-delimited (HTTP/1.0).
-    let chunked = contentLength < 0 and c.parser.minor >= 1
+    let chunked = effLen < 0 and c.parser.minor >= 1
     c.respChunked = chunked
-    c.respCLDelimited = contentLength >= 0
+    c.respCLDelimited = effLen >= 0
+    when defined(httpGzip) or defined(httpBrotli):
+      if enc.len > 0:
+        c.respComp = makeStreamComp(enc)
+        c.respEnc = enc
     appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
                      contentType, hdrs, chunked, keepAlive = ka,
                      announceKeepAlive = ka and c.parser.minor == 0,
-                     altSvc = res.core.altSvc, contentLength = contentLength)
+                     altSvc = res.core.altSvc, contentLength = effLen)
     flushConn(res)
   except Exception:
     discard
@@ -768,16 +818,47 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
+          when defined(httpGzip) or defined(httpBrotli):
+            let comp = h3RespComp(h3c, uint64(res.stream))
+            if comp != nil:
+              let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)),
+                                data, false)
+              if z.len == 0: return true      # buffered; still writable
+              return h3StreamWrite(h3c, uint64(res.stream), z) < respHighWater
           return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
       return false
     var c = conn(res.core, res.fd, res.gen)
     if c == nil: return false
     if res.stream != 0:
+      when defined(httpGzip) or defined(httpBrotli):
+        let st = h2Stream(c, res.stream)
+        if st != nil and st.respComp != nil:
+          let z = compChunk(st.respComp, st.respEnc, data, false)
+          if z.len == 0: return true
+          let backlog = h2StreamWrite(c, res.stream, z)
+          flushConn(res)
+          return backlog < respHighWater
       let backlog = h2StreamWrite(c, res.stream, data)
       flushConn(res)
       return backlog < respHighWater
     if not c.respStreaming: return false
     if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
+    when defined(httpGzip) or defined(httpBrotli):
+      if c.respComp != nil:
+        let z = compChunk(c.respComp, c.respEnc, data, false)
+        if z.len > 0:
+          if c.respChunked: appendChunk(c.wbuf, z)
+          else:
+            let oldLen = c.wbuf.len
+            c.wbuf.setLen(oldLen + z.len)
+            copyMem(addr c.wbuf[oldLen], unsafeAddr z[0], z.len)
+        flushConn(res)
+        c = conn(res.core, res.fd, res.gen)
+        if c == nil: return false
+        if pendingOut(c) >= respHighWater:
+          c.respBackedUp = true
+          return false
+        return true
     if c.respChunked:
       appendChunk(c.wbuf, data)
     elif data.len > 0:
@@ -805,11 +886,24 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
+          when defined(httpGzip) or defined(httpBrotli):
+            let comp = h3RespComp(h3c, uint64(res.stream))
+            if comp != nil:
+              let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)), "", true)
+              if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
+              h3SetRespComp(h3c, uint64(res.stream), nil, "")
           h3StreamFinish(h3c, uint64(res.stream))
       return
     let c = conn(res.core, res.fd, res.gen)
     if c == nil: return
     if res.stream != 0:
+      when defined(httpGzip) or defined(httpBrotli):
+        let st = h2Stream(c, res.stream)
+        if st != nil and st.respComp != nil:
+          let z = compChunk(st.respComp, st.respEnc, "", true)
+          if z.len > 0: discard h2StreamWrite(c, res.stream, z)
+          st.respComp = nil
+          st.respEnc = ""
       h2StreamFinish(c, res.stream)
       flushConn(res)
       return
@@ -819,6 +913,17 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
     c.onRespDrain = nil
     let clDelimited = c.respCLDelimited
     c.respCLDelimited = false
+    when defined(httpGzip) or defined(httpBrotli):
+      if c.respComp != nil:
+        let z = compChunk(c.respComp, c.respEnc, "", true)   # trailer/finish
+        if z.len > 0 and c.parser.httpMethod != HttpHead:
+          if c.respChunked: appendChunk(c.wbuf, z)
+          else:
+            let oldLen = c.wbuf.len
+            c.wbuf.setLen(oldLen + z.len)
+            copyMem(addr c.wbuf[oldLen], unsafeAddr z[0], z.len)
+        c.respComp = nil
+        c.respEnc = ""
     if c.respChunked and c.parser.httpMethod != HttpHead:
       appendLastChunk(c.wbuf, trailers)
     # Close-delimited (HTTP/1.0, neither chunked nor Content-Length) must close;
