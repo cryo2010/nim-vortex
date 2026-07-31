@@ -15,6 +15,16 @@ type
     cvOptional,  ## request a client cert; if presented it must verify (mTLS)
     cvRequire    ## require a valid client cert or refuse the handshake (mTLS)
 
+  ProxyProtocol* = enum
+    ## HAProxy PROXY protocol on the listener, for recovering the real client
+    ## address behind an L4 / TLS-passthrough load balancer (feeds
+    ## req.remoteAddress). Only honored from a trusted peer (trustedProxies).
+    ppDisabled,  ## never read a PROXY header (default)
+    ppOptional,  ## from a trusted peer, consume a PROXY header if present;
+                 ## otherwise treat the bytes as normal traffic
+    ppRequire    ## require a valid PROXY header from a trusted peer; drop
+                 ## the connection otherwise
+
   SniCertEntry* = object
     ## A per-hostname certificate for SNI. `host` selects it; the cert/key come
     ## from one source (files, in-memory PEM, or PKCS#12), like the defaults.
@@ -33,6 +43,10 @@ type
     workerThreads*: int       ## worker pool size for `blocking:` (0 = numThreads * 2)
     listenBacklog*: int
     reusePort*: bool          ## SO_REUSEPORT per-thread listeners
+    proxyProtocol*: ProxyProtocol  ## accept a HAProxy PROXY header (see enum)
+    trustedProxies*: seq[string]   ## IPs/CIDRs allowed to send a PROXY header;
+                                   ## empty trusts any direct peer (safe only when
+                                   ## the listener is not publicly reachable)
 
     # Limits (bytes unless noted)
     maxHeaderSize*: int       ## request line + headers, 431 when exceeded
@@ -92,6 +106,8 @@ proc initSettings*(
     workerThreads = 0,
     listenBacklog = 1024,
     reusePort = true,
+    proxyProtocol = ppDisabled,
+    trustedProxies: seq[string] = @[],
     maxHeaderSize = 16 * 1024,
     maxHeaderCount = 100,
     maxBodySize = 8 * 1024 * 1024,
@@ -136,7 +152,8 @@ proc initSettings*(
   Settings(
     port: port, address: address, numThreads: numThreads,
     workerThreads: workerThreads, listenBacklog: listenBacklog,
-    reusePort: reusePort, maxHeaderSize: maxHeaderSize,
+    reusePort: reusePort, proxyProtocol: proxyProtocol,
+    trustedProxies: trustedProxies, maxHeaderSize: maxHeaderSize,
     maxHeaderCount: maxHeaderCount, maxBodySize: maxBodySize,
     initialBufferSize: initialBufferSize,
     maxWsMessageSize: maxWsMessageSize, wsCompression: wsCompression,
