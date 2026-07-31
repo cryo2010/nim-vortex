@@ -28,6 +28,33 @@ single port and a single handler API.
   Build with `-d:plainHttp` for a zero-dependency cleartext (h1 + h2c)
   server.
 
+**Platform:** POSIX only (Linux and macOS), by design. The core is built on
+readiness-based `kqueue`/`epoll` and per-thread `SO_REUSEPORT` listeners, which
+have no direct Windows equivalent; a `select()`-backed Windows port would
+defeat the performance goal. On Windows, run vortex under WSL2 or a Linux
+container (Docker).
+
+## Table of contents
+
+- [Quick start](#quick-start)
+- [Settings](#settings)
+  - [Transport Layer Security (TLS)](#transport-layer-security-tls)
+  - [Client address behind a proxy](#client-address-behind-a-proxy)
+- [Handlers](#handlers)
+  - [Handler rules](#handler-rules)
+  - [Async handlers](#async-handlers)
+- [Routing](#routing)
+- [Compression](#compression)
+- [WebSockets](#websockets)
+  - [Roadmap and Autobahn conformance](#roadmap-and-autobahn-conformance)
+- [Streaming responses](#streaming-responses)
+  - [Streaming request bodies](#streaming-request-bodies)
+- [Static files](#static-files)
+- [Server-Sent Events (SSE)](#server-sent-events-sse)
+- [Build flags](#build-flags)
+- [Security](#security)
+- [Thanks](#thanks)
+
 ## Quick start
 
 ```nim
@@ -46,6 +73,31 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 
 run(handler, initSettings(port = Port(8080)))
 ```
+
+See [Settings](#settings) for TLS and other configuration, [Routing](#routing)
+for the path router, and [Handlers](#handlers) for the handler rules and async
+support.
+
+Embedded / test usage: `var srv = start(handler, settings)` returns
+immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
+
+Shutdown is graceful: `requestShutdown()` (or a SIGINT/SIGTERM under `run`, or
+`srv.close()`) stops accepting and closes the listener so the port frees for a
+replacement, sends HTTP/2 and HTTP/3 `GOAWAY`, closes open WebSockets with a
+`1001` (going away), and lets in-flight requests and streams finish before
+closing. Idle keep-alive connections close promptly; anything still running is
+force-closed once `shutdownGrace` seconds elapse.
+
+## Settings
+
+Server configuration is a value built with `initSettings(...)` and passed to
+`run` or `start`. Beyond `port` and `address` (dual-stack by default, see
+above), it carries the TLS material, timeouts (`responseTimeout`,
+`shutdownGrace`), worker/thread counts, and the toggles described throughout
+this document (`compress`, `decompressRequest`, `proxyProtocol`, the WebSocket
+ping intervals, and so on).
+
+### Transport Layer Security (TLS)
 
 TLS + HTTP/2 + HTTP/3:
 
@@ -117,7 +169,9 @@ initSettings(certFile = "cert.pem", keyFile = "key.pem",
              ocspFile = "ocsp.der")        # or ocspResponse = derBytes
 ```
 
-**Client address behind a proxy**: `req.remoteAddress` is the direct peer. Behind
+### Client address behind a proxy
+
+`req.remoteAddress` is the direct peer. Behind
 an L7 proxy, recover the origin client from `req.forwardedFor` (the parsed
 `X-Forwarded-For` chain) under a trust policy you control. Behind an **L4 /
 TLS-passthrough** load balancer (AWS NLB, HAProxy in TCP mode) where
@@ -137,17 +191,35 @@ direct client. An empty `trustedProxies` trusts any direct peer, so use it only
 when the listener is not publicly reachable. A header from an untrusted peer is
 never believed.
 
-Router:
+## Handlers
 
-```nim
-proc getUser(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "user " & req.param("id"))
+A handler is a plain `proc (req: Request, res: Response) {.gcsafe.}` (see the
+[Quick start](#quick-start)). It runs inline on the event loop; the rules below
+cover what is and isn't safe inside one.
 
-var router = newRouter()
-router.get("/users/:id", getUser)
-router.get("/static/*", staticHandler("public"))
-run(router.toHandler, initSettings(port = Port(8080)))
-```
+### Handler rules
+
+- Handlers run **inline on the event loop**: never block in them (no sync
+  DB calls, no `sleep`). Use `req.blocking:` for anything that blocks.
+- Inside `blocking:` the request and response are available as `req`
+  and `res`; the body cannot capture surrounding locals (it runs on
+  another thread); read request data through `req`, which remains valid
+  until you send the response.
+- Handlers receive the read half (`req`) and the write half (`res`);
+  `res.send(...)` may be called after the handler returns (deferred
+  responses), and sending through a dead connection is a safe no-op.
+  (`std/httpclient` also exports a `Response` type; in modules using
+  both, `import std/httpclient except Response`.)
+- Route parameters are per-request state: `req.param("id")` /
+  `req.params` work anywhere the handle does, including inside
+  `blocking:` bodies. (Stored eagerly at match time: the router computes
+  them while matching, so there is nothing to defer.)
+- `req.path` is the raw request target (query string included, matching
+  httpbeast). `req.url` gives the parsed form (`req.url.path` excludes
+  the query) and `req.query` a decoded parameter Table; both are lazy
+  and cached per request, on any protocol.
+
+### Async handlers
 
 Async handlers (optional adapter; asyncdispatch drivers like asyncpg):
 
@@ -189,15 +261,44 @@ asyncdispatch ships in Nim's stdlib. For the same reason chronos stays
 out of the default `nimble test`; its suite runs via `nimble
 testchronos`.
 
-Embedded / test usage: `var srv = start(handler, settings)` returns
-immediately (`srv.port` has the resolved port); `srv.close()` shuts down.
+## Routing
 
-Shutdown is graceful: `requestShutdown()` (or a SIGINT/SIGTERM under `run`, or
-`srv.close()`) stops accepting and closes the listener so the port frees for a
-replacement, sends HTTP/2 and HTTP/3 `GOAWAY`, closes open WebSockets with a
-`1001` (going away), and lets in-flight requests and streams finish before
-closing. Idle keep-alive connections close promptly; anything still running is
-force-closed once `shutdownGrace` seconds elapse.
+`newRouter()` gives a path router: register a handler per method, with `:name`
+path parameters and a trailing `*` wildcard, then hand `router.toHandler` to
+`run`/`start`.
+
+```nim
+proc getUser(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "user " & req.param("id"))
+
+var router = newRouter()
+router.get("/users/:id", getUser)
+router.get("/static/*", staticHandler("public"))
+run(router.toHandler, initSettings(port = Port(8080)))
+```
+
+## Compression
+
+`-d:httpGzip` (`--passL:-lz`), `-d:httpBrotli`
+(`--passL:"-lbrotlienc -lbrotlicommon"`), and/or `-d:httpZstd` (`--passL:-lzstd`)
+enable **response compression**. Turn it on per server with `settings.compress`:
+an eligible response (the client accepts an encoding we can produce, a
+compressible content-type, and no existing `Content-Encoding`) is compressed with
+the best encoding `Accept-Encoding` offers, adding `Content-Encoding` +
+`Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out); on a
+tie the server prefers **br**, then **zstd**, then **gzip**. Build with several
+flags to offer several and let the client choose. This covers both buffered
+`res.send` (compressed when over ~1400 bytes) and **streamed** responses --
+`res.sendHead`/`write`/`finish`, SSE, and file streaming -- which are compressed
+incrementally (the compressed body is chunked, no `Content-Length`). Off by
+default, so the standard and `-d:plainHttp` builds link no zlib/brotli/zstd.
+
+The **inbound** direction is opt-in with `settings.decompressRequest`: a request
+whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
+`req.body`. It is bounded by `maxBodySize` so a decompression bomb can't exhaust
+memory -- a body that would exceed the cap is rejected with `413`, a corrupt one
+with `400` -- and the handler never runs for either. (Buffered bodies;
+inbound-streaming routes still see the raw encoded chunks.)
 
 ## WebSockets
 
@@ -367,28 +468,6 @@ Node's `ws` (the de facto reference implementation), it is noted.
   or `curl` speaks WebSockets over HTTP/3. Idle ping/timeout over h3 is not
   wired (QUIC keepalive covers liveness).
 
-## Handler rules
-
-- Handlers run **inline on the event loop**: never block in them (no sync
-  DB calls, no `sleep`). Use `req.blocking:` for anything that blocks.
-- Inside `blocking:` the request and response are available as `req`
-  and `res`; the body cannot capture surrounding locals (it runs on
-  another thread); read request data through `req`, which remains valid
-  until you send the response.
-- Handlers receive the read half (`req`) and the write half (`res`);
-  `res.send(...)` may be called after the handler returns (deferred
-  responses), and sending through a dead connection is a safe no-op.
-  (`std/httpclient` also exports a `Response` type; in modules using
-  both, `import std/httpclient except Response`.)
-- Route parameters are per-request state: `req.param("id")` /
-  `req.params` work anywhere the handle does, including inside
-  `blocking:` bodies. (Stored eagerly at match time: the router computes
-  them while matching, so there is nothing to defer.)
-- `req.path` is the raw request target (query string included, matching
-  httpbeast). `req.url` gives the parsed form (`req.url.path` excludes
-  the query) and `req.query` a decoded parameter Table; both are lazy
-  and cached per request, on any protocol.
-
 ## Streaming responses
 
 For bodies you do not want to buffer whole (large downloads, server-sent
@@ -537,37 +616,6 @@ consumer therefore throttles the sender end to end. In a plain (synchronous)
 `req.onBody(cb, manualAck = true)` + `req.ackBody(n)` expose the same control
 directly.
 
-### Server-Sent Events
-
-`res.sse` opens a `text/event-stream` response over the streaming primitives
-above, so it inherits chunked/streamed framing and backpressure. It needs no
-router and no `streamRoute` predicate (SSE is outbound-only), so it works from
-any handler:
-
-```nim
-proc events(req: Request, res: Response) {.gcsafe.} =
-  let s = res.sse(retry = 3000)               # sends the SSE headers
-  discard s.send("hi", event = "greet", id = req.lastEventId())
-  discard s.comment("keepalive")              # heartbeat; clients ignore it
-  s.close()
-```
-
-`send` emits one event (multi-line `data` splits into multiple `data:` fields;
-`event`/`id`/`retry` are optional), returns `false` under write backpressure
-(reuse `s.bufferedAmount` / `s.onDrain`, or `await s.drained()` with an
-adapter), and `s.alive` reports client disconnect. `req.lastEventId()` gives
-the `Last-Event-ID` a client echoes on reconnect. `res.withSse(s): body` is a
-block form that closes (or aborts on exception) for you:
-
-```nim
-res.withSse(s):
-  for row in report: s.send(row.toJson, event = "row", id = $row.id)
-```
-
-The response sets `Cache-Control: no-cache, no-transform` and
-`X-Accel-Buffering: no` so intermediary proxies don't buffer or transform the
-stream.
-
 ## Static files
 
 `staticHandler(rootDir)` returns a handler that serves a directory, keyed off a
@@ -623,6 +671,37 @@ Small files, ranges, and `HEAD` are read in one shot (a range is already bounded
 by the requested slice). `sendfile(2)` is intentionally not used — it composes
 with neither TLS nor the readiness event loop.
 
+## Server-Sent Events (SSE)
+
+`res.sse` opens a `text/event-stream` response over the streaming primitives
+above, so it inherits chunked/streamed framing and backpressure. It needs no
+router and no `streamRoute` predicate (SSE is outbound-only), so it works from
+any handler:
+
+```nim
+proc events(req: Request, res: Response) {.gcsafe.} =
+  let s = res.sse(retry = 3000)               # sends the SSE headers
+  discard s.send("hi", event = "greet", id = req.lastEventId())
+  discard s.comment("keepalive")              # heartbeat; clients ignore it
+  s.close()
+```
+
+`send` emits one event (multi-line `data` splits into multiple `data:` fields;
+`event`/`id`/`retry` are optional), returns `false` under write backpressure
+(reuse `s.bufferedAmount` / `s.onDrain`, or `await s.drained()` with an
+adapter), and `s.alive` reports client disconnect. `req.lastEventId()` gives
+the `Last-Event-ID` a client echoes on reconnect. `res.withSse(s): body` is a
+block form that closes (or aborts on exception) for you:
+
+```nim
+res.withSse(s):
+  for row in report: s.send(row.toJson, event = "row", id = $row.id)
+```
+
+The response sets `Cache-Control: no-cache, no-transform` and
+`X-Accel-Buffering: no` so intermediary proxies don't buffer or transform the
+stream.
+
 ## Build flags
 
 Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
@@ -634,106 +713,12 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 permessage-deflate compression via zlib. Off by default so the standard
 build keeps its OpenSSL-only footprint.
 
-`-d:httpGzip` (`--passL:-lz`), `-d:httpBrotli`
-(`--passL:"-lbrotlienc -lbrotlicommon"`), and/or `-d:httpZstd` (`--passL:-lzstd`)
-enable **response compression**. Turn it on per server with `settings.compress`:
-an eligible response (the client accepts an encoding we can produce, a
-compressible content-type, and no existing `Content-Encoding`) is compressed with
-the best encoding `Accept-Encoding` offers, adding `Content-Encoding` +
-`Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out); on a
-tie the server prefers **br**, then **zstd**, then **gzip**. Build with several
-flags to offer several and let the client choose. This covers both buffered
-`res.send` (compressed when over ~1400 bytes) and **streamed** responses --
-`res.sendHead`/`write`/`finish`, SSE, and file streaming -- which are compressed
-incrementally (the compressed body is chunked, no `Content-Length`). Off by
-default, so the standard and `-d:plainHttp` builds link no zlib/brotli/zstd.
-
-The **inbound** direction is opt-in with `settings.decompressRequest`: a request
-whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
-`req.body`. It is bounded by `maxBodySize` so a decompression bomb can't exhaust
-memory -- a body that would exceed the cap is rejected with `413`, a corrupt one
-with `400` -- and the handler never runs for either. (Buffered bodies;
-inbound-streaming routes still see the raw encoded chunks.)
-
-## Verification
-
-See [TESTING.md](TESTING.md) for a full registry of every test (CI and local)
-and what each verifies.
-
-- `nimble test`: parser/HPACK/QPACK unit tests (RFC vectors) plus
-  integration suites for h1, h2 (curl), h3 (h3-capable curl), TLS,
-  worker pool, and router.
-- HTTP/2 conformance: `nimble h2spec` runs
-  [h2spec](https://github.com/summerwind/h2spec) over TLS in Docker and
-  fails on any failed test. See [conformance/h2spec/](conformance/h2spec/).
-- HTTP/3 conformance: `nimble h3spec` runs
-  [h3spec](https://github.com/kazu-yamamoto/h3spec)'s HTTP/3 + QPACK
-  error-case group in Docker (15/15 pass). The QUIC transport group is
-  OpenSSL's stack, not vortex, so it is excluded. See
-  [conformance/h3spec/](conformance/h3spec/).
-- HTTP/3 WebSocket conformance: `nimble h3websocket` runs an
-  [aioquic](https://github.com/aiortc/aioquic) RFC 9220 client against a
-  vortex echo server in Docker. See
-  [conformance/h3websocket/](conformance/h3websocket/).
-- HTTP/1.1 conformance: `nimble redbot` runs [REDbot](https://redbot.org)
-  against a live server in Docker and fails on any BAD-level finding (or
-  `sh conformance/run.sh` with a host REDbot). See
-  [conformance/](conformance/). `nimble h1spec` additionally runs
-  [h1spec](https://github.com/dropseed/h1spec)'s request/header/body/framing
-  cases in Docker (32/32 pass). See [conformance/h1spec/](conformance/h1spec/).
-- WebSocket conformance: `nimble autobahn` runs the
-  [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
-  in Docker (301/301 non-compression cases pass). See
-  [conformance/autobahn/](conformance/autobahn/).
-- Security scan: `nimble zap` runs the [OWASP ZAP](https://www.zaproxy.org/)
-  packaged baseline (passive) scan against a hardened vortex site in Docker.
-  Its rule config promotes the security-header rules the app satisfies to FAIL,
-  so the run gates against a regression that drops one. See
-  [conformance/zap/](conformance/zap/).
-- TLS scan: `nimble testssl` runs [testssl.sh](https://testssl.sh/) against a
-  vortex TLS server in Docker (protocols/ciphers/vulnerabilities) and fails on
-  any HIGH/CRITICAL finding. See [conformance/testssl/](conformance/testssl/).
-- Load/stress smoke: `nimble h2load` fires many concurrent h1 + h2c requests at
-  a vortex server with nghttp2's [h2load](https://nghttp2.org/) in Docker,
-  failing on any failed/errored/non-2xx request. See
-  [conformance/h2load/](conformance/h2load/).
-- HTTP/3 load/throughput: `nimble h3load` drives many concurrent QUIC
-  connections and streams at a vortex HTTP/3 server with an `h2load` built for
-  HTTP/3 (ngtcp2 + nghttp3 on OpenSSL >= 3.5) in Docker, printing req/s and
-  failing on any failed/errored/non-2xx request. A real QUIC client stack, so
-  the number reflects the server (the HTTP/3 throughput/regression measurement).
-  See [conformance/h3load/](conformance/h3load/).
-- Cross-client interop: `nimble interop` drives the server with real clients
-  from five ecosystems (Node `http2`, Python `httpx`, Go `net/http`, Rust
-  `reqwest`, Java `HttpClient`) over HTTP/2 + TLS with gzip, exercising every
-  method, and an optional mTLS mode (`INTEROP_MTLS=1`). Each client asserts h2
-  negotiation and a gzip round-trip; the run fails if any backend errors. See
-  [conformance/interop/](conformance/interop/).
-- Sanitizers: the CI `sanitize` job runs the whole suite under
-  AddressSanitizer + UBSan (`NIM_SANITIZE=1 nimble test`).
-- `bench/run.sh` drives wrk/oha/ab and h2load against `bench/handlers`.
-
-The chronos adapter is covered by `nimble testchronos` (its dependency is
-opt-in, so it is kept out of the default `nimble test`).
+Response and request compression have their own build flags (`-d:httpGzip`,
+`-d:httpBrotli`, `-d:httpZstd`); see [Compression](#compression).
 
 ## Security
 
-Rapid Reset, framing floods, decompression bombs, request smuggling,
-slowloris, and resource exhaustion are defended with configurable limits
-and covered by tests and fuzzers. See [SECURITY.md](SECURITY.md).
-
-## Status
-
-Pre-1.0. Streaming request and response bodies (with backpressure) are
-supported on h1/h2/h3, shutdown is graceful, and HTTP/3 both accepts and emits
-QPACK dynamic-table-compressed headers. (h2c `Upgrade` is intentionally
-omitted: RFC 9113 removed it; cleartext HTTP/2 uses prior knowledge.)
-
-**Platform:** POSIX only (Linux and macOS), by design. The core is built on
-readiness-based `kqueue`/`epoll` and per-thread `SO_REUSEPORT` listeners, which
-have no direct Windows equivalent; a `select()`-backed Windows port would
-defeat the performance goal. On Windows, run vortex under WSL2 or a Linux
-container (Docker).
+See [SECURITY.md](SECURITY.md) for thread mitigation, security-related settings and more.
 
 ## Thanks
 
