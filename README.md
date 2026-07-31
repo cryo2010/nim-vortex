@@ -634,13 +634,16 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 permessage-deflate compression via zlib. Off by default so the standard
 build keeps its OpenSSL-only footprint.
 
-`-d:httpGzip` (link with `--passL:-lz`) enables **gzip response compression**.
-Turn it on per server with `settings.compress`: an eligible buffered response
-(the client sent `Accept-Encoding: gzip`, a compressible content-type, over
-~1400 bytes, and no existing `Content-Encoding`) is gzip-compressed with
-`Content-Encoding: gzip` + `Vary: Accept-Encoding`. Streaming responses
-(`sendHead`/`write`) are sent uncompressed. Off by default, so the standard and
-`-d:plainHttp` builds link no zlib.
+`-d:httpGzip` (link with `--passL:-lz`) and/or `-d:httpBrotli` (link with
+`--passL:"-lbrotlienc -lbrotlicommon"`) enable **response compression**. Turn it
+on per server with `settings.compress`: an eligible buffered response (the client
+accepts an encoding we can produce, a compressible content-type, over ~1400
+bytes, and no existing `Content-Encoding`) is compressed with the best encoding
+`Accept-Encoding` offers -- **brotli preferred over gzip** -- adding
+`Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values, so
+`gzip;q=0` opts out. Build with both flags to offer both and let the client
+choose. Streaming responses (`sendHead`/`write`) are sent uncompressed. Off by
+default, so the standard and `-d:plainHttp` builds link no zlib/brotli.
 
 ## Verification
 

@@ -50,7 +50,9 @@ The run fails if any backend reports an error or a failed assertion.
 | `INTEROP_RUNTIME` | `5`  | seconds each backend runs (total ≈ ×5 backends) |
 | `INTEROP_CLIENTS` | `10` | total concurrent clients, split evenly (min 1 each) |
 | `INTEROP_MTLS`    | `0`  | `1` = require + present client certs; each client also checks `/whoami` reports its cert subject |
+| `INTEROP_ENCODING`| `gzip` | content-encoding the clients request and assert: `gzip` or `br` (brotli). `nimble brotli` sets `br` |
 
 ```sh
 INTEROP_MTLS=1 INTEROP_RUNTIME=10 INTEROP_CLIENTS=20 nimble interop
+INTEROP_ENCODING=br nimble interop        # or: nimble brotli
 ```

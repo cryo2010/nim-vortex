@@ -1,10 +1,12 @@
 // Go interop client for the vortex cross-client test. Uses the standard
 // net/http client, which negotiates HTTP/2 over TLS via ALPN (asserted through
 // resp.Proto), trusting the shared CA and exercising every method against
-// /echo. It sets Accept-Encoding: gzip itself, so Go does not auto-decompress;
-// gunzipping here (and checking Content-Encoding) proves the gzip path.
+// /echo. It sets Accept-Encoding itself (so Go does not auto-decompress) and
+// decodes the response (gzip via stdlib, brotli via andybalholm/brotli),
+// checking Content-Encoding, to prove the compression path.
 //
-// Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1).
+// Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1),
+//      INTEROP_ENCODING (gzip|br).
 // Certs: /certs/ca.pem, and for mTLS /certs/client.pem + /certs/client.key.
 package main
 
@@ -21,11 +23,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/andybalholm/brotli"
 )
 
 const name = "go"
 
 var methods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+var enc = env("INTEROP_ENCODING", "gzip")
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -65,9 +71,9 @@ func newClient(mtls bool) (*http.Client, error) {
 	}
 	// ForceAttemptHTTP2 makes the default transport negotiate h2 over TLS.
 	tr := &http.Transport{
-		TLSClientConfig:   tlsCfg,
-		ForceAttemptHTTP2: true,
-		DisableCompression: true, // we manage Accept-Encoding to test gzip
+		TLSClientConfig:    tlsCfg,
+		ForceAttemptHTTP2:  true,
+		DisableCompression: true, // we manage Accept-Encoding + decoding ourselves
 	}
 	return &http.Client{Transport: tr, Timeout: 30 * time.Second}, nil
 }
@@ -82,7 +88,7 @@ func do(client *http.Client, method, url, body string) error {
 		return err
 	}
 	req.Header.Set("x-api-key", "interop")
-	req.Header.Set("accept-encoding", "gzip")
+	req.Header.Set("accept-encoding", enc)
 	if body != "" {
 		req.Header.Set("content-type", "text/plain")
 	}
@@ -97,6 +103,11 @@ func do(client *http.Client, method, url, body string) error {
 	if resp.ProtoMajor != 2 {
 		return fmt.Errorf("%s not HTTP/2: %s", method, resp.Proto)
 	}
+	echo := !strings.HasSuffix(url, "/whoami")
+	if echo && resp.Header.Get("content-encoding") != enc {
+		return fmt.Errorf("%s not %s-encoded: %q", method, enc,
+			resp.Header.Get("content-encoding"))
+	}
 	if method == "HEAD" {
 		if resp.Header.Get("x-echo-method") != "HEAD" {
 			return fmt.Errorf("HEAD missing x-echo-method")
@@ -105,13 +116,16 @@ func do(client *http.Client, method, url, body string) error {
 		return nil
 	}
 	var reader io.Reader = resp.Body
-	if resp.Header.Get("content-encoding") == "gzip" {
+	switch resp.Header.Get("content-encoding") {
+	case "gzip":
 		gz, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return fmt.Errorf("%s gunzip: %w", method, err)
 		}
 		defer gz.Close()
 		reader = gz
+	case "br":
+		reader = brotli.NewReader(resp.Body)
 	}
 	data, err := io.ReadAll(reader)
 	if err != nil {
@@ -178,6 +192,6 @@ func main() {
 	if v := failure.Load(); v != nil {
 		fail(v.(string))
 	}
-	fmt.Printf("INTEROP OK %s: requests=%d (clients=%d, runtime=%ds, mtls=%d)\n",
-		name, count, clients, runtime, map[bool]int{true: 1, false: 0}[mtls])
+	fmt.Printf("INTEROP OK %s: requests=%d (clients=%d, runtime=%ds, mtls=%d, enc=%s)\n",
+		name, count, clients, runtime, map[bool]int{true: 1, false: 0}[mtls], enc)
 }

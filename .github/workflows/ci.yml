@@ -281,3 +281,16 @@ jobs:
         run: >-
           INTEROP_RUNTIME=3 INTEROP_CLIENTS=5 INTEROP_MTLS=${{ matrix.mtls }}
           sh conformance/interop/run.sh
+
+  brotli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cross-client brotli (Node/Python/Go/Rust/Java)
+        # Same harness as interop, but every client requests and asserts
+        # Content-Encoding: br. The server is built -d:httpBrotli and each client
+        # decodes brotli with its ecosystem's library. It picks the x86_64 server
+        # base itself; short runtime keeps CI quick.
+        run: >-
+          INTEROP_ENCODING=br INTEROP_RUNTIME=3 INTEROP_CLIENTS=5
+          sh conformance/interop/run.sh

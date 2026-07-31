@@ -2,10 +2,12 @@
 
 Uses httpx with the h2 backend so every request genuinely negotiates HTTP/2
 over TLS, trusting the shared CA, exercising every method against /echo. httpx
-sets Accept-Encoding and transparently decompresses, so a correct round-trip
-proves the gzip path; we also assert the negotiated protocol is HTTP/2.
+transparently decompresses gzip and brotli (the brotli package is installed),
+so a correct round-trip proves the compression path; we also assert the
+negotiated protocol is HTTP/2 and the response's Content-Encoding.
 
-Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1).
+Env: INTEROP_URL, INTEROP_RUNTIME (s), INTEROP_CLIENTS, INTEROP_MTLS (0/1),
+     INTEROP_ENCODING (gzip|br).
 Certs: /certs/ca.pem, and for mTLS /certs/client.pem + /certs/client.key.
 """
 import os
@@ -19,6 +21,7 @@ URL = os.environ.get("INTEROP_URL", "https://server:8443")
 RUNTIME = int(os.environ.get("INTEROP_RUNTIME", "5"))
 CLIENTS = max(1, int(os.environ.get("INTEROP_CLIENTS", "1")))
 MTLS = os.environ.get("INTEROP_MTLS") == "1"
+ENC = os.environ.get("INTEROP_ENCODING", "gzip")
 NAME = "python"
 METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
@@ -30,7 +33,7 @@ def fail(reason):
 
 def make_client():
     kwargs = dict(http2=True, verify="/certs/ca.pem", timeout=30.0,
-                  headers={"x-api-key": "interop"})
+                  headers={"x-api-key": "interop", "accept-encoding": ENC})
     if MTLS:
         kwargs["cert"] = ("/certs/client.pem", "/certs/client.key")
     return httpx.Client(**kwargs)
@@ -47,6 +50,9 @@ def worker(deadline):
                     raise RuntimeError(f"{m} status {r.status_code}")
                 if r.http_version != "HTTP/2":
                     raise RuntimeError(f"{m} not HTTP/2: {r.http_version}")
+                if r.headers.get("content-encoding") != ENC:
+                    raise RuntimeError(
+                        f"{m} not {ENC}-encoded: {r.headers.get('content-encoding')}")
                 if m == "HEAD":
                     if r.headers.get("x-echo-method") != "HEAD":
                         raise RuntimeError("HEAD missing x-echo-method")
@@ -72,7 +78,8 @@ def main():
     except Exception as e:  # noqa: BLE001
         fail(str(e))
     print(f"INTEROP OK {NAME}: requests={total} "
-          f"(clients={CLIENTS}, runtime={RUNTIME}s, mtls={1 if MTLS else 0})")
+          f"(clients={CLIENTS}, runtime={RUNTIME}s, mtls={1 if MTLS else 0}, "
+          f"enc={ENC})")
 
 
 if __name__ == "__main__":
