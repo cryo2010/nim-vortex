@@ -24,6 +24,8 @@ when defined(httpGzip):
   import ./gzip
 when defined(httpBrotli):
   import ./brotli
+when defined(httpZstd):
+  import ./zstd
 
 type
   Request* = object
@@ -517,7 +519,7 @@ proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
     applyResponse(res.core, c, res.stream, int(code), contentType,
                   headers, body)
 
-when defined(httpGzip) or defined(httpBrotli):
+when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
   const compressMinSize = 1400   # not worth compressing below ~one MTU
 
   proc compressibleType(ct: string): bool =
@@ -535,9 +537,10 @@ when defined(httpGzip) or defined(httpBrotli):
 
   proc chooseEncoding(req: Request): string =
     ## Pick the best Content-Encoding we can produce from the client's
-    ## Accept-Encoding, honoring q-values (q=0 disables an encoding); brotli wins
-    ## a tie. Returns "br", "gzip", or "" (send identity).
-    var brQ, gzQ = -1.0
+    ## Accept-Encoding, honoring q-values (q=0 disables an encoding). On a q tie
+    ## the server prefers br, then zstd, then gzip (widest support / best text
+    ## ratio first). Returns "br", "zstd", "gzip", or "" (send identity).
+    var brQ, zsQ, gzQ = -1.0
     for part in req.header("accept-encoding").split(','):
       let tok = part.strip
       if tok.len == 0: continue
@@ -553,14 +556,18 @@ when defined(httpGzip) or defined(httpBrotli):
           except ValueError: q = 0.0
       case name.toLowerAscii
       of "br": brQ = q
+      of "zstd": zsQ = q
       of "gzip": gzQ = q
       of "*":
         if brQ < 0: brQ = q
+        if zsQ < 0: zsQ = q
         if gzQ < 0: gzQ = q
       else: discard
     when not defined(httpBrotli): brQ = -1.0     # can't produce it
+    when not defined(httpZstd): zsQ = -1.0
     when not defined(httpGzip): gzQ = -1.0
-    if brQ > 0 and brQ >= gzQ: "br"
+    if brQ > 0 and brQ >= zsQ and brQ >= gzQ: "br"
+    elif zsQ > 0 and zsQ >= gzQ: "zstd"
     elif gzQ > 0: "gzip"
     else: ""
 
@@ -579,6 +586,8 @@ when defined(httpGzip) or defined(httpBrotli):
     ## A streaming compressor for `enc` (upcast to RootRef), or nil.
     when defined(httpBrotli):
       if enc == "br": return newBrotliStream()
+    when defined(httpZstd):
+      if enc == "zstd": return newZstdStream()
     when defined(httpGzip):
       if enc == "gzip": return newGzipStream()
     nil
@@ -588,6 +597,8 @@ when defined(httpGzip) or defined(httpBrotli):
     ## Feed a chunk to `comp` and return the bytes to emit (may be "").
     when defined(httpBrotli):
       if enc == "br": return BrotliStream(comp).compress(data, last)
+    when defined(httpZstd):
+      if enc == "zstd": return ZstdStream(comp).compress(data, last)
     when defined(httpGzip):
       if enc == "gzip": return GzipStream(comp).compress(data, last)
     ""
@@ -597,9 +608,9 @@ proc send*(res: Response, code: HttpCode, body: openArray[char],
   ## Queue the response. Safe to call once per request, from the handler,
   ## later (deferred), or from a worker thread inside `blocking:`; no-op
   ## if the connection is already gone. With `settings.compress` and a
-  ## compression build (`-d:httpBrotli` and/or `-d:httpGzip`), an eligible body
-  ## is compressed with the best encoding the client accepts (brotli preferred).
-  when defined(httpGzip) or defined(httpBrotli):
+  ## compression build (`-d:httpBrotli`, `-d:httpZstd` and/or `-d:httpGzip`), an
+  ## eligible body is compressed with the best encoding the client accepts.
+  when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if res.core.compress and body.len >= compressMinSize and
         compressibleType(contentType) and not hasContentEncoding(headers):
       let enc = chooseEncoding(Request(core: res.core, fd: res.fd,
@@ -607,6 +618,8 @@ proc send*(res: Response, code: HttpCode, body: openArray[char],
       var packed = ""
       when defined(httpBrotli):
         if enc == "br": packed = brotli(body)
+      when defined(httpZstd):
+        if enc == "zstd": packed = zstd(body)
       when defined(httpGzip):
         if enc == "gzip": packed = gzip(body)
       if packed.len > 0 and packed.len < body.len:
@@ -797,7 +810,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # Negotiate streaming compression up front: it drops Content-Length (the
     # compressed size is unknown -> chunked) and adds Content-Encoding + Vary.
     var enc = ""
-    when defined(httpGzip) or defined(httpBrotli):
+    when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       enc = negotiateStreamEnc(res, contentType, headers)
       if enc.len > 0:
         hdrs.add ("content-encoding", enc)
@@ -811,7 +824,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
         if h3c != nil:
           h3SendHead(res.core, h3c, uint64(res.stream), int(code),
                      contentType, hdrs)
-          when defined(httpGzip) or defined(httpBrotli):
+          when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             if enc.len > 0:
               h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
       return
@@ -820,7 +833,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
                  res.core.serverHeader, contentType, hdrs, res.core.altSvc)
-      when defined(httpGzip) or defined(httpBrotli):
+      when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         if enc.len > 0:
           let st = h2Stream(c, res.stream)
           if st != nil and not st.isHead:
@@ -841,7 +854,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     let chunked = effLen < 0 and c.parser.minor >= 1
     c.respChunked = chunked
     c.respCLDelimited = effLen >= 0
-    when defined(httpGzip) or defined(httpBrotli):
+    when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc.len > 0:
         c.respComp = makeStreamComp(enc)
         c.respEnc = enc
@@ -866,7 +879,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
-          when defined(httpGzip) or defined(httpBrotli):
+          when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
               let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)),
@@ -878,7 +891,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
     var c = conn(res.core, res.fd, res.gen)
     if c == nil: return false
     if res.stream != 0:
-      when defined(httpGzip) or defined(httpBrotli):
+      when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
         if st != nil and st.respComp != nil:
           let z = compChunk(st.respComp, st.respEnc, data, false)
@@ -891,7 +904,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       return backlog < respHighWater
     if not c.respStreaming: return false
     if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
-    when defined(httpGzip) or defined(httpBrotli):
+    when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.respComp != nil:
         let z = compChunk(c.respComp, c.respEnc, data, false)
         if z.len > 0:
@@ -934,7 +947,7 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
-          when defined(httpGzip) or defined(httpBrotli):
+          when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
               let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)), "", true)
@@ -945,7 +958,7 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
     let c = conn(res.core, res.fd, res.gen)
     if c == nil: return
     if res.stream != 0:
-      when defined(httpGzip) or defined(httpBrotli):
+      when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
         if st != nil and st.respComp != nil:
           let z = compChunk(st.respComp, st.respEnc, "", true)
@@ -961,7 +974,7 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
     c.onRespDrain = nil
     let clDelimited = c.respCLDelimited
     c.respCLDelimited = false
-    when defined(httpGzip) or defined(httpBrotli):
+    when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.respComp != nil:
         let z = compChunk(c.respComp, c.respEnc, "", true)   # trailer/finish
         if z.len > 0 and c.parser.httpMethod != HttpHead:

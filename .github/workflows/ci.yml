@@ -132,6 +132,21 @@ jobs:
         # -> 400.
         run: nimble testreqdecomp -y
 
+  testzstd:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain
+        # zstd/brotli provide the encoders + CLIs; curl fetches, the CLIs decode.
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc openssl zlib brotli zstd curl
+      - uses: actions/checkout@v7
+      - name: Test zstd response compression
+        # Buffered + streamed zstd over HTTP/1.1 and h2c, plus br/zstd/gzip
+        # Accept-Encoding negotiation; byte-exact round-trip.
+        run: nimble testzstd -y
+
   testrace:
     runs-on: ubuntu-latest
     # Privileged to lower the host's mmap randomization for ThreadSanitizer's

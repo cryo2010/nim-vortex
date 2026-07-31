@@ -83,6 +83,15 @@ task testreqdecomp, "Test request-body decompression (needs zlib + brotli)":
        "--passL:-lz --passL:\"-lbrotlienc -lbrotlidec -lbrotlicommon\" -p:src " &
        "-o:tests/test_request_decompression tests/test_request_decompression.nim"
 
+task testzstd, "Test zstd response compression (needs zstd + zlib + brotli)":
+  # Buffered + streamed zstd responses over HTTP/1.1 and h2c, plus br/zstd/gzip
+  # Accept-Encoding negotiation (built with all three encoders); curl + the
+  # gzip/brotli/zstd CLIs verify framing and a byte-exact round-trip.
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli " &
+       "-d:httpZstd --passL:-lz --passL:\"-lbrotlienc -lbrotlicommon\" " &
+       "--passL:-lzstd -p:src " &
+       "-o:tests/test_zstd_compression tests/test_zstd_compression.nim"
+
 task testrace, "ThreadSanitizer regression for the handler thread race":
   # Builds the start()/shutdown stress under TSan; TSan aborts the process on
   # any data race, failing the task. -d:plainHttp keeps OpenSSL out of the

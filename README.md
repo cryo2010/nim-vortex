@@ -634,19 +634,19 @@ Release builds: `--mm:orc --threads:on -d:danger --passC:-flto`
 permessage-deflate compression via zlib. Off by default so the standard
 build keeps its OpenSSL-only footprint.
 
-`-d:httpGzip` (link with `--passL:-lz`) and/or `-d:httpBrotli` (link with
-`--passL:"-lbrotlienc -lbrotlicommon"`) enable **response compression**. Turn it
-on per server with `settings.compress`: an eligible response (the client accepts
-an encoding we can produce, a compressible content-type, and no existing
-`Content-Encoding`) is compressed with the best encoding `Accept-Encoding` offers
--- **brotli preferred over gzip** -- adding `Content-Encoding` +
-`Vary: Accept-Encoding`. Negotiation honors q-values, so `gzip;q=0` opts out.
-Build with both flags to offer both and let the client choose. This covers both
-buffered `res.send` (compressed when over ~1400 bytes) and **streamed**
-responses -- `res.sendHead`/`write`/`finish`, SSE, and file streaming -- which
-are compressed incrementally (the compressed body is chunked, no
-`Content-Length`). Off by default, so the standard and `-d:plainHttp` builds link
-no zlib/brotli.
+`-d:httpGzip` (`--passL:-lz`), `-d:httpBrotli`
+(`--passL:"-lbrotlienc -lbrotlicommon"`), and/or `-d:httpZstd` (`--passL:-lzstd`)
+enable **response compression**. Turn it on per server with `settings.compress`:
+an eligible response (the client accepts an encoding we can produce, a
+compressible content-type, and no existing `Content-Encoding`) is compressed with
+the best encoding `Accept-Encoding` offers, adding `Content-Encoding` +
+`Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out); on a
+tie the server prefers **br**, then **zstd**, then **gzip**. Build with several
+flags to offer several and let the client choose. This covers both buffered
+`res.send` (compressed when over ~1400 bytes) and **streamed** responses --
+`res.sendHead`/`write`/`finish`, SSE, and file streaming -- which are compressed
+incrementally (the compressed body is chunked, no `Content-Length`). Off by
+default, so the standard and `-d:plainHttp` builds link no zlib/brotli/zstd.
 
 The **inbound** direction is opt-in with `settings.decompressRequest`: a request
 whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
