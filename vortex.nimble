@@ -68,6 +68,14 @@ task testgzip, "Test gzip response compression (needs zlib)":
   exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip --passL:-lz -p:src " &
        "-o:tests/test_compression tests/test_compression.nim"
 
+task teststreamcomp, "Test streaming response compression (needs zlib + brotli)":
+  # Streaming (res.sendHead/write/finish, SSE, file streaming) compressed with
+  # gzip + brotli, over HTTP/1.1 (chunked) and h2c; curl + the gzip/brotli CLIs
+  # verify the framing and a byte-exact round-trip.
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli " &
+       "--passL:-lz --passL:\"-lbrotlienc -lbrotlicommon\" -p:src " &
+       "-o:tests/test_streaming_compression tests/test_streaming_compression.nim"
+
 task testrace, "ThreadSanitizer regression for the handler thread race":
   # Builds the start()/shutdown stress under TSan; TSan aborts the process on
   # any data race, failing the task. -d:plainHttp keeps OpenSSL out of the
