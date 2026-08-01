@@ -246,18 +246,15 @@ adapter per program. chronos is **not** a vortex dependency (a bare
 
 ### Requests
 
-`Request` is a small handle (internally: the owning loop, the connection fd, a
-generation counter, and an HTTP/2/3 stream id — you never touch these directly).
-Everything is read through the accessors below, all valid on any protocol and
-from a `blocking:` worker:
+The `Request` object passed into the handler contains the content and metadata related to each request.
 
-| Member | Result | What it gives |
+| Member | Type | Description |
 |--------|--------|---------------|
 | `req.method` | `HttpMethod` | request method (`HttpGet`, `HttpPost`, …) |
 | `req.path` | `string` | raw request target, query string included |
 | `req.url` | `Uri` | parsed target — `req.url.path` excludes the query (lazy, cached) |
 | `req.query` | `Table[string, string]` | decoded query params, last value wins (lazy, cached) |
-| `req.headers` | iterator `(string, string)` | every header pair (pseudo-headers skipped) |
+| `req.headers` | `iterator (string, string)` | every header pair (pseudo-headers skipped) |
 | `req.header(name)` | `string` | one header, case-insensitive; "" if absent |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
 | `req.contentLength` | `int` | body length in bytes |
@@ -269,15 +266,20 @@ from a `blocking:` worker:
 | `req.clientCertSubject` | `string` | mTLS client-cert subject DN; "" if none |
 | `req.isSecure` | `bool` | arrived over TLS/HTTPS or QUIC |
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
-| `req.params` / `req.param(name)` | `PathParams` / `string` | router path parameters |
+| `req.params` | `PathParams` | all router path parameters |
+| `req.param(name)` | `string` | one router path parameter; "" if absent |
 | `req.isAlive` | `bool` | connection/stream still open |
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
-| `req.sendContinue()` | | send `100 Continue` (h1 streaming routes) |
-| `req.blocking: body` | template | run `body` on the worker pool (see above) |
-| `req.isWebSocketUpgrade` / `req.acceptWebSocket(protocols = [])` | `bool` / `WebSocket` | WebSocket handshake (see [WebSockets](#websockets)) |
-| `req.onBody(cb, manualAck = false)` / `req.ackBody(n)` / `req.stream(chunk, last): body` | | inbound body streaming (see [Streaming requests](#streaming-requests)) |
-| `req.doAsync: body` / `await req.read()` | | async adapter (see [Handlers](#handlers) / [Streaming](#streaming)) |
+| `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
+| `req.blocking: body` | `template` | run `body` on the worker pool (see above) |
+| `req.isWebSocketUpgrade` | `bool` | is this request a WebSocket handshake (see [WebSockets](#websockets)) |
+| `req.acceptWebSocket(protocols = [])` | `WebSocket` | complete the WebSocket handshake (see [WebSockets](#websockets)) |
+| `req.onBody(cb, manualAck = false)` | `void` | register an inbound body sink (see [Streaming requests](#streaming-requests)) |
+| `req.ackBody(n)` | `void` | grant flow-control credit for consumed body bytes (see [Streaming requests](#streaming-requests)) |
+| `req.stream(chunk, last): body` | `template` | consume the request body chunk by chunk (see [Streaming requests](#streaming-requests)) |
+| `req.doAsync: body` | `template` | run an `{.async.}` body on the loop thread (async adapter) |
+| `req.read()` | `Future[string]` | pull the next request-body chunk (async adapter; see [Streaming](#streaming)) |
 
 ```nim
 proc handler(req: Request, res: Response) {.gcsafe.} =
@@ -292,24 +294,25 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 
 ### Responses
 
-`Response` is the write half of the pair (the same handle words as `Request`,
-carrying only the capability to send). Copy it freely into workers or async
-callbacks; sending through a dead connection is a safe no-op.
+The `Response` object paired with each request is the write half: use it to send
+the reply. Copying it into workers or async callbacks is free, and sending
+through a dead connection is a safe no-op.
 
-| Member | What it does |
-|--------|--------------|
-| `res.send(code, body = "", contentType = "", headers = [])` | queue a buffered response (compressed when eligible). Overloads: `res.send(code)`, and `code` as `int` or `HttpCode` |
-| `res.redirect(location, permanent = false, extraHeaders = [])` | 301 (permanent) / 302 redirect |
-| `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | begin a streamed response (see [Streaming responses](#streaming-responses)) |
-| `res.write(data): bool` | append a streamed chunk; `false` signals backpressure |
-| `res.finish(trailers = [])` | end a streamed response cleanly |
-| `res.abort()` | truncate a streamed response (error mid-body) |
-| `res.stream(code, ct, headers-or-emit): body` | block form of a streamed response |
-| `res.onDrain(cb)` / `res.bufferedAmount` | streamed-response backpressure |
-| `res.drained()` | awaitable drain, `Future[void]` (async adapter) |
-| `res.sse(headers = [], retry = 0): SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
-| `res.withSse(s): body` | block form of an SSE stream |
-| `res.sendFile(path, opts = staticOptions())` | send one file (see [Static files](#static-files)) |
+| Member | Type | Description |
+|--------|--------|---------------|
+| `res.send(code, body = "", contentType = "", headers = [])` | `void` | queue a buffered response (compressed when eligible); also `res.send(code)` and an `int`-code overload |
+| `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
+| `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Streaming responses](#streaming-responses)) |
+| `res.write(data)` | `bool` | append a streamed chunk; `false` signals backpressure |
+| `res.finish(trailers = [])` | `void` | end a streamed response cleanly |
+| `res.abort()` | `void` | truncate a streamed response (error mid-body) |
+| `res.stream(code, ct, headers-or-emit): body` | `template` | block form of a streamed response |
+| `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
+| `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket |
+| `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
+| `res.sse(headers = [], retry = 0)` | `SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
+| `res.withSse(s): body` | `template` | block form of an SSE stream |
+| `res.sendFile(path, opts = staticOptions())` | `void` | send one file (see [Static files](#static-files)) |
 
 Two helpers build header pairs to pass in `res.send`'s `headers`:
 `securityHeaders(...)` (OWASP baseline, see [Security](#security)) and
