@@ -26,6 +26,26 @@ proc setTimeout(c: var H2TestConn, ms: int) =
 proc sendRaw*(c: var H2TestConn, data: string) =
   if data.len > 0: c.sock.send(data)
 
+proc sendAndDrain*(c: var H2TestConn, data: string, chunk = 4096) =
+  ## Send `data` in chunks, draining any already-available response bytes into
+  ## the read buffer between chunks. A single blocking send of a large request
+  ## burst can deadlock: the server's replies fill the socket buffers while the
+  ## client is still blocked in `send()` and not yet reading. Interleaving a
+  ## short non-blocking drain keeps the buffers flowing, so the send always
+  ## completes and no responses are lost (they are parsed later from `c.buf`).
+  var i = 0
+  var buf = newString(16 * 1024)
+  while i < data.len:
+    let hi = min(i + chunk, data.len)
+    c.sock.send(data[i ..< hi])
+    i = hi
+    c.setTimeout(1)                    # drain only what is already buffered
+    while true:
+      let n = recv(c.sock.getFd, addr buf[0], buf.len, cint(0))
+      if n <= 0: break                 # nothing (more) available right now
+      c.buf.add buf[0 ..< n]
+      if n < buf.len: break            # drained the available bytes
+
 proc newH2TestConn*(port: Port): H2TestConn =
   ## Connect and send the client preface plus an empty SETTINGS frame.
   result.sock = newSocket(buffered = false)
