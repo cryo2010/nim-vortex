@@ -1,0 +1,6 @@
+# k6 pushes metrics via remote write (the receiver is enabled by the
+# --web.enable-remote-write-receiver flag in docker-compose.yml), so Prometheus
+# does not need to scrape anything here.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
