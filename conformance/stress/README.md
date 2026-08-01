@@ -130,6 +130,25 @@ request + check, connection reuse). If you push hard, watch the dashboard:
   the raw ceiling with `conformance/h2load` instead.
 - **Virtual users** pinned at the max with flat request rate means the same.
 
+### k6 client memory on long, fast runs
+
+k6 retains a sample per request for its metrics, so its memory grows with the
+**total** request count — roughly **1 GiB per minute at ~130k req/s**, regardless
+of push interval or `--no-summary` (it is the client's Trend sinks, not the
+Prometheus output, which stays flat now that latency ships as a native
+histogram). A long high-rate run can therefore exhaust Docker's memory and the
+k6 container gets OOM-killed (exit 137); `run.sh` reports this explicitly. The
+**vortex server is unaffected** — it holds flat at ~45 MiB throughout.
+
+Rule of thumb: keep `DURATION × req/s` within your Docker memory. To go longer or
+faster, raise Docker Desktop's memory limit, lower `VUS`/`RATE`, split one long
+run into several shorter ones (Prometheus keeps the history), or use
+`conformance/h2load` for a pure ceiling number without the metrics overhead.
+
+Latency is recorded as a **Prometheus native histogram**
+(`k6_http_req_duration_seconds`); the dashboard reads percentiles with
+`histogram_quantile`, which keeps Prometheus ingestion cheap even at high rates.
+
 ## Limitations
 
 k6 cannot drive **HTTP/3 (QUIC)**, and its HTTP/2 client requires TLS, so **h2c**

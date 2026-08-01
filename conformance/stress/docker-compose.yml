@@ -23,6 +23,10 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.enable-remote-write-receiver
+      # Native histograms keep k6's Prometheus output memory-flat at high req/s
+      # (it ships a compact histogram instead of aggregating a raw-sample
+      # firehose each flush, which otherwise OOMs k6 on long, fast runs).
+      - --enable-feature=native-histograms
       - --storage.tsdb.retention.time=15d
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro

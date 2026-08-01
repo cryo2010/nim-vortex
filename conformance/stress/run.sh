@@ -106,17 +106,32 @@ run_case() {
   # can group or filter by any single axis.
   ts=$(date +%Y%m%d-%H%M%S)
   echo "running k6..."
-  docker run --rm --network "$net" \
+  # Ship latency as a native histogram (not per-flush percentile aggregation of
+  # every raw sample): at high req/s the aggregating output backlogs and OOM-kills
+  # k6 on long runs, while the native histogram keeps k6's memory flat.
+  if ! docker run --rm --network "$net" \
     -e TARGET_URL="$scheme://server:$port" \
     -e ENDPOINT="$endpoint" -e MODE="$mode" -e DURATION="$duration" \
     -e VUS="$vus" -e RATE="$rate" \
     -e K6_PROMETHEUS_RW_SERVER_URL="http://prometheus:9090/api/v1/write" \
-    -e K6_PROMETHEUS_RW_TREND_STATS="p(95),p(99),avg,max" \
+    -e K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM="true" \
     -e K6_PROMETHEUS_RW_PUSH_INTERVAL="1s" \
     -v "$here/stress.js:/stress.js:ro" \
     grafana/k6 run -o experimental-prometheus-rw \
       --tag testid="$b-$r-$mode-$ts" \
       --tag backend="$b" --tag runtime="$r" --tag mode="$mode" /stress.js
+  then
+    rc=$?
+    docker rm -f "$srvc" >/dev/null 2>&1 || true
+    echo >&2
+    echo "RESULT: k6 exited non-zero ($rc) for backend $b / runtime $r." >&2
+    if [ "$rc" = 137 ]; then
+      echo "  Exit 137 = the k6 container was OOM-killed. At this request rate the" >&2
+      echo "  Prometheus output backlogged. Give Docker more memory, lower VUS/RATE," >&2
+      echo "  or shorten DURATION. The vortex server itself is unaffected." >&2
+    fi
+    exit "$rc"
+  fi
 
   docker rm -f "$srvc" >/dev/null 2>&1 || true
 }
