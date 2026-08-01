@@ -101,6 +101,7 @@ run_backend() {
     -e VUS="$vus" -e RATE="$rate" \
     -e K6_PROMETHEUS_RW_SERVER_URL="http://prometheus:9090/api/v1/write" \
     -e K6_PROMETHEUS_RW_TREND_STATS="p(95),p(99),avg,max" \
+    -e K6_PROMETHEUS_RW_PUSH_INTERVAL="1s" \
     -v "$here/stress.js:/stress.js:ro" \
     grafana/k6 run -o experimental-prometheus-rw \
       --tag testid="$b-$mode-$ts" /stress.js

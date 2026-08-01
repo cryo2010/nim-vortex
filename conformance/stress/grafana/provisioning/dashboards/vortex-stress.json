@@ -4,8 +4,8 @@
   "editable": true,
   "schemaVersion": 39,
   "timezone": "browser",
-  "refresh": "5s",
-  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "1s",
+  "time": { "from": "now-5m", "to": "now" },
   "tags": ["vortex", "k6"],
   "templating": {
     "list": [

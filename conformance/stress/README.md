@@ -14,6 +14,38 @@ Then open **http://localhost:3000** (Grafana, anonymous admin) and select the
 dashboard **"vortex stress (k6)"**. Prometheus retains history, so successive
 runs stay comparable via the **test id** dashboard variable.
 
+## Watching charts in real time
+
+The Grafana/Prometheus stack starts *before* k6, so open the dashboard as soon
+as `run.sh` prints "starting Prometheus + Grafana" and watch data stream in.
+Give the run enough time to watch:
+
+```sh
+BACKEND=h2 MODE=throughput DURATION=5m VUS=200 nimble stress
+```
+
+The dashboard auto-refreshes every **1s** over a `now-5m` window, and k6 pushes
+metrics on a **1s** interval (`K6_PROMETHEUS_RW_PUSH_INTERVAL`), so the charts
+track roughly a second behind live. The `Request rate` and latency panels update
+the smoothest; percentiles step once per push. `BACKEND=all` runs backends
+sequentially, so their series appear one after another (each its own `test id`),
+not concurrently.
+
+### Extending the runtime
+
+`DURATION` takes any k6 duration string and sets how long each backend runs:
+
+```sh
+DURATION=10m nimble stress            # ten minutes
+DURATION=1h  nimble stress            # one hour
+DURATION=1h30m BACKEND=h2 nimble stress
+BACKEND=all DURATION=2m nimble stress  # 2m per backend -> ~6m total
+```
+
+There is no fixed cap; the run ends when `DURATION` elapses (throughput mode) or
+after holding `RATE` for `DURATION` (rate mode). Prometheus keeps 15 days of
+history (`--storage.tsdb.retention.time` in `docker-compose.yml`).
+
 ## Configuration
 
 All knobs are environment variables:
