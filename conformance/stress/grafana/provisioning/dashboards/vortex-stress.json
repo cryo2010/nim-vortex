@@ -1,0 +1,98 @@
+{
+  "title": "vortex stress (h2load)",
+  "uid": "vortex-stress",
+  "editable": true,
+  "schemaVersion": 39,
+  "timezone": "browser",
+  "refresh": "2s",
+  "time": { "from": "now-15m", "to": "now" },
+  "tags": ["vortex", "h2load", "stress"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Server CPU (cores)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "description": "Vortex server container CPU under saturation, sampled from `docker stats` and pushed to the Pushgateway. This is the live signal to watch during a run.",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "stress_server_cpu_cores",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Server memory (RSS)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "description": "Vortex server container memory under saturation, from `docker stats`.",
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "stress_server_memory_bytes",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Achieved req/s (last run)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "description": "h2load's measured throughput for the most recent run of each backend (a summary, not a live series: h2load only reports at the end).",
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "stress_req_per_sec",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Requests total (last run)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "stress_requests_total",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Requests succeeded (last run)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "stress_requests_succeeded",
+          "legendFormat": "{{backend}}"
+        }
+      ]
+    }
+  ]
+}

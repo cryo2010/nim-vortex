@@ -1,0 +1,53 @@
+# Observability stack for the h2load stress harness: Prometheus + Grafana +
+# Pushgateway. Kept separate from the loadtest stack (own project name and host
+# ports) so the two can coexist; run.sh brings this up and leaves it running so
+# the charts stay viewable. `run.sh --down` (add -v to drop history) stops it.
+#
+# Host ports differ from loadtest (3000/9090/9091) to avoid collisions:
+#   Grafana 3001, Prometheus 9190, Pushgateway 9191.
+# The network has a fixed name so run.sh can attach the server + client to it.
+
+name: vortex-stress
+
+networks:
+  default:
+    name: vortex-stress
+
+volumes:
+  prom-data:
+  grafana-data:
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    ports:
+      - "9190:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_USERS_DEFAULT_THEME=dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+  # Sink for the server's docker-stats and h2load's summary. run.sh pushes to it
+  # (host port 9191); Prometheus scrapes it. `docker stats` on the host gives the
+  # server container's CPU/mem where cAdvisor can't on Docker Desktop.
+  pushgateway:
+    image: prom/pushgateway:latest
+    ports:
+      - "9191:9091"

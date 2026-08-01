@@ -1,0 +1,13 @@
+# run.sh pushes the server's docker-stats CPU/memory and h2load's summary req/s
+# to the Pushgateway; Prometheus scrapes it here. honor_labels keeps the job and
+# backend labels set on the push so the dashboard can select per-backend series.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: pushgateway
+    honor_labels: true
+    scrape_interval: 2s
+    static_configs:
+      - targets: ['pushgateway:9091']
