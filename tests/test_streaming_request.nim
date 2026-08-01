@@ -30,9 +30,15 @@ proc hEchoStream(req: Request, res: Response) {.gcsafe.} =
 proc hBuffered(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "buffered:" & $req.body.len, "text/plain")
 
+proc hReject(req: Request, res: Response) {.gcsafe.} =
+  ## Streaming route that rejects at headers-complete without reading the body,
+  ## so no 100 Continue is ever sent (Go's respond-before-read).
+  res.send(Http403, "nope", "text/plain")
+
 var rt = newRouter()
 rt.stream(HttpPost, "/upload", hUpload)
 rt.stream(HttpPost, "/echo", hEchoStream)
+rt.stream(HttpPost, "/reject", hReject)
 rt.post("/buffered", hBuffered)
 
 var srv = start(rt.toHandler,
@@ -109,6 +115,34 @@ suite "HTTP/1 streaming request bodies":
   test "buffered routes still work alongside streaming ones":
     let resp = rawPost("/buffered", "12345")
     check splitBody(resp) == "buffered:5"
+
+  test "expect 100-continue: streaming route sends 100 implicitly on read":
+    # The handler reads the body (registers onBody), which sends 100 Continue
+    # (Go's send-on-read). Only then does the client send the body.
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.setRecvTimeout(2000)
+    s.send("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n" &
+           "Expect: 100-continue\r\nConnection: close\r\n\r\n")
+    check s.recvAvailable(1000) == "HTTP/1.1 100 Continue\r\n\r\n"
+    s.send("hello")
+    let rest = s.recvUntilClose(1000)
+    check "200" in rest
+    check rest.endsWith("got 5")
+
+  test "expect 100-continue: a streaming route that rejects sends no 100":
+    # The handler responds before reading, so the client is never prompted for
+    # the body: it gets the 403 straight away and no 100 Continue.
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.setRecvTimeout(2000)
+    s.send("POST /reject HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n" &
+           "Expect: 100-continue\r\nConnection: close\r\n\r\n")
+    let resp = s.recvUntilClose(1000)
+    check "403" in resp
+    check "100 Continue" notin resp
 
   test "chunked streamed upload reassembles via onBody":
     let body = "y".repeat(200 * 1024)

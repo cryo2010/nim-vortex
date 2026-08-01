@@ -736,23 +736,6 @@ proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
   ("Set-Cookie", v)
 
-proc sendContinue*(req: Request) =
-  ## Send a "100 Continue" interim response for a request that carried
-  ## `Expect: 100-continue`, telling the client to proceed with the body. Only
-  ## needed when `settings.auto100Continue` is false (otherwise the loop sends it
-  ## automatically); call it from a streaming-route handler (which runs at
-  ## headers-complete, before the body) once you decide to accept the upload --
-  ## or answer 4xx instead to reject it before it is sent. Loop-thread only;
-  ## HTTP/1 only (HTTP/2 and HTTP/3 have no Expect flow), a no-op otherwise.
-  if req.fd < 0 or req.stream != 0: return
-  if currentThreadId() != req.core.threadId: return
-  let c = conn(req.core, req.fd, req.gen)
-  if c == nil or c.sent100 or c.responded or not c.parser.expectContinue: return
-  c.sent100 = true
-  c.wbuf.add continue100
-  try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
-  except Exception: discard
-
 # --- streaming request bodies (inbound) -------------------------------------
 
 proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
@@ -781,6 +764,16 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
     h2SetOnBody(c, req.stream, cb, manualAck)
     return
   c.onBodyCb = cb
+  # HTTP/1 Expect: 100-continue -> send it now that the handler is reading the
+  # body (Go's send-on-read model; h2/h3 have no Expect flow). Loop-thread only;
+  # a handler that responds before reading never reaches here, so it never
+  # prompts the client for the body.
+  if c.parser.expectContinue and not c.sent100 and not c.responded and
+      currentThreadId() == req.core.threadId:
+    c.sent100 = true
+    c.wbuf.add continue100
+    try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+    except Exception: discard
 
 proc ackBody*(req: Request, n: int) =
   ## Grant flow-control credit for `n` consumed request-body bytes on a
