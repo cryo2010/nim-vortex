@@ -1,7 +1,7 @@
 apiVersion: 1
 
 providers:
-  - name: vortex-stress
+  - name: vortex-loadtest
     orgId: 1
     folder: ''
     type: file

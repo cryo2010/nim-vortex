@@ -1,4 +1,4 @@
-// k6 stress script for the vortex load harness (conformance/stress/run.sh).
+// k6 load script for the vortex load harness (conformance/loadtest/run.sh).
 //
 // One script, two load models, chosen by MODE:
 //   throughput  constant-vus: VUS virtual users loop flat-out for DURATION,
@@ -42,7 +42,7 @@ if (mode === 'rate') {
 }
 
 export const options = {
-  scenarios: { stress: scenario },
+  scenarios: { load: scenario },
   discardResponseBodies: true,   // measure the server, not JSON/body parsing
   insecureSkipTLSVerify: true,   // self-signed cert on the TLS backends
   summaryTrendStats: ['avg', 'p(95)', 'p(99)', 'max'],

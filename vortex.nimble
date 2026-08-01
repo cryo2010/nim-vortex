@@ -172,13 +172,13 @@ task h3load, "HTTP/3 (QUIC) throughput/stress via h2load-http3 (Docker)":
   # number reflects the server -- the HTTP/3 throughput/regression measurement.
   exec "sh conformance/h3load/run.sh"
 
-task stress, "Configurable k6 stress test with live Grafana/Prometheus charts (Docker)":
+task loadtest, "Configurable k6 load test with live Grafana/Prometheus charts (Docker)":
   # run.sh brings up Prometheus + Grafana, builds the selected vortex backend
   # image(s) (h1 / h2 / h2-gzip, or all), and drives k6 load into them for a
   # configurable duration, streaming metrics to Grafana (http://localhost:3000).
-  # Env knobs: BACKEND, MODE (throughput|rate), DURATION, VUS, RATE, ENDPOINT.
-  # Interactive, so not a CI gate. See conformance/stress/README.md.
-  exec "sh conformance/stress/run.sh"
+  # Env knobs: BACKEND, RUNTIME, MODE (throughput|rate), DURATION, VUS, RATE,
+  # ENDPOINT. Interactive, so not a CI gate. See conformance/loadtest/README.md.
+  exec "sh conformance/loadtest/run.sh"
 
 task interop, "Cross-client interop test (Node/Python/Go/Rust/Java) (Docker)":
   # run.sh mints a shared CA, builds a vortex TLS server (h1/h2, gzip) image and

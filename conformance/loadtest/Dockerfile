@@ -1,5 +1,5 @@
-# Builds the vortex server under test for the k6 stress harness.
-# conformance/stress/run.sh (or `nimble stress`) builds this once per
+# Builds the vortex server under test for the k6 load harness.
+# conformance/loadtest/run.sh (or `nimble loadtest`) builds this once per
 # (backend, runtime) pair, passing two build-args:
 #
 #   BUILD_FLAGS  protocol/backend:
@@ -27,23 +27,23 @@ RUN for i in 1 2 3 4 5; do \
 
 WORKDIR /vortex
 COPY src ./src
-COPY conformance/stress/stress_server.nim ./stress_server.nim
+COPY conformance/loadtest/loadtest_server.nim ./loadtest_server.nim
 
 ARG BUILD_FLAGS=""
 ARG RUNTIME=sync
 RUN case "$RUNTIME" in \
       sync)          rtflag="" ;; \
-      async)         rtflag="-d:stressAsync" ;; \
-      async-await)   rtflag="-d:stressAsyncAwait" ;; \
-      chronos)       rtflag="-d:stressChronos" ;; \
-      chronos-await) rtflag="-d:stressChronosAwait" ;; \
+      async)         rtflag="-d:ltAsync" ;; \
+      async-await)   rtflag="-d:ltAsyncAwait" ;; \
+      chronos)       rtflag="-d:ltChronos" ;; \
+      chronos-await) rtflag="-d:ltChronosAwait" ;; \
       *) echo "unknown RUNTIME: $RUNTIME (sync|async|async-await|chronos|chronos-await)" >&2; exit 1 ;; \
     esac; \
     case "$RUNTIME" in \
       chronos|chronos-await) nimble install -y "chronos@>= 4.0.0" ;; \
     esac; \
     nim c --mm:orc --threads:on -d:danger $BUILD_FLAGS $rtflag -p:src \
-      -o:stress_server stress_server.nim
+      -o:loadtest_server loadtest_server.nim
 
 # Throwaway self-signed cert for the TLS backends (unused by the h1 build).
 RUN openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
@@ -52,4 +52,4 @@ RUN openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
       -addext "subjectAltName=DNS:server,DNS:localhost"
 
 EXPOSE 8080 8443
-CMD ["./stress_server"]
+CMD ["./loadtest_server"]

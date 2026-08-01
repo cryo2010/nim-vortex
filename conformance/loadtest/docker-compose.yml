@@ -1,17 +1,17 @@
-# Long-lived observability stack for the k6 stress harness: Prometheus (with the
+# Long-lived observability stack for the k6 load harness: Prometheus (with the
 # remote-write receiver enabled so k6 can push metrics) and Grafana (anonymous
 # admin, provisioned datasource + dashboard). run.sh brings this up and leaves it
 # running so the charts stay viewable after a run; `run.sh --down` (add -v to drop
 # retained history) stops it.
 #
 # The network is given a fixed name so run.sh can attach the per-backend server
-# and the k6 client to it with `docker run --network vortex-stress`.
+# and the k6 client to it with `docker run --network vortex-loadtest`.
 
-name: vortex-stress
+name: vortex-loadtest
 
 networks:
   default:
-    name: vortex-stress
+    name: vortex-loadtest
 
 volumes:
   prom-data:

@@ -1,6 +1,6 @@
 {
-  "title": "vortex stress (k6)",
-  "uid": "vortex-stress",
+  "title": "vortex load test (k6)",
+  "uid": "vortex-loadtest",
   "editable": true,
   "schemaVersion": 39,
   "timezone": "browser",

@@ -1,14 +1,14 @@
 #!/bin/sh
-# Configurable k6 stress test with a live Grafana + Prometheus dashboard.
+# Configurable k6 load test with a live Grafana + Prometheus dashboard.
 #
 # Brings up Prometheus + Grafana (once, and leaves them up for viewing), builds
 # the selected vortex backend image(s), starts each on a private docker network,
 # and drives k6 load into it while streaming metrics to Grafana. Runs for a
 # configurable duration in either a max-throughput or a fixed-rate model.
 #
-# Usage:  sh conformance/stress/run.sh          (or `nimble stress`)
-#         sh conformance/stress/run.sh --down    (stop Grafana/Prometheus)
-#         sh conformance/stress/run.sh --down -v (also drop retained history)
+# Usage:  sh conformance/loadtest/run.sh          (or `nimble loadtest`)
+#         sh conformance/loadtest/run.sh --down    (stop Grafana/Prometheus)
+#         sh conformance/loadtest/run.sh --down -v (also drop retained history)
 # Needs: docker (with the compose plugin).
 #
 # Env knobs:
@@ -44,9 +44,9 @@ vus=${VUS:-50}
 rate=${RATE:-5000}
 endpoint=${ENDPOINT:-/plaintext}
 
-net=vortex-stress
-srvc=vortex-stress-server
-simg=vortex-stress-server-img
+net=vortex-loadtest
+srvc=vortex-loadtest-server
+simg=vortex-loadtest-server-img
 
 if [ "$(uname -m)" = "x86_64" ]; then
   basearg="--build-arg BASE=archlinux:latest"
@@ -90,7 +90,7 @@ run_case() {
 
   docker rm -f "$srvc" >/dev/null 2>&1 || true
   docker run -d --name "$srvc" --network "$net" --network-alias server \
-    -e STRESS_PORT="$port" -e STRESS_TLS="$tls" -e STRESS_COMPRESS="$comp" \
+    -e LOADTEST_PORT="$port" -e LOADTEST_TLS="$tls" -e LOADTEST_COMPRESS="$comp" \
     "$simg" >/dev/null
 
   # start() binds before returning, so the "listening" log line means ready.
@@ -107,8 +107,7 @@ run_case() {
   ts=$(date +%Y%m%d-%H%M%S)
   echo "running k6..."
   # Ship latency as a native histogram (not per-flush percentile aggregation of
-  # every raw sample): at high req/s the aggregating output backlogs and OOM-kills
-  # k6 on long runs, while the native histogram keeps k6's memory flat.
+  # every raw sample) so the Prometheus output stays cheap at high req/s.
   if ! docker run --rm --network "$net" \
     -e TARGET_URL="$scheme://server:$port" \
     -e ENDPOINT="$endpoint" -e MODE="$mode" -e DURATION="$duration" \
@@ -116,19 +115,20 @@ run_case() {
     -e K6_PROMETHEUS_RW_SERVER_URL="http://prometheus:9090/api/v1/write" \
     -e K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM="true" \
     -e K6_PROMETHEUS_RW_PUSH_INTERVAL="1s" \
-    -v "$here/stress.js:/stress.js:ro" \
+    -v "$here/loadtest.js:/loadtest.js:ro" \
     grafana/k6 run -o experimental-prometheus-rw \
       --tag testid="$b-$r-$mode-$ts" \
-      --tag backend="$b" --tag runtime="$r" --tag mode="$mode" /stress.js
+      --tag backend="$b" --tag runtime="$r" --tag mode="$mode" /loadtest.js
   then
     rc=$?
     docker rm -f "$srvc" >/dev/null 2>&1 || true
     echo >&2
     echo "RESULT: k6 exited non-zero ($rc) for backend $b / runtime $r." >&2
     if [ "$rc" = 137 ]; then
-      echo "  Exit 137 = the k6 container was OOM-killed. At this request rate the" >&2
-      echo "  Prometheus output backlogged. Give Docker more memory, lower VUS/RATE," >&2
-      echo "  or shorten DURATION. The vortex server itself is unaffected." >&2
+      echo "  Exit 137 = the k6 container was OOM-killed. k6 retains a sample per" >&2
+      echo "  request, so its memory grows with total requests. Give Docker more" >&2
+      echo "  memory, lower VUS/RATE, or shorten DURATION. The vortex server is" >&2
+      echo "  unaffected. See conformance/loadtest/README.md for the budget." >&2
     fi
     exit "$rc"
   fi
@@ -150,6 +150,6 @@ for b in $backends; do
 done
 
 echo
-echo "RESULT: stress run complete."
-echo "Charts: http://localhost:3000  (Grafana, dashboard \"vortex stress (k6)\")."
+echo "RESULT: load test run complete."
+echo "Charts: http://localhost:3000  (Grafana, dashboard \"vortex load test (k6)\")."
 echo "Filter with the 'test id' variable. Stop the stack: sh $0 --down  (add -v to drop history)."

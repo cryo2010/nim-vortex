@@ -1,4 +1,4 @@
-# Stress test (k6 + Grafana/Prometheus)
+# Load test (k6 + Grafana/Prometheus)
 
 A configurable, time-boxed load test that drives a chosen vortex backend (or all
 of them) with [k6](https://k6.io) and streams live throughput / latency / error
@@ -6,12 +6,16 @@ charts to Grafana. Unlike `conformance/h2load` and `conformance/h3load` (pass/fa
 smoke checks), this is an interactive tool for watching the server under load and
 comparing backends over time.
 
+It is a *load* test, not a *stress* test: it applies a chosen level of load and
+charts it, rather than ramping past capacity to find the breaking point. (See the
+Limitations section for what it would take to make it a true stress test.)
+
 ```sh
-sh conformance/stress/run.sh          # or: nimble stress
+sh conformance/loadtest/run.sh          # or: nimble loadtest
 ```
 
 Then open **http://localhost:3000** (Grafana, anonymous admin) and select the
-dashboard **"vortex stress (k6)"**. Prometheus retains history, so successive
+dashboard **"vortex load test (k6)"**. Prometheus retains history, so successive
 runs stay comparable via the **test id** dashboard variable.
 
 ## Watching charts in real time
@@ -21,7 +25,7 @@ as `run.sh` prints "starting Prometheus + Grafana" and watch data stream in.
 Give the run enough time to watch:
 
 ```sh
-BACKEND=h2 MODE=throughput DURATION=5m VUS=200 nimble stress
+BACKEND=h2 MODE=throughput DURATION=5m VUS=200 nimble loadtest
 ```
 
 The dashboard auto-refreshes every **1s** over a `now-5m` window, and k6 pushes
@@ -36,15 +40,16 @@ not concurrently.
 `DURATION` takes any k6 duration string and sets how long each backend runs:
 
 ```sh
-DURATION=10m nimble stress            # ten minutes
-DURATION=1h  nimble stress            # one hour
-DURATION=1h30m BACKEND=h2 nimble stress
-BACKEND=all DURATION=2m nimble stress  # 2m per backend -> ~6m total
+DURATION=10m nimble loadtest            # ten minutes
+DURATION=1h  nimble loadtest            # one hour
+DURATION=1h30m BACKEND=h2 nimble loadtest
+BACKEND=all DURATION=2m nimble loadtest  # 2m per backend -> ~6m total
 ```
 
 There is no fixed cap; the run ends when `DURATION` elapses (throughput mode) or
 after holding `RATE` for `DURATION` (rate mode). Prometheus keeps 15 days of
-history (`--storage.tsdb.retention.time` in `docker-compose.yml`).
+history (`--storage.tsdb.retention.time` in `docker-compose.yml`). At high request
+rates the practical limit is k6's memory, not time -- see "k6 client memory".
 
 ## Configuration
 
@@ -68,7 +73,7 @@ All knobs are environment variables:
 | `h2`      | default (TLS)    | HTTP/2 over TLS     | 8443   |
 | `h2-gzip` | `-d:httpGzip`    | HTTP/2 + gzip       | 8443   |
 
-The server (`stress_server.nim`) serves the same `/plaintext` and `/json`
+The server (`loadtest_server.nim`) serves the same `/plaintext` and `/json`
 handlers as `bench/handlers.nim`, plus `/big` for exercising compression.
 
 ### Handler execution model (`RUNTIME`)
@@ -94,28 +99,28 @@ all five; combined with `BACKEND=all` that is 15 runs (each its own `test id`).
 
 ```sh
 # Find the h2 ceiling for 1 minute with 200 VUs
-BACKEND=h2 MODE=throughput DURATION=1m VUS=200 sh conformance/stress/run.sh
+BACKEND=h2 MODE=throughput DURATION=1m VUS=200 sh conformance/loadtest/run.sh
 
 # Compare all three backends back-to-back (side by side in Grafana)
-BACKEND=all DURATION=30s sh conformance/stress/run.sh
+BACKEND=all DURATION=30s sh conformance/loadtest/run.sh
 
 # Compare the handler execution models on h2 (sync vs the adapters)
-BACKEND=h2 RUNTIME=all DURATION=30s sh conformance/stress/run.sh
+BACKEND=h2 RUNTIME=all DURATION=30s sh conformance/loadtest/run.sh
 
 # The adapter tax of a suspending chronos handler vs plain sync, h2
-BACKEND=h2 RUNTIME=chronos-await DURATION=1m sh conformance/stress/run.sh
-BACKEND=h2 RUNTIME=sync          DURATION=1m sh conformance/stress/run.sh
+BACKEND=h2 RUNTIME=chronos-await DURATION=1m sh conformance/loadtest/run.sh
+BACKEND=h2 RUNTIME=sync          DURATION=1m sh conformance/loadtest/run.sh
 
 # Hold 10k req/s at h2 and watch latency under load
-BACKEND=h2 MODE=rate RATE=10000 DURATION=2m sh conformance/stress/run.sh
+BACKEND=h2 MODE=rate RATE=10000 DURATION=2m sh conformance/loadtest/run.sh
 
 # See gzip's effect: compare h2 vs h2-gzip on the compressible endpoint
-BACKEND=h2      ENDPOINT=/big sh conformance/stress/run.sh
-BACKEND=h2-gzip ENDPOINT=/big sh conformance/stress/run.sh
+BACKEND=h2      ENDPOINT=/big sh conformance/loadtest/run.sh
+BACKEND=h2-gzip ENDPOINT=/big sh conformance/loadtest/run.sh
 
 # Stop Grafana/Prometheus (add -v to also drop retained history)
-sh conformance/stress/run.sh --down
-sh conformance/stress/run.sh --down -v
+sh conformance/loadtest/run.sh --down
+sh conformance/loadtest/run.sh --down -v
 ```
 
 ## Keeping k6 (not the server) honest
@@ -140,10 +145,12 @@ histogram). A long high-rate run can therefore exhaust Docker's memory and the
 k6 container gets OOM-killed (exit 137); `run.sh` reports this explicitly. The
 **vortex server is unaffected** — it holds flat at ~45 MiB throughout.
 
-Rule of thumb: keep `DURATION × req/s` within your Docker memory. To go longer or
-faster, raise Docker Desktop's memory limit, lower `VUS`/`RATE`, split one long
-run into several shorter ones (Prometheus keeps the history), or use
-`conformance/h2load` for a pure ceiling number without the metrics overhead.
+Rule of thumb: keep `DURATION × req/s` within your Docker memory (≈ 200 bytes per
+request). On a ~7.6 GiB Docker VM that is roughly **20M requests** per run — about
+65k req/s for 5 min, or 130k req/s for ~2 min. To go longer or faster, raise
+Docker Desktop's memory limit, lower `VUS`/`RATE`, split one long run into several
+shorter ones (Prometheus keeps the history), or use `conformance/h2load` for a
+pure ceiling number without the metrics overhead.
 
 Latency is recorded as a **Prometheus native histogram**
 (`k6_http_req_duration_seconds`); the dashboard reads percentiles with
@@ -156,6 +163,12 @@ k6 cannot drive **HTTP/3 (QUIC)**, and its HTTP/2 client requires TLS, so **h2c*
 
 - `conformance/h3load` — real ngtcp2/nghttp3 QUIC client (HTTP/3)
 - `conformance/h2load` — nghttp2 `h2load` (h2c and HTTP/1.1)
+
+This is a load test, not a stress test. To make it a true stress test you would
+add: a ramp-to-breaking-point profile (k6 `ramping-arrival-rate`), server-side
+metrics so you can see the SUT degrade (e.g. cAdvisor for the server container's
+CPU/RSS), and a leaner driver (`h2load`/`wrk`) so the client is not the first
+thing to break at saturation.
 
 This tool is intentionally not wired into CI (it is interactive and the Grafana
 stack is meant to stay up); it complements the pass/fail load smokes there.
