@@ -1,13 +1,14 @@
 # Testing
 
 A registry of every test in vortex, what it verifies, and how it runs. Tests
-fall into five groups:
+fall into six groups:
 
 1. [Default unit + integration suite](#default-suite-nimble-test) (`nimble test`)
 2. [Opt-in feature tests](#opt-in-feature-tests) (need a build flag or dependency)
 3. [Docker conformance & load suites](#docker-conformance--load-suites)
-4. [Fuzzing](#fuzzing)
-5. [Benchmarks](#benchmarks) (performance, not correctness)
+4. [Interactive load & stress tools](#interactive-load--stress-grafana) (k6 / h2load + Grafana)
+5. [Fuzzing](#fuzzing)
+6. [Benchmarks](#benchmarks) (performance, not correctness)
 
 The **CI** column says whether a check runs on every PR (see
 `.github/workflows/ci.yml`). "local" means it is not wired into CI and is run on
@@ -31,6 +32,10 @@ nimble testchronos     # chronos async adapter (needs chronos)
 # Docker conformance / load (each builds images and exits non-zero on failure):
 nimble h1spec h2spec h3spec h3websocket autobahn redbot \
        zap testssl h2load h3load interop brotli fuzz
+
+# Interactive load/stress with live Grafana charts (the stack stays up):
+nimble loadtest        # k6: hold a load, chart latency + server CPU/mem  (localhost:3000)
+nimble stress          # h2load: saturate, chart server CPU/mem + req/s   (localhost:3001)
 
 nimble bench perf perf2   # benchmarks (not pass/fail)
 ```
@@ -200,6 +205,40 @@ finding or failure. All need Docker; `interop` also needs host `openssl`.
 | `nimble brotli` | **yes** (`brotli`) | Node / Python / Go / Rust / Java clients | Same harness with `INTEROP_ENCODING=br`: every client requests and asserts `Content-Encoding: br` and decodes it with its ecosystem's brotli library |
 
 Details for each live in the matching `conformance/<name>/README.md`.
+
+---
+
+## Interactive load & stress (Grafana)
+
+Two Docker-based tools that drive load at a vortex server and stream metrics to a
+local Grafana + Prometheus stack for live charts. Unlike the pass/fail load smokes
+above (`h2load`/`h3load`), these are **interactive**: they leave the observability
+stack running so you can watch a run and compare runs over time. Not wired into
+CI. Each brings up its own stack on its own ports; stop it with the runner's
+`--down` (add `-v` to also drop retained history).
+
+| Task | CI | Driver | Grafana | For |
+|------|----|--------|---------|-----|
+| `nimble loadtest` | local | k6 | http://localhost:3000 | Hold a chosen load; chart client throughput, latency (p50/p95/p99), errors, plus server CPU/memory |
+| `nimble stress` | local | h2load | http://localhost:3001 | Saturate (max req/s); chart the server's own CPU/memory live, with achieved req/s as a summary |
+
+Both build the selected backend(s) (`BACKEND=h1|h2|h2-gzip|all`) from the shared
+`conformance/loadtest/loadtest_server.nim` (TechEmpower-style `/plaintext`,
+`/json`, `/big`) and show the server's own CPU/memory sampled from `docker stats`
+(pushed to a Pushgateway -- cAdvisor can't name containers on Docker Desktop).
+
+**`nimble loadtest` (k6).** Holds a load and charts the client's view. Also
+varies the handler runtime (`RUNTIME=sync|async|async-await|chronos|chronos-await|all`)
+and the load model (`MODE=throughput|rate`); knobs: `DURATION`, `VUS`, `RATE`,
+`ENDPOINT`. Latency is a Prometheus native histogram. k6 cannot drive HTTP/3 or
+h2c, and its memory grows with total requests, so long high-rate runs are
+memory-bound. See `conformance/loadtest/README.md`.
+
+**`nimble stress` (h2load).** Saturates the server so the *client* is not the
+bottleneck; knobs: `DURATION` (seconds), `CONNS`, `STREAMS` (h2), `ENDPOINT`.
+Achieved req/s is a summary stat, not a live curve (h2load reports only at the
+end); the live signal is the server's CPU/memory. h2load drives h1/h2c/h2-TLS;
+for HTTP/3 saturation use `nimble h3load`. See `conformance/stress/README.md`.
 
 ---
 
