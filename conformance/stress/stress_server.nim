@@ -5,11 +5,21 @@
 ##   /json       -> {"message":"Hello, World!"}
 ##   /big        -> ~9 KB of text             (compressible; use for the gzip backend)
 ##
-## One source builds every k6-drivable backend: the build flags pick the
-## protocol surface and the env vars pick the runtime settings.
+## Two build-time axes, both driven by the Dockerfile from run.sh:
+##
+## Protocol (BUILD_FLAGS) + runtime env pick the transport:
 ##   plain build (-d:plainHttp)                    -> h1 (cleartext) on STRESS_PORT
 ##   default build + STRESS_TLS=1                   -> h1 + h2 over TLS (ALPN), h3 off
 ##   + -d:httpGzip --passL:-lz + STRESS_COMPRESS=1 -> h2 + gzip response compression
+##
+## Handler execution model (one -d: flag, set from RUNTIME):
+##   sync           plain {.gcsafe.} handler (default; no flag)
+##   async          -d:stressAsync         asyncdispatch adapter, no suspend
+##   async-await    -d:stressAsyncAwait    asyncdispatch adapter, one await/req
+##   chronos        -d:stressChronos       chronos adapter, no suspend
+##   chronos-await  -d:stressChronosAwait  chronos adapter, one await/req
+## The asyncdispatch and chronos adapters both re-export async/Future/toHandler,
+## so only one adapter is imported per build -- a single binary is one runtime.
 ##
 ## start() binds before returning, so the "listening" log line is the readiness
 ## signal run.sh polls for.
@@ -17,18 +27,39 @@
 import std/[os, strutils]
 import vortex
 
+when defined(stressAsync) or defined(stressAsyncAwait):
+  import vortex/adapters/asyncdispatch
+elif defined(stressChronos) or defined(stressChronosAwait):
+  import vortex/adapters/chronos
+
 const bigBody = "The quick brown fox jumps over the lazy dog. ".repeat(200)  # ~9 KB
 
-proc handler(req: Request, res: Response) {.gcsafe.} =
+template respond(req, res: untyped) =
+  ## Shared routing, used by both the sync and the async handler shapes.
   case req.path
   of "/plaintext":
-    res.send(Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!", "text/plain")
   of "/json":
-    res.send(Http200, """{"message":"Hello, World!"}""", "application/json")
+    vortex.send(res, Http200, """{"message":"Hello, World!"}""", "application/json")
   of "/big":
-    res.send(Http200, bigBody, "text/plain")
+    vortex.send(res, Http200, bigBody, "text/plain")
   else:
-    res.send(Http404)
+    vortex.send(res, Http404)
+
+when defined(stressAsync) or defined(stressAsyncAwait) or
+     defined(stressChronos) or defined(stressChronosAwait):
+  proc appHandlerProc(req: vortex.Request,
+                      res: vortex.Response): Future[void] {.async.} =
+    when defined(stressAsyncAwait):
+      await sleepAsync(0)                # asyncdispatch: force a real suspend
+    elif defined(stressChronosAwait):
+      await sleepAsync(ZeroDuration)     # chronos: force a real suspend
+    respond(req, res)
+  let appHandler = toHandler(appHandlerProc)
+else:
+  proc appHandlerProc(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
+    respond(req, res)
+  let appHandler = RequestHandler(appHandlerProc)
 
 when isMainModule:
   let port = Port(parseInt(getEnv("STRESS_PORT", "8080")))
@@ -41,6 +72,6 @@ when isMainModule:
       settings.certFile = "/vortex/cert.pem"
       settings.keyFile = "/vortex/key.pem"
       settings.http3 = false      # k6 is TCP-only (h1/h2); no QUIC listener needed
-  var srv = start(RequestHandler(handler), settings)
+  var srv = start(appHandler, settings)
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

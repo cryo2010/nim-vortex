@@ -13,6 +13,8 @@
 #
 # Env knobs:
 #   BACKEND   h1 | h2 | h2-gzip | all     (default h1)
+#   RUNTIME   sync | async | async-await | chronos | chronos-await | all
+#             handler execution model (default sync)
 #   MODE      throughput | rate           (default throughput)
 #   DURATION  k6 duration, e.g. 30s, 2m   (default 30s)
 #   VUS       virtual users, throughput mode   (default 50)
@@ -35,6 +37,7 @@ if [ "${1:-}" = "--down" ]; then
 fi
 
 backend=${BACKEND:-h1}
+runtime=${RUNTIME:-sync}
 mode=${MODE:-throughput}
 duration=${DURATION:-30s}
 vus=${VUS:-50}
@@ -68,15 +71,22 @@ backend_cfg() {
   esac
 }
 
-run_backend() {
-  b="$1"
+validate_runtime() {
+  case "$1" in
+    sync|async|async-await|chronos|chronos-await) ;;
+    *) echo "unknown RUNTIME: $1 (want sync|async|async-await|chronos|chronos-await|all)" >&2; exit 2 ;;
+  esac
+}
+
+run_case() {
+  b="$1"; r="$2"
   backend_cfg "$b"
   echo
-  echo "=== backend $b: $scheme://:$port, mode=$mode, duration=$duration, endpoint=$endpoint ==="
+  echo "=== backend $b, runtime $r: $scheme://:$port, mode=$mode, duration=$duration, endpoint=$endpoint ==="
 
-  echo "building server image (flags: ${bflags:-none})..."
+  echo "building server image (protocol: ${bflags:-none}; runtime: $r)..."
   docker build -f "$here/Dockerfile" -t "$simg" $basearg \
-    --build-arg BUILD_FLAGS="$bflags" "$root"
+    --build-arg BUILD_FLAGS="$bflags" --build-arg RUNTIME="$r" "$root"
 
   docker rm -f "$srvc" >/dev/null 2>&1 || true
   docker run -d --name "$srvc" --network "$net" --network-alias server \
@@ -92,7 +102,8 @@ run_backend() {
   done
   echo "server up: $scheme://server:$port"
 
-  # Tag every metric with a unique testid so runs are separable in Grafana.
+  # testid separates runs; backend/runtime/mode are also tagged so the dashboard
+  # can group or filter by any single axis.
   ts=$(date +%Y%m%d-%H%M%S)
   echo "running k6..."
   docker run --rm --network "$net" \
@@ -104,16 +115,24 @@ run_backend() {
     -e K6_PROMETHEUS_RW_PUSH_INTERVAL="1s" \
     -v "$here/stress.js:/stress.js:ro" \
     grafana/k6 run -o experimental-prometheus-rw \
-      --tag testid="$b-$mode-$ts" /stress.js
+      --tag testid="$b-$r-$mode-$ts" \
+      --tag backend="$b" --tag runtime="$r" --tag mode="$mode" /stress.js
 
   docker rm -f "$srvc" >/dev/null 2>&1 || true
 }
 
-if [ "$backend" = "all" ]; then
-  for b in h1 h2 h2-gzip; do run_backend "$b"; done
+if [ "$backend" = "all" ]; then backends="h1 h2 h2-gzip"; else backends="$backend"; fi
+if [ "$runtime" = "all" ]; then
+  runtimes="sync async async-await chronos chronos-await"
 else
-  run_backend "$backend"
+  validate_runtime "$runtime"; runtimes="$runtime"
 fi
+
+for b in $backends; do
+  for r in $runtimes; do
+    run_case "$b" "$r"
+  done
+done
 
 echo
 echo "RESULT: stress run complete."

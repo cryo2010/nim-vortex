@@ -53,6 +53,7 @@ All knobs are environment variables:
 | Var        | Values                        | Default      | Meaning                                   |
 |------------|-------------------------------|--------------|-------------------------------------------|
 | `BACKEND`  | `h1` `h2` `h2-gzip` `all`     | `h1`         | Which server backend(s) to drive          |
+| `RUNTIME`  | `sync` `async` `async-await` `chronos` `chronos-await` `all` | `sync` | Handler execution model |
 | `MODE`     | `throughput` `rate`           | `throughput` | Saturate for the ceiling, or hold a rate  |
 | `DURATION` | k6 duration (`30s`, `2m`, …)  | `30s`        | How long to run                           |
 | `VUS`      | integer                       | `50`         | Virtual users (throughput mode)           |
@@ -70,6 +71,25 @@ All knobs are environment variables:
 The server (`stress_server.nim`) serves the same `/plaintext` and `/json`
 handlers as `bench/handlers.nim`, plus `/big` for exercising compression.
 
+### Handler execution model (`RUNTIME`)
+
+An orthogonal axis: how the handler is dispatched. Selected by a build-time flag
+(the adapters can't share a binary), so each variant is its own server image.
+
+| `RUNTIME`       | Handler                                                        |
+|-----------------|---------------------------------------------------------------|
+| `sync`          | plain `{.gcsafe.}` handler, `res.send` (the future-agnostic core) |
+| `async`         | asyncdispatch adapter, `{.async.}` handler that never suspends |
+| `async-await`   | asyncdispatch adapter, one real `await` (suspend) per request  |
+| `chronos`       | chronos adapter, `{.async.}` handler that never suspends       |
+| `chronos-await` | chronos adapter, one real `await` (suspend) per request        |
+
+`chronos`/`chronos-await` pull chronos into the server image at build time
+(`nimble install chronos`); the others need no extra dependency. `async`/`chronos`
+measure the adapter's overhead versus `sync`; the `-await` variants add a forced
+loop suspend/resume per request (the worst case). `RUNTIME=all` builds and runs
+all five; combined with `BACKEND=all` that is 15 runs (each its own `test id`).
+
 ### Examples
 
 ```sh
@@ -78,6 +98,13 @@ BACKEND=h2 MODE=throughput DURATION=1m VUS=200 sh conformance/stress/run.sh
 
 # Compare all three backends back-to-back (side by side in Grafana)
 BACKEND=all DURATION=30s sh conformance/stress/run.sh
+
+# Compare the handler execution models on h2 (sync vs the adapters)
+BACKEND=h2 RUNTIME=all DURATION=30s sh conformance/stress/run.sh
+
+# The adapter tax of a suspending chronos handler vs plain sync, h2
+BACKEND=h2 RUNTIME=chronos-await DURATION=1m sh conformance/stress/run.sh
+BACKEND=h2 RUNTIME=sync          DURATION=1m sh conformance/stress/run.sh
 
 # Hold 10k req/s at h2 and watch latency under load
 BACKEND=h2 MODE=rate RATE=10000 DURATION=2m sh conformance/stress/run.sh
