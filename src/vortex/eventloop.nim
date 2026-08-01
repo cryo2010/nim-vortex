@@ -560,19 +560,24 @@ proc processInput(loop: Loop, c: ptr Connection) =
     case res
     of prNeedMore:
       if c.parser.inBody:
-        if c.parser.expectContinue and not c.sent100 and
-            loop.settings.auto100Continue:
-          c.sent100 = true
-          c.wbuf.add continue100
         if c.dlKind != dkBody:
           c.setDeadline(loop, dkBody)
         # Streaming route: dispatch at headers-complete, then feed the body
         # incrementally to onBody instead of waiting for the whole request.
+        # 100 Continue is sent implicitly when the handler first reads
+        # (req.onBody / req.read), Go-style; a handler that responds before
+        # reading (a reject) never prompts the body.
         if hasStreamRoute(addr loop.core) and not c.reqStreaming and
             not c.responded:
           loop.startStreamingDispatch(c)
         if c.reqStreaming:
           loop.feedBody(c, last = false)
+        elif c.parser.expectContinue and not c.sent100 and not c.responded:
+          # Buffered route: the loop must receive the whole body to dispatch, so
+          # prompt an Expect: 100-continue client to send it (buffering is the
+          # read).
+          c.sent100 = true
+          c.wbuf.add continue100
       elif c.rlen > c.parser.reqStart and c.dlKind != dkHeader:
         # Bytes of the next request head are pending.
         c.setDeadline(loop, dkHeader)
