@@ -48,3 +48,14 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+
+  # Server-side metrics sink. run.sh samples the server container with
+  # `docker stats` and pushes its CPU/memory here; Prometheus scrapes it, so the
+  # dashboard shows the SUT's own load, not just the client's view. This works on
+  # Docker Desktop (where cAdvisor can't reach the daemon to name containers),
+  # because `docker stats` runs on the host. Published so the host sampler can
+  # POST to localhost:9091.
+  pushgateway:
+    image: prom/pushgateway:latest
+    ports:
+      - "9091:9091"

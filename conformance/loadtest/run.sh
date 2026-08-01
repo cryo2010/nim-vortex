@@ -58,8 +58,40 @@ fi
 echo "starting Prometheus + Grafana..."
 docker compose -f "$here/docker-compose.yml" up -d
 
-cleanup() { docker rm -f "$srvc" >/dev/null 2>&1 || true; }
+statspid=""
+cleanup() {
+  [ -n "$statspid" ] && kill "$statspid" >/dev/null 2>&1
+  docker rm -f "$srvc" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT INT TERM
+
+# Sample the server container with `docker stats` and push CPU (cores) + memory
+# (bytes) to the Pushgateway, which Prometheus scrapes. Runs on the host, so it
+# works on Docker Desktop (where cAdvisor cannot reach the daemon to name
+# containers). `docker stats --no-stream` blocks ~1-2s per read, pacing the loop.
+sample_server_stats() {
+  while docker inspect -f '{{.State.Running}}' "$srvc" >/dev/null 2>&1; do
+    line=$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' "$srvc" 2>/dev/null) || break
+    [ -n "$line" ] || { sleep 1; continue; }
+    printf '%s\n' "$line" | awk -F'|' '{
+      cpu=$1; sub(/%/,"",cpu);
+      mem=$2; sub(/ .*/,"",mem);
+      num=mem; sub(/[A-Za-z]+/,"",num);
+      unit=mem; sub(/[0-9.]+/,"",unit);
+      m=1; if(unit=="KiB")m=1024; else if(unit=="MiB")m=1048576;
+      else if(unit=="GiB")m=1073741824; else if(unit=="B")m=1;
+      printf "loadtest_server_cpu_cores %.3f\nloadtest_server_memory_bytes %d\n", cpu/100, num*m
+    }' | curl -s --data-binary @- http://localhost:9091/metrics/job/loadtest_server >/dev/null 2>&1
+  done
+}
+
+# Stop the sampler and clear its Pushgateway group so the series ends when the run
+# does (Prometheus keeps the history it already scraped).
+stop_server_stats() {
+  [ -n "$statspid" ] && kill "$statspid" >/dev/null 2>&1
+  statspid=""
+  curl -s -X DELETE http://localhost:9091/metrics/job/loadtest_server >/dev/null 2>&1 || true
+}
 
 # backend -> build flags / tls / compress / port / scheme
 backend_cfg() {
@@ -102,6 +134,9 @@ run_case() {
   done
   echo "server up: $scheme://server:$port"
 
+  # Push the server container's CPU/memory to the Pushgateway while k6 runs.
+  sample_server_stats & statspid=$!
+
   # testid separates runs; backend/runtime/mode are also tagged so the dashboard
   # can group or filter by any single axis.
   ts=$(date +%Y%m%d-%H%M%S)
@@ -121,6 +156,7 @@ run_case() {
       --tag backend="$b" --tag runtime="$r" --tag mode="$mode" /loadtest.js
   then
     rc=$?
+    stop_server_stats
     docker rm -f "$srvc" >/dev/null 2>&1 || true
     echo >&2
     echo "RESULT: k6 exited non-zero ($rc) for backend $b / runtime $r." >&2
@@ -133,6 +169,7 @@ run_case() {
     exit "$rc"
   fi
 
+  stop_server_stats
   docker rm -f "$srvc" >/dev/null 2>&1 || true
 }
 

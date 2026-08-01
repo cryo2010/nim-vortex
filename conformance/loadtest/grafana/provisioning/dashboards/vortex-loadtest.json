@@ -115,6 +115,40 @@
           "legendFormat": "{{testid}}"
         }
       ]
+    },
+    {
+      "id": 6,
+      "title": "Server CPU (cores)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "description": "Vortex server container CPU, sampled from `docker stats` and pushed to the Pushgateway. Not filtered by test id (it tracks the container, not the run); correlate with the client charts by time.",
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "loadtest_server_cpu_cores",
+          "legendFormat": "server cores"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Server memory (RSS)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "Vortex server container memory, sampled from `docker stats` and pushed to the Pushgateway. Not filtered by test id; correlate by time.",
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "loadtest_server_memory_bytes",
+          "legendFormat": "server RSS"
+        }
+      ]
     }
   ]
 }

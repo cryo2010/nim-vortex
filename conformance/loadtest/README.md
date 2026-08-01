@@ -2,9 +2,12 @@
 
 A configurable, time-boxed load test that drives a chosen vortex backend (or all
 of them) with [k6](https://k6.io) and streams live throughput / latency / error
-charts to Grafana. Unlike `conformance/h2load` and `conformance/h3load` (pass/fail
-smoke checks), this is an interactive tool for watching the server under load and
-comparing backends over time.
+charts to Grafana — alongside the server container's own CPU and memory (sampled
+from `docker stats`), so you see both the client's view and the server under
+load. Unlike
+`conformance/h2load` and `conformance/h3load` (pass/fail smoke checks), this is an
+interactive tool for watching the server under load and comparing backends over
+time.
 
 It is a *load* test, not a *stress* test: it applies a chosen level of load and
 charts it, rather than ramping past capacity to find the breaking point. (See the
@@ -123,6 +126,26 @@ sh conformance/loadtest/run.sh --down
 sh conformance/loadtest/run.sh --down -v
 ```
 
+## Server-side metrics
+
+The dashboard's bottom row shows **Server CPU (cores)** and **Server memory
+(RSS)** for the vortex server container, next to the k6 client charts. That lets
+you:
+
+- see how much CPU/RAM a given load costs, and how much headroom is left;
+- tell a **client** bottleneck from a **server** one — if req/s plateaus while
+  server CPU sits well under the core count, k6 is the limit, not vortex;
+- confirm the server holds steady under sustained load (e.g. flat memory).
+
+These come from `run.sh` sampling the server container with `docker stats` and
+pushing the numbers to a Prometheus **Pushgateway** (which Prometheus scrapes).
+This deliberately does **not** use cAdvisor: cAdvisor can't reach the Docker
+daemon inside Docker Desktop's Linux VM, so it never resolves container names
+there and the panels would stay empty. `docker stats` runs on the host and works
+everywhere. The panels track the container, not a `test id`, so correlate them
+with the client charts by time; on Docker Desktop the figures reflect the shared
+Linux VM, so read them as relative/trend rather than absolute host numbers.
+
 ## Keeping k6 (not the server) honest
 
 k6 is convenient and scriptable but slower per core than a native client, so at
@@ -164,11 +187,10 @@ k6 cannot drive **HTTP/3 (QUIC)**, and its HTTP/2 client requires TLS, so **h2c*
 - `conformance/h3load` — real ngtcp2/nghttp3 QUIC client (HTTP/3)
 - `conformance/h2load` — nghttp2 `h2load` (h2c and HTTP/1.1)
 
-This is a load test, not a stress test. To make it a true stress test you would
-add: a ramp-to-breaking-point profile (k6 `ramping-arrival-rate`), server-side
-metrics so you can see the SUT degrade (e.g. cAdvisor for the server container's
-CPU/RSS), and a leaner driver (`h2load`/`wrk`) so the client is not the first
-thing to break at saturation.
+This is a load test, not a stress test. It already has server-side metrics (see
+above), so what remains to make it a true stress test is: a ramp-to-breaking-point
+profile (k6 `ramping-arrival-rate`), and a leaner driver (`h2load`/`wrk`) so the
+client is not the first thing to break at saturation.
 
 This tool is intentionally not wired into CI (it is interactive and the Grafana
 stack is meant to stay up); it complements the pass/fail load smokes there.
