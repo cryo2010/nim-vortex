@@ -4,7 +4,7 @@
 
 import std/[unittest, net, posix, strutils, httpcore, atomics, os]
 import vortex/[settings, request, server, router]
-import vortex/adapters/asyncdispatch
+import vortex/asyncdispatch
 import ./helper
 
 var finished: Atomic[int]      # incremented when a streaming handler unwinds
@@ -39,10 +39,7 @@ rt.stream(HttpPost, "/upload", hUpload)
 rt.stream(HttpPost, "/echo", hEcho)
 rt.stream(HttpPost, "/abortable", hAbortable)
 
-var srv = start(rt.toHandler,
-                initSettings(port = Port(0), numThreads = 1,
-                             maxBodySize = 8 * 1024 * 1024),
-                rt.streamPredicate)
+var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1, maxBodySize = 8 * 1024 * 1024), rt.streamPredicate).start(0)
 let port = srv.port
 
 proc rawPost(path, body: string): string =

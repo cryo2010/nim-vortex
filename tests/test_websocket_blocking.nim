@@ -26,8 +26,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 
 # Several workers so concurrency is possible; a single loop thread owns the
 # one test connection.
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1, workerThreads = 4))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 4)).start(0)
 let port = srv.port
 
 proc recvN(s: Socket, n: int): string =

@@ -24,8 +24,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     doAssert sink >= 0
     res.send(Http200, "ok", "text/plain")
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 4))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 4)).start(0)
 let port = srv.port
 
 var okCount: Atomic[int]

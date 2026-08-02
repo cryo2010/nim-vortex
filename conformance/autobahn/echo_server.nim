@@ -18,8 +18,6 @@ when isMainModule:
   # A large message cap so the 9.* limit/performance cases (payloads up to
   # 16 MiB) pass. start() binds before returning, so the "listening" log
   # line is a reliable readiness signal for run.sh.
-  var srv = start(RequestHandler(handler),
-                  initSettings(port = Port(9001), numThreads = 1,
-                               maxWsMessageSize = 64 * 1024 * 1024))
+  var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxWsMessageSize = 64 * 1024 * 1024)).start(9001)
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

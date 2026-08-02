@@ -12,10 +12,6 @@ when isMainModule:
   # TLS on (ALPN negotiates h2); HTTP/3 off so no UDP/QUIC listener is
   # needed for this TCP-only check. start() binds before returning, so the
   # "listening" log line is a reliable readiness signal for run.sh.
-  var srv = start(RequestHandler(handler),
-                  initSettings(port = Port(8443), numThreads = 1,
-                               certFile = "/vortex/cert.pem",
-                               keyFile = "/vortex/key.pem",
-                               http3 = false))
+  var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = "/vortex/cert.pem", keyFile = "/vortex/key.pem", http3 = false)).start(8443)
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

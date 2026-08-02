@@ -11,9 +11,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.send(Http200, "http", "text/plain")
 
 # Fast keepalive so the test runs in a few seconds.
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1,
-                             wsPingInterval = 1, wsPongTimeout = 1))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, wsPingInterval = 1, wsPongTimeout = 1)).start(0)
 let port = srv.port
 
 proc readFrame(s: Socket): tuple[ok: bool, op: int, payload: string] =

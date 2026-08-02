@@ -10,8 +10,7 @@ import ./h2client
 proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "hello h2", "text/plain")     # 8-byte body
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 
 proc addInitialWindow(buf: var string, value: uint32) =
   var payload = ""

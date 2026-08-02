@@ -13,10 +13,6 @@ when isMainModule:
   # HTTP/3 over QUIC on UDP 4433; a throwaway self-signed cert (h3spec runs
   # with --no-validate). start() binds before returning, so the "listening"
   # log line is the readiness signal for run.sh.
-  var srv = start(RequestHandler(handler),
-                  initSettings(port = Port(4433), numThreads = 1,
-                               certFile = "/vortex/cert.pem",
-                               keyFile = "/vortex/key.pem",
-                               http3 = true))
+  var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = "/vortex/cert.pem", keyFile = "/vortex/key.pem", http3 = true)).start(4433)
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

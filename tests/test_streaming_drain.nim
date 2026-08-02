@@ -6,7 +6,7 @@
 import std/[unittest, net, posix, strutils, httpcore, atomics]
 from std/os import sleep
 import vortex/[settings, request, server, router]
-import vortex/adapters/asyncdispatch
+import vortex/asyncdispatch
 import ./helper
 
 var drainCount: Atomic[int]
@@ -23,8 +23,7 @@ proc bigStream(req: Request, res: Response) {.async.} =
 var rt = newRouter()
 rt.get("/big", bigStream)
 
-var srv = start(rt.toHandler,
-                initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port
 
 proc slowGet(path: string): string =

@@ -32,9 +32,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http404)
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 2,
-                             workerThreads = 4, keepAliveTimeout = 5))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 2, workerThreads = 4, keepAliveTimeout = 5)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc fetch(path: string): string =
@@ -124,9 +122,7 @@ proc hangHandler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http200, "ok", "text/plain")
 
-var tsrv = start(RequestHandler(hangHandler),
-                 initSettings(port = Port(0), numThreads = 1,
-                              responseTimeout = 1))
+var tsrv = newVortex(RequestHandler(hangHandler), initVortexConfig(numThreads = 1, responseTimeout = 1)).start(0)
 let tbase = "http://127.0.0.1:" & $tsrv.port
 
 suite "response timeout":

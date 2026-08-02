@@ -4,7 +4,7 @@
 
 import std/[unittest, net, posix, strutils]
 import vortex/[settings, request, server, router]
-import vortex/adapters/asyncdispatch
+import vortex/asyncdispatch
 import ./helper
 
 proc chat(req: Request, res: Response) {.async.} =
@@ -20,7 +20,7 @@ proc boom(req: Request, res: Response) {.async.} =
 var r = newRouter()
 r.ws("/chat", chat)
 r.ws("/boom", boom)
-var srv = start(r.toHandler, initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(r.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port
 
 proc recvN(s: Socket, n: int): string =

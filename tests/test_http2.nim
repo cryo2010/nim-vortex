@@ -23,10 +23,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http404, "nope", "text/plain")
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 2,
-                             workerThreads = 2,
-                             maxBodySize = 1024 * 1024))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 2, workerThreads = 2, maxBodySize = 1024 * 1024)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc h2curl(args: string): (string, int) =

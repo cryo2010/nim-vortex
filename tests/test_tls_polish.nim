@@ -48,12 +48,9 @@ proc tls13Establishes(port: Port): bool =
 
 suite "wildcard SNI":
   test "*.example.com matches one label; not the bare domain":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = key,
-                                 sni = @[SniCertEntry(host: "*.example.com",
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, sni = @[SniCertEntry(host: "*.example.com",
                                          certFile: dir / "wild.pem",
-                                         keyFile: dir / "wildkey.pem")]))
+                                         keyFile: dir / "wildkey.pem")])).start(0)
     defer: srv.close()
     check "*.example.com" in servedSubject(srv.port, "foo.example.com")  # wildcard hit
     check "localhost" in servedSubject(srv.port, "example.com")          # bare -> default
@@ -61,20 +58,14 @@ suite "wildcard SNI":
 
 suite "max TLS version":
   test "cap at 1.2 negotiates 1.2, refuses 1.3":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = key,
-                                 maxTlsVersion = tlsMax12))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, maxTlsVersion = tlsMax12)).start(0)
     defer: srv.close()
     check "TLSv1.2" in negotiatedProto(srv.port)
     check not tls13Establishes(srv.port)                          # 1.3 refused
 
   test "min 1.3 > max 1.2 is rejected at start":
     expect CatchableError:
-      var srv = start(RequestHandler(handler),
-                      initSettings(port = Port(0), numThreads = 1,
-                                   certFile = cert, keyFile = key,
-                                   minTlsVersion = tlsV13, maxTlsVersion = tlsMax12))
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, minTlsVersion = tlsV13, maxTlsVersion = tlsMax12)).start(0)
       srv.close()
 
 # --- OCSP stapling: generate a real response, or skip if the toolchain differs
@@ -107,11 +98,7 @@ suite "OCSP stapling":
       echo "  SKIP: could not build an OCSP response with this openssl"
       skip()
     else:
-      var srv = start(RequestHandler(handler),
-                      initSettings(port = Port(0), numThreads = 1,
-                                   certFile = dir / "srv.pem",
-                                   keyFile = dir / "srv.key",
-                                   ocspFile = dir / "resp.der"))
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = dir / "srv.pem", keyFile = dir / "srv.key", ocspFile = dir / "resp.der")).start(0)
       defer: srv.close()
       let cmd = "echo | " & opensslBin & " s_client -status -connect 127.0.0.1:" &
         $srv.port & " 2>/dev/null | grep -iE 'OCSP Response Status'"

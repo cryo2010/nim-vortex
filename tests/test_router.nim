@@ -33,8 +33,7 @@ appRouter.get("/users/{id}/posts/{post}", hUserPosts)
 appRouter.get("/static/*", hStatic)
 appRouter.post("/users", hCreate)
 
-var srv = start(appRouter.toHandler,
-                initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(appRouter.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc fetch(path: string): (HttpCode, string) =

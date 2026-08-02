@@ -23,4 +23,4 @@ when isMainModule:
     key = paramStr(3)
   echo "serving on port ", int(port),
        (if cert.len > 0: " (TLS + h2 + h3 enabled)" else: " (cleartext h1 + h2c)")
-  run(handler, initSettings(port = port, certFile = cert, keyFile = key))
+  newVortex(handler, initVortexConfig(port = port, certFile = cert, keyFile = key)).serve()

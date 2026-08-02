@@ -16,9 +16,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http200, "ok", "text/plain")
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1,
-                             workerThreads = 2, shutdownGrace = 5))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2, shutdownGrace = 5)).start(0)
 let port = srv.port
 
 proc connectSock(): Socket =

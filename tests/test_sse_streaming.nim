@@ -35,9 +35,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 
 # streamPaths (router-free) opts /upload into inbound streaming; /events is a
 # plain buffered handler that happens to stream its *response*.
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1),
-                streamRoute = streamPaths("/upload"))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1), streamRoute = streamPaths("/upload")).start(0)
 let port = srv.port
 
 proc splitHeadBody(resp: string): (string, string) =

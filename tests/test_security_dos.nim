@@ -24,32 +24,19 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 # buffered and processed by the h2 codec, but uses modest reset/control
 # budgets so a small flood trips the defense.
 const budget = 100
-var floodSrv = start(RequestHandler(handler),
-                     initSettings(port = Port(0), numThreads = 1,
-                                  maxResetStreams = budget,
-                                  maxControlFrames = budget))
+var floodSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxResetStreams = budget, maxControlFrames = budget)).start(0)
 
 # The limits server uses tight header/body/timeout caps for the h1 tests.
-var limitSrv = start(RequestHandler(handler),
-                     initSettings(port = Port(0), numThreads = 1,
-                                  headerTimeout = 1, bodyTimeout = 2,
-                                  keepAliveTimeout = 3,
-                                  maxHeaderSize = 4096, maxBodySize = 8192))
+var limitSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, headerTimeout = 1, bodyTimeout = 2, keepAliveTimeout = 3, maxHeaderSize = 4096, maxBodySize = 8192)).start(0)
 
 # A tiny connection cap to exercise accept-and-drop.
 const connCap = 8
-var capSrv = start(RequestHandler(handler),
-                   initSettings(port = Port(0), numThreads = 1,
-                                maxConnections = connCap))
+var capSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxConnections = connCap)).start(0)
 
 # Tight h1 limits + small initial buffer, but a high stream cap: a large
 # h2 request burst must be processed via receive-buffer compaction rather
 # than clipped by the h1 body limit.
-var tightSrv = start(RequestHandler(handler),
-                     initSettings(port = Port(0), numThreads = 1,
-                                  initialBufferSize = 2048,
-                                  maxHeaderSize = 2048, maxBodySize = 2048,
-                                  maxConcurrentStreams = 4000))
+var tightSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, initialBufferSize = 2048, maxHeaderSize = 2048, maxBodySize = 2048, maxConcurrentStreams = 4000)).start(0)
 
 suite "HTTP/2 flood defenses":
   test "rapid reset flood should GOAWAY and bound handler work":

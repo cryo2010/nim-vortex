@@ -27,8 +27,7 @@ let sh = staticHandler(dir)
 r.get("/assets", sh)         # /assets and /assets/ -> directory index
 r.get("/assets/*", sh)       # /assets/<path>
 r.get("/one", oneFile(dir / "hello.txt"))   # res.sendFile
-var srv = start(r.toHandler(),
-                initSettings(port = Port(0), numThreads = 1, workerThreads = 2))
+var srv = newVortex(r.toHandler(), initVortexConfig(numThreads = 1, workerThreads = 2)).start(0)
 
 proc raw(path: string, extra = ""): string =
   let s = newSocket()

@@ -16,10 +16,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 
 # Small HTTP body limit but a larger WebSocket message limit: a message
 # between the two must still be accepted (the buffer cap is WS-specific).
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1,
-                             maxBodySize = 32 * 1024,
-                             maxWsMessageSize = 512 * 1024))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxBodySize = 32 * 1024, maxWsMessageSize = 512 * 1024)).start(0)
 let port = srv.port
 
 proc recvN(s: Socket, n: int): string =

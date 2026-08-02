@@ -9,8 +9,7 @@ import vortex/[settings, request, server]
 proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "ok", "text/plain")
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port
 
 proc getStatus(family: Domain, host: string): string =

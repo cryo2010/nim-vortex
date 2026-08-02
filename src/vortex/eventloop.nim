@@ -25,7 +25,7 @@ when not defined(plainHttp):
     of cvOptional: TlsVerifyOptional
     of cvRequire: TlsVerifyRequire
 
-  proc toSniCerts*(s: Settings): seq[SniCert] =
+  proc toSniCerts*(s: VortexConfig): seq[SniCert] =
     ## Convert the plain-data SNI entries into TLS-layer SniCerts.
     for e in s.sni:
       result.add SniCert(host: e.host, material: TlsMaterial(
@@ -40,7 +40,7 @@ when not defined(plainHttp):
     of tlsMax12: TLS1_2_VERSION
     of tlsMax13: TLS1_3_VERSION
 
-  proc ocspBytes*(s: Settings): string =
+  proc ocspBytes*(s: VortexConfig): string =
     ## The DER OCSP response to staple: in-memory bytes, else the file, else "".
     if s.ocspResponse.len > 0: s.ocspResponse
     elif s.ocspFile.len > 0:
@@ -64,7 +64,7 @@ type
     selector: Selector[FdKind]
     listenFd: int
     core*: LoopCore
-    settings*: Settings
+    settings*: VortexConfig
     limits: ParserLimits
     handlerRaw: RawClosure       # the request handler as a raw (proc, env) pair
                                  # so it never refcounts across loop threads
@@ -131,7 +131,7 @@ proc openBoundSocket(host: string, port: Port, sockType: SockType,
   fd.setBlocking(false)
   fd
 
-proc bindListener(settings: Settings, sockType: SockType,
+proc bindListener(settings: VortexConfig, sockType: SockType,
                   proto: Protocol): SocketHandle =
   ## Bind with the configured address, or dual-stack ("::") by default.
   ## The default falls back to IPv4 ("0.0.0.0") on hosts without IPv6.
@@ -144,7 +144,7 @@ proc bindListener(settings: Settings, sockType: SockType,
     result = openBoundSocket("0.0.0.0", settings.port, sockType, proto,
                              settings.reusePort)
 
-proc newListenSocket*(settings: Settings): SocketHandle =
+proc newListenSocket*(settings: VortexConfig): SocketHandle =
   ## Raw nonblocking listener fd. Plain data so it can cross threads;
   ## with reusePort every loop thread creates its own.
   result = bindListener(settings, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
@@ -152,7 +152,7 @@ proc newListenSocket*(settings: Settings): SocketHandle =
     result.close()
     raiseOSError(osLastError())
 
-proc newUdpSocket*(settings: Settings): SocketHandle =
+proc newUdpSocket*(settings: VortexConfig): SocketHandle =
   ## Nonblocking SO_REUSEPORT UDP socket for QUIC, bound like the TCP one.
   bindListener(settings, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP)
 
@@ -172,7 +172,7 @@ proc refreshDate(loop: Loop) =
     loop.lastWallSec = wallSec
     loop.core.dateStr = httpDate(wallSec)
 
-proc newLoop*(settings: Settings, handler: RequestHandler,
+proc newLoop*(settings: VortexConfig, handler: RequestHandler,
               stopFlag: ptr Atomic[bool], listenFd: SocketHandle,
               pool: pointer = nil, outbox: ptr Outbox = nil,
               tls: pointer = nil,
@@ -1421,7 +1421,7 @@ type LoopThreadArg* = tuple
   ## itself is constructed inside the thread (refs never cross threads).
   ## The outbox is created by the caller (see connection.newOutbox) and
   ## freed by the caller after workers and loops have stopped.
-  settings: Settings
+  settings: VortexConfig
   handler: RequestHandler
   stopFlag: ptr Atomic[bool]
   listenFd: SocketHandle
