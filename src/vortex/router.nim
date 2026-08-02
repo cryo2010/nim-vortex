@@ -26,9 +26,14 @@ type
     handlers: array[HttpMethod, RequestHandler]
     streaming: array[HttpMethod, bool]  ## route registered via `stream`
 
+  Middleware* = proc(next: RequestHandler): RequestHandler {.gcsafe.}
+    ## Wraps a handler: run code before/after `next(req, res)`, or skip `next`
+    ## to short-circuit (e.g. auth sending 401). Registered with `router.use`.
+
   Router* = ref object
     root: RouteNode
     notFound*: RequestHandler ## default: plain 404
+    middleware: seq[Middleware]
 
 proc defaultNotFound(req: Request, res: Response) {.gcsafe.} =
   res.send(Http404, "404 Not Found", "text/plain")
@@ -76,6 +81,15 @@ proc stream*(router: Router, meth: HttpMethod, path: string,
   let node = router.addRouteNode(path)
   node.handlers[meth] = handler
   node.streaming[meth] = true
+
+proc use*(r: Router, mw: Middleware) =
+  ## Register a middleware. Middleware run in registration order (the first
+  ## `use`d is outermost, so it runs first on the way in and last on the way
+  ## out) and wrap every route, including the 404/405 responses. Call before
+  ## `toHandler`; order relative to route registration does not matter. A
+  ## middleware that reads `req.body` is only meaningful for buffered routes
+  ## (a `stream` route has no body yet when it is dispatched).
+  r.middleware.add mw
 
 proc get*(r: Router, path: string, h: RequestHandler) =
   r.addRoute(HttpGet, path, h)
@@ -154,12 +168,16 @@ proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
 proc toHandler*(router: Router): RequestHandler =
   ## Adapt a router into the server's RequestHandler. The router is
   ## GC-pinned: it is shared read-only across loop threads for the
-  ## process lifetime.
+  ## process lifetime. Any middleware registered with `use` is folded around
+  ## the route dispatch here (first registered = outermost).
   GC_ref(router)
   let r = router
-  proc (req: Request, res: Response) {.gcsafe.} =
+  var h: RequestHandler = proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
       r.route(req, res)
+  for i in countdown(r.middleware.high, 0):
+    h = r.middleware[i](h)
+  h
 
 proc hasStreamRoutes*(router: Router): bool =
   ## True if any route was registered with `stream`; used to skip installing
