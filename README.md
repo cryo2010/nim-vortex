@@ -352,6 +352,40 @@ Route parameters are stored eagerly at match time, so `req.param` / `req.params`
 work anywhere the handle does, including inside `blocking:` bodies. A path with
 no matching route gets a 404; a path that matches but not the method, a 405.
 
+### Middleware
+
+`router.use(mw)` wraps every route (and the 404/405 responses) with a
+`Middleware` — `proc(next: RequestHandler): RequestHandler`. Run code before or
+after `next(req, res)`, or skip `next` to short-circuit. Middleware run in
+registration order: the first `use`d is outermost (runs first in, last out).
+
+```nim
+proc logging(next: RequestHandler): RequestHandler =
+  let inner = next
+  proc(req: Request, res: Response) {.gcsafe.} =
+    let t0 = getMonoTime()
+    inner(req, res)
+    echo req.method, " ", req.path, " ", getMonoTime() - t0
+
+proc requireAuth(next: RequestHandler): RequestHandler =
+  let inner = next
+  proc(req: Request, res: Response) {.gcsafe.} =
+    if req.header("authorization").len == 0:
+      res.send(Http401, "unauthorized")   # short-circuit: never calls inner
+    else:
+      inner(req, res)
+
+var router = newRouter()
+router.use(logging)         # outermost
+router.use(requireAuth)
+router.get("/users/:id", getUser)
+newVortex(router.toHandler).serve(8080)
+```
+
+`use` is sugar over closure composition, so it is not required: since a handler
+is a plain proc, you can wrap one directly without a router —
+`newVortex(logging(requireAuth(handler))).serve(8080)`.
+
 ## Static files
 
 `staticHandler(rootDir)` returns a handler that serves a directory, keyed off a
