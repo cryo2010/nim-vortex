@@ -16,9 +16,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.send(Http200, "http", "text/plain")
 
 # Small message cap so a bomb hits the limit quickly.
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1,
-                             maxWsMessageSize = 8 * 1024))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxWsMessageSize = 8 * 1024)).start(0)
 let port = srv.port
 
 # --- raw client with its own deflate context (matches server negotiation) ---

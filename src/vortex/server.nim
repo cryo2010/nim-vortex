@@ -62,7 +62,7 @@ proc requestShutdown*(server: var Server) =
   if server.stopFlag != nil:
     server.stopFlag[].store(true, moRelaxed)
 
-proc validateSettings(s: Settings) =
+proc validateConfig(s: VortexConfig) =
   ## Reject nonsensical/dangerous configurations up front rather than failing
   ## silently at run time.
   let hasCert = s.certFile.len > 0 or s.certPem.len > 0
@@ -82,13 +82,12 @@ proc validateSettings(s: Settings) =
      s.numThreads < 0 or s.workerThreads < 0:
     raise newException(CatchableError, "settings must not be negative")
 
-proc start*(handler: RequestHandler, settings = initSettings(),
-            streamRoute: StreamRouteCb = nil): Server =
-  ## Start loops and workers in the background; returns immediately.
-  ## Use `close` (or `waitFor` after installing your own stop signal)
-  ## to shut down. `streamRoute` (e.g. `router.streamPredicate`) opts requests
-  ## into inbound streaming; nil keeps every request buffered.
-  validateSettings(settings)
+proc startServer(handler: RequestHandler, settings: VortexConfig,
+                 streamRoute: StreamRouteCb = nil): Server =
+  ## Internal: bind, start loops + workers in the background, return immediately.
+  ## The public entry point is the `Vortex` object (`newVortex`, `serve`,
+  ## `start`) at the bottom of this module.
+  validateConfig(settings)
   signal(SIGPIPE, SIG_IGN)   # a mid-response client reset must not kill us
                              # (OpenSSL's raw write on Linux has no MSG_NOSIGNAL)
   result.stopFlag = createShared(Atomic[bool])   # zero-init == false
@@ -259,9 +258,67 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
                         certFile, keyFile)
     ok
 
-proc run*(handler: RequestHandler, settings = initSettings(),
-          streamRoute: StreamRouteCb = nil) =
-  ## Start serving; blocks until SIGINT/SIGTERM or `requestShutdown`.
+# --- the Vortex object API --------------------------------------------------
+
+type
+  Vortex* = ref object
+    ## A configured HTTP server. Build one with `newVortex`, tweak `config`,
+    ## then `serve` (blocking) or `start` (non-blocking).
+    handler: RequestHandler
+    streamRoute: StreamRouteCb
+    config*: VortexConfig     ## Mutable until `serve`/`start`, which copy it
+                              ## into the loop threads; changing it after has no
+                              ## effect (set everything before serving).
+    server: Server
+    started: bool
+
+proc newVortex*(handler: RequestHandler, config = initVortexConfig(),
+                streamRoute: StreamRouteCb = nil): Vortex =
+  ## Create a server for `handler`. Pass a `config` to override defaults (or edit
+  ## `vortex.config` before serving). `streamRoute` (e.g. `router.streamPredicate`)
+  ## opts requests into inbound streaming; nil keeps every request buffered.
+  Vortex(handler: handler, config: config, streamRoute: streamRoute)
+
+proc start*(v: Vortex, port = -1, address = ""): Vortex {.discardable.} =
+  ## Start serving in the background and return immediately (for embedding and
+  ## tests). Read the resolved port from `v.port`, stop with `v.close`. `port`
+  ## overrides `config.port` when >= 0 (0 = pick a free port); -1 keeps the
+  ## configured port. Returns `v` for chaining: `newVortex(h).start(0)`.
+  if port >= 0: v.config.port = Port(port)
+  if address.len > 0: v.config.address = address
+  v.server = startServer(v.handler, v.config, v.streamRoute)
+  v.started = true
+  v
+
+proc serve*(v: Vortex, port = -1, address = "") =
+  ## Start serving and block until SIGINT/SIGTERM or `requestShutdown`, then shut
+  ## down gracefully. `port`/`address` override `config` as in `start`.
   installSignalHandlers()
-  var server = start(handler, settings, streamRoute)
-  server.waitFor()
+  discard v.start(port, address)
+  v.server.waitFor()
+
+proc port*(v: Vortex): Port =
+  ## The actual bound port (useful after `start(0)`); Port(0) before serving.
+  ## `$v.port` gives the number for building URLs.
+  v.server.port
+
+proc requestShutdown*(v: Vortex) =
+  ## Ask this server's loops to stop after their current tick (non-blocking).
+  v.server.requestShutdown()
+
+proc waitFor*(v: Vortex) =
+  ## Block until the loops exit (after `requestShutdown` or a signal).
+  v.server.waitFor()
+
+proc close*(v: Vortex) =
+  ## Stop and tear down this server (only this one, not others in the process).
+  v.server.close()
+
+proc stop*(v: Vortex) =
+  ## Alias for `close`.
+  v.server.close()
+
+proc reloadTls*(v: Vortex, certFile = "", keyFile = ""): bool =
+  ## Hot-reload the TLS cert/key for new connections without a restart (see the
+  ## Server-level docs). Returns false if TLS is off or the new material is bad.
+  v.server.reloadTls(certFile, keyFile)

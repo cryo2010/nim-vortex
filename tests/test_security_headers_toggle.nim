@@ -18,11 +18,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http404)
 
-var onSrv = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1,
-                               securityHeaders = true))
-var offSrv = start(RequestHandler(handler),
-                   initSettings(port = Port(0), numThreads = 1))
+var onSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, securityHeaders = true)).start(0)
+var offSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 
 proc raw(port: Port, path: string): string =
   let s = newSocket()

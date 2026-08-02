@@ -77,12 +77,7 @@ proc streamPred(core: ptr LoopCore, fd: int32, gen: uint32,
   let req = Request(core: core, fd: fd, gen: gen, stream: stream)
   req.path == "/up" and req.method == HttpPost
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1,
-                             workerThreads = 2, certFile = certFile,
-                             keyFile = keyFile,
-                             maxBodySize = 1024 * 1024),
-                streamPred)
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2, certFile = certFile, keyFile = keyFile, maxBodySize = 1024 * 1024), streamPred).start(0)
 let base = "https://localhost:" & $srv.port
 
 proc h3curl(args: string): (string, int) =

@@ -39,29 +39,21 @@ proc get(port: Port): (string, int) =
 
 suite "TLS key options":
   test "in-memory cert + key (certPem/keyPem)":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certPem = certData, keyPem = keyData))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certPem = certData, keyPem = keyData)).start(0)
     defer: srv.close()
     let (o, rc) = get(srv.port)
     check rc == 0
     check o == "ok"
 
   test "passphrase-protected key from a file (keyFile + keyPassword)":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = enckey,
-                                 keyPassword = pass))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = enckey, keyPassword = pass)).start(0)
     defer: srv.close()
     let (o, rc) = get(srv.port)
     check rc == 0
     check o == "ok"
 
   test "in-memory encrypted key + passphrase (keyPem + keyPassword)":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certPem = certData, keyPem = encKeyData,
-                                 keyPassword = pass))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certPem = certData, keyPem = encKeyData, keyPassword = pass)).start(0)
     defer: srv.close()
     let (o, rc) = get(srv.port)
     check rc == 0
@@ -69,17 +61,12 @@ suite "TLS key options":
 
   test "wrong passphrase fails to start":
     expect CatchableError:
-      var srv = start(RequestHandler(handler),
-                      initSettings(port = Port(0), numThreads = 1,
-                                   certFile = cert, keyFile = enckey,
-                                   keyPassword = "wrong"))
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = enckey, keyPassword = "wrong")).start(0)
       srv.close()
 
   test "cert without key is rejected":
     expect CatchableError:
-      var srv = start(RequestHandler(handler),
-                      initSettings(port = Port(0), numThreads = 1,
-                                   certPem = certData))   # no key material
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certPem = certData)).start(0)   # no key material
       srv.close()
 
 removeDir(dir)

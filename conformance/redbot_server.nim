@@ -45,4 +45,4 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 when isMainModule:
   let port = if paramCount() >= 1: Port(parseInt(paramStr(1))) else: Port(8099)
   echo "redbot conformance server on http://127.0.0.1:", int(port), "/"
-  run(handler, initSettings(port = port, numThreads = 1))
+  newVortex(handler, initVortexConfig(port = port, numThreads = 1)).serve()

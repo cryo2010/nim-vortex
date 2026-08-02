@@ -5,7 +5,7 @@
 
 import std/[net, httpcore]
 import ../src/vortex
-import ../src/vortex/adapters/chronos as nhschronos
+import ../src/vortex/chronos as nhschronos
 
 proc serveOursChronos*(port: int, doAwait: bool) =
   ## Through the chronos adapter: the chronos counterpart to
@@ -20,5 +20,5 @@ proc serveOursChronos*(port: int, doAwait: bool) =
   let handler =
     if doAwait: nhschronos.toHandler(suspending)
     else: nhschronos.toHandler(immediate)
-  vortex.run(handler,
-    vortex.initSettings(port = net.Port(port), numThreads = 0))
+  newVortex(handler,
+    vortex.initVortexConfig(port = net.Port(port), numThreads = 0)).serve()

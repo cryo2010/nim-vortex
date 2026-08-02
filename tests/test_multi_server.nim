@@ -17,10 +17,10 @@ proc get(port: Port): string =
 
 suite "multiple servers are independent":
   test "closing one server leaves the other serving":
-    var a = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1))
-    var b = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1))
+    let a = newVortex(RequestHandler(handler),
+                      initVortexConfig(numThreads = 1)).start(0)
+    let b = newVortex(RequestHandler(handler),
+                      initVortexConfig(numThreads = 1)).start(0)
     check get(a.port) == "ok"
     check get(b.port) == "ok"
     a.close()                      # must stop only a
@@ -28,30 +28,28 @@ suite "multiple servers are independent":
     b.close()
 
   test "starting a new server does not prevent stopping an old one":
-    var a = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1))
+    let a = newVortex(RequestHandler(handler),
+                      initVortexConfig(numThreads = 1)).start(0)
     check get(a.port) == "ok"
     # A second start (which resets its own flag) used to clear the shared flag
     # and could make a.close() block forever. It must not.
-    var b = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1))
+    let b = newVortex(RequestHandler(handler),
+                      initVortexConfig(numThreads = 1)).start(0)
     a.close()                      # returns promptly
     check get(b.port) == "ok"
     b.close()
 
-suite "settings validation":
+suite "config validation":
   test "keyFile without certFile is rejected (would serve plaintext)":
     expect CatchableError:
-      var s = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 keyFile = "/x/key.pem"))
+      let s = newVortex(RequestHandler(handler),
+                        initVortexConfig(keyFile = "/x/key.pem")).start(0)
       s.close()
 
   test "negative limits are rejected":
     expect CatchableError:
-      var s = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 maxBodySize = -1))
+      let s = newVortex(RequestHandler(handler),
+                        initVortexConfig(maxBodySize = -1)).start(0)
       s.close()
 
 echo "multi-server ok"

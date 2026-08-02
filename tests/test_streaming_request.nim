@@ -41,10 +41,7 @@ rt.stream(HttpPost, "/echo", hEchoStream)
 rt.stream(HttpPost, "/reject", hReject)
 rt.post("/buffered", hBuffered)
 
-var srv = start(rt.toHandler,
-                initSettings(port = Port(0), numThreads = 1,
-                             maxBodySize = 8 * 1024 * 1024),
-                rt.streamPredicate)
+var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1, maxBodySize = 8 * 1024 * 1024), rt.streamPredicate).start(0)
 let port = srv.port
 
 proc rawPost(path, body: string): string =

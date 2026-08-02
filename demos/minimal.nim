@@ -13,8 +13,7 @@
 ## Ctrl-C stops the server.
 
 import std/os
-import ../src/vortex
-import ../src/vortex/adapters/asyncdispatch
+import ../src/vortex/asyncdispatch   # single import: core + async adapter
 
 proc hRoot(req: Request, res: Response) {.async.} =
   res.send(Http200, "Hello, World!\n", "text/plain")
@@ -45,4 +44,4 @@ router.get("/slow", hSlow)
 router.get("/report", hReport)
 
 echo "listening on http://localhost:8080  (Ctrl-C to stop)"
-run(router.toHandler, initSettings(port = Port(8080)))
+newVortex(router.toHandler).serve(8080)

@@ -23,7 +23,7 @@
 import std/[os, osproc, strutils, atomics, posix, nativesockets, net,
             httpcore]
 import ../src/vortex
-import ../src/vortex/adapters/asyncdispatch as nhsasync
+import ../src/vortex/asyncdispatch as nhsasync
 import ../src/vortex/http2/frames
 import ./perf_common
 from ./perf_srv_vortex_chronos import serveOursChronos
@@ -37,8 +37,8 @@ const
 proc serveOurs(port: int, threads: int) =
   proc handler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
     vortex.send(res, Http200, "Hello, World!", "text/plain")
-  vortex.run(handler,
-    vortex.initSettings(port = net.Port(port), numThreads = threads))
+  newVortex(handler,
+    vortex.initVortexConfig(port = net.Port(port), numThreads = threads)).serve()
 
 proc serveOursAsync(port: int) =
   ## Suspending async handler via the adapter: h2 streams are
@@ -46,8 +46,8 @@ proc serveOursAsync(port: int) =
   proc h(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
     await sleepAsync(0)
     vortex.send(res, Http200, "Hello, World!", "text/plain")
-  vortex.run(toHandler(h),
-    vortex.initSettings(port = net.Port(port), numThreads = 0))
+  newVortex(toHandler(h),
+    vortex.initVortexConfig(port = net.Port(port), numThreads = 0)).serve()
 
 # --- HTTP/2 client -----------------------------------------------------------
 

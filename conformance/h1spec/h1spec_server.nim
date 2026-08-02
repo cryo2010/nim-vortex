@@ -13,7 +13,6 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 when isMainModule:
   # Plain HTTP/1.1 on 8080. start() binds before returning, so the
   # "listening" log line is the readiness signal for run.sh.
-  var srv = start(RequestHandler(handler),
-                  initSettings(port = Port(8080), numThreads = 1))
+  var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(8080)
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

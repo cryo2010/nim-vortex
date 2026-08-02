@@ -3,7 +3,7 @@ import std/httpclient except Response
 import std/times except milliseconds
 import vortex/[settings, request, server, router]
 import ./helper
-import vortex/adapters/chronos as nhschronos
+import vortex/chronos as nhschronos
 
 proc hRoot(req: Request, res: Response) {.async.} =
   # No await at all: completes synchronously through the async path.
@@ -89,10 +89,7 @@ appRouter.stream(HttpPost, "/upload", hUpload)
 appRouter.get("/stream", hStream)
 appRouter.get("/streamemit", hStreamEmit)
 
-var srv = start(appRouter.toHandler,
-                initSettings(port = Port(0), numThreads = 1,
-                             workerThreads = 2),
-                appRouter.streamPredicate)
+var srv = newVortex(appRouter.toHandler, initVortexConfig(numThreads = 1, workerThreads = 2), appRouter.streamPredicate).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc fetch(path: string): string =

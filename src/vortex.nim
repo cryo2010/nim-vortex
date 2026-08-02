@@ -8,7 +8,7 @@
 ##   of "/": res.send(Http200, "Hello, World!", "text/plain")
 ##   else: res.send(Http404)
 ##
-## run(handler, initSettings(port = Port(8080)))
+## newVortex(handler).serve(8080)
 ## ```
 
 import std/httpcore

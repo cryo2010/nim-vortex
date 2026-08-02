@@ -66,7 +66,7 @@ when isMainModule:
 
   # Certs are generated once by run.sh and mounted read-only at /certs, shared
   # by every container so they trust a common CA.
-  var s = initSettings(port = Port(8443), numThreads = 0,
+  var s = initVortexConfig(port = Port(8443), numThreads = 0,
                        certFile = "/certs/cert.pem", keyFile = "/certs/key.pem",
                        http3 = false,        # this test is h1/h2 over TLS
                        compress = true)      # gzip (needs -d:httpGzip build)
@@ -74,6 +74,6 @@ when isMainModule:
     s.verifyClient = cvRequire
     s.clientCaFile = "/certs/ca.pem"
 
-  var srv = start(dispatch, s)
+  let srv = newVortex(dispatch, s).start()
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

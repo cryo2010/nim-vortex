@@ -12,8 +12,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http200, "http", "text/plain")
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port
 
 proc recvN(s: Socket, n: int): string =

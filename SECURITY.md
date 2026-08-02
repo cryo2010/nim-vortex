@@ -7,7 +7,7 @@ defenses, and how the defenses are verified.
 
 The guiding principle is **bounded by default**: every place where a client
 can make the server allocate memory, spawn work, or hold a resource has a
-limit with a safe default, and the limits are configurable in `initSettings`.
+limit with a safe default, and the limits are configurable in `initVortexConfig`.
 
 ## Threat coverage
 
@@ -24,7 +24,7 @@ limit with a safe default, and the limits are configurable in `initSettings`.
 
 ## Configuration
 
-All limits are fields on `Settings` (see `initSettings`). A value of `0`
+All limits are fields on `VortexConfig` (see `initVortexConfig`). A value of `0`
 disables the corresponding check where noted.
 
 | Setting | Default | Purpose |

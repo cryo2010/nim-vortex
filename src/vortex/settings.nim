@@ -34,7 +34,7 @@ type
     pkcs12File*, pkcs12*: string
     keyPassword*: string
 
-  Settings* = object
+  VortexConfig* = object
     port*: Port
     address*: string          ## bind address; "" = all interfaces, dual-stack
                               ## ("::" with IPv4-mapped, IPv4 fallback). Set an
@@ -101,7 +101,7 @@ type
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
     tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default)
 
-proc initSettings*(
+proc initVortexConfig*(
     port = Port(8080),
     address = "",
     numThreads = 0,
@@ -150,8 +150,8 @@ proc initSettings*(
     minTlsVersion = tlsV12,
     tlsCipherList = "",
     tlsCipherSuites = ""
-): Settings =
-  Settings(
+): VortexConfig =
+  VortexConfig(
     port: port, address: address, numThreads: numThreads,
     workerThreads: workerThreads, listenBacklog: listenBacklog,
     reusePort: reusePort, proxyProtocol: proxyProtocol,
@@ -179,7 +179,7 @@ proc initSettings*(
     tlsCipherSuites: tlsCipherSuites
   )
 
-proc hasTls*(s: Settings): bool =
+proc hasTls*(s: VortexConfig): bool =
   ## True when TLS material is configured (files, in-memory PEM, or PKCS#12).
   s.certFile.len > 0 or s.certPem.len > 0 or
     s.pkcs12File.len > 0 or s.pkcs12.len > 0

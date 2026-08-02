@@ -18,7 +18,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       res.send(Http200, data, "application/json")
   else:         res.send(Http404)
 
-run(handler, initSettings(port = Port(8080)))
+newVortex(handler).serve(8080)
 ```
 
 - **Architecture**: one event loop per thread (`SO_REUSEPORT`,
@@ -70,24 +70,24 @@ container (Docker).
 
 ## Quick start
 
-`run` starts the server and blocks until a SIGINT/SIGTERM (or
-`requestShutdown()`) arrives, then shuts down gracefully:
+`newVortex(handler).serve(port)` starts the server and blocks until a
+SIGINT/SIGTERM (or `requestShutdown()`) arrives, then shuts down gracefully:
 
 ```nim
-run(handler, initSettings(port = Port(8080)))
+newVortex(handler).serve(8080)
 ```
 
 For embedding or tests, `start` returns immediately and `close` stops it:
 
 ```nim
-var srv = start(handler, initSettings(port = Port(0)))   # port 0 = pick a free port
-echo "listening on ", srv.port                           # the resolved port
+let srv = newVortex(handler).start(0)   # start(0) = pick a free port; non-blocking
+echo "listening on ", srv.port          # the resolved port
 # ... drive requests against srv.port ...
 srv.close()
 ```
 
 Shutdown is graceful either way: `requestShutdown()` (or a SIGINT/SIGTERM under
-`run`, or `srv.close()`) stops accepting and closes the listener so the port
+`serve`, or `srv.close()`) stops accepting and closes the listener so the port
 frees for a replacement, sends HTTP/2 and HTTP/3 `GOAWAY`, closes open
 WebSockets with a `1001` (going away), and lets in-flight requests and streams
 finish before closing. Idle keep-alive connections close promptly; anything
@@ -95,20 +95,22 @@ still running is force-closed once `shutdownGrace` seconds elapse.
 
 ## Settings
 
-Server configuration is a value built with `initSettings(...)` and passed to
-`run` or `start`. Beyond `port` and `address` (dual-stack by default), it
-carries the TLS material, timeouts, worker/thread counts, and the feature
-toggles used throughout this document:
+Server configuration is a `VortexConfig` value built with `initVortexConfig(...)`
+and passed to `newVortex`; you can also edit `vortex.config` before serving.
+Beyond `port` and `address` (dual-stack by default), it carries the TLS material,
+timeouts, worker/thread counts, and the feature toggles used throughout this
+document:
 
 ```nim
-run(handler, initSettings(
-  port = Port(8080),
+let vortex = newVortex(handler, initVortexConfig(
   address = "::",                 # dual-stack (default); pin a family with "0.0.0.0"
   numThreads = 0,                 # 0 = one event loop per core (SO_REUSEPORT)
   compress = true,                # response compression (needs a -d:http* build)
   decompressRequest = true,       # transparently decode gzip/br request bodies
   responseTimeout = 30,           # seconds a handler may take before the conn is closed
   shutdownGrace = 10))            # seconds to drain in-flight work on shutdown
+vortex.config.serverHeader = "acme"   # config is mutable until you serve/start
+vortex.serve(8080)
 ```
 
 **Client address behind a proxy.** `req.remoteAddress` is the direct peer.
@@ -118,8 +120,8 @@ balancer prepends (v1 and v2, TCP over IPv4/IPv6), honored only from a trusted
 peer:
 
 ```nim
-initSettings(proxyProtocol = ppRequire,             # or ppOptional
-             trustedProxies = @["10.0.0.0/8"])      # IPs/CIDRs; empty = any peer
+initVortexConfig(proxyProtocol = ppRequire,             # or ppOptional
+                 trustedProxies = @["10.0.0.0/8"])      # IPs/CIDRs; empty = any peer
 ```
 
 `ppRequire` drops a connection without a valid header from a trusted peer;
@@ -134,8 +136,8 @@ Providing a certificate turns on TLS, which enables HTTP/2 (via ALPN) and
 HTTP/3 (over QUIC):
 
 ```nim
-run(handler, initSettings(port = Port(8443),
-                          certFile = "cert.pem", keyFile = "key.pem"))
+newVortex(handler, initVortexConfig(
+  certFile = "cert.pem", keyFile = "key.pem")).serve(8443)
 ```
 
 The cert and key can also come **from memory** instead of files — pass the PEM
@@ -143,10 +145,10 @@ directly (e.g. loaded from a secret manager), with `keyPassword` for an
 encrypted key:
 
 ```nim
-run(handler, initSettings(port = Port(8443),
-                          certPem = vault.get("tls/cert"),
-                          keyPem = vault.get("tls/key"),
-                          keyPassword = vault.get("tls/key-pass")))
+newVortex(handler, initVortexConfig(
+  certPem = vault.get("tls/cert"),
+  keyPem = vault.get("tls/key"),
+  keyPassword = vault.get("tls/key-pass"))).serve(8443)
 ```
 
 `certPem`/`keyPem` take precedence over `certFile`/`keyFile`; either source works
@@ -159,7 +161,7 @@ prompting).
 file or the bytes, with `keyPassword` as the bundle passphrase:
 
 ```nim
-initSettings(pkcs12File = "server.p12", keyPassword = "…")   # or pkcs12 = bytes
+initVortexConfig(pkcs12File = "server.p12", keyPassword = "…")   # or pkcs12 = bytes
 ```
 
 **mTLS (client certificates)**: request or require a client cert and verify it
@@ -169,8 +171,8 @@ valid one. Inside a handler, `req.clientCertSubject` gives the verified client's
 subject DN ("" if none):
 
 ```nim
-initSettings(certFile = "cert.pem", keyFile = "key.pem",
-             verifyClient = cvRequire, clientCaFile = "client-ca.pem")
+initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
+                 verifyClient = cvRequire, clientCaFile = "client-ca.pem")
 # ... req.clientCertSubject -> e.g. "/CN=service-a"     (clientCaPem takes in-memory CA)
 ```
 
@@ -181,9 +183,9 @@ PEM, or PKCS#12). A `host` of `*.example.com` matches a single leading label
 over a wildcard:
 
 ```nim
-initSettings(certFile = "default.pem", keyFile = "default.key",
-             sni = @[SniCertEntry(host: "*.example.com",
-                                  certFile: "wild.pem", keyFile: "wild.key")])
+initVortexConfig(certFile = "default.pem", keyFile = "default.key",
+                 sni = @[SniCertEntry(host: "*.example.com",
+                                      certFile: "wild.pem", keyFile: "wild.key")])
 ```
 
 **TLS version range**: `minTlsVersion` (default `tlsV12`) floors it; `maxTlsVersion`
@@ -195,8 +197,8 @@ don't query the responder. Provide the DER bytes (refresh them out-of-band and
 `reloadTls`); vortex doesn't fetch OCSP itself:
 
 ```nim
-initSettings(certFile = "cert.pem", keyFile = "key.pem",
-             ocspFile = "ocsp.der")        # or ocspResponse = derBytes
+initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
+                 ocspFile = "ocsp.der")        # or ocspResponse = derBytes
 ```
 
 ## Handlers
@@ -224,7 +226,7 @@ handler `await` on the loop thread:
 
 ```nim
 import vortex
-import vortex/adapters/asyncdispatch          # or vortex/adapters/chronos
+import vortex/asyncdispatch   # (or vortex/chronos for chronos drivers)
 
 proc getUser(req: Request, res: Response) {.async.} =
   let user = await db.getUser(req.param("id"))   # loop keeps serving
@@ -232,7 +234,7 @@ proc getUser(req: Request, res: Response) {.async.} =
 
 var router = newRouter()
 router.get("/users/:id", getUser)               # async handlers register directly
-run(router.toHandler, initSettings(port = Port(8080)))
+newVortex(router.toHandler).serve(8080)
 ```
 
 Without a router, wrap a `proc (req, res) {.async.}` with the adapter's
@@ -343,7 +345,7 @@ proc getUser(req: Request, res: Response) {.gcsafe.} =
 var router = newRouter()
 router.get("/users/:id", getUser)
 router.get("/static/*", staticHandler("public"))
-run(router.toHandler, initSettings(port = Port(8080)))
+newVortex(router.toHandler).serve(8080)
 ```
 
 Route parameters are stored eagerly at match time, so `req.param` / `req.params`
@@ -424,7 +426,7 @@ proc upload(req: Request, res: Response) {.gcsafe.} =
 
 var router = newRouter()
 router.stream(HttpPost, "/upload", upload)
-start(router.toHandler, settings, router.streamPredicate)
+newVortex(router.toHandler, streamRoute = router.streamPredicate).serve(8080)
 ```
 
 The `req.stream` template is the inbound mirror of `res.stream` (its block runs
@@ -524,7 +526,7 @@ nim c -d:httpGzip -d:httpBrotli --passL:-lz \
 ```
 
 ```nim
-run(handler, initSettings(port = Port(8080), compress = true))
+newVortex(handler, initVortexConfig(compress = true)).serve(8080)
 ```
 
 An eligible response (the client accepts an encoding we can produce, a
@@ -594,7 +596,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http200, "…", "text/html")
 
-run(handler, initSettings(port = Port(8080)))
+newVortex(handler).serve(8080)
 ```
 
 To negotiate a subprotocol, pass your supported list (preference order) to
@@ -620,7 +622,7 @@ adapter and use `ws.doAsync:` to `await` on the loop thread (an uncaught
 exception closes the socket with 1011):
 
 ```nim
-import vortex/adapters/asyncdispatch   # or vortex/adapters/chronos
+import vortex/asyncdispatch   # (or vortex/chronos)
 
 ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
   ws.doAsync:
@@ -635,7 +637,7 @@ gives `ws.messages(msg): body` — a loop over incoming messages (sugar over
 `router.get` would answer with an HTTP 500):
 
 ```nim
-import vortex/adapters/asyncdispatch   # or vortex/adapters/chronos
+import vortex/asyncdispatch   # (or vortex/chronos)
 
 proc chat(req: Request, res: Response) {.async.} =
   let ws = req.acceptWebSocket()

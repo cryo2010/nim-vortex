@@ -21,9 +21,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http404)
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 2,
-                             certFile = certFile, keyFile = keyFile))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 2, certFile = certFile, keyFile = keyFile)).start(0)
 let base = "https://localhost:" & $srv.port
 
 proc tlsClient(): HttpClient =
@@ -76,14 +74,9 @@ proc handshakeOk(port: Port, tlsFlag: string): bool =
   execCmdEx("echo | openssl s_client -connect localhost:" & $port & " " &
             tlsFlag & " >/dev/null 2>&1")[1] == 0
 
-var srv12 = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1, http3 = false,
-                               certFile = certFile, keyFile = keyFile))
+var srv12 = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile)).start(0)
                                # default minTlsVersion = tlsV12
-var srv13 = start(RequestHandler(handler),
-                  initSettings(port = Port(0), numThreads = 1, http3 = false,
-                               certFile = certFile, keyFile = keyFile,
-                               minTlsVersion = tlsV13))
+var srv13 = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile, minTlsVersion = tlsV13)).start(0)
 
 suite "minimum TLS version":
   test "default (tlsV12) accepts TLS 1.2":
@@ -98,11 +91,7 @@ suite "minimum TLS version":
   test "tlsV13 accepts TLS 1.3":
     check handshakeOk(srv13.port, "-tls1_3")
 
-var srvCipher = start(RequestHandler(handler),
-                      initSettings(port = Port(0), numThreads = 1,
-                                   http3 = false, certFile = certFile,
-                                   keyFile = keyFile,
-                                   tlsCipherSuites = "TLS_AES_128_GCM_SHA256"))
+var srvCipher = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile, tlsCipherSuites = "TLS_AES_128_GCM_SHA256")).start(0)
 
 suite "TLS cipher configuration":
   test "restricted TLS 1.3 cipher suite is honored":
@@ -115,11 +104,7 @@ suite "TLS cipher configuration":
 
   test "an invalid cipher suite is rejected at startup":
     expect CatchableError:
-      var bad = start(RequestHandler(handler),
-                      initSettings(port = Port(0), numThreads = 1,
-                                   http3 = false, certFile = certFile,
-                                   keyFile = keyFile,
-                                   tlsCipherSuites = "NOT_A_REAL_CIPHER"))
+      var bad = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile, tlsCipherSuites = "NOT_A_REAL_CIPHER")).start(0)
       bad.close()
 
 srvCipher.close()

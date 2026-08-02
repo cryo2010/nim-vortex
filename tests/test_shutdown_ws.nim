@@ -10,8 +10,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
     ws.send(data)
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1, shutdownGrace = 5))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, shutdownGrace = 5)).start(0)
 let port = srv.port
 
 proc openWs(): Socket =

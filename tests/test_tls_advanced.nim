@@ -49,40 +49,26 @@ proc curlGet(port: Port, args = ""): (string, int) =
 
 suite "PKCS#12":
   test "cert+key from a .p12 file":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 pkcs12File = dir / "bundle.p12",
-                                 keyPassword = "p12pass"))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, pkcs12File = dir / "bundle.p12", keyPassword = "p12pass")).start(0)
     defer: srv.close()
     let (o, rc) = curlGet(srv.port)
     check rc == 0 and o == "ok"
 
   test "cert+key from in-memory .p12 bytes":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 pkcs12 = readFile(dir / "bundle.p12"),
-                                 keyPassword = "p12pass"))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, pkcs12 = readFile(dir / "bundle.p12"), keyPassword = "p12pass")).start(0)
     defer: srv.close()
     let (o, rc) = curlGet(srv.port)
     check rc == 0 and o == "ok"
 
 suite "mTLS":
   test "require: connection without a client cert is refused":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = key,
-                                 verifyClient = cvRequire,
-                                 clientCaFile = dir / "ca.pem"))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = cvRequire, clientCaFile = dir / "ca.pem")).start(0)
     defer: srv.close()
     let (_, rc) = curlGet(srv.port)                 # no client cert
     check rc != 0                                    # TLS handshake rejected
 
   test "require: valid client cert is accepted and its subject exposed":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = key,
-                                 verifyClient = cvRequire,
-                                 clientCaFile = dir / "ca.pem"))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = cvRequire, clientCaFile = dir / "ca.pem")).start(0)
     defer: srv.close()
     let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 --cert " & dir &
       "/client.pem --key " & dir & "/client.key https://127.0.0.1:" &
@@ -91,11 +77,7 @@ suite "mTLS":
     check "test-client" in o
 
   test "optional: no client cert still connects, subject empty":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = key,
-                                 verifyClient = cvOptional,
-                                 clientCaFile = dir / "ca.pem"))
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = cvOptional, clientCaFile = dir / "ca.pem")).start(0)
     defer: srv.close()
     let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 https://127.0.0.1:" &
       $srv.port & "/whoami")
@@ -104,12 +86,10 @@ suite "mTLS":
 
 suite "SNI":
   test "servername selects the matching per-host certificate":
-    var srv = start(RequestHandler(handler),
-                    initSettings(port = Port(0), numThreads = 1,
-                                 certFile = cert, keyFile = key,   # default CN=localhost
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, # default CN=localhost
                                  sni = @[SniCertEntry(host: "alt.example",
                                          certFile: dir / "alt.pem",
-                                         keyFile: dir / "altkey.pem")]))
+                                         keyFile: dir / "altkey.pem")])).start(0)
     defer: srv.close()
     proc servedSubject(servername: string): string =
       let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &

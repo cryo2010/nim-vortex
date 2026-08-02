@@ -35,8 +35,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http404)
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1, compress = true))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, compress = true)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 let tmp = getTempDir() / "vortex_streamcomp_" & $getCurrentProcessId()
 createDir(tmp)

@@ -39,7 +39,7 @@
 
 import std/[os, osproc, strutils, net, httpcore]
 import ../src/vortex
-import ../src/vortex/adapters/asyncdispatch as nhsasync
+import ../src/vortex/asyncdispatch as nhsasync
 import ./perf_common
 from ./perf_srv_std import serveHttpbeast, serveHttpbeastAsync,
                            serveAsynchttpserver
@@ -59,13 +59,13 @@ proc serveOurs(port: int, threads: int, minimal = false) =
     vortex.send(res, Http200, "Hello, World!", "text/plain")
   proc minHandler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
     vortex.send(res, Http200, "Hello, World!")
-  var cfg = vortex.initSettings(port = net.Port(port),
+  var cfg = vortex.initVortexConfig(port = net.Port(port),
                                          numThreads = threads)
   if minimal:
     cfg.serverHeader = ""       # diagnostic: byte-parity with httpbeast
-    vortex.run(minHandler, cfg)
+    newVortex(minHandler, cfg).serve()
   else:
-    vortex.run(handler, cfg)
+    newVortex(handler, cfg).serve()
 
 proc serveOursAsync(port: int, doAwait: bool) =
   ## Through the asyncdispatch adapter: measures the future/adapter tax
@@ -77,8 +77,8 @@ proc serveOursAsync(port: int, doAwait: bool) =
     await sleepAsync(0)                  # force a real suspend/resume
     vortex.send(res, Http200, "Hello, World!", "text/plain")
   let handler = if doAwait: toHandler(suspending) else: toHandler(immediate)
-  vortex.run(handler,
-    vortex.initSettings(port = net.Port(port), numThreads = 0))
+  newVortex(handler,
+    vortex.initVortexConfig(port = net.Port(port), numThreads = 0)).serve()
 
 # --- orchestration -----------------------------------------------------------
 

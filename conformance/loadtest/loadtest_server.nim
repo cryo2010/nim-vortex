@@ -28,9 +28,9 @@ import std/[os, strutils]
 import vortex
 
 when defined(ltAsync) or defined(ltAsyncAwait):
-  import vortex/adapters/asyncdispatch
+  import vortex/asyncdispatch
 elif defined(ltChronos) or defined(ltChronosAwait):
-  import vortex/adapters/chronos
+  import vortex/chronos
 
 const bigBody = "The quick brown fox jumps over the lazy dog. ".repeat(200)  # ~9 KB
 
@@ -65,13 +65,13 @@ when isMainModule:
   let port = Port(parseInt(getEnv("LOADTEST_PORT", "8080")))
   # numThreads 0 = one loop per core (SO_REUSEPORT), so the server is not the
   # artificial bottleneck. compress only has an effect in an -d:httpGzip build.
-  var settings = initSettings(port = port, numThreads = 0,
+  var settings = initVortexConfig(port = port, numThreads = 0,
                               compress = getEnv("LOADTEST_COMPRESS") == "1")
   when not defined(plainHttp):
     if getEnv("LOADTEST_TLS") == "1":
       settings.certFile = "/vortex/cert.pem"
       settings.keyFile = "/vortex/key.pem"
       settings.http3 = false      # k6 is TCP-only (h1/h2); no QUIC listener needed
-  var srv = start(appHandler, settings)
+  let srv = newVortex(appHandler, settings).start()
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

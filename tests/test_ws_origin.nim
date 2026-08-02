@@ -16,8 +16,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/origin":  res.send(Http200, req.origin, "text/plain")
   else: res.send(Http404)
 
-var srv = start(RequestHandler(handler),
-                initSettings(port = Port(0), numThreads = 1))
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc get(path, origin: string): string =
