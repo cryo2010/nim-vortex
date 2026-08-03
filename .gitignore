@@ -36,3 +36,7 @@ conformance/testssl/*.pem
 nimble.develop
 nimble.paths
 nimbledeps
+# nimble-generated (includes nimble.paths)
+config.nims
+# `nim doc` output
+src/htmldocs/
