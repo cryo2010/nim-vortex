@@ -67,6 +67,25 @@ proc isAlive*(req: Request): bool =
   if req.stream == 0: true
   else: h2StreamAlive(c, req.stream)
 
+proc responded*(res: Response): bool =
+  ## True once a response has been sent (or a streamed response started) for this
+  ## request, on any protocol. Used by the async `req.stream` sugar to auto-ack
+  ## with 200 only when the handler hasn't answered itself. A dead connection
+  ## reads as `true` (nothing left to answer).
+  if res.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(res.core, res.fd, res.gen)
+      if h3c != nil:
+        let st = h3StreamPtr(h3c, uint64(res.stream))
+        if st != nil: return st.responded
+    return true
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return true
+  if res.stream != 0:
+    let st = h2Stream(c, res.stream)
+    return st == nil or st.responded
+  c.responded
+
 when not defined(plainHttp):
   template withH3(req: Request, st, body: untyped) =
     let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -1098,32 +1117,22 @@ proc abort*(res: Response) {.raises: [].} =
     discard
 
 template stream*(res: Response, code: HttpCode, contentType: string,
-                 headersOrEmit, body: untyped) =
-  ## Block form of a streamed response: sends the head, runs `body`, and
-  ## terminates the stream afterwards -- or aborts it if `body` raises, so the
-  ## client sees an incomplete transfer rather than a well-formed truncation
-  ## (the exception propagates). The 4th argument is one of two things:
+                 headers: openArray[(string, string)], body: untyped) =
+  ## Block form of a streamed response: send the head, run `body`, then
+  ## `finish()` on clean exit -- or `abort()` if `body` raises, so the client
+  ## sees an incomplete transfer rather than a well-formed truncation (the
+  ## exception propagates). The body emits chunks with `res.write(chunk)`
+  ## (sync, returns false under backpressure) or, in an `{.async.}` handler with
+  ## an async adapter, `await res.write(chunk)` (write + await the drain):
   ##
-  ## * **response headers** (`openArray[(string, string)]`) -- the body writes
-  ##   chunks itself with `res.write(...)`:
+  ##     res.stream(Http200, "text/csv", @[("X-K", "v")]):
+  ##       for row in rows: await res.write(row)
   ##
-  ##       res.stream(Http200, "text/plain", @[("X-K", "v")]):
-  ##         for chunk in chunks: res.write(chunk)
-  ##
-  ## * **a fresh identifier** -- injected as an auto-draining `emit(chunk)`: it
-  ##   writes and `await`s the drain under backpressure for you. This form needs
-  ##   an async adapter in scope (for `res.drained`) and an `{.async.}` body:
-  ##
-  ##       res.stream(Http200, "application/octet-stream", emit):
-  ##         for chunk in source: emit(chunk)
-  ##
-  ## (The no-headers `res.stream(code, ct): body` form delegates to the first.)
-  when compiles(sendHead(res, code, contentType, headersOrEmit)):
-    sendHead(res, code, contentType, headersOrEmit)
-  else:
-    sendHead(res, code, contentType)
-    template headersOrEmit(chunk: untyped) =   # injected as the caller's ident
-      if not res.write(chunk): await res.drained()
+  ## Shorthands drop trailing args: `res.stream(code, ct): ...`,
+  ## `res.stream(ct): ...`, and `res.stream(): ...` (defaults to 200 +
+  ## application/octet-stream -- pass a text/* content-type to enable
+  ## compression).
+  sendHead(res, code, contentType, headers)
   var streamCompleted = false
   # `streamCompleted = true` is unreachable when the caller's `body` ends in a
   # `return` (a legitimate way to end a stream), so silence that here.
@@ -1139,6 +1148,12 @@ template stream*(res: Response, code: HttpCode, contentType: string,
 template stream*(res: Response, code: HttpCode, contentType: string,
                  body: untyped) =
   res.stream(code, contentType, [], body)
+
+template stream*(res: Response, contentType: string, body: untyped) =
+  res.stream(Http200, contentType, [], body)
+
+template stream*(res: Response, body: untyped) =
+  res.stream(Http200, "application/octet-stream", [], body)
 
 template stream*(req: Request, chunk, last, body: untyped) =
   ## Consume a streaming request body: `body` runs on the loop thread for each
