@@ -36,17 +36,16 @@ proc hUpload(req: Request, res: Response) {.async.} =
   res.send(Http200, "got " & $total, "text/plain")
 
 proc hStream(req: Request, res: Response) {.async.} =
-  # Outbound streaming with awaitable backpressure.
+  # Outbound streaming with awaitable backpressure (write + await drain).
   res.sendHead(Http200, "text/plain")
   for i in 0 ..< 50:
-    if not res.write("chunk"):
-      await res.drained()
+    await res.write("chunk")
   res.finish()
 
 proc hStreamEmit(req: Request, res: Response) {.async.} =
-  # res.stream(..., emit): the block form with auto-draining emit.
-  res.stream(Http200, "text/plain", emit):
-    for i in 0 ..< 50: emit("chunk")
+  # res.stream block form with the awaitable write (built-in backpressure).
+  res.stream(Http200, "text/plain"):
+    for i in 0 ..< 50: await res.write("chunk")
 
 proc hBoom(req: Request, res: Response) {.async.} =
   await sleepAsync(10.milliseconds)

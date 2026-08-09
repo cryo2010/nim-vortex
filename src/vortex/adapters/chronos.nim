@@ -166,6 +166,18 @@ proc drained*(res: Response): Future[void] =
   res.onDrain proc (r: Response) {.gcsafe.} =
     if not fut.finished: complete(fut)
 
+proc write*(res: Response, data: string) {.async.} =
+  ## Async streamed write with built-in backpressure (write + await drain). The
+  ## awaitable companion to the sync `res.write(openArray[char]): bool`; use
+  ## inside `res.stream`:
+  ##
+  ##   res.stream(Http200, "text/csv"):
+  ##     for row in rows: await res.write(row)
+  ##
+  ## (Forgetting `await` compiles but skips backpressure; the write still happens.)
+  if not write(res, data.toOpenArray(0, data.len - 1)):
+    await res.drained()
+
 # --- pull-based request-body reading (await req.read) -----------------------
 # Wraps the core's push req.onBody into an awaitable read(); see the
 # asyncdispatch adapter for the design.
@@ -313,19 +325,33 @@ proc options*(r: Router, path: string, h: AsyncRequestHandler) =
 
 template stream*(req: Request, chunk, body: untyped) =
   ## Consume a streaming request body with a pull loop: `body` runs once with
-  ## `chunk: string` rebound each iteration, until end of body. The async twin
-  ## of the core `req.stream(chunk, last)` and the structural mirror of
-  ## `res.stream`. Use inside an async body (e.g. `req.doAsync:`); relies on
-  ## `await req.read()`.
+  ## `chunk: string` rebound each iteration, until end of body. On a clean exit
+  ## it auto-acks with an empty `200` **unless the handler already responded
+  ## from inside the block** (so a `res.send(Http201, id)` / 4xx *inside* the
+  ## loop wins). A response *after* the block is too late -- the 200 already
+  ## went out on block exit -- so to reply once you've consumed the whole body,
+  ## use the explicit `while (let c = await req.read(); c.len > 0)` loop instead.
+  ## If `body` raises, the response is aborted and the exception propagates (a
+  ## failed upload becomes a 500, never a 200). Use inside an async body.
   ##
-  ##   req.doAsync:
+  ##   proc upload(req: Request, res: Response) {.async.} =
   ##     req.stream(chunk):
-  ##       sink.write(chunk)
-  ##     res.send(Http200, "stored\n")
-  while true:
-    let chunk = await read(req)
-    if chunk.len == 0: break
-    body
+  ##       await save(chunk)         # -> empty 200 on success
+  block:
+    let capturedReq = req
+    var streamOk = false
+    try:
+      while true:
+        let chunk = await read(capturedReq)
+        if chunk.len == 0: break
+        body
+      streamOk = true
+    finally:
+      let res = response(capturedReq)
+      if streamOk:
+        if not res.responded: res.send(Http200)
+      else:
+        res.abort()
 
 proc drained*(s: SseStream): Future[void] = s.response.drained()
   ## Await until the SSE stream's write backlog empties, so a producer can

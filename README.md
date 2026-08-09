@@ -305,10 +305,11 @@ through a dead connection is a safe no-op.
 | `res.send(code, body = "", contentType = "", headers = [])` | `void` | queue a buffered response (compressed when eligible); also `res.send(code)` and an `int`-code overload |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Streaming responses](#streaming-responses)) |
-| `res.write(data)` | `bool` | append a streamed chunk; `false` signals backpressure |
+| `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
+| `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
 | `res.finish(trailers = [])` | `void` | end a streamed response cleanly |
 | `res.abort()` | `void` | truncate a streamed response (error mid-body) |
-| `res.stream(code, ct, headers-or-emit): body` | `template` | block form of a streamed response |
+| `res.stream(code = Http200, contentType, headers = []): body` | `template` | block form of a streamed response |
 | `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
 | `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket |
 | `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
@@ -464,12 +465,23 @@ newVortex(router.toHandler, streamRoute = router.streamPredicate).serve(8080)
 ```
 
 The `req.stream` template is the inbound mirror of `res.stream` (its block runs
-per chunk, and resets the response if it raises):
+per chunk, and aborts the response if it raises):
 
 ```nim
-req.stream(chunk, last):
+req.stream(chunk, last):        # sync: `last` marks the final chunk
   sink(chunk)
   if last: res.send(Http200, "ok")
+```
+
+With an async adapter the pull-loop form drops `last` and **auto-acks with an
+empty `200`** on a clean exit — unless the handler responded from inside the
+block (a `res.send(Http201, id)`/4xx *inside* wins), or the block raises (then
+`500`, never `200`):
+
+```nim
+proc upload(req: Request, res: Response) {.async.} =
+  req.stream(chunk):
+    await save(chunk)            # -> empty 200 on success
 ```
 
 You don't need the router — `vortex/streaming` builds the same `streamRoute`
@@ -534,14 +546,16 @@ proc pump(res: Response) {.gcsafe.} =
   res.finish()
 ```
 
-With an async adapter, pass a fresh identifier to `res.stream` instead of
-headers: it is injected as an `emit(chunk)` that writes and `await`s the drain
-for you (`await res.drained()` is the explicit form):
+With an async adapter, `await res.write(chunk)` writes and awaits the drain for
+you — the awaitable companion to the sync `res.write(...): bool` (`res.stream`
+also takes lighter forms: `res.stream(ct): ...` and `res.stream(): ...`, which
+defaults to `application/octet-stream` — pass a `text/*` type to keep compression
+on):
 
 ```nim
 proc download(req: Request, res: Response) {.async.} =
-  res.stream(Http200, "application/octet-stream", emit):
-    for chunk in source: emit(chunk)          # backpressure handled per chunk
+  res.stream(Http200, "text/csv"):
+    for chunk in source: await res.write(chunk)   # backpressure handled per chunk
 ```
 
 Call `res.abort()` yourself if you catch an error mid-stream in the manual API —

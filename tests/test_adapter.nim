@@ -44,10 +44,29 @@ const streamChunk = "0123456789abcdef".repeat(1024)   # 16 KiB
 const streamCount = 100                                # 1.6 MiB, > respHighWater
 
 proc hStream(req: Request, res: Response) {.async.} =
-  # emit(chunk) writes and awaits the drain under backpressure automatically.
-  res.stream(Http200, "application/octet-stream", emit):
+  # await res.write writes and awaits the drain under backpressure automatically.
+  res.stream(Http200, "application/octet-stream"):
     for i in 0 ..< streamCount:
-      emit(streamChunk)
+      await res.write(streamChunk)
+
+proc hUpload(req: Request, res: Response) {.async.} =
+  # Consume the whole body; no explicit response -> auto-200 on block exit.
+  req.stream(chunk):
+    discard chunk
+    await sleepAsync(0)                   # a real suspend mid-stream
+
+proc hUploadReject(req: Request, res: Response) {.async.} =
+  # Respond from inside the block: this overrides the auto-200.
+  req.stream(chunk):
+    if "BAD" in chunk:
+      res.send(Http400, "bad chunk", "text/plain")
+      return
+  # a clean, unanswered exit still auto-200s (good body case)
+
+proc hUploadBoom(req: Request, res: Response) {.async.} =
+  req.stream(chunk):
+    discard chunk
+    raise newException(ValueError, "save failed")   # -> 500, never 200
 
 var appRouter = newRouter()
 appRouter.get("/", hRoot)
@@ -58,8 +77,13 @@ appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
 appRouter.get("/stream", hStream)
+appRouter.stream(HttpPost, "/upload", hUpload)
+appRouter.stream(HttpPost, "/upload-reject", hUploadReject)
+appRouter.stream(HttpPost, "/upload-boom", hUploadBoom)
 
-var srv = newVortex(appRouter.toHandler, initVortexConfig(numThreads = 1, workerThreads = 2)).start(0)
+var srv = newVortex(appRouter.toHandler,
+                    initVortexConfig(numThreads = 1, workerThreads = 2),
+                    appRouter.streamPredicate).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
 proc fetch(path: string): string =
@@ -117,10 +141,28 @@ suite "asyncdispatch adapter":
   test "blocking: works inside an async handler":
     check fetch("/worker") == "worker done"
 
-  test "res.stream(emit) streams with backpressure, body intact":
+  test "res.stream + await res.write streams with backpressure, body intact":
     let body = fetch("/stream")
     check body.len == streamChunk.len * streamCount
     check body == streamChunk.repeat(streamCount)
+
+  test "upload: req.stream auto-200 on clean exit":
+    var client = newHttpClient()
+    defer: client.close()
+    let r = client.post(base & "/upload", "hello world")
+    check r.code == Http200
+    check r.body == ""
+
+  test "upload: a response from inside the block overrides the auto-200":
+    var client = newHttpClient()
+    defer: client.close()
+    check client.post(base & "/upload-reject", "BAD").code == Http400
+    check client.post(base & "/upload-reject", "fine").code == Http200   # auto-200
+
+  test "upload: a raise in the block gives 500, never 200":
+    var client = newHttpClient()
+    defer: client.close()
+    check client.post(base & "/upload-boom", "x").code == Http500
 
   test "async handler over HTTP/2":
     let (output, rc) = execCmdEx(

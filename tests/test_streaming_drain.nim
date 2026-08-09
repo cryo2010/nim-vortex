@@ -15,7 +15,9 @@ proc bigStream(req: Request, res: Response) {.async.} =
   res.sendHead(Http200, "application/octet-stream")
   let chunk = repeat('x', 8192)
   for i in 0 ..< 512:                    # 4 MiB
-    if not res.write(chunk):
+    # Low-level bool form on purpose (this test counts drains); a string arg
+    # would resolve to the awaitable `await res.write`, so slice to openArray.
+    if not res.write(chunk.toOpenArray(0, chunk.high)):
       drainCount.atomicInc
       await res.drained()                # yield until the socket drains
   res.finish()
