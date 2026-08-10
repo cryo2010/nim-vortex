@@ -2,7 +2,16 @@
 ## listener; the kernel load-balances connections) plus a shared worker
 ## pool for `blocking:` code.
 
-import std/[atomics, posix, cpuinfo, nativesockets, net]
+import std/[atomics, cpuinfo]
+when defined(nimdoc):
+  # See eventloop.nim: `nim doc` (-d:nimdoc) flips net/nativesockets to winlean
+  # types, colliding with std/posix. Resolve the two clashing names from posix
+  # for doc builds; the real build (`else`) is unchanged.
+  import std/nativesockets except SocketHandle, osInvalidSocket
+  import std/posix
+  const osInvalidSocket = SocketHandle(-1)
+else:
+  import std/[posix, nativesockets, net]
 import ./settings, ./request, ./eventloop, ./connection, ./workerpool
 when not defined(plainHttp):
   import ./transport/tls

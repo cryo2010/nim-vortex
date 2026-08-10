@@ -2,8 +2,34 @@
 ## nonblocking accept/read/write, request dispatch, and a coarse 1-second
 ## timeout sweep (slowloris protection without per-connection timers).
 
-import std/[selectors, net, nativesockets, posix, httpcore, times, monotimes,
-            atomics, oserrors]
+import std/[selectors, httpcore, times, monotimes, atomics, oserrors]
+when defined(nimdoc):
+  # `nim doc` defines `nimdoc`, which flips std/net & std/nativesockets to their
+  # winlean (Windows) socket types so Windows APIs document on any host -- that
+  # collides with the std/posix syscalls this module uses (SocketHandle,
+  # Sockaddr_*, SockLen, recv/send/setsockopt/... exist in both winlean and
+  # posix). For doc builds ONLY, take the platform socket types from posix (one
+  # consistent family) and stub the nativesockets handle-returning helpers to
+  # posix types so the bodies type-check. The real build (`else`) is unchanged.
+  import std/nativesockets except SocketHandle, AddrInfo, SockAddr, SockLen,
+    Sockaddr_in, Sockaddr_storage, MSG_PEEK, SOL_SOCKET, SO_REUSEADDR,
+    SO_REUSEPORT, close, createNativeSocket, getAddrInfo, freeAddrInfo,
+    bindAddr, setBlocking, osInvalidSocket, getAddrString
+  import std/posix
+  proc getAddrString(sockAddr: ptr SockAddr): string = ""
+  const osInvalidSocket = SocketHandle(-1)
+  proc createNativeSocket(domain, sockType, protocol: cint): SocketHandle =
+    SocketHandle(-1)
+  proc getAddrInfo(address: string, port: Port, domain = Domain.AF_INET,
+                   sockType = SockType.SOCK_STREAM,
+                   protocol = Protocol.IPPROTO_TCP): ptr AddrInfo = nil
+  proc freeAddrInfo(ai: ptr AddrInfo) = discard
+  proc bindAddr(socket: SocketHandle, name: ptr SockAddr,
+                namelen: SockLen): cint = 0
+  proc setBlocking(socket: SocketHandle, blocking: bool) = discard
+  proc close(socket: SocketHandle) = discard   # nativesockets' close is void
+else:
+  import std/[net, nativesockets, posix]
 import ./settings
 import ./connection
 import ./request
@@ -148,7 +174,7 @@ proc newListenSocket*(settings: VortexConfig): SocketHandle =
   ## Raw nonblocking listener fd. Plain data so it can cross threads;
   ## with reusePort every loop thread creates its own.
   result = bindListener(settings, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
-  if nativesockets.listen(result, cint(settings.listenBacklog)) < 0:
+  if posix.listen(result, cint(settings.listenBacklog)) < 0:
     result.close()
     raiseOSError(osLastError())
 
@@ -223,7 +249,7 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
   # the size: preallocating millions of slots wastes memory and startup time.
   result.core.conns = newSeq[Connection](1024)
   result.refreshDate()
-  result.selector.registerHandle(listenFd, {Event.Read}, fkListen)
+  result.selector.registerHandle(int(listenFd), {Event.Read}, fkListen)
   if outbox != nil:
     result.selector.registerEvent(outbox.ev, fkWakeup)
   when not defined(plainHttp):
@@ -249,7 +275,7 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
       result.quicListener = newQuicListener(ownCfg, cint(udpFd))
       if result.quicListener != nil:
         result.udpFd = int(udpFd)
-        result.selector.registerHandle(udpFd, {Event.Read}, fkQuic)
+        result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
 
 const drainTimeoutSec = 5    # bound on how long a lingering close waits
@@ -883,7 +909,7 @@ proc handleAccept(loop: Loop) =
       dec loop.connCount
       continue
     c.setDeadline(loop, dkHeader)   # handshake counts toward header timeout
-    loop.selector.registerHandle(client, {Event.Read}, fkClient)
+    loop.selector.registerHandle(int(client), {Event.Read}, fkClient)
     c.registered = true
 
 proc beginAfterProxy(loop: Loop, c: ptr Connection) =
