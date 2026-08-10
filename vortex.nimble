@@ -2,7 +2,7 @@
 
 version       = "0.1.0"
 author        = "Craig Younker"
-description   = "A fast HTTP/1.1, HTTP/2 and HTTP/3 server"
+description   = "An HTTP server for HTTP/1.1, HTTP/2, HTTP/3, TLS, WebSockets and more"
 license       = "MIT"
 srcDir        = "src"
 
