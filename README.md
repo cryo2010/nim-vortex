@@ -3,37 +3,22 @@
 [![CI](https://github.com/cryo2010/nim-vortex/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-vortex/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A fast HTTP server for Nim speaking **HTTP/1.1, HTTP/2, and HTTP/3** from a
-single port and a single handler API.
+An HTTP server for Nim with support for HTTP/1.1, HTTP/2, HTTP/3, TLS, WebSockets and more. 
 
 ```nim
-import vortex
+import vortex/asyncdispatch
 
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.async.} =
   case req.path
-  of "/":       res.send(Http200, "Hello, World!", "text/plain")
-  of "/report":
-    req.blocking:                       # runs on the worker pool
+  of "/":
+    req.blocking: # runs on the worker pool
       let data = expensiveBlockingCall()
-      res.send(Http200, data, "application/json")
-  else:         res.send(Http404)
+      await res.send(Http200, data, "application/json")
+  else:
+    await res.send(Http404)
 
 newVortex(handler).serve(8080)
 ```
-
-- **Architecture**: one event loop per thread (`SO_REUSEPORT`,
-  kqueue/epoll via `std/selectors`), handlers run inline on the loop:
-  the httpbeast model, with the protocol gaps filled in.
-- **Blocking escape hatch**: `req.blocking:` moves a handler body to a
-  worker pool where synchronous DB drivers, file IO, and CPU work are
-  safe; routes that never use it pay zero overhead.
-- **Future-agnostic**: handlers are plain procs and responses may be
-  deferred: no async runtime dependency, no Future type in the core.
-  Optional asyncdispatch and chronos adapters layer `await` support on
-  top through the same loop hook.
-- **All three protocols, one port**: HTTP/1.1, HTTP/2, and HTTP/3 (plus
-  WebSockets over each) behind the same handler API, negotiated
-  automatically.
 
 ## Contents
 
@@ -47,7 +32,7 @@ newVortex(handler).serve(8080)
   - [Config](#config)
     - [Compression](#compression)
     - [Transport Layer Security (TLS)](#transport-layer-security-tls)
-    - [Response size limits](#response-size-limits)
+    - [Request size limits](#request-size-limits)
   - [Handlers](#handlers)
     - [Requests](#requests)
     - [Responses](#responses)
@@ -84,10 +69,8 @@ newVortex(handler).serve(8080)
   middleware.
 - **Static file serving** with conditional requests, byte ranges, streamed
   large files, and traversal safety.
-- **Blocking escape hatch** (`req.blocking:`) backed by a worker pool for sync
+- **Worker pool** (`req.blocking:`) backed by a worker pool for sync
   DB drivers, file IO, and CPU work.
-- **Optional async**: asyncdispatch or chronos adapters add `await` on the loop
-  thread without pulling a runtime into the core.
 - **Dual-stack**: binds IPv4 and IPv6 by default, with graceful fallback.
 - **PROXY protocol** (v1/v2) and `X-Forwarded-For` support for the real client
   address behind a load balancer.
@@ -96,6 +79,7 @@ newVortex(handler).serve(8080)
 
 ## Requirements
 
+- **Linux or macOS** host environment. Windows requires running via Docker.
 - **Nim >= 2.2.10**.
 - **OpenSSL >= 3.5** at runtime, for TLS, HTTP/2-over-TLS, and HTTP/3 (the QUIC
   server API landed in 3.5). A `-d:plainHttp` build needs no OpenSSL at all (see
@@ -103,24 +87,17 @@ newVortex(handler).serve(8080)
 - The chronos adapter additionally needs `chronos >= 4.0.0` in your own project
   (it is never a dependency of a bare `import vortex`).
 
-**Platform: POSIX only (Linux and macOS), by design.** The core is built on
-readiness-based `kqueue`/`epoll` and per-thread `SO_REUSEPORT` listeners, which
-have no direct Windows equivalent; a `select()`-backed Windows port would defeat
-the performance goal. On Windows, run vortex under WSL2 or a Linux container
-(Docker).
+> [!TIP]
+> You can run a `vortex` server on Windows via [Docker](https://www.docker.com/).
 
 ## Install
 
 ```sh
-nimble install https://github.com/cryo2010/nim-vortex
+nimble add https://github.com/cryo2010/nim-vortex
 ```
 
-Then `import vortex`. The library is threaded and uses ORC, so build your app
-with `--mm:orc --threads:on` (see [Build flags](#build-flags) for the full
-release line). To use `await` in handlers, import one async adapter alongside it
-— `vortex/asyncdispatch` (no extra dependency) or `vortex/chronos` (add
-`requires "chronos >= 4.0.0"` to your project); see
-[Choose an implementation](#choose-an-implementation).
+> [!NOTE]
+> If you plan to use `chronos` futures for async you will need to also install `chronos`.
 
 ## Build flags
 
@@ -130,25 +107,27 @@ Release builds use:
 nim c --mm:orc --threads:on -d:danger --passC:-flto app.nim
 ```
 
-(`nimble bench` builds the benchmark server this way.)
+| Flag | Default | Effect |
+|------|---------|--------|
+| `-d:plainHttp` | Off | Zero-dependency cleartext build (h1 + h2c); removes OpenSSL and TLS/h2-over-TLS/h3 |
+| `-d:wsDeflate` (`--passL:-lz`) | Off | WebSocket permessage-deflate compression via zlib |
+| `-d:httpGzip` / `-d:httpBrotli` / `-d:httpZstd` | Off | Response + request compression codecs (see [Compression](#compression) for link flags) |
 
-| Flag | Effect |
-|------|--------|
-| `-d:plainHttp` | Zero-dependency cleartext build (h1 + h2c); removes OpenSSL and TLS/h2-over-TLS/h3 |
-| `-d:wsDeflate` (`--passL:-lz`) | WebSocket permessage-deflate compression via zlib |
-| `-d:httpGzip` / `-d:httpBrotli` / `-d:httpZstd` | Response + request compression codecs (see [Compression](#compression) for link flags) |
-
-All are off by default, so the standard build keeps its OpenSSL-only footprint.
+They are all off by default, so the standard build keeps its OpenSSL-only footprint.
 
 ## Choose an implementation
 
-Handlers are plain `proc (req: Request, res: Response)` values, so the core has
-no async runtime and no `Future` type. You pick how a handler does its work per
-route; all three styles register through the same API and share one event loop.
+Vortex is future-agnostic and ships with four implementation options:
 
-**Synchronous** — the default. Reply inline, or move blocking work to the worker
-pool with `req.blocking:`. No adapter, no `await`:
+1. A sync client via `import navi`
+2. An async client via `import navi/asyncdispatch`
+3. An async client via `import navi/chronos`
+4. A JavaScript-only client via `import navi/js` 
 
+> [!NOTE]
+> If you transpile to JavaScript from any other implementation, the `navi/js` client is used instead.
+
+**Synchronous**
 ```nim
 import vortex
 
@@ -158,89 +137,57 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 newVortex(handler).serve(8080)
 ```
 
-**asyncdispatch** — the `vortex/asyncdispatch` adapter lets a handler `await`
-`std/asyncdispatch` futures on the loop thread (no extra dependency):
-
+**asyncdispatch** - An async server that uses `std/asyncdispatch` futures.
 ```nim
 import vortex
 import vortex/asyncdispatch
 
-proc getUser(req: Request, res: Response) {.async.} =
-  let user = await db.getUser(req.param("id"))   # loop keeps serving
-  res.send(Http200, user.toJson, "application/json")
+proc handler(req: Request, res: Response) {.async.} =
+  await res.send(Http200, "Hello, World!", "text/plain")
 
-var router = newRouter()
-router.get("/users/:id", getUser)
-newVortex(router.toHandler).serve(8080)
+newVortex(handler).serve(8080)
 ```
 
-**chronos** — the `vortex/chronos` adapter does the same for chronos futures.
-chronos is **not** a vortex dependency, so using it means adding
-`requires "chronos >= 4.0.0"` to your own project:
-
+**chronos** — An async server that uses `/chronos` futures.
 ```nim
 import vortex
 import vortex/chronos
 
-proc getUser(req: Request, res: Response) {.async.} =
-  let user = await db.getUser(req.param("id"))   # chronos await, loop serves
-  res.send(Http200, user.toJson, "application/json")
+proc handler(req: Request, res: Response) {.async.} =
+  await res.send(Http200, "Hello, World!", "text/plain")
 
-var router = newRouter()
-router.get("/users/:id", getUser)
-newVortex(router.toHandler).serve(8080)
+newVortex(handler).serve(8080)
 ```
 
-Import only one async adapter per program. The sync path is always available;
-async is purely additive.
-
-> `std/httpclient` also exports a `Response` type; in modules using both,
-> `import std/httpclient except Response`.
+> [!IMPORTANT]
+> You must add `chronos` to your project in order to use the `vortex/chronos` server.
 
 ## Quick start
 
-`newVortex(handler).serve(port)` starts the server and blocks until a
-SIGINT/SIGTERM (or `requestShutdown()`) arrives, then shuts down gracefully:
+`newVortex(handler).serve(port)` creates and starts the server.
 
 ```nim
 newVortex(handler).serve(8080)
 ```
 
-For embedding or tests, `start` returns immediately and `close` stops it:
-
-```nim
-let srv = newVortex(handler).start(0)   # start(0) = pick a free port; non-blocking
-echo "listening on ", srv.port          # the resolved port
-# ... drive requests against srv.port ...
-srv.close()
-```
-
-Shutdown is graceful either way: `requestShutdown()` (or a SIGINT/SIGTERM under
-`serve`, or `srv.close()`) stops accepting and closes the listener so the port
-frees for a replacement, sends HTTP/2 and HTTP/3 `GOAWAY`, closes open
-WebSockets with a `1001` (going away), and lets in-flight requests and streams
-finish before closing. Idle keep-alive connections close promptly; anything
-still running is force-closed once `shutdownGrace` seconds elapse.
-
 ## Usage
 
 ### Config
 
-Server configuration is a `VortexConfig` value built with `initVortexConfig(...)`
-and passed to `newVortex`; you can also edit `vortex.config` before serving.
-Beyond `port` and `address` (dual-stack by default), it carries the TLS material,
-timeouts, worker/thread counts, and the feature toggles used throughout this
-document:
+The server's `VortexConfig` can optionally be passed into `newVortex`, or you can simply 
+edit `vortex.config` before serving. It carries the TLS material, timeouts, worker/thread
+counts, and the feature toggles used throughout this document.
 
 ```nim
-let vortex = newVortex(handler, initVortexConfig(
+let config = initVortexConfig(
   address = "::",                 # dual-stack (default); pin a family with "0.0.0.0"
-  numThreads = 0,                 # 0 = one event loop per core (SO_REUSEPORT)
-  compress = true,                # response compression (needs a -d:http* build)
+  numThreads = 0,                 # 0 = one event loop per core
+  compress = true,                # response compression
   decompressRequest = true,       # transparently decode gzip/br request bodies
   responseTimeout = 30,           # seconds a handler may take before the conn is closed
   shutdownGrace = 10))            # seconds to drain in-flight work on shutdown
-vortex.config.serverHeader = "acme"   # config is mutable until you serve/start
+let vortex = newVortex(handler, config)
+vortex.config.serverHeader = "acme"   # config is mutable until you start serving requests
 vortex.serve(8080)
 ```
 
@@ -263,35 +210,38 @@ proxy that sets `X-Forwarded-For`, recover the origin client from
 
 #### Compression
 
-`-d:httpGzip` (`--passL:-lz`), `-d:httpBrotli`
-(`--passL:"-lbrotlienc -lbrotlicommon"`), and/or `-d:httpZstd` (`--passL:-lzstd`)
-enable **response compression**, turned on per server with `config.compress`:
-
-```sh
-nim c -d:httpGzip -d:httpBrotli --passL:-lz \
-      --passL:"-lbrotlienc -lbrotlicommon" --threads:on app.nim
-```
+Vortex supports gzip, brotli and zstd compression for requests and responses whenever the libraries are linked. **Request decompression** is generally not recommended but handled transparently. **Response compression** is recommended and enabled via `VortexConfig.compress` (boolean).
 
 ```nim
-newVortex(handler, initVortexConfig(compress = true)).serve(8080)
+let server = newVortex(handler)
+server.config.compress = true # Enables compression
+server.config.maxBodySize = 8*1024*1024 # Defends against decompression bomb attacks
+server.config.decompressRequest = true # Enables request decompression
 ```
 
-An eligible response (the client accepts an encoding we can produce, a
-compressible content-type, no existing `Content-Encoding`) is compressed with the
-best encoding `Accept-Encoding` offers, adding `Content-Encoding` +
-`Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out); on a
-tie the server prefers **br**, then **zstd**, then **gzip**. Build with several
-flags to offer several and let the client choose. This covers both buffered
-`res.send` (compressed when over ~1400 bytes) and **streamed** responses
-(`res.sendHead`/`write`/`finish`, SSE, and file streaming), compressed
-incrementally. Off by default, so the standard and `-d:plainHttp` builds link no
-zlib/brotli/zstd.
+| Algorithm | Compiler Flags | 
+|-----------|---------------|
+| brotli    | `-d:httpBrotli --passL:"-lbrotlienc -lbrotlicommon"` |
+| gzip      | `-d:httpGzip --passL:-lz` |
+| zstd      | `-d:httpZstd --passL:-lzstd`|
+
+> [!TIP]
+> Build with multiple compression options and let the client choose.
+
+```sh
+nim c -d:httpBrotli -d:httpGzip -d:httpZstd --passL:"-lbrotlienc -lbrotlicommon" \
+  --passL:-lz --passL:-lzstd --threads:on app.nim
+```
+
+An eligible response is compressed with the best encoding `Accept-Encoding` offers, 
+adding `Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out);
+on a tie the server prefers **br**, then **zstd**, then **gzip**. 
 
 The **inbound** direction is opt-in with `config.decompressRequest`: a request
-whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
-`req.body`. It is bounded by `maxBodySize` so a decompression bomb can't exhaust
-memory — a body that would exceed the cap is rejected with `413`, a corrupt one
-with `400` — and the handler never runs for either.
+whose `Content-Encoding` is `gzip` or `br` is transparently decoded into `req.body`. 
+
+> [!CAUTION]
+> Vortex disables request decompression by default in accordance with OWASP guidelines for attack-surface reduction. Enable at your own risk.
 
 #### Transport Layer Security (TLS)
 
@@ -364,7 +314,7 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
                  ocspFile = "ocsp.der")        # or ocspResponse = derBytes
 ```
 
-#### Response size limits
+#### Request size limits
 
 Inbound requests are bounded so a malformed or hostile client can't exhaust
 memory. Each limit is a `VortexConfig` field with a default and a specific
@@ -392,11 +342,9 @@ constraint), stream it instead — see [Upload](#upload).
 
 ### Handlers
 
-A handler is a plain `proc (req: Request, res: Response) {.gcsafe.}`. It runs
+A handler is a plain `proc (req: Request, res: Response)` or `proc (req: Request, res: Response) {.async.}`. It runs
 **inline on the event loop**, so it must never block (no sync DB calls, no
-`sleep`). Read the request through `req`, reply through `res`; `res.send` may be
-called after the handler returns (deferred), and sending through a dead
-connection is a safe no-op.
+`sleep`). Read the request through `req`, reply through `res`.
 
 For synchronous work (a sync DB driver, file IO, CPU-bound work), `req.blocking:`
 moves the body to a worker pool. Inside it, `req`/`res` are available but the
@@ -404,16 +352,11 @@ body cannot capture surrounding locals (it runs on another thread); read what
 you need through `req`:
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) {.async.} =
   req.blocking:
     let rows = db.getAllRows(sql"select …")   # blocking is safe here
     res.send(Http200, $rows, "application/json")
 ```
-
-For `await`-style handlers, import an async adapter and write a
-`proc (req, res) {.async.}` — see
-[Choose an implementation](#choose-an-implementation). Without a router, wrap it
-with the adapter's `toHandler`, or use `req.doAsync:` inside a plain handler.
 
 #### Requests
 
