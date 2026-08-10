@@ -4,7 +4,7 @@
 ## server must keep working unchanged.
 
 import std/[unittest, net, posix, strutils, httpcore, os, osproc]
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 import ./helper
 
 proc hUpload(req: Request, res: Response) {.gcsafe.} =

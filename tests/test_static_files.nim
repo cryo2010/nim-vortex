@@ -2,7 +2,7 @@
 ## body are checked exactly.
 
 import std/[unittest, net, os, strutils, osproc]
-import vortex/[settings, request, server, router, staticfiles]
+import vortex/[settings, request, server, routing, staticfiles]
 
 let dir = getTempDir() / "vortex_static_" & $getCurrentProcessId()
 removeDir(dir)

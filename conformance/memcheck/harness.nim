@@ -24,7 +24,7 @@ import std/[net, posix, os, osproc, strutils, httpcore]
 const backend {.strdefine.}: string = "sync"
 const isAsync = backend == "async" or backend == "chronos"
 
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 when backend == "chronos":
   import vortex/chronos
 elif backend == "async":

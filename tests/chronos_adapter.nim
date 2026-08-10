@@ -1,7 +1,7 @@
 import std/[unittest, net, httpcore, strutils, os, osproc, posix]
 import std/httpclient except Response
 import std/times except milliseconds
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 import ./helper
 import vortex/chronos as nhschronos
 

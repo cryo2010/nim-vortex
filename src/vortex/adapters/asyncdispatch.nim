@@ -37,7 +37,7 @@
 import std/[asyncdispatch, httpcore, tables, deques]
 import ../connection
 import ../request
-import ../router
+import ../routing
 
 export asyncdispatch
 
