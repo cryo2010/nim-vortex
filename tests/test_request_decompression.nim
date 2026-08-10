@@ -1,4 +1,4 @@
-## Inbound request-body decompression (settings.decompressRequest): a gzip/br
+## Inbound request-body decompression (settings.decompressRequest): a gzip/br/zstd
 ## request body is transparently decoded into req.body, bounded by maxBodySize
 ## so a decompression bomb is rejected with 413 (corrupt -> 400). Run via
 ## `nimble testreqdecomp`; skips under a build without a compression flag.
@@ -7,14 +7,15 @@
 # when the flags are absent (the SKIP path quits).
 {.warning[UnreachableCode]: off.}
 
-when not defined(httpGzip) and not defined(httpBrotli):
-  echo "SKIP: request decompression needs -d:httpGzip and/or -d:httpBrotli"
+when not defined(httpGzip) and not defined(httpBrotli) and not defined(httpZstd):
+  echo "SKIP: request decompression needs -d:httpGzip, -d:httpBrotli and/or -d:httpZstd"
   quit 0
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
 when defined(httpGzip): import vortex/gzip
 when defined(httpBrotli): import vortex/brotli
+when defined(httpZstd): import vortex/zstd
 
 let curlBin = findExe("curl")
 if curlBin.len == 0:
@@ -55,6 +56,10 @@ when defined(httpBrotli):
   writeFile(tmp / "ok.br", brotli(expected))
   writeFile(tmp / "bomb.br", brotli(bomb))
   encs.add "br"
+when defined(httpZstd):
+  writeFile(tmp / "ok.zstd", zstd(expected))
+  writeFile(tmp / "bomb.zstd", zstd(bomb))
+  encs.add "zstd"
 
 suite "request-body decompression":
   for enc in encs:
@@ -76,6 +81,12 @@ suite "request-body decompression":
     when defined(httpGzip):
       writeFile(tmp / "bad.gzip", "this is not a gzip stream at all")
       let (status, _) = post(false, "gzip", tmp / "bad.gzip")
+      check status == 400
+
+  test "corrupt zstd body -> 400":
+    when defined(httpZstd):
+      writeFile(tmp / "bad.zstd", "this is not a zstd stream at all")
+      let (status, _) = post(false, "zstd", tmp / "bad.zstd")
       check status == 400
 
 srv.close()

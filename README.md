@@ -183,7 +183,7 @@ let config = initVortexConfig(
   address = "::",                 # dual-stack (default); pin a family with "0.0.0.0"
   numThreads = 0,                 # 0 = one event loop per core
   compress = true,                # response compression
-  decompressRequest = true,       # transparently decode gzip/br request bodies
+  decompressRequest = true,       # transparently decode gzip/br/zstd request bodies
   responseTimeout = 30,           # seconds a handler may take before the conn is closed
   shutdownGrace = 10))            # seconds to drain in-flight work on shutdown
 let vortex = newVortex(handler, config)
@@ -217,7 +217,7 @@ adding `Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values
 on a tie the server prefers **br**, then **zstd**, then **gzip**. 
 
 The **inbound** direction is opt-in with `config.decompressRequest`: a request
-whose `Content-Encoding` is `gzip` or `br` is transparently decoded into `req.body`. 
+whose `Content-Encoding` is `gzip`, `br`, or `zstd` is transparently decoded into `req.body`. 
 
 ```nim
 let server = newVortex(handler)

@@ -121,8 +121,8 @@ proc callHandler(loop: Loop, req: Request, res: Response) {.inline.} =
   ## how the compiler calls a closure -- prc(args..., env) -- so it works for
   ## both a capturing closure (router.toHandler) and a bare top-level proc
   ## (nil env, ignored), without touching any refcount. See RawClosure.
-  when defined(httpGzip) or defined(httpBrotli):
-    # Transparently decode a gzip/br request body (opt-in) before dispatch; a
+  when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
+    # Transparently decode a gzip/br/zstd request body (opt-in) before dispatch; a
     # bomb/corrupt body is rejected (413/400) without running the handler. No-op
     # for streaming routes (their body isn't buffered here).
     if not decodeRequestBody(req, res): return

@@ -56,9 +56,9 @@ type
     maxWsMessageSize*: int    ## largest inbound WebSocket message (close 1009 over it)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
     compress*: bool           ## gzip/brotli eligible responses (needs -d:httpGzip/httpBrotli)
-    decompressRequest*: bool  ## transparently decode a gzip/br request body into
-                              ## req.body, bounded by maxBodySize (needs
-                              ## -d:httpGzip/httpBrotli); over the cap -> 413
+    decompressRequest*: bool  ## transparently decode a gzip/br/zstd request body
+                              ## into req.body, bounded by maxBodySize (needs
+                              ## -d:httpGzip/httpBrotli/httpZstd); over the cap -> 413
 
     # DoS budgets (0 disables the check)
     maxConnections*: int          ## live connections per loop thread
