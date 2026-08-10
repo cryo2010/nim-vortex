@@ -19,7 +19,7 @@
 ## (there is no h2 client in the stdlib); only this harness process is under the
 ## tool, which is what we want -- the child curl is not traced.
 
-import std/[net, posix, os, osproc, strutils, httpcore, times]
+import std/[net, posix, os, osproc, strutils, httpcore]
 
 const backend {.strdefine.}: string = "sync"
 const isAsync = backend == "async" or backend == "chronos"
