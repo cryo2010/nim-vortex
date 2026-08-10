@@ -399,8 +399,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [http1, http1c, shutdown]
-        target: [sync, chronos]
+        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
+        target: [sync, async, chronos]
         mm: [orc]
     steps:
       - name: Install toolchain
@@ -425,8 +425,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [http1, http1c, shutdown]
-        target: [sync, chronos]
+        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
+        target: [sync, async, chronos]
         mm: [orc]
     steps:
       - name: Install toolchain
@@ -454,8 +454,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [http1, http1c, shutdown]
-        target: [sync, chronos]
+        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
+        target: [sync, async, chronos]
         mm: [orc]
     steps:
       - name: Lower ASLR entropy for ThreadSanitizer
