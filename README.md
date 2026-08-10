@@ -148,7 +148,7 @@ proc handler(req: Request, res: Response) {.async.} =
 newVortex(handler).serve(8080)
 ```
 
-**chronos** — An async server that uses `/chronos` futures.
+**chronos**: An async server that uses `/chronos` futures.
 ```nim
 import vortex
 import vortex/chronos
@@ -212,9 +212,16 @@ proxy that sets `X-Forwarded-For`, recover the origin client from
 
 Vortex supports gzip, brotli and zstd compression for requests and responses whenever the libraries are linked. **Request decompression** is generally not recommended but handled transparently. **Response compression** is recommended and enabled via `VortexConfig.compress` (boolean).
 
+An eligible response is compressed with the best encoding `Accept-Encoding` offers, 
+adding `Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out);
+on a tie the server prefers **br**, then **zstd**, then **gzip**. 
+
+The **inbound** direction is opt-in with `config.decompressRequest`: a request
+whose `Content-Encoding` is `gzip` or `br` is transparently decoded into `req.body`. 
+
 ```nim
 let server = newVortex(handler)
-server.config.compress = true # Enables compression
+server.config.compress = true # Enables response compression
 server.config.maxBodySize = 8*1024*1024 # Defends against decompression bomb attacks
 server.config.decompressRequest = true # Enables request decompression
 ```
@@ -225,20 +232,14 @@ server.config.decompressRequest = true # Enables request decompression
 | gzip      | `-d:httpGzip --passL:-lz` |
 | zstd      | `-d:httpZstd --passL:-lzstd`|
 
-> [!TIP]
-> Build with multiple compression options and let the client choose.
-
+**Example Command:**
 ```sh
 nim c -d:httpBrotli -d:httpGzip -d:httpZstd --passL:"-lbrotlienc -lbrotlicommon" \
   --passL:-lz --passL:-lzstd --threads:on app.nim
 ```
 
-An eligible response is compressed with the best encoding `Accept-Encoding` offers, 
-adding `Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out);
-on a tie the server prefers **br**, then **zstd**, then **gzip**. 
-
-The **inbound** direction is opt-in with `config.decompressRequest`: a request
-whose `Content-Encoding` is `gzip` or `br` is transparently decoded into `req.body`. 
+> [!TIP]
+> Build with multiple compression options and let the client choose.
 
 > [!CAUTION]
 > Vortex disables request decompression by default in accordance with OWASP guidelines for attack-surface reduction. Enable at your own risk.
@@ -253,7 +254,7 @@ newVortex(handler, initVortexConfig(
   certFile = "cert.pem", keyFile = "key.pem")).serve(8443)
 ```
 
-The cert and key can also come **from memory** instead of files — pass the PEM
+The cert and key can also come **from memory** instead of files. Pass the PEM
 directly (e.g. loaded from a secret manager), with `keyPassword` for an
 encrypted key:
 
@@ -270,7 +271,7 @@ OpenSSL accepts (RSA, ECDSA, Ed25519) is supported. `keyPassword` applies to a
 file or in-memory key; without it, an encrypted key fails to start (rather than
 prompting).
 
-**PKCS#12 (.pfx/.p12)** bundles the cert, key, and chain in one blob — pass the
+**PKCS#12 (.pfx/.p12)** bundles the cert, key, and chain in one blob; pass the
 file or the bytes, with `keyPassword` as the bundle passphrase:
 
 ```nim
@@ -318,7 +319,7 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
 
 Inbound requests are bounded so a malformed or hostile client can't exhaust
 memory. Each limit is a `VortexConfig` field with a default and a specific
-rejection when exceeded — the handler never runs for a rejected request:
+rejection when exceeded, and the handler never runs for a rejected request:
 
 | Field | Default | Enforcement |
 |-------|---------|-------------|
@@ -338,7 +339,7 @@ newVortex(handler, initVortexConfig(
 ```
 
 To accept a large upload without buffering it whole (so `maxBodySize` isn't the
-constraint), stream it instead — see [Upload](#upload).
+constraint), stream it instead; see [Upload](#upload).
 
 ### Handlers
 
@@ -366,7 +367,7 @@ The `Request` object passed into the handler contains the content and metadata r
 |--------|--------|---------------|
 | `req.method` | `HttpMethod` | request method (`HttpGet`, `HttpPost`, …) |
 | `req.path` | `string` | raw request target, query string included |
-| `req.url` | `Uri` | parsed target — `req.url.path` excludes the query (lazy, cached) |
+| `req.url` | `Uri` | parsed target; `req.url.path` excludes the query (lazy, cached) |
 | `req.query` | `Table[string, string]` | decoded query params, last value wins (lazy, cached) |
 | `req.headers` | `iterator (string, string)` | every header pair (pseudo-headers skipped) |
 | `req.header(name)` | `string` | one header, case-insensitive; "" if absent |
@@ -447,8 +448,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 #### Cookies
 
 `setCookie(...)` builds a `Set-Cookie` header as a `(name, value)` pair to pass
-in `res.send`'s `headers`. It defaults to the OWASP session-management baseline —
-`Secure`, `HttpOnly`, `SameSite=Lax` — so a plain call is already hardened:
+in `res.send`'s `headers`. It defaults to the OWASP session-management baseline
+(`Secure`, `HttpOnly`, `SameSite=Lax`), so a plain call is already hardened:
 
 ```nim
 proc login(req: Request, res: Response) {.gcsafe.} =
@@ -474,7 +475,7 @@ Reading cookies is left to the handler: the raw header is `req.header("cookie")`
 ### Middleware
 
 `router.use(mw)` wraps every route (and the 404/405 responses) with a
-`Middleware` — `proc(next: RequestHandler): RequestHandler`. Run code before or
+`Middleware`: `proc(next: RequestHandler): RequestHandler`. Run code before or
 after `next(req, res)`, or skip `next` to short-circuit. Middleware run in
 registration order: the first `use`d is outermost (runs first in, last out).
 
@@ -502,7 +503,7 @@ newVortex(router.toHandler).serve(8080)
 ```
 
 `use` is sugar over closure composition, so it is not required: since a handler
-is a plain proc, you can wrap one directly without a router —
+is a plain proc, you can wrap one directly without a router:
 `newVortex(logging(requireAuth(handler))).serve(8080)`.
 
 ### Routing
@@ -565,7 +566,7 @@ r.get("/assets/*", assets)
 ```
 
 To serve one specific file from any handler, use `res.sendFile(path)` (a
-trusted path — no traversal resolution):
+trusted path, no traversal resolution):
 
 ```nim
 r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
@@ -573,16 +574,16 @@ r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
 ```
 
 Large full-file `GET` responses are **streamed** from the worker pool in bounded
-chunks — memory stays flat no matter how big the file is — with `Content-Length`
+chunks (memory stays flat no matter how big the file is) with `Content-Length`
 preserved (length-delimited, keep-alive intact). Small files, ranges, and `HEAD`
-are read in one shot. `sendfile(2)` is intentionally not used — it composes with
+are read in one shot. `sendfile(2)` is intentionally not used: it composes with
 neither TLS nor the readiness event loop.
 
 ### Streaming
 
 Stream when a body is too large to buffer whole (large downloads, live feeds,
 proxying) or when it should be consumed as it arrives (large uploads). Streaming
-is **loop-thread only** — call it from the handler or an async/onDrain callback,
+is **loop-thread only**: call it from the handler or an async/onDrain callback,
 not from inside `req.blocking:` (a worker), where it does nothing.
 
 #### Upload
@@ -612,7 +613,7 @@ req.stream(chunk, last):        # sync: `last` marks the final chunk
 ```
 
 With an async adapter the pull-loop form drops `last` and **auto-acks with an
-empty `200`** on a clean exit — unless the handler responded from inside the
+empty `200`** on a clean exit, unless the handler responded from inside the
 block (a `res.send(Http201, id)`/4xx *inside* wins), or the block raises (then
 `500`, never `200`):
 
@@ -622,7 +623,7 @@ proc upload(req: Request, res: Response) {.async.} =
     await save(chunk)            # -> empty 200 on success
 ```
 
-You don't need the router — `vortex/streaming` builds the same `streamRoute`
+You don't need the router: `vortex/streaming` builds the same `streamRoute`
 predicate directly (`streamPaths(...)`, `streamAll()`, `streamWhen(pred)`). Works
 on HTTP/1.1 (Content-Length and chunked), HTTP/2, and HTTP/3 (`last` is true on
 the final chunk). Ordinary routes are unchanged and still get `req.body`; the
@@ -656,7 +657,7 @@ across all three protocols. Pass `contentLength` to `sendHead` for a
 length-delimited body instead of chunked (used by file serving).
 
 For the common "produce it all inline" case, the `res.stream` template brackets a
-block with `sendHead`/`finish` — and `abort`s the stream (a visible truncation,
+block with `sendHead`/`finish`, and `abort`s the stream (a visible truncation,
 not a clean end) if the block raises:
 
 ```nim
@@ -685,9 +686,9 @@ proc pump(res: Response) {.gcsafe.} =
 ```
 
 With an async adapter, `await res.write(chunk)` writes and awaits the drain for
-you — the awaitable companion to the sync `res.write(...): bool` (`res.stream`
+you, the awaitable companion to the sync `res.write(...): bool` (`res.stream`
 also takes lighter forms: `res.stream(ct): ...` and `res.stream(): ...`, which
-defaults to `application/octet-stream` — pass a `text/*` type to keep compression
+defaults to `application/octet-stream`; pass a `text/*` type to keep compression
 on):
 
 ```nim
@@ -696,7 +697,7 @@ proc download(req: Request, res: Response) {.async.} =
     for chunk in source: await res.write(chunk)   # backpressure handled per chunk
 ```
 
-Call `res.abort()` yourself if you catch an error mid-stream in the manual API —
+Call `res.abort()` yourself if you catch an error mid-stream in the manual API:
 HTTP/1.1 closes the connection before the terminating chunk, HTTP/2 and HTTP/3
 reset the stream, so the client sees the transfer was cut short.
 
@@ -785,7 +786,7 @@ ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
 ```
 
 For an `await`-per-message flow instead of the two callbacks, the async adapter
-gives `ws.messages(msg): body` — a loop over incoming messages (sugar over
+gives `ws.messages(msg): body`, a loop over incoming messages (sugar over
 `await ws.receive()`). Write a plain `{.async.}` handler and register it with
 `router.ws` (a raised exception closes the socket with `1011`, whereas
 `router.get` would answer with an HTTP 500):
@@ -831,7 +832,7 @@ See [SECURITY.md](SECURITY.md) for the threat model, mitigations (Rapid Reset,
 framing floods, decompression bombs, request smuggling, slowloris, resource
 exhaustion), and security-related settings.
 
-Two helpers make secure responses easy — `securityHeaders(...)` returns the OWASP
+Two helpers make secure responses easy: `securityHeaders(...)` returns the OWASP
 Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 `Set-Cookie` (see [Cookies](#cookies)):
 
