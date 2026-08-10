@@ -2,7 +2,8 @@
 ## libzstd. Compiled only under `-d:httpZstd` (link with `--passL:-lzstd`);
 ## without the flag the response path never imports this and no zstd is linked,
 ## so the default and `-d:plainHttp` builds keep their footprint. Mirrors
-## gzip.nim / brotli.nim (one-shot + streaming encoders).
+## gzip.nim / brotli.nim (one-shot + streaming encoders, plus a bounded decoder
+## for inbound request-body decompression).
 
 when not defined(httpZstd):
   {.error: "vortex/zstd requires -d:httpZstd (and --passL:-lzstd)".}
@@ -38,6 +39,11 @@ proc zstdCCtxSetParameter(cctx: pointer, param: cint, value: cint): csize_t
 proc zstdCompressStream2(cctx: pointer, output: ptr ZstdOutBuffer,
                          input: ptr ZstdInBuffer, endOp: cint): csize_t
   {.importc: "ZSTD_compressStream2", cdecl.}
+proc zstdCreateDCtx(): pointer {.importc: "ZSTD_createDCtx", cdecl.}
+proc zstdFreeDCtx(dctx: pointer): csize_t {.importc: "ZSTD_freeDCtx", cdecl.}
+proc zstdDecompressStream(dctx: pointer, output: ptr ZstdOutBuffer,
+                          input: ptr ZstdInBuffer): csize_t
+  {.importc: "ZSTD_decompressStream", cdecl.}
 
 proc zstd*(data: openArray[char]): string =
   ## Zstd-compress `data` in one shot; "" on failure (caller sends uncompressed).
@@ -95,3 +101,38 @@ proc compress*(s: ZstdStream, data: openArray[char], last: bool): string =
     # Done when all input is consumed and nothing remains to flush/end.
     if input.pos == input.size and rem == 0:
       break
+
+# --- bounded zstd decode (inbound request-body decompression) ----------------
+# Decompress a zstd request body, capped at `maxOut` bytes so a decompression
+# bomb can't exhaust memory: it stops and fails the moment the output would
+# exceed the cap. Returns (false, "") on a corrupt/truncated stream or an
+# over-cap body; the caller rejects it. Mirrors gzip.gunzip / brotli.brotliDecode.
+
+proc zstdDecode*(data: openArray[char], maxOut: int):
+    tuple[ok: bool, tooLarge: bool, data: string] =
+  ## `tooLarge` distinguishes an over-cap body (-> 413) from a corrupt one.
+  if maxOut <= 0: return (false, false, "")
+  let dctx = zstdCreateDCtx()
+  if dctx == nil: return (false, false, "")
+  defer: discard zstdFreeDCtx(dctx)
+  var input = ZstdInBuffer(
+    src: (if data.len > 0: unsafeAddr data[0] else: nil),
+    size: csize_t(data.len), pos: 0)
+  var res = newString(min(maxOut, max(1024, data.len * 4)))
+  var total = 0
+  while true:
+    if total == res.len:
+      if res.len >= maxOut: return (false, true, "")   # over the cap (bomb)
+      res.setLen(min(maxOut, res.len * 2))
+    var output = ZstdOutBuffer(dst: addr res[0], size: csize_t(res.len),
+                               pos: csize_t(total))
+    let rc = zstdDecompressStream(dctx, addr output, addr input)
+    if zstdIsError(rc) != 0: return (false, false, "")  # corrupt
+    total = int(output.pos)
+    if rc == 0: break                                   # frame complete
+    # rc != 0 with output space left means it wants more input; if the input is
+    # already drained the stream is truncated.
+    if total < res.len and input.pos == input.size:
+      return (false, false, "")
+  res.setLen(total)
+  (true, false, res)

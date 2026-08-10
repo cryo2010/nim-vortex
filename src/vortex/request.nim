@@ -683,9 +683,9 @@ proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
 
-when defined(httpGzip) or defined(httpBrotli):
+when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
   proc decodeRequestBody*(req: Request, res: Response): bool =
-    ## Transparently decode a gzip/br request body into `req.body` when
+    ## Transparently decode a gzip/br/zstd request body into `req.body` when
     ## settings.decompressRequest is set. Bounded by maxBodySize so a
     ## decompression bomb can't exhaust memory. Returns false (having sent 413
     ## for an over-cap body or 400 for a corrupt one) to skip the handler; true
@@ -693,12 +693,14 @@ when defined(httpGzip) or defined(httpBrotli):
     ## empty body). Called once at dispatch (loop thread) before the handler.
     if not req.core.decompressRequest: return true
     let enc = req.header("content-encoding").strip.toLowerAscii
-    var isGzip, isBr = false
+    var isGzip, isBr, isZstd = false
     when defined(httpGzip):
       if enc == "gzip": isGzip = true
     when defined(httpBrotli):
       if enc == "br": isBr = true
-    if not (isGzip or isBr): return true
+    when defined(httpZstd):
+      if enc == "zstd": isZstd = true
+    if not (isGzip or isBr or isZstd): return true
     let raw = req.body
     if raw.len == 0: return true
     let cap = if req.core.maxDecompressedBody > 0: req.core.maxDecompressedBody
@@ -708,6 +710,8 @@ when defined(httpGzip) or defined(httpBrotli):
       if isGzip: r = gunzip(raw, cap)
     when defined(httpBrotli):
       if isBr: r = brotliDecode(raw, cap)
+    when defined(httpZstd):
+      if isZstd: r = zstdDecode(raw, cap)
     if not r.ok:
       if r.tooLarge:
         res.send(HttpCode(413), "413 Payload Too Large", "text/plain")

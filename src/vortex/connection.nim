@@ -177,7 +177,7 @@ type
                               ## (WsConn upcast; h1 uses the connection deadline wheel)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
     compress*: bool           ## gzip/brotli eligible responses (needs the flags)
-    decompressRequest*: bool  ## decode gzip/br request bodies into req.body
+    decompressRequest*: bool  ## decode gzip/br/zstd request bodies into req.body
     maxDecompressedBody*: int ## cap on a decoded request body (decompression bomb)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)

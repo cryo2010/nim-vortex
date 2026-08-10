@@ -148,16 +148,17 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli curl
+          nim gcc openssl zlib brotli zstd curl
       - uses: actions/checkout@v7
-      - name: Test request-body decompression (gzip + brotli)
-        # Inbound gzip/br request bodies decoded into req.body, bounded by
+      - name: Test request-body decompression (gzip + brotli + zstd)
+        # Inbound gzip/br/zstd request bodies decoded into req.body, bounded by
         # maxBodySize: decode round-trips over h1 + h2c, a bomb -> 413, corrupt
         # -> 400. Built/run directly (not `nimble testreqdecomp`) so a failure is
         # not masked by nim-lang/nimble#1802.
         run: >-
           nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli
-          --passL:-lz --passL:"-lbrotlienc -lbrotlidec -lbrotlicommon" -p:src
+          -d:httpZstd --passL:-lz
+          --passL:"-lbrotlienc -lbrotlidec -lbrotlicommon" --passL:-lzstd -p:src
           -o:tests/test_request_decompression tests/test_request_decompression.nim
 
   testzstd:
