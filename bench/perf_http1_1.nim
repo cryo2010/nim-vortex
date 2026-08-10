@@ -1,4 +1,4 @@
-## HTTP/1.1 throughput comparison: vortex vs httpbeast,
+## HTTP/1.1 throughput comparison: vortex vs httpbeast, powpow, mummy,
 ## std/asynchttpserver, and chronos.
 ##
 ## One binary, two modes:
@@ -46,6 +46,7 @@ from ./perf_srv_std import serveHttpbeast, serveHttpbeastAsync,
 from ./perf_srv_chronos import serveChronos
 from ./perf_srv_vortex_chronos import serveOursChronos
 from ./perf_srv_mummy import serveMummy
+from ./perf_srv_powpow import servePowpow, servePowpow1
 
 const
   benchSeconds {.intdefine.} = 5
@@ -98,6 +99,8 @@ proc orchestrate() =
     (name: "vortex-chronos-await", port: 9111, pipelines: true),
     (name: "httpbeast", port: 9103, pipelines: true),
     (name: "httpbeast-async", port: 9109, pipelines: true),
+    (name: "powpow", port: 9113, pipelines: true),
+    (name: "powpow-1thread", port: 9114, pipelines: true),
     (name: "mummy", port: 9112, pipelines: false),
     (name: "asynchttpserver", port: 9104, pipelines: false),
     (name: "chronos", port: 9105, pipelines: false),
@@ -139,6 +142,8 @@ when isMainModule:
     of "vortex-chronos-await": serveOursChronos(port, doAwait = true)
     of "httpbeast": serveHttpbeast(port)
     of "httpbeast-async": serveHttpbeastAsync(port)
+    of "powpow": servePowpow(port)
+    of "powpow-1thread": servePowpow1(port)
     of "mummy": serveMummy(port)
     of "asynchttpserver": serveAsynchttpserver(port)
     of "chronos": serveChronos(port)

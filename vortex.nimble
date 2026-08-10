@@ -38,10 +38,18 @@ proc ensureNimblePath() =
 taskRequires "perf", "httpbeast >= 0.4.0"
 taskRequires "perf", "chronos >= 4.0.0"
 taskRequires "perf", "mummy >= 0.4.0"
+taskRequires "perf", "powpow >= 0.1.8"
 
 task perf, "Run the HTTP/1.1 throughput comparison benchmark":
   ensureNimblePath()
-  exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http1_1 bench/perf_http1_1.nim"
+  var extra = ""
+  when defined(macosx):
+    # powpow links -lssl/-lcrypto directly (vortex loads OpenSSL dynamically),
+    # so point the linker at Homebrew's OpenSSL. Missing -L dirs are ignored, so
+    # listing both Apple-silicon and Intel prefixes is harmless.
+    extra = " --passL:-L/opt/homebrew/lib --passL:-L/usr/local/lib"
+  exec "nim c -r --mm:orc --threads:on -d:danger" & extra &
+       " -o:bench/perf_http1_1 bench/perf_http1_1.nim"
 
 taskRequires "perf2", "chronos >= 4.0.0"
 
