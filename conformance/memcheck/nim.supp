@@ -29,3 +29,17 @@
    fun:*streamToHandler*
    ...
 }
+
+# fd twin of the dispatcher leak: the async runtime's global dispatcher owns an
+# epoll selector fd (asyncdispatch: epoll_create1 -> newSelector -> newDispatcher;
+# chronos: epoll_create -> selectors.new -> asyncengine.newDispatcher) created on
+# the loop thread and never closed (no API to destroy the global dispatcher), so
+# --track-fds reports it open at exit. Process-lifetime, not a leak.
+{
+   nim-async-dispatcher-selector-fd
+   CoreError:FdNotClosed
+   fun:epoll_create*
+   ...
+   fun:*newDispatcher*
+   ...
+}
