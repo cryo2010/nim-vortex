@@ -311,10 +311,10 @@ if scenario == "shutdown":
 
 let compressed = scenario.endsWith("c") and (scenario.startsWith("http") or
                  scenario.startsWith("streamdown"))
-let router = buildRouter()          # held for the server's lifetime (see runShutdown)
-let srv = newVortex(router.toHandler, initVortexConfig(
+let rt = buildRouter()              # held for the server's lifetime (see runShutdown)
+let srv = newVortex(rt.toHandler, initVortexConfig(
   numThreads = 1, workerThreads = 2, compress = compressed),
-  router.streamPredicate).start(0)
+  rt.streamPredicate).start(0)
 let port = srv.port
 
 let total = reps(20)
