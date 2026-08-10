@@ -249,8 +249,12 @@ proc runShutdown(n: int) =
   # C4/C5 UAF territory). Looping also lets the fd check catch a close() that
   # fails to free the loop's epoll/eventfd/listen sockets.
   for i in 0 ..< n:
-    let srv = newVortex(buildRouter().toHandler, initVortexConfig(numThreads = 1,
-      workerThreads = 2), buildRouter().streamPredicate).start(0)
+    # Hold the router for the server's lifetime (the handler is stored as a raw,
+    # non-owned (proc, env) pair, so the caller owns it); freed at iteration end,
+    # after close(). Building it inline would drop it while the server still runs.
+    let r = buildRouter()
+    let srv = newVortex(r.toHandler, initVortexConfig(numThreads = 1,
+      workerThreads = 2), r.streamPredicate).start(0)
     let port = srv.port
     let idle = newSocket(buffered = false)
     idle.connect("127.0.0.1", port)
@@ -307,9 +311,10 @@ if scenario == "shutdown":
 
 let compressed = scenario.endsWith("c") and (scenario.startsWith("http") or
                  scenario.startsWith("streamdown"))
-let srv = newVortex(buildRouter().toHandler, initVortexConfig(
+let router = buildRouter()          # held for the server's lifetime (see runShutdown)
+let srv = newVortex(router.toHandler, initVortexConfig(
   numThreads = 1, workerThreads = 2, compress = compressed),
-  buildRouter().streamPredicate).start(0)
+  router.streamPredicate).start(0)
 let port = srv.port
 
 let total = reps(20)

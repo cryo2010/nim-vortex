@@ -47,9 +47,15 @@ case "$TOOL" in
     # children of a root, and our only roots-at-exit are process-lifetime async
     # runtime globals (suppressed below). --gen-suppressions prints exact
     # suppression text in the log if a new benign global appears.
+    # --track-fds catches fd leaks (open at exit) + double-close, but the curl
+    # driven http2 scenarios spawn curl via osproc, whose pipe reaping double-
+    # closes fds (std-lib, unsuppressible in this valgrind); the harness's
+    # /proc/self/fd growth check still covers fd leaks there, so skip it for them.
+    FDFLAG="--track-fds=yes"
+    case "$SCENARIO" in http2|http2c) FDFLAG="" ;; esac
     REPS=${REPS:-25} valgrind --tool=memcheck --error-exitcode=1 \
       --leak-check=full --errors-for-leak-kinds=definite \
-      --show-leak-kinds=definite --track-origins=yes --track-fds=yes \
+      --show-leak-kinds=definite --track-origins=yes $FDFLAG \
       --gen-suppressions=all --suppressions="$SUPP_DIR/nim.supp" "$BIN"
     ;;
   helgrind)
