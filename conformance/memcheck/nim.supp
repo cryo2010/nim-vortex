@@ -1,0 +1,3 @@
+# Valgrind memcheck suppressions for the vortex scenario harness.
+# Nim + -d:useMalloc is generally clean; add entries here only for confirmed
+# false positives (runtime/stdlib), never to hide a real vortex bug.

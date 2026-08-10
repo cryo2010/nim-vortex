@@ -1,0 +1,5 @@
+# Helgrind suppressions for the vortex scenario harness.
+# Helgrind models happens-before via pthread primitives and does NOT understand
+# C11 atomics/fences, which vortex uses for cross-thread signaling (shutdown
+# flags, generation counters, connection pin counts). Those show up as false
+# races here; suppress the confirmed-benign atomic sites, not real bugs.
