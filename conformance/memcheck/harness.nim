@@ -140,25 +140,25 @@ proc h1Get(port: Port, path: string, acceptEncoding = ""): string =
   s.send(req)
   s.recvUntilClose()
 
-proc runHttp1(port: Port, compressed: bool) =
-  for i in 0 ..< reps(60):
+proc runHttp1(port: Port, compressed: bool, n: int) =
+  for i in 0 ..< n:
     let resp = h1Get(port, "/", if compressed: "gzip" else: "")
     if "200" notin resp.splitLines()[0]: fail("http1: no 200: " & resp[0..min(60,resp.high)])
     if compressed and "content-encoding: gzip" notin resp.toLowerAscii:
       fail("http1c: response not gzip-encoded")
 
-proc runHttp2(port: Port, compressed: bool) =
+proc runHttp2(port: Port, compressed: bool, n: int) =
   let curl = findExe("curl")
   if curl.len == 0: fail("http2 scenario needs curl")
   let enc = if compressed: " -H 'Accept-Encoding: gzip'" else: ""
-  for i in 0 ..< reps(15):
+  for i in 0 ..< n:
     let (outp, rc) = execCmdEx(curl & " -s --http2-prior-knowledge" & enc &
       " -w '|%{http_code}|%{http_version}' http://127.0.0.1:" & $port & "/")
     if rc != 0: fail("http2: curl rc=" & $rc)
     if "|200|2" notin outp: fail("http2: expected |200|2, got: " & outp.strip)
 
-proc runStreamDown(port: Port, compressed: bool) =
-  for i in 0 ..< reps(30):
+proc runStreamDown(port: Port, compressed: bool, n: int) =
+  for i in 0 ..< n:
     let resp = h1Get(port, "/down", if compressed: "gzip" else: "")
     let i2 = resp.find("\r\n\r\n")
     if i2 < 0: fail("streamdown: no header terminator")
@@ -175,8 +175,8 @@ proc runStreamDown(port: Port, compressed: bool) =
       if total != downCount * downChunk.len:
         fail("streamdown: size " & $total & " != " & $(downCount*downChunk.len))
 
-proc runStreamUp(port: Port) =
-  for i in 0 ..< reps(30):
+proc runStreamUp(port: Port, n: int) =
+  for i in 0 ..< n:
     let s = newSocket(buffered = false)
     s.connect("127.0.0.1", port)
     s.send("POST /up HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
@@ -192,8 +192,8 @@ proc runStreamUp(port: Port) =
       if ("up:" & $upBody.len) notin resp: fail("streamup: bad ack: " &
         resp[0..min(80, resp.high)])
 
-proc runSse(port: Port) =
-  for i in 0 ..< reps(20):
+proc runSse(port: Port, n: int) =
+  for i in 0 ..< n:
     let s = newSocket(buffered = false)
     s.connect("127.0.0.1", port)
     s.send("GET /sse HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -209,8 +209,8 @@ proc wsFrame(payload: string): string =
   for m in mask: result.add char(m)
   for i in 0 ..< payload.len: result.add char(uint8(payload[i]) xor mask[i and 3])
 
-proc runWs(port: Port) =
-  for i in 0 ..< reps(20):
+proc runWs(port: Port, n: int) =
+  for i in 0 ..< n:
     let s = newSocket(buffered = false)
     s.connect("127.0.0.1", port)
     s.send("GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" &
@@ -243,30 +243,65 @@ proc slowClient(port: Port) {.thread.} =
     s.close()
   except CatchableError: discard
 
-proc runShutdown() =
-  # Start a fresh server, put a request in flight + idle keep-alive conns, then
-  # close mid-flight; a clean exit (no tool report) is the pass condition.
-  let srv = newVortex(buildRouter().toHandler, initVortexConfig(numThreads = 1,
-    workerThreads = 2), buildRouter().streamPredicate).start(0)
-  let port = srv.port
-  # one idle keep-alive connection
-  let idle = newSocket(buffered = false)
-  idle.connect("127.0.0.1", port)
-  idle.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-  discard idle.recvUntilClose(500)
-  # one in-flight slow request on a worker
-  createThread(shutdownThread, slowClient, port)
-  sleep(15)                       # let it reach the worker
-  srv.close()                     # graceful: drain in-flight, GOAWAY, force-close idle
-  joinThread(shutdownThread)
-  idle.close()
+proc runShutdown(n: int) =
+  # Each iteration starts a fresh server, puts a request in flight + an idle
+  # keep-alive conn, then closes mid-flight (graceful-drain / force-close, the
+  # C4/C5 UAF territory). Looping also lets the fd check catch a close() that
+  # fails to free the loop's epoll/eventfd/listen sockets.
+  for i in 0 ..< n:
+    let srv = newVortex(buildRouter().toHandler, initVortexConfig(numThreads = 1,
+      workerThreads = 2), buildRouter().streamPredicate).start(0)
+    let port = srv.port
+    let idle = newSocket(buffered = false)
+    idle.connect("127.0.0.1", port)
+    idle.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    discard idle.recvUntilClose(500)
+    createThread(shutdownThread, slowClient, port)
+    sleep(15)                       # let it reach the worker
+    srv.close()                     # drain in-flight, GOAWAY, force-close idle
+    joinThread(shutdownThread)
+    idle.close()
+
+# --- fd-leak check ------------------------------------------------------------
+# Count the process's open fds (Linux only; -1 elsewhere -> the check is skipped
+# on the macOS dev box). A per-connection/per-request fd leak in the server
+# shows up as growth across the measured loop, beyond a small warmup-settled
+# baseline. Complements valgrind --track-fds (which reports fds open at exit).
+
+proc openFdCount(): int =
+  when defined(linux):
+    result = 0
+    for _ in walkDir("/proc/self/fd"): inc result   # consistent method both ends
+  else:
+    result = -1
+
+proc checkFds(name: string, base, after: int) =
+  const slack = 3           # allow small non-determinism; a real leak grows ~n
+  if base > 0 and after > base + slack:
+    fail("fd leak: " & name & " grew " & $base & " -> " & $after & " open fds")
+
+proc runScenario(sc: string, port: Port, n: int) =
+  case sc
+  of "http1": runHttp1(port, false, n)
+  of "http1c": runHttp1(port, true, n)
+  of "http2": runHttp2(port, false, n)
+  of "http2c": runHttp2(port, true, n)
+  of "streamup": runStreamUp(port, n)
+  of "streamdown": runStreamDown(port, false, n)
+  of "streamdownc": runStreamDown(port, true, n)
+  of "sse": runSse(port, n)
+  of "ws": runWs(port, n)
+  else: fail("unknown SCENARIO: " & sc)
 
 # --- main ---------------------------------------------------------------------
 
 let scenario = getEnv("SCENARIO", "http1")
 
 if scenario == "shutdown":
-  runShutdown()
+  runShutdown(1)                    # warmup (settle lazy allocations)
+  let base = openFdCount()
+  runShutdown(6)                    # measured: each cycle must free its fds
+  checkFds("shutdown", base, openFdCount())
   echo "scenario ok: ", scenario, " (", backend, ")"
   quit 0
 
@@ -277,17 +312,11 @@ let srv = newVortex(buildRouter().toHandler, initVortexConfig(
   buildRouter().streamPredicate).start(0)
 let port = srv.port
 
-case scenario
-of "http1": runHttp1(port, false)
-of "http1c": runHttp1(port, true)
-of "http2": runHttp2(port, false)
-of "http2c": runHttp2(port, true)
-of "streamup": runStreamUp(port)
-of "streamdown": runStreamDown(port, false)
-of "streamdownc": runStreamDown(port, true)
-of "sse": runSse(port)
-of "ws": runWs(port)
-else: fail("unknown SCENARIO: " & scenario)
+let total = reps(20)
+runScenario(scenario, port, min(4, total))    # warmup: settle lazy fds
+let base = openFdCount()
+runScenario(scenario, port, total)            # measured
+checkFds(scenario, base, openFdCount())
 
 srv.close()
 echo "scenario ok: ", scenario, " (", backend, ")"

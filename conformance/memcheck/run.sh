@@ -49,8 +49,8 @@ case "$TOOL" in
     # suppression text in the log if a new benign global appears.
     REPS=${REPS:-25} valgrind --tool=memcheck --error-exitcode=1 \
       --leak-check=full --errors-for-leak-kinds=definite \
-      --show-leak-kinds=definite --track-origins=yes --gen-suppressions=all \
-      --suppressions="$SUPP_DIR/nim.supp" "$BIN"
+      --show-leak-kinds=definite --track-origins=yes --track-fds=yes \
+      --gen-suppressions=all --suppressions="$SUPP_DIR/nim.supp" "$BIN"
     ;;
   helgrind)
     REPS=${REPS:-12} valgrind --tool=helgrind --error-exitcode=1 \
