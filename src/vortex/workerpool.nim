@@ -101,6 +101,11 @@ proc shutdown*(pool: ptr WorkerPool) =
   broadcast pool.cond
   for t in pool.threads.mitems:
     joinThread t
-  pool.threads.setLen(0)
+  # The pool is a manually-managed `ptr WorkerPool` (createShared), so
+  # deallocShared frees only the struct, not these seq/deque payloads. Free
+  # them here (setLen(0) would keep the buffer), or they leak per pool -- one
+  # leak per served-then-closed server instance.
+  reset(pool.threads)
+  reset(pool.tasks)
   deinitLock pool.lock
   deinitCond pool.cond
