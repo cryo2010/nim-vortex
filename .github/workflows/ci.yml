@@ -383,3 +383,89 @@ jobs:
         run: >-
           INTEROP_ENCODING=br INTEROP_RUNTIME=3 INTEROP_CLIENTS=5
           sh conformance/interop/run.sh
+
+  # --- Memory / race scenario matrix (conformance/memcheck/harness.nim) --------
+  # Self-driving server+client scenarios under valgrind memcheck, helgrind, and
+  # ThreadSanitizer, across backends (sync/async/chronos) and memory managers.
+  # Built -d:plainHttp (no OpenSSL) so the tools run cleanly; scenarios are
+  # cleartext. See conformance/memcheck/run.sh.
+  valgrind:
+    name: valgrind / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [http1, http1c, shutdown]
+        target: [sync, chronos]
+        mm: [orc]
+    steps:
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git valgrind zlib curl
+      - uses: actions/checkout@v7
+      - name: Install chronos
+        if: matrix.target == 'chronos'
+        run: nimble install -y "chronos@>= 4.0.0"
+      - name: memcheck
+        run: >-
+          TOOL=valgrind SCENARIO=${{ matrix.scenario }}
+          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
+          bash conformance/memcheck/run.sh
+
+  helgrind:
+    name: helgrind / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [http1, http1c, shutdown]
+        target: [sync, chronos]
+        mm: [orc]
+    steps:
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git valgrind zlib curl
+      - uses: actions/checkout@v7
+      - name: Install chronos
+        if: matrix.target == 'chronos'
+        run: nimble install -y "chronos@>= 4.0.0"
+      - name: helgrind
+        run: >-
+          TOOL=helgrind SCENARIO=${{ matrix.scenario }}
+          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
+          bash conformance/memcheck/run.sh
+
+  tsan:
+    name: tsan / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    runs-on: ubuntu-latest
+    # Privileged to lower mmap randomization for ThreadSanitizer's shadow
+    # mapping (same as the sanitize/testrace jobs).
+    container:
+      image: archlinux:latest
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [http1, http1c, shutdown]
+        target: [sync, chronos]
+        mm: [orc]
+    steps:
+      - name: Lower ASLR entropy for ThreadSanitizer
+        run: sysctl -w vm.mmap_rnd_bits=28 || true
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git zlib curl
+      - uses: actions/checkout@v7
+      - name: Install chronos
+        if: matrix.target == 'chronos'
+        run: nimble install -y "chronos@>= 4.0.0"
+      - name: tsan
+        run: >-
+          TOOL=tsan SCENARIO=${{ matrix.scenario }}
+          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
+          bash conformance/memcheck/run.sh
