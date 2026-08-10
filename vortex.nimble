@@ -16,6 +16,9 @@ requires "nim >= 2.2.10"
 task bench, "Build benchmark server with release flags":
   exec "nim c --mm:orc --threads:on -d:danger --passC:-flto -o:bench/handlers bench/handlers.nim"
 
+task docs, "Generate the public API documentation into htmldocs/":
+  exec "nim doc --project --index:on --outdir:htmldocs src/vortex.nim"
+
 proc ensureNimblePath() =
   ## The perf/testchronos tasks compile the third-party comparison servers
   ## (httpbeast, chronos, mummy) with a raw `nim c`, which resolves them from
