@@ -63,7 +63,7 @@ newVortex(handler).serve(8080)
 - **Streaming** requests and responses with end-to-end flow control and
   backpressure, on all three protocols.
 - **Server-Sent Events** over the same streaming primitives.
-- **Compression**: gzip / brotli / zstd responses and gzip / brotli request
+- **Compression**: gzip / brotli / zstd responses and gzip / brotli / zstd request
   decompression, negotiated per request (opt-in build flags).
 - **Routing** with `:name` params and `*` wildcards, plus composable
   middleware.
