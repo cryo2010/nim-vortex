@@ -383,3 +383,120 @@ jobs:
         run: >-
           INTEROP_ENCODING=br INTEROP_RUNTIME=3 INTEROP_CLIENTS=5
           sh conformance/interop/run.sh
+
+  # --- Memory / race scenario matrix (conformance/memcheck/harness.nim) --------
+  # Self-driving server+client scenarios under valgrind memcheck, helgrind, and
+  # ThreadSanitizer, across backends (sync/async/chronos) and memory managers.
+  # Built -d:plainHttp (no OpenSSL) so the tools run cleanly; scenarios are
+  # cleartext. See conformance/memcheck/run.sh.
+  valgrind:
+    name: valgrind / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    runs-on: ubuntu-latest
+    # Debian-based nim image: Arch ships a stripped ld.so that valgrind can't set
+    # up its mandatory memcmp redirection against. -d:plainHttp means no OpenSSL,
+    # so we don't need Arch's OpenSSL >= 3.5 here.
+    container: nimlang/nim
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
+        target: [sync, async, chronos]
+        mm: [orc]
+    steps:
+      - name: Install toolchain
+        run: >-
+          apt-get update && apt-get install -y --no-install-recommends
+          valgrind libc6-dbg gcc git curl zlib1g-dev ca-certificates
+      - uses: actions/checkout@v7
+      - name: Install chronos
+        if: matrix.target == 'chronos'
+        # Retry: nimble fetches chronos's deps from several git remotes, which
+        # occasionally hit a transient TLS/network error across the 30 chronos
+        # cells.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
+      - name: memcheck
+        run: >-
+          TOOL=valgrind SCENARIO=${{ matrix.scenario }}
+          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
+          bash conformance/memcheck/run.sh
+
+  helgrind:
+    name: helgrind / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    runs-on: ubuntu-latest
+    # Debian-based (see valgrind job): Arch's stripped ld.so breaks valgrind.
+    container: nimlang/nim
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
+        target: [sync, async, chronos]
+        mm: [orc]
+    steps:
+      - name: Install toolchain
+        run: >-
+          apt-get update && apt-get install -y --no-install-recommends
+          valgrind libc6-dbg gcc git curl zlib1g-dev ca-certificates
+      - uses: actions/checkout@v7
+      - name: Install chronos
+        if: matrix.target == 'chronos'
+        # Retry: nimble fetches chronos's deps from several git remotes, which
+        # occasionally hit a transient TLS/network error across the 30 chronos
+        # cells.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
+      - name: helgrind
+        run: >-
+          TOOL=helgrind SCENARIO=${{ matrix.scenario }}
+          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
+          bash conformance/memcheck/run.sh
+
+  tsan:
+    name: tsan / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    runs-on: ubuntu-latest
+    # Privileged to lower mmap randomization for ThreadSanitizer's shadow
+    # mapping (same as the sanitize/testrace jobs).
+    container:
+      image: archlinux:latest
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
+        target: [sync, async, chronos]
+        mm: [orc]
+    steps:
+      - name: Lower ASLR entropy for ThreadSanitizer
+        run: sysctl -w vm.mmap_rnd_bits=28 || true
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git zlib curl
+      - uses: actions/checkout@v7
+      - name: Install chronos
+        if: matrix.target == 'chronos'
+        # Retry: nimble fetches chronos's deps from several git remotes, which
+        # occasionally hit a transient TLS/network error across the 30 chronos
+        # cells.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
+      - name: tsan
+        run: >-
+          TOOL=tsan SCENARIO=${{ matrix.scenario }}
+          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
+          bash conformance/memcheck/run.sh

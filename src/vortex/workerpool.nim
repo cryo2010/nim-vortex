@@ -90,17 +90,24 @@ proc start*(pool: ptr WorkerPool, n: int) =
 proc enqueue*(pool: ptr WorkerPool, task: WorkerTask) =
   acquire pool.lock
   pool.tasks.addLast task
-  release pool.lock
+  # Signal while holding the lock: queue overhead is noise here (blocking work
+  # is ms-scale) and it keeps the condvar wakeup race-clean for helgrind.
   signal pool.cond
+  release pool.lock
 
 proc shutdown*(pool: ptr WorkerPool) =
   ## Finish queued tasks, then stop the workers.
   acquire pool.lock
   pool.stopping = true
+  broadcast pool.cond          # under the lock (see enqueue)
   release pool.lock
-  broadcast pool.cond
   for t in pool.threads.mitems:
     joinThread t
-  pool.threads.setLen(0)
+  # The pool is a manually-managed `ptr WorkerPool` (createShared), so
+  # deallocShared frees only the struct, not these seq/deque payloads. Free
+  # them here (setLen(0) would keep the buffer), or they leak per pool -- one
+  # leak per served-then-closed server instance.
+  reset(pool.threads)
+  reset(pool.tasks)
   deinitLock pool.lock
   deinitCond pool.cond

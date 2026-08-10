@@ -1,0 +1,45 @@
+# Valgrind memcheck suppressions for the vortex scenario harness.
+#
+# Only process-lifetime globals from the async runtimes belong here: they are
+# allocated once on the loop thread and live until the process exits (the OS
+# reclaims them), so memcheck's "definitely lost" at exit is a false positive.
+# Never suppress a per-request or per-instance leak (e.g. the worker-pool buffers
+# fixed in workerpool.nim) -- those are real bugs.
+
+# std/asyncdispatch (and chronos) keep a global dispatcher per thread with no
+# public API to destroy it; created lazily by the adapter's pump on the loop
+# thread. Lost at exit.
+{
+   nim-async-global-dispatcher
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:*newDispatcher*
+   ...
+}
+
+# The adapter's `bodyReaders` threadvar Table: per-request entries ARE deleted
+# (adapters/*.nim del the key on completion), but the Table's backing array is
+# a threadvar that is never shrunk/freed and is lost at exit.
+{
+   nim-adapter-bodyreaders-table
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:*streamToHandler*
+   ...
+}
+
+# fd twin of the dispatcher leak: the async runtime's global dispatcher owns an
+# epoll selector fd (asyncdispatch: epoll_create1 -> newSelector -> newDispatcher;
+# chronos: epoll_create -> selectors.new -> asyncengine.newDispatcher) created on
+# the loop thread and never closed (no API to destroy the global dispatcher), so
+# --track-fds reports it open at exit. Process-lifetime, not a leak.
+{
+   nim-async-dispatcher-selector-fd
+   CoreError:FdNotClosed
+   fun:epoll_create*
+   ...
+   fun:*newDispatcher*
+   ...
+}
