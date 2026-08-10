@@ -3,7 +3,7 @@
 ## checked exactly.
 
 import std/[unittest, net, posix, strutils]
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 import vortex/asyncdispatch
 import ./helper
 

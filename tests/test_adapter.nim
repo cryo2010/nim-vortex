@@ -1,6 +1,6 @@
 import std/[unittest, net, httpcore, strutils, os, osproc, times]
 import std/httpclient except Response
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 import ./helper
 import vortex/asyncdispatch as nhsasync
 

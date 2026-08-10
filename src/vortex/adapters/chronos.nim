@@ -48,7 +48,7 @@ import pkg/chronos
 import std/[httpcore, tables, deques]
 import ../connection
 import ../request
-import ../router
+import ../routing
 
 export chronos
 

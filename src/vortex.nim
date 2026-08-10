@@ -17,7 +17,7 @@ import std/net
 import vortex/settings
 import vortex/request
 import vortex/server
-import vortex/router
+import vortex/routing
 import vortex/streaming
 import vortex/staticfiles
 import vortex/ratelimit
@@ -27,7 +27,7 @@ export net.Port
 export settings
 export request
 export server
-export router
+export routing
 export streaming
 export staticfiles
 export ratelimit

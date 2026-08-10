@@ -3,7 +3,7 @@
 
 import std/[unittest, net, httpcore]
 import std/httpclient except Response
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 
 # Single-threaded server + one request at a time, so a plain global trace is
 # race-free here (the loop thread is the only writer).

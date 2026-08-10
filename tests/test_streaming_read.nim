@@ -3,7 +3,7 @@
 ## push `onBody`.
 
 import std/[unittest, net, posix, strutils, httpcore, atomics, os]
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 import vortex/asyncdispatch
 import ./helper
 

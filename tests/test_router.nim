@@ -1,6 +1,6 @@
 import std/[unittest, net, httpcore]
 import std/httpclient except Response
-import vortex/[settings, request, server, router]
+import vortex/[settings, request, server, routing]
 
 proc hRoot(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "root", "text/plain")
