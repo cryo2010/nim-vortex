@@ -410,7 +410,16 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install chronos
         if: matrix.target == 'chronos'
-        run: nimble install -y "chronos@>= 4.0.0"
+        # Retry: nimble fetches chronos's deps from several git remotes, which
+        # occasionally hit a transient TLS/network error across the 30 chronos
+        # cells.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
       - name: memcheck
         run: >-
           TOOL=valgrind SCENARIO=${{ matrix.scenario }}
@@ -436,7 +445,16 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install chronos
         if: matrix.target == 'chronos'
-        run: nimble install -y "chronos@>= 4.0.0"
+        # Retry: nimble fetches chronos's deps from several git remotes, which
+        # occasionally hit a transient TLS/network error across the 30 chronos
+        # cells.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
       - name: helgrind
         run: >-
           TOOL=helgrind SCENARIO=${{ matrix.scenario }}
@@ -467,7 +485,16 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install chronos
         if: matrix.target == 'chronos'
-        run: nimble install -y "chronos@>= 4.0.0"
+        # Retry: nimble fetches chronos's deps from several git remotes, which
+        # occasionally hit a transient TLS/network error across the 30 chronos
+        # cells.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
       - name: tsan
         run: >-
           TOOL=tsan SCENARIO=${{ matrix.scenario }}
