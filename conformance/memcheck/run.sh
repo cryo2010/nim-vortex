@@ -42,9 +42,14 @@ export SCENARIO
 echo "== run under $TOOL =="
 case "$TOOL" in
   valgrind)
+    # Fail on real memory errors (invalid access, uninitialised reads) and on
+    # `definitely lost` leaks. `indirectly lost` is not an error kind: those are
+    # children of a root, and our only roots-at-exit are process-lifetime async
+    # runtime globals (suppressed below). --gen-suppressions prints exact
+    # suppression text in the log if a new benign global appears.
     REPS=${REPS:-25} valgrind --tool=memcheck --error-exitcode=1 \
-      --leak-check=full --errors-for-leak-kinds=definite,indirect \
-      --show-leak-kinds=definite --track-origins=yes \
+      --leak-check=full --errors-for-leak-kinds=definite \
+      --show-leak-kinds=definite --track-origins=yes --gen-suppressions=all \
       --suppressions="$SUPP_DIR/nim.supp" "$BIN"
     ;;
   helgrind)

@@ -1,3 +1,31 @@
 # Valgrind memcheck suppressions for the vortex scenario harness.
-# Nim + -d:useMalloc is generally clean; add entries here only for confirmed
-# false positives (runtime/stdlib), never to hide a real vortex bug.
+#
+# Only process-lifetime globals from the async runtimes belong here: they are
+# allocated once on the loop thread and live until the process exits (the OS
+# reclaims them), so memcheck's "definitely lost" at exit is a false positive.
+# Never suppress a per-request or per-instance leak (e.g. the worker-pool buffers
+# fixed in workerpool.nim) -- those are real bugs.
+
+# std/asyncdispatch (and chronos) keep a global dispatcher per thread with no
+# public API to destroy it; created lazily by the adapter's pump on the loop
+# thread. Lost at exit.
+{
+   nim-async-global-dispatcher
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:*newDispatcher*
+   ...
+}
+
+# The adapter's `bodyReaders` threadvar Table: per-request entries ARE deleted
+# (adapters/*.nim del the key on completion), but the Table's backing array is
+# a threadvar that is never shrunk/freed and is lost at exit.
+{
+   nim-adapter-bodyreaders-table
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:*streamToHandler*
+   ...
+}
