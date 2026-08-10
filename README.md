@@ -31,42 +31,171 @@ newVortex(handler).serve(8080)
   deferred: no async runtime dependency, no Future type in the core.
   Optional asyncdispatch and chronos adapters layer `await` support on
   top through the same loop hook.
-- **Protocols**: HTTP/1.1 (keep-alive, pipelining, chunked bodies,
-  100-continue), HTTP/2 (TLS ALPN and h2c prior knowledge; h2spec-clean),
-  HTTP/3 over QUIC (OpenSSL >= 3.5 server API), with automatic `Alt-Svc`
-  advertisement, plus **WebSockets** (RFC 6455) over `ws://` and `wss://`.
-- **Dual-stack**: binds IPv4 and IPv6 by default (`address = "::"` with
-  IPv4-mapped, falling back to IPv4-only where IPv6 is unavailable); set an
-  explicit `address` to pin one family.
-- **Dependencies**: none beyond OpenSSL >= 3.5 at runtime for TLS/h2/h3.
-  Build with `-d:plainHttp` for a zero-dependency cleartext (h1 + h2c)
-  server.
-
-**Platform:** POSIX only (Linux and macOS), by design. The core is built on
-readiness-based `kqueue`/`epoll` and per-thread `SO_REUSEPORT` listeners, which
-have no direct Windows equivalent; a `select()`-backed Windows port would
-defeat the performance goal. On Windows, run vortex under WSL2 or a Linux
-container (Docker).
+- **All three protocols, one port**: HTTP/1.1, HTTP/2, and HTTP/3 (plus
+  WebSockets over each) behind the same handler API, negotiated
+  automatically.
 
 ## Contents
 
-- [Quick start](#quick-start)
-- [Settings](#settings)
-  - [Transport Layer Security (TLS)](#transport-layer-security-tls)
-- [Handlers](#handlers)
-  - [Requests](#requests)
-  - [Responses](#responses)
-- [Routing](#routing)
-- [Static files](#static-files)
-- [Streaming](#streaming)
-  - [Streaming requests](#streaming-requests)
-  - [Streaming responses](#streaming-responses)
-- [Compression](#compression)
-- [Server-Sent Events](#server-sent-events)
-- [WebSockets](#websockets)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Install](#install)
 - [Build flags](#build-flags)
+- [Choose an implementation](#choose-an-implementation)
+- [Quick start](#quick-start)
+- [Usage](#usage)
+  - [Config](#config)
+    - [Compression](#compression)
+    - [Transport Layer Security (TLS)](#transport-layer-security-tls)
+    - [Response size limits](#response-size-limits)
+  - [Handlers](#handlers)
+    - [Requests](#requests)
+    - [Responses](#responses)
+    - [Cookies](#cookies)
+  - [Middleware](#middleware)
+  - [Routing](#routing)
+  - [Static files](#static-files)
+  - [Streaming](#streaming)
+    - [Upload](#upload)
+    - [Download](#download)
+  - [Server-Sent Events](#server-sent-events)
+  - [WebSockets](#websockets)
 - [Security](#security)
 - [Thanks](#thanks)
+
+## Features
+
+- **HTTP/1.1**: keep-alive, request pipelining, chunked bodies, and
+  `100-continue`.
+- **HTTP/2**: over TLS (ALPN) and h2c prior knowledge; h2spec-clean, with
+  rapid-reset and framing-flood defenses.
+- **HTTP/3 over QUIC**: on the OpenSSL >= 3.5 server API, with automatic
+  `Alt-Svc` advertisement so clients upgrade.
+- **WebSockets** (RFC 6455) over `ws://`/`wss://`, and over HTTP/2 (RFC 8441)
+  and HTTP/3 (RFC 9220) via Extended CONNECT, with the same handler API.
+- **TLS**: certs from files, memory, or PKCS#12; SNI, mTLS client certs, OCSP
+  stapling, configurable version range and ciphers, and hot `reloadTls`.
+- **Streaming** requests and responses with end-to-end flow control and
+  backpressure, on all three protocols.
+- **Server-Sent Events** over the same streaming primitives.
+- **Compression**: gzip / brotli / zstd responses and gzip / brotli request
+  decompression, negotiated per request (opt-in build flags).
+- **Routing** with `:name` params and `*` wildcards, plus composable
+  middleware.
+- **Static file serving** with conditional requests, byte ranges, streamed
+  large files, and traversal safety.
+- **Blocking escape hatch** (`req.blocking:`) backed by a worker pool for sync
+  DB drivers, file IO, and CPU work.
+- **Optional async**: asyncdispatch or chronos adapters add `await` on the loop
+  thread without pulling a runtime into the core.
+- **Dual-stack**: binds IPv4 and IPv6 by default, with graceful fallback.
+- **PROXY protocol** (v1/v2) and `X-Forwarded-For` support for the real client
+  address behind a load balancer.
+- **Security-minded**: threat-model-driven defenses plus `securityHeaders` and
+  hardened `setCookie` helpers (see [Security](#security)).
+
+## Requirements
+
+- **Nim >= 2.2.10**.
+- **OpenSSL >= 3.5** at runtime, for TLS, HTTP/2-over-TLS, and HTTP/3 (the QUIC
+  server API landed in 3.5). A `-d:plainHttp` build needs no OpenSSL at all (see
+  [Build flags](#build-flags)).
+- The chronos adapter additionally needs `chronos >= 4.0.0` in your own project
+  (it is never a dependency of a bare `import vortex`).
+
+**Platform: POSIX only (Linux and macOS), by design.** The core is built on
+readiness-based `kqueue`/`epoll` and per-thread `SO_REUSEPORT` listeners, which
+have no direct Windows equivalent; a `select()`-backed Windows port would defeat
+the performance goal. On Windows, run vortex under WSL2 or a Linux container
+(Docker).
+
+## Install
+
+```sh
+nimble install https://github.com/cryo2010/nim-vortex
+```
+
+Then `import vortex`. The library is threaded and uses ORC, so build your app
+with `--mm:orc --threads:on` (see [Build flags](#build-flags) for the full
+release line). To use `await` in handlers, import one async adapter alongside it
+— `vortex/asyncdispatch` (no extra dependency) or `vortex/chronos` (add
+`requires "chronos >= 4.0.0"` to your project); see
+[Choose an implementation](#choose-an-implementation).
+
+## Build flags
+
+Release builds use:
+
+```sh
+nim c --mm:orc --threads:on -d:danger --passC:-flto app.nim
+```
+
+(`nimble bench` builds the benchmark server this way.)
+
+| Flag | Effect |
+|------|--------|
+| `-d:plainHttp` | Zero-dependency cleartext build (h1 + h2c); removes OpenSSL and TLS/h2-over-TLS/h3 |
+| `-d:wsDeflate` (`--passL:-lz`) | WebSocket permessage-deflate compression via zlib |
+| `-d:httpGzip` / `-d:httpBrotli` / `-d:httpZstd` | Response + request compression codecs (see [Compression](#compression) for link flags) |
+
+All are off by default, so the standard build keeps its OpenSSL-only footprint.
+
+## Choose an implementation
+
+Handlers are plain `proc (req: Request, res: Response)` values, so the core has
+no async runtime and no `Future` type. You pick how a handler does its work per
+route; all three styles register through the same API and share one event loop.
+
+**Synchronous** — the default. Reply inline, or move blocking work to the worker
+pool with `req.blocking:`. No adapter, no `await`:
+
+```nim
+import vortex
+
+proc handler(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "Hello, World!", "text/plain")
+
+newVortex(handler).serve(8080)
+```
+
+**asyncdispatch** — the `vortex/asyncdispatch` adapter lets a handler `await`
+`std/asyncdispatch` futures on the loop thread (no extra dependency):
+
+```nim
+import vortex
+import vortex/asyncdispatch
+
+proc getUser(req: Request, res: Response) {.async.} =
+  let user = await db.getUser(req.param("id"))   # loop keeps serving
+  res.send(Http200, user.toJson, "application/json")
+
+var router = newRouter()
+router.get("/users/:id", getUser)
+newVortex(router.toHandler).serve(8080)
+```
+
+**chronos** — the `vortex/chronos` adapter does the same for chronos futures.
+chronos is **not** a vortex dependency, so using it means adding
+`requires "chronos >= 4.0.0"` to your own project:
+
+```nim
+import vortex
+import vortex/chronos
+
+proc getUser(req: Request, res: Response) {.async.} =
+  let user = await db.getUser(req.param("id"))   # chronos await, loop serves
+  res.send(Http200, user.toJson, "application/json")
+
+var router = newRouter()
+router.get("/users/:id", getUser)
+newVortex(router.toHandler).serve(8080)
+```
+
+Import only one async adapter per program. The sync path is always available;
+async is purely additive.
+
+> `std/httpclient` also exports a `Response` type; in modules using both,
+> `import std/httpclient except Response`.
 
 ## Quick start
 
@@ -93,7 +222,9 @@ WebSockets with a `1001` (going away), and lets in-flight requests and streams
 finish before closing. Idle keep-alive connections close promptly; anything
 still running is force-closed once `shutdownGrace` seconds elapse.
 
-## Settings
+## Usage
+
+### Config
 
 Server configuration is a `VortexConfig` value built with `initVortexConfig(...)`
 and passed to `newVortex`; you can also edit `vortex.config` before serving.
@@ -130,7 +261,39 @@ direct client. A header from an untrusted peer is never believed. Behind an L7
 proxy that sets `X-Forwarded-For`, recover the origin client from
 `req.forwardedFor` under a trust policy you control (see [Requests](#requests)).
 
-### Transport Layer Security (TLS)
+#### Compression
+
+`-d:httpGzip` (`--passL:-lz`), `-d:httpBrotli`
+(`--passL:"-lbrotlienc -lbrotlicommon"`), and/or `-d:httpZstd` (`--passL:-lzstd`)
+enable **response compression**, turned on per server with `config.compress`:
+
+```sh
+nim c -d:httpGzip -d:httpBrotli --passL:-lz \
+      --passL:"-lbrotlienc -lbrotlicommon" --threads:on app.nim
+```
+
+```nim
+newVortex(handler, initVortexConfig(compress = true)).serve(8080)
+```
+
+An eligible response (the client accepts an encoding we can produce, a
+compressible content-type, no existing `Content-Encoding`) is compressed with the
+best encoding `Accept-Encoding` offers, adding `Content-Encoding` +
+`Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out); on a
+tie the server prefers **br**, then **zstd**, then **gzip**. Build with several
+flags to offer several and let the client choose. This covers both buffered
+`res.send` (compressed when over ~1400 bytes) and **streamed** responses
+(`res.sendHead`/`write`/`finish`, SSE, and file streaming), compressed
+incrementally. Off by default, so the standard and `-d:plainHttp` builds link no
+zlib/brotli/zstd.
+
+The **inbound** direction is opt-in with `config.decompressRequest`: a request
+whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
+`req.body`. It is bounded by `maxBodySize` so a decompression bomb can't exhaust
+memory — a body that would exceed the cap is rejected with `413`, a corrupt one
+with `400` — and the handler never runs for either.
+
+#### Transport Layer Security (TLS)
 
 Providing a certificate turns on TLS, which enables HTTP/2 (via ALPN) and
 HTTP/3 (over QUIC):
@@ -201,7 +364,33 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
                  ocspFile = "ocsp.der")        # or ocspResponse = derBytes
 ```
 
-## Handlers
+#### Response size limits
+
+Inbound requests are bounded so a malformed or hostile client can't exhaust
+memory. Each limit is a `VortexConfig` field with a default and a specific
+rejection when exceeded — the handler never runs for a rejected request:
+
+| Field | Default | Enforcement |
+|-------|---------|-------------|
+| `maxHeaderSize` | 16 KiB | request line + headers combined; `431` when exceeded (also bounds the URI/path) |
+| `maxHeaderCount` | 100 | number of header fields; `400` when exceeded |
+| `maxBodySize` | 8 MiB | request body (post-decompression); `413` when exceeded |
+| `maxWsMessageSize` | 1 MiB | largest inbound WebSocket message; close `1009` over it |
+| `initialBufferSize` | 8 KiB | per-connection read/write buffer starting size (grows as needed) |
+| `maxConcurrentStreams` | 256 | open HTTP/2 or HTTP/3 streams per connection |
+| `maxResetStreams` | 512 | HTTP/2 peer resets before `GOAWAY` (rapid-reset defense) |
+| `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/etc. between stream progress (flood defense) |
+
+```nim
+newVortex(handler, initVortexConfig(
+  maxBodySize = 64 * 1024 * 1024,     # allow 64 MiB uploads
+  maxHeaderSize = 32 * 1024)).serve(8080)
+```
+
+To accept a large upload without buffering it whole (so `maxBodySize` isn't the
+constraint), stream it instead — see [Upload](#upload).
+
+### Handlers
 
 A handler is a plain `proc (req: Request, res: Response) {.gcsafe.}`. It runs
 **inline on the event loop**, so it must never block (no sync DB calls, no
@@ -221,32 +410,12 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.send(Http200, $rows, "application/json")
 ```
 
-**Async handlers** (optional adapter; asyncdispatch or chronos drivers) let a
-handler `await` on the loop thread:
+For `await`-style handlers, import an async adapter and write a
+`proc (req, res) {.async.}` — see
+[Choose an implementation](#choose-an-implementation). Without a router, wrap it
+with the adapter's `toHandler`, or use `req.doAsync:` inside a plain handler.
 
-```nim
-import vortex
-import vortex/asyncdispatch   # (or vortex/chronos for chronos drivers)
-
-proc getUser(req: Request, res: Response) {.async.} =
-  let user = await db.getUser(req.param("id"))   # loop keeps serving
-  res.send(Http200, user.toJson, "application/json")
-
-var router = newRouter()
-router.get("/users/:id", getUser)               # async handlers register directly
-newVortex(router.toHandler).serve(8080)
-```
-
-Without a router, wrap a `proc (req, res) {.async.}` with the adapter's
-`toHandler`, or use `req.doAsync:` inside a plain handler. Import only one async
-adapter per program. chronos is **not** a vortex dependency (a bare
-`import vortex` never needs it), so using that adapter means adding
-`requires "chronos >= 4.0.0"` to your own project.
-
-> `std/httpclient` also exports a `Response` type; in modules using both,
-> `import std/httpclient except Response`.
-
-### Requests
+#### Requests
 
 The `Request` object passed into the handler contains the content and metadata related to each request.
 
@@ -277,11 +446,11 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.blocking: body` | `template` | run `body` on the worker pool (see above) |
 | `req.isWebSocketUpgrade` | `bool` | is this request a WebSocket handshake (see [WebSockets](#websockets)) |
 | `req.acceptWebSocket(protocols = [])` | `WebSocket` | complete the WebSocket handshake (see [WebSockets](#websockets)) |
-| `req.onBody(cb, manualAck = false)` | `void` | register an inbound body sink (see [Streaming requests](#streaming-requests)) |
-| `req.ackBody(n)` | `void` | grant flow-control credit for consumed body bytes (see [Streaming requests](#streaming-requests)) |
-| `req.stream(chunk, last): body` | `template` | consume the request body chunk by chunk (see [Streaming requests](#streaming-requests)) |
+| `req.onBody(cb, manualAck = false)` | `void` | register an inbound body sink (see [Upload](#upload)) |
+| `req.ackBody(n)` | `void` | grant flow-control credit for consumed body bytes (see [Upload](#upload)) |
+| `req.stream(chunk, last): body` | `template` | consume the request body chunk by chunk (see [Upload](#upload)) |
 | `req.doAsync: body` | `template` | run an `{.async.}` body on the loop thread (async adapter) |
-| `req.read()` | `Future[string]` | pull the next request-body chunk (async adapter; see [Streaming](#streaming)) |
+| `req.read()` | `Future[string]` | pull the next request-body chunk (async adapter; see [Upload](#upload)) |
 
 ```nim
 proc handler(req: Request, res: Response) {.gcsafe.} =
@@ -294,7 +463,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.send(Http404)
 ```
 
-### Responses
+#### Responses
 
 The `Response` object paired with each request is the write half: use it to send
 the reply. Copying it into workers or async callbacks is free, and sending
@@ -304,7 +473,7 @@ through a dead connection is a safe no-op.
 |--------|--------|---------------|
 | `res.send(code, body = "", contentType = "", headers = [])` | `void` | queue a buffered response (compressed when eligible); also `res.send(code)` and an `int`-code overload |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
-| `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Streaming responses](#streaming-responses)) |
+| `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
 | `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
 | `res.finish(trailers = [])` | `void` | end a streamed response cleanly |
@@ -319,8 +488,7 @@ through a dead connection is a safe no-op.
 
 Two helpers build header pairs to pass in `res.send`'s `headers`:
 `securityHeaders(...)` (OWASP baseline, see [Security](#security)) and
-`setCookie(...)` (a `Set-Cookie` with `Secure`/`HttpOnly`/`SameSite=Lax`
-defaults).
+`setCookie(...)` (see [Cookies](#cookies)).
 
 ```nim
 proc handler(req: Request, res: Response) {.gcsafe.} =
@@ -333,25 +501,32 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:         res.send(Http404, "not found", "text/plain")
 ```
 
-## Routing
+#### Cookies
 
-`newRouter()` gives a path router: register a handler per method, with `:name`
-path parameters and a trailing `*` wildcard, then hand `router.toHandler` to
-`run`/`start`:
+`setCookie(...)` builds a `Set-Cookie` header as a `(name, value)` pair to pass
+in `res.send`'s `headers`. It defaults to the OWASP session-management baseline —
+`Secure`, `HttpOnly`, `SameSite=Lax` — so a plain call is already hardened:
 
 ```nim
-proc getUser(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "user " & req.param("id"))
-
-var router = newRouter()
-router.get("/users/:id", getUser)
-router.get("/static/*", staticHandler("public"))
-newVortex(router.toHandler).serve(8080)
+proc login(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "{}", "application/json",
+           @[setCookie("sid", newSession(), maxAge = 3600)])   # session cookie
 ```
 
-Route parameters are stored eagerly at match time, so `req.param` / `req.params`
-work anywhere the handle does, including inside `blocking:` bodies. A path with
-no matching route gets a 404; a path that matches but not the method, a 405.
+The full signature is
+`setCookie(name, value, maxAge = -1, path = "/", domain = "", secure = true,
+httpOnly = true, sameSite = "Lax")`. `maxAge < 0` omits `Max-Age` (a browser
+session cookie); set `secure = false` only for local plaintext development. Emit
+several cookies by passing several pairs:
+
+```nim
+res.send(Http200, body, "text/html",
+         @[setCookie("sid", sid, maxAge = 3600),
+           setCookie("theme", "dark", httpOnly = false, maxAge = 31536000)])
+```
+
+Reading cookies is left to the handler: the raw header is `req.header("cookie")`
+(a `name=value; name2=value2` string), which you parse as your app needs.
 
 ### Middleware
 
@@ -387,7 +562,27 @@ newVortex(router.toHandler).serve(8080)
 is a plain proc, you can wrap one directly without a router —
 `newVortex(logging(requireAuth(handler))).serve(8080)`.
 
-## Static files
+### Routing
+
+`newRouter()` gives a path router: register a handler per method, with `:name`
+path parameters and a trailing `*` wildcard, then hand `router.toHandler` to
+`serve`/`start`:
+
+```nim
+proc getUser(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "user " & req.param("id"))
+
+var router = newRouter()
+router.get("/users/:id", getUser)
+router.get("/static/*", staticHandler("public"))
+newVortex(router.toHandler).serve(8080)
+```
+
+Route parameters are stored eagerly at match time, so `req.param` / `req.params`
+work anywhere the handler does, including inside `blocking:` bodies. A path with
+no matching route gets a 404; a path that matches but not the method, a 405.
+
+### Static files
 
 `staticHandler(rootDir)` returns a handler that serves a directory, keyed off a
 route's trailing `*` wildcard. Register it on `/prefix/*` (and the bare
@@ -440,17 +635,17 @@ preserved (length-delimited, keep-alive intact). Small files, ranges, and `HEAD`
 are read in one shot. `sendfile(2)` is intentionally not used — it composes with
 neither TLS nor the readiness event loop.
 
-## Streaming
+### Streaming
 
 Stream when a body is too large to buffer whole (large downloads, live feeds,
 proxying) or when it should be consumed as it arrives (large uploads). Streaming
 is **loop-thread only** — call it from the handler or an async/onDrain callback,
 not from inside `req.blocking:` (a worker), where it does nothing.
 
-### Streaming requests
+#### Upload
 
 To consume a large upload without buffering it whole, register a route with
-`router.stream` (or pass a `streamRoute` predicate to `start`). Its handler is
+`router.stream` (or pass a `streamRoute` predicate to `newVortex`). Its handler is
 dispatched at headers-complete and reads the body incrementally via `req.onBody`:
 
 ```nim
@@ -498,7 +693,7 @@ to end. In a plain synchronous `onBody` handler this is automatic;
 `req.onBody(cb, manualAck = true)` + `req.ackBody(n)` expose the same control
 directly.
 
-### Streaming responses
+#### Download
 
 Open the body with `sendHead`, append chunks with `write`, and terminate with
 `finish`:
@@ -562,39 +757,7 @@ Call `res.abort()` yourself if you catch an error mid-stream in the manual API �
 HTTP/1.1 closes the connection before the terminating chunk, HTTP/2 and HTTP/3
 reset the stream, so the client sees the transfer was cut short.
 
-## Compression
-
-`-d:httpGzip` (`--passL:-lz`), `-d:httpBrotli`
-(`--passL:"-lbrotlienc -lbrotlicommon"`), and/or `-d:httpZstd` (`--passL:-lzstd`)
-enable **response compression**, turned on per server with `settings.compress`:
-
-```sh
-nim c -d:httpGzip -d:httpBrotli --passL:-lz \
-      --passL:"-lbrotlienc -lbrotlicommon" --threads:on app.nim
-```
-
-```nim
-newVortex(handler, initVortexConfig(compress = true)).serve(8080)
-```
-
-An eligible response (the client accepts an encoding we can produce, a
-compressible content-type, no existing `Content-Encoding`) is compressed with the
-best encoding `Accept-Encoding` offers, adding `Content-Encoding` +
-`Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out); on a
-tie the server prefers **br**, then **zstd**, then **gzip**. Build with several
-flags to offer several and let the client choose. This covers both buffered
-`res.send` (compressed when over ~1400 bytes) and **streamed** responses
-(`res.sendHead`/`write`/`finish`, SSE, and file streaming), compressed
-incrementally. Off by default, so the standard and `-d:plainHttp` builds link no
-zlib/brotli/zstd.
-
-The **inbound** direction is opt-in with `settings.decompressRequest`: a request
-whose `Content-Encoding` is `gzip` or `br` is transparently decoded into
-`req.body`. It is bounded by `maxBodySize` so a decompression bomb can't exhaust
-memory — a body that would exceed the cap is rejected with `413`, a corrupt one
-with `400` — and the handler never runs for either.
-
-## Server-Sent Events
+### Server-Sent Events
 
 `res.sse` opens a `text/event-stream` response over the streaming primitives, so
 it inherits chunked/streamed framing and backpressure. It needs no router and no
@@ -626,7 +789,7 @@ The response sets `Cache-Control: no-cache, no-transform` and
 `X-Accel-Buffering: no` so intermediary proxies don't buffer or transform the
 stream.
 
-## WebSockets
+### WebSockets
 
 A handler detects the upgrade and calls `req.acceptWebSocket()`; set `onMessage`
 / `onClose` callbacks that run on the loop thread (they may capture locals).
@@ -719,24 +882,6 @@ h2, and h3. WebSocket behavior is validated against the
 (`nimble autobahn`); h2 and h3 WebSockets are covered by `nimble h2spec`-adjacent
 suites and `nimble h3websocket` (aioquic).
 
-## Build flags
-
-Release builds use:
-
-```sh
-nim c --mm:orc --threads:on -d:danger --passC:-flto app.nim
-```
-
-(`nimble bench` builds the benchmark server this way.)
-
-| Flag | Effect |
-|------|--------|
-| `-d:plainHttp` | Zero-dependency cleartext build (h1 + h2c); removes OpenSSL and TLS/h2-over-TLS/h3 |
-| `-d:wsDeflate` (`--passL:-lz`) | WebSocket permessage-deflate compression via zlib |
-| `-d:httpGzip` / `-d:httpBrotli` / `-d:httpZstd` | Response + request compression codecs (see [Compression](#compression) for link flags) |
-
-All are off by default, so the standard build keeps its OpenSSL-only footprint.
-
 ## Security
 
 See [SECURITY.md](SECURITY.md) for the threat model, mitigations (Rapid Reset,
@@ -745,7 +890,7 @@ exhaustion), and security-related settings.
 
 Two helpers make secure responses easy — `securityHeaders(...)` returns the OWASP
 Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
-`Set-Cookie`:
+`Set-Cookie` (see [Cookies](#cookies)):
 
 ```nim
 proc handler(req: Request, res: Response) {.gcsafe.} =
