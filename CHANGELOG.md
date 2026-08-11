@@ -82,12 +82,6 @@ the public API may still change before 1.0.
   WebSockets with `1001`, drain in-flight work, then force-close after a grace
   window.
 
-#### Build and platform
-
-- POSIX only (Linux and macOS). Requires **Nim >= 2.2.10** and **OpenSSL >= 3.5**
-  for TLS/HTTP2/HTTP3; `-d:plainHttp` builds a zero-dependency cleartext
-  (h1 + h2c) server with no OpenSSL.
-
 #### Conformance and testing
 
 - Conformance / interop CI: h1spec, h2spec, h3spec, Autobahn (WebSocket),
