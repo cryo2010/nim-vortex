@@ -7,23 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [0.1.0] - 2026-08-10
 
-- **Breaking:** the public config/WebSocket enums are now `{.pure.}` and their
-  values lost the camelCase prefixes. Qualify them by type:
-  `ClientVerify` (`cvNone`/`cvOptional`/`cvRequire` -> `ClientVerify.None`/`.Optional`/`.Require`),
-  `ProxyProtocol` (`ppDisabled`/`ppOptional`/`ppRequire` -> `ProxyProtocol.Disabled`/`.Optional`/`.Require`),
-  and `WsKind` (`wsText`/`wsBinary` -> `WsKind.Text`/`.Binary`).
-- **Breaking:** `TlsMinVersion` and `TlsMaxVersion` are merged into one
-  `{.pure.}` `TlsVersion` enum with `None`, `V12`, `V13`. `minTlsVersion` and
-  `maxTlsVersion` now take `TlsVersion`; on a minimum, `None` means the secure
-  default (TLS 1.2 floor), and on a maximum it means no cap. Migration:
-  `tlsV12`/`tlsMax12` -> `TlsVersion.V12`, `tlsV13`/`tlsMax13` -> `TlsVersion.V13`,
-  `tlsMaxNone` -> `TlsVersion.None`. Defaults are unchanged
-  (`minTlsVersion = TlsVersion.V12`, `maxTlsVersion = TlsVersion.None`).
-- **Breaking:** the `router` module is renamed to `routing`. Import it as
-  `import vortex/routing`. Only code that imported the submodule directly
-  (`import vortex/router`) needs to update; `import vortex` is unaffected. The
-  rename lets a local `var router = newRouter()` coexist with the module and
-  matches the `streaming` module's naming. The `Router` type and `newRouter`
-  are unchanged.
+Initial release: a fast, POSIX HTTP server for Nim speaking HTTP/1.1, HTTP/2,
+and HTTP/3 from a single port and a single handler API. This is a 0.x release;
+the public API may still change before 1.0.
+
+### Added
+
+#### Protocols
+
+- **HTTP/1.1**: keep-alive, request pipelining, chunked transfer encoding, and
+  `100-continue`.
+- **HTTP/2**: over TLS (ALPN) and h2c prior knowledge; h2spec-clean, with
+  rapid-reset and framing-flood defenses.
+- **HTTP/3 over QUIC** on the OpenSSL >= 3.5 server API, with automatic
+  `Alt-Svc` advertisement so clients upgrade.
+- **WebSockets** (RFC 6455) over `ws://` and `wss://`, and over HTTP/2
+  (RFC 8441) and HTTP/3 (RFC 9220) via Extended CONNECT; optional
+  permessage-deflate (RFC 7692) with `-d:wsDeflate`.
+
+#### Architecture
+
+- One **event loop per thread** over `SO_REUSEPORT` listeners (kqueue/epoll via
+  `std/selectors`); handlers run inline on the loop.
+- **`req.blocking:`** escape hatch runs a handler body on a worker pool for sync
+  DB drivers, file I/O, and CPU work; routes that never use it pay no overhead.
+- **Future-agnostic core** (handlers are plain procs, responses may be deferred)
+  with optional **asyncdispatch** and **chronos** adapters that add `await` on
+  the loop thread without a runtime dependency in the core.
+- **Dual-stack** IPv4/IPv6 by default, with graceful fallback.
+
+#### TLS
+
+- Certificates from files, in-memory PEM, or PKCS#12; **SNI** per-hostname
+  certs; **mTLS** client-certificate verification; **OCSP stapling**;
+  configurable TLS version range and ciphers; and hot `reloadTls`.
+
+#### Routing and handlers
+
+- Path **router** with `:name` parameters and a trailing `*` wildcard,
+  composable **middleware**, and automatic 404 / 405 (with `Allow`).
+- `Request` / `Response` API: buffered `send`, redirects, header helpers, and a
+  hardened `setCookie` (Secure / HttpOnly / SameSite defaults).
+
+#### Static files
+
+- `staticHandler` / `res.sendFile`: extension-to-MIME typing, conditional
+  requests (`ETag` / `Last-Modified`, `304`), byte ranges (`206` / `416`),
+  bounded-memory streaming of large files, and path-traversal safety.
+
+#### Streaming
+
+- Inbound (upload) streaming with end-to-end flow control and outbound
+  (download) streaming with backpressure, across HTTP/1.1, /2, and /3.
+- **Server-Sent Events** over the same streaming primitives.
+
+#### Compression
+
+- gzip / brotli / zstd **response compression** with q-value negotiation, and
+  gzip / brotli / zstd **request-body decompression** bounded against
+  decompression bombs. Opt-in via `-d:httpGzip` / `-d:httpBrotli` / `-d:httpZstd`.
+
+#### Operations and security
+
+- **PROXY protocol** (v1/v2) and `X-Forwarded-For` for the real client address
+  behind an L4/L7 load balancer.
+- Per-IP token-bucket **rate limiting**; OWASP `securityHeaders` helper;
+  `req.originAllowed` (cross-site WebSocket hijacking defense).
+- Configurable request size limits (headers / body / WebSocket message) and
+  per-phase timeouts; DoS budgets for rapid reset and framing/control-frame
+  floods.
+- **Graceful shutdown**: stop accepting, send HTTP/2 and HTTP/3 `GOAWAY`, close
+  WebSockets with `1001`, drain in-flight work, then force-close after a grace
+  window.
+
+#### Build and platform
+
+- POSIX only (Linux and macOS). Requires **Nim >= 2.2.10** and **OpenSSL >= 3.5**
+  for TLS/HTTP2/HTTP3; `-d:plainHttp` builds a zero-dependency cleartext
+  (h1 + h2c) server with no OpenSSL.
+
+#### Conformance and testing
+
+- Conformance / interop CI: h1spec, h2spec, h3spec, Autobahn (WebSocket),
+  REDbot, OWASP ZAP, testssl.sh, and cross-client interop
+  (Node / Python / Go / Rust / Java).
+- Safety CI: AddressSanitizer + UBSan, ThreadSanitizer, a valgrind
+  memcheck/helgrind race-and-leak matrix, and libFuzzer fuzzing of the
+  parser / HPACK / QPACK decoders.
+
+[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/cryo2010/nim-vortex/releases/tag/v0.1.0
