@@ -251,5 +251,14 @@ suite "chronos adapter":
     s.sendMasked("two")
     check s.wsRecvFrame().payload == "echo: two"
 
+  test "newVortex overload accepts a bare async handler (no toHandler)":
+    proc bare(req: Request, res: Response) {.async.} =
+      res.send(Http200, "bare-async", "text/plain")
+    let s = newVortex(bare).start(0)
+    defer: s.close()
+    var client = newHttpClient()
+    defer: client.close()
+    check client.getContent("http://127.0.0.1:" & $s.port & "/") == "bare-async"
+
 srv.close()
 echo "server shut down cleanly"

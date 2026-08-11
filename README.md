@@ -13,9 +13,9 @@ proc handler(req: Request, res: Response) {.async.} =
   of "/":
     req.blocking: # runs on the worker pool
       let data = expensiveBlockingCall()
-      await res.send(Http200, data, "application/json")
+      res.send(Http200, data, "application/json")
   else:
-    await res.send(Http404)
+    res.send(Http404)
 
 newVortex(handler).serve(8080)
 ```
@@ -135,22 +135,20 @@ newVortex(handler).serve(8080)
 
 **asyncdispatch** - An async server that uses `std/asyncdispatch` futures.
 ```nim
-import vortex
 import vortex/asyncdispatch
 
 proc handler(req: Request, res: Response) {.async.} =
-  await res.send(Http200, "Hello, World!", "text/plain")
+  res.send(Http200, "Hello, World!", "text/plain")
 
 newVortex(handler).serve(8080)
 ```
 
 **chronos**: An async server that uses `/chronos` futures.
 ```nim
-import vortex
 import vortex/chronos
 
 proc handler(req: Request, res: Response) {.async.} =
-  await res.send(Http200, "Hello, World!", "text/plain")
+  res.send(Http200, "Hello, World!", "text/plain")
 
 newVortex(handler).serve(8080)
 ```

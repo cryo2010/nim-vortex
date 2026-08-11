@@ -171,5 +171,14 @@ suite "asyncdispatch adapter":
     check rc == 0
     check output.strip() == "slept|2"
 
+  test "newVortex overload accepts a bare async handler (no toHandler)":
+    proc bare(req: Request, res: Response) {.async.} =
+      res.send(Http200, "bare-async", "text/plain")
+    let s = newVortex(bare).start(0)
+    defer: s.close()
+    var client = newHttpClient()
+    defer: client.close()
+    check client.getContent("http://127.0.0.1:" & $s.port & "/") == "bare-async"
+
 srv.close()
 echo "server shut down cleanly"
