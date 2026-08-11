@@ -47,9 +47,9 @@ when not defined(plainHttp):
   proc tlsVerifyMode*(v: ClientVerify): cint =
     ## Map the public verify enum to OpenSSL's SSL_VERIFY_* mode.
     case v
-    of cvNone: TlsVerifyNone
-    of cvOptional: TlsVerifyOptional
-    of cvRequire: TlsVerifyRequire
+    of ClientVerify.None: TlsVerifyNone
+    of ClientVerify.Optional: TlsVerifyOptional
+    of ClientVerify.Require: TlsVerifyRequire
 
   proc toSniCerts*(s: VortexConfig): seq[SniCert] =
     ## Convert the plain-data SNI entries into TLS-layer SniCerts.
@@ -59,12 +59,12 @@ when not defined(plainHttp):
         keyPem: e.keyPem, pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
         keyPassword: e.keyPassword))
 
-  proc tlsMaxVer*(v: TlsMaxVersion): clong =
+  proc tlsMaxVer*(v: TlsVersion): clong =
     ## Map the max-version enum to an OpenSSL version number (0 = no cap).
     case v
-    of tlsMaxNone: 0
-    of tlsMax12: TLS1_2_VERSION
-    of tlsMax13: TLS1_3_VERSION
+    of TlsVersion.None: 0
+    of TlsVersion.V12: TLS1_2_VERSION
+    of TlsVersion.V13: TLS1_3_VERSION
 
   proc ocspBytes*(s: VortexConfig): string =
     ## The DER OCSP response to staple: in-memory bytes, else the file, else "".
@@ -898,7 +898,7 @@ proc handleAccept(loop: Loop) =
     try: c.remoteAddr = getAddrString(cast[ptr SockAddr](addr sa))
     except CatchableError: discard
     inc loop.connCount
-    if loop.settings.proxyProtocol != ppDisabled:
+    if loop.settings.proxyProtocol != ProxyProtocol.Disabled:
       # Read (and strip) the PROXY header from the raw socket before starting
       # TLS or HTTP; the transport is set up in handleProxyHeader once done.
       c.awaitingProxy = true
@@ -940,7 +940,7 @@ proc handleProxyHeader(loop: Loop, c: ptr Connection) =
 
   let directPeer = c.remoteAddr    # the accept peer, before any override
   let trusted = isTrustedProxy(directPeer, loop.settings.trustedProxies)
-  let require = loop.settings.proxyProtocol == ppRequire
+  let require = loop.settings.proxyProtocol == ProxyProtocol.Require
   let res = parseProxyHeader(toOpenArray(buf, 0, n - 1))
 
   case res.kind
@@ -950,7 +950,7 @@ proc handleProxyHeader(loop: Loop, c: ptr Connection) =
   of ppError:
     loop.closeConn(c); return
   of ppNotPresent:
-    # No PROXY header. Mandatory under ppRequire; otherwise a direct client.
+    # No PROXY header. Mandatory under ProxyProtocol.Require; otherwise a direct client.
     if require: loop.closeConn(c)
     else: loop.beginAfterProxy(c)
     return

@@ -58,14 +58,14 @@ suite "wildcard SNI":
 
 suite "max TLS version":
   test "cap at 1.2 negotiates 1.2, refuses 1.3":
-    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, maxTlsVersion = tlsMax12)).start(0)
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, maxTlsVersion = TlsVersion.V12)).start(0)
     defer: srv.close()
     check "TLSv1.2" in negotiatedProto(srv.port)
     check not tls13Establishes(srv.port)                          # 1.3 refused
 
   test "min 1.3 > max 1.2 is rejected at start":
     expect CatchableError:
-      var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, minTlsVersion = tlsV13, maxTlsVersion = tlsMax12)).start(0)
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, minTlsVersion = TlsVersion.V13, maxTlsVersion = TlsVersion.V12)).start(0)
       srv.close()
 
 # --- OCSP stapling: generate a real response, or skip if the toolchain differs

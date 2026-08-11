@@ -198,12 +198,12 @@ balancer prepends (v1 and v2, TCP over IPv4/IPv6), honored only from a trusted
 peer:
 
 ```nim
-initVortexConfig(proxyProtocol = ppRequire,             # or ppOptional
-                 trustedProxies = @["10.0.0.0/8"])      # IPs/CIDRs; empty = any peer
+initVortexConfig(proxyProtocol = ProxyProtocol.Require,   # or ProxyProtocol.Optional
+                 trustedProxies = @["10.0.0.0/8"])        # IPs/CIDRs; empty = any peer
 ```
 
-`ppRequire` drops a connection without a valid header from a trusted peer;
-`ppOptional` uses the header when present and otherwise treats the peer as a
+`ProxyProtocol.Require` drops a connection without a valid header from a trusted peer;
+`ProxyProtocol.Optional` uses the header when present and otherwise treats the peer as a
 direct client. A header from an untrusted peer is never believed. Behind an L7
 proxy that sets `X-Forwarded-For`, recover the origin client from
 `req.forwardedFor` under a trust policy you control (see [Requests](#requests)).
@@ -279,14 +279,14 @@ initVortexConfig(pkcs12File = "server.p12", keyPassword = "…")   # or pkcs12 =
 ```
 
 **mTLS (client certificates)**: request or require a client cert and verify it
-against a CA. `verifyClient = cvOptional` accepts connections with no cert but
-validates any that is presented; `cvRequire` refuses the handshake without a
+against a CA. `verifyClient = ClientVerify.Optional` accepts connections with no cert but
+validates any that is presented; `ClientVerify.Require` refuses the handshake without a
 valid one. Inside a handler, `req.clientCertSubject` gives the verified client's
 subject DN ("" if none):
 
 ```nim
 initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
-                 verifyClient = cvRequire, clientCaFile = "client-ca.pem")
+                 verifyClient = ClientVerify.Require, clientCaFile = "client-ca.pem")
 # ... req.clientCertSubject -> e.g. "/CN=service-a"     (clientCaPem takes in-memory CA)
 ```
 
@@ -302,8 +302,8 @@ initVortexConfig(certFile = "default.pem", keyFile = "default.key",
                                       certFile: "wild.pem", keyFile: "wild.key")])
 ```
 
-**TLS version range**: `minTlsVersion` (default `tlsV12`) floors it; `maxTlsVersion`
-(default `tlsMaxNone` = no cap) ceils it, e.g. `maxTlsVersion = tlsMax12` to keep
+**TLS version range**: `minTlsVersion` (default `TlsVersion.V12`) floors it; `maxTlsVersion`
+(default `TlsVersion.None` = no cap) ceils it, e.g. `maxTlsVersion = TlsVersion.V12` to keep
 a client on 1.2. (QUIC/HTTP/3 is always 1.3.)
 
 **OCSP stapling**: hand clients a cached OCSP response in the handshake so they

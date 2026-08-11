@@ -62,13 +62,13 @@ suite "PKCS#12":
 
 suite "mTLS":
   test "require: connection without a client cert is refused":
-    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = cvRequire, clientCaFile = dir / "ca.pem")).start(0)
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = ClientVerify.Require, clientCaFile = dir / "ca.pem")).start(0)
     defer: srv.close()
     let (_, rc) = curlGet(srv.port)                 # no client cert
     check rc != 0                                    # TLS handshake rejected
 
   test "require: valid client cert is accepted and its subject exposed":
-    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = cvRequire, clientCaFile = dir / "ca.pem")).start(0)
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = ClientVerify.Require, clientCaFile = dir / "ca.pem")).start(0)
     defer: srv.close()
     let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 --cert " & dir &
       "/client.pem --key " & dir & "/client.key https://127.0.0.1:" &
@@ -77,7 +77,7 @@ suite "mTLS":
     check "test-client" in o
 
   test "optional: no client cert still connects, subject empty":
-    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = cvOptional, clientCaFile = dir / "ca.pem")).start(0)
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = ClientVerify.Optional, clientCaFile = dir / "ca.pem")).start(0)
     defer: srv.close()
     let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 https://127.0.0.1:" &
       $srv.port & "/whoami")

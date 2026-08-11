@@ -15,8 +15,8 @@ when defined(wsDeflate):
   import ./deflate
 
 type
-  WsKind* = enum
-    wsText, wsBinary
+  WsKind* {.pure.} = enum
+    Text, Binary
 
   WebSocket* = object
     ## Handle to an upgraded connection: the same four words as Request,
@@ -348,7 +348,7 @@ proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     failClose(core, c, w, 1007)          # not valid UTF-8
     return false
   if w.onMessage != nil:
-    let kind = if op == opBinary: wsBinary else: wsText
+    let kind = if op == opBinary: WsKind.Binary else: WsKind.Text
     w.onMessage(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream),
                 payload, kind)
   true
@@ -665,10 +665,10 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
   except Exception:
     discard
 
-proc send*(ws: WebSocket, data: openArray[char], kind = wsText) {.raises: [].} =
+proc send*(ws: WebSocket, data: openArray[char], kind = WsKind.Text) {.raises: [].} =
   ## Send a message. Safe from any thread; a no-op if the connection is
   ## gone. Text is not validated here (send what you mean).
-  sendFrame(ws, (if kind == wsBinary: opBinary else: opText), data)
+  sendFrame(ws, (if kind == WsKind.Binary: opBinary else: opText), data)
 
 proc ping*(ws: WebSocket, data: openArray[char] = "") {.raises: [].} =
   ## Send a ping; the peer should answer with a pong. A control frame's payload

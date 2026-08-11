@@ -82,7 +82,7 @@ proc validateConfig(s: VortexConfig) =
       "Set both (file or PEM) to enable TLS, or neither for plain HTTP.")
   if hasCert and not hasKey:
     raise newException(CatchableError, "a certificate is set but no private key.")
-  if s.minTlsVersion == tlsV13 and s.maxTlsVersion == tlsMax12:
+  if s.minTlsVersion == TlsVersion.V13 and s.maxTlsVersion == TlsVersion.V12:
     raise newException(CatchableError,
       "maxTlsVersion (TLS 1.2) is below minTlsVersion (TLS 1.3).")
   if s.maxHeaderSize < 0 or s.maxBodySize < 0 or s.maxWsMessageSize < 0 or
@@ -116,8 +116,8 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
   when not defined(plainHttp):
     if settings.hasTls:
       let minVer = case settings.minTlsVersion
-                   of tlsV12: TLS1_2_VERSION
-                   of tlsV13: TLS1_3_VERSION
+                   of TlsVersion.None, TlsVersion.V12: TLS1_2_VERSION  # None: secure default floor
+                   of TlsVersion.V13: TLS1_3_VERSION
       result.tls = cast[pointer](
         newTlsConfig(settings.certFile, settings.keyFile, enableH2 = true,
                      minProtoVersion = minVer,

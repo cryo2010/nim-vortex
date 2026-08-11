@@ -75,20 +75,20 @@ proc handshakeOk(port: Port, tlsFlag: string): bool =
             tlsFlag & " >/dev/null 2>&1")[1] == 0
 
 var srv12 = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile)).start(0)
-                               # default minTlsVersion = tlsV12
-var srv13 = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile, minTlsVersion = tlsV13)).start(0)
+                               # default minTlsVersion = TlsVersion.V12
+var srv13 = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile, minTlsVersion = TlsVersion.V13)).start(0)
 
 suite "minimum TLS version":
-  test "default (tlsV12) accepts TLS 1.2":
+  test "default (TlsVersion.V12) accepts TLS 1.2":
     check handshakeOk(srv12.port, "-tls1_2")
 
-  test "default (tlsV12) accepts TLS 1.3":
+  test "default (TlsVersion.V12) accepts TLS 1.3":
     check handshakeOk(srv12.port, "-tls1_3")
 
-  test "tlsV13 rejects TLS 1.2":
+  test "TlsVersion.V13 rejects TLS 1.2":
     check not handshakeOk(srv13.port, "-tls1_2")
 
-  test "tlsV13 accepts TLS 1.3":
+  test "TlsVersion.V13 accepts TLS 1.3":
     check handshakeOk(srv13.port, "-tls1_3")
 
 var srvCipher = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, http3 = false, certFile = certFile, keyFile = keyFile, tlsCipherSuites = "TLS_AES_128_GCM_SHA256")).start(0)

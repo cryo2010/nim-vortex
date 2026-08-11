@@ -465,7 +465,7 @@ template messages*(ws: WebSocket, msg, body: untyped) =
 
 template messages*(ws: WebSocket, msg, kind, body: untyped) =
   ## Two-variable form of `messages`: `msg: string` plus `kind: WsKind`
-  ## (`wsText` / `wsBinary`).
+  ## (`WsKind.Text` / `WsKind.Binary`).
   block:
     installWsReader(ws)
     try:
