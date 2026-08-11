@@ -38,6 +38,8 @@ import std/[asyncdispatch, httpcore, tables, deques]
 import ../connection
 import ../request
 import ../routing
+import ../server
+import ../settings
 
 export asyncdispatch
 
@@ -256,6 +258,12 @@ proc toHandler*(h: AsyncRequestHandler): RequestHandler =
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
       watch(req, inner(req, res))
+
+proc newVortex*(h: AsyncRequestHandler, config = initVortexConfig(),
+                streamRoute: StreamRouteCb = nil): Vortex =
+  ## Build a server directly from an async handler (wraps it with `toHandler`),
+  ## so `newVortex(handler)` works without the explicit wrap.
+  newVortex(toHandler(h), config, streamRoute)
 
 proc route(r: Router, meth: HttpMethod, path: string,
            h: AsyncRequestHandler) =
