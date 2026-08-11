@@ -117,21 +117,17 @@ They are all off by default, so the standard build keeps its OpenSSL-only footpr
 
 ## Choose an implementation
 
-Vortex is future-agnostic and ships with four implementation options:
+Vortex is future-agnostic and ships with three server options:
 
-1. A sync client via `import navi`
-2. An async client via `import navi/asyncdispatch`
-3. An async client via `import navi/chronos`
-4. A JavaScript-only client via `import navi/js` 
-
-> [!NOTE]
-> If you transpile to JavaScript from any other implementation, the `navi/js` client is used instead.
+1. A sync server via `import vortex`
+2. An async server via `import vortex/asyncdispatch`
+3. An async server via `import vortex/chronos`
 
 **Synchronous**
 ```nim
 import vortex
 
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   res.send(Http200, "Hello, World!", "text/plain")
 
 newVortex(handler).serve(8080)
@@ -397,7 +393,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.read()` | `Future[string]` | pull the next request-body chunk (async adapter; see [Upload](#upload)) |
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   if req.method == HttpGet and req.path.startsWith("/search"):
     let term = req.query.getOrDefault("q")
     let agent = req.header("user-agent")
@@ -435,7 +431,7 @@ Two helpers build header pairs to pass in `res.send`'s `headers`:
 `setCookie(...)` (see [Cookies](#cookies)).
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   case req.path
   of "/":       res.send(Http200, "hi", "text/plain")
   of "/old":    res.redirect("/new", permanent = true)
@@ -452,7 +448,7 @@ in `res.send`'s `headers`. It defaults to the OWASP session-management baseline
 (`Secure`, `HttpOnly`, `SameSite=Lax`), so a plain call is already hardened:
 
 ```nim
-proc login(req: Request, res: Response) {.gcsafe.} =
+proc login(req: Request, res: Response) =
   res.send(Http200, "{}", "application/json",
            @[setCookie("sid", newSession(), maxAge = 3600)])   # session cookie
 ```
@@ -482,14 +478,14 @@ registration order: the first `use`d is outermost (runs first in, last out).
 ```nim
 proc logging(next: RequestHandler): RequestHandler =
   let inner = next
-  proc(req: Request, res: Response) {.gcsafe.} =
+  proc(req: Request, res: Response) =
     let t0 = getMonoTime()
     inner(req, res)
     echo req.method, " ", req.path, " ", getMonoTime() - t0
 
 proc requireAuth(next: RequestHandler): RequestHandler =
   let inner = next
-  proc(req: Request, res: Response) {.gcsafe.} =
+  proc(req: Request, res: Response) =
     if req.header("authorization").len == 0:
       res.send(Http401, "unauthorized")   # short-circuit: never calls inner
     else:
@@ -513,7 +509,7 @@ path parameters and a trailing `*` wildcard, then hand `router.toHandler` to
 `serve`/`start`:
 
 ```nim
-proc getUser(req: Request, res: Response) {.gcsafe.} =
+proc getUser(req: Request, res: Response) =
   res.send(Http200, "user " & req.param("id"))
 
 var router = newRouter()
@@ -569,7 +565,7 @@ To serve one specific file from any handler, use `res.sendFile(path)` (a
 trusted path, no traversal resolution):
 
 ```nim
-r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
+r.get("/favicon.ico", proc(req: Request, res: Response) =
   res.sendFile("public/favicon.ico"))
 ```
 
@@ -593,8 +589,8 @@ To consume a large upload without buffering it whole, register a route with
 dispatched at headers-complete and reads the body incrementally via `req.onBody`:
 
 ```nim
-proc upload(req: Request, res: Response) {.gcsafe.} =
-  req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+proc upload(req: Request, res: Response) =
+  req.onBody proc(chunk: openArray[char], last: bool) =
     sink(chunk)                     # write to disk, hash, proxy, ...
     if last: res.send(Http200, "ok")
 
@@ -639,57 +635,11 @@ directly.
 
 #### Download
 
-Open the body with `sendHead`, append chunks with `write`, and terminate with
-`finish`:
-
-```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.sendHead(Http200, "text/plain")   # status + headers, no Content-Length
-  discard res.write("first chunk\n")
-  discard res.write("second chunk\n")
-  res.finish()                          # terminate the body
-```
-
-`sendHead` opens the body (HTTP/1.1 uses `Transfer-Encoding: chunked`; HTTP/2 and
-HTTP/3 leave the stream open with DATA frames), `write` appends a chunk, and
-`finish` ends it (optionally with HTTP/1.1 trailers). The framing is identical
-across all three protocols. Pass `contentLength` to `sendHead` for a
-length-delimited body instead of chunked (used by file serving).
-
-For the common "produce it all inline" case, the `res.stream` template brackets a
-block with `sendHead`/`finish`, and `abort`s the stream (a visible truncation,
-not a clean end) if the block raises:
-
-```nim
-proc download(req: Request, res: Response) {.gcsafe.} =
-  res.stream(Http200, "application/octet-stream"):
-    var f = open("big.bin")
-    defer: f.close()
-    var buf = newString(64 * 1024)
-    while true:
-      let n = f.readChars(buf)
-      if n == 0: break
-      discard res.write(buf.toOpenArray(0, n - 1))
-```
-
-`write` returns `false` once the unsent backlog reaches `respHighWater` (256 KiB);
-a producer that outruns a slow client should pause and resume from `onDrain`
-(`res.bufferedAmount` reports the current backlog):
-
-```nim
-proc pump(res: Response) {.gcsafe.} =
-  while moreData():
-    if not res.write(nextChunk()):
-      res.onDrain(pump)               # backed up: resume when it empties
-      return
-  res.finish()
-```
-
-With an async adapter, `await res.write(chunk)` writes and awaits the drain for
-you, the awaitable companion to the sync `res.write(...): bool` (`res.stream`
-also takes lighter forms: `res.stream(ct): ...` and `res.stream(): ...`, which
-defaults to `application/octet-stream`; pass a `text/*` type to keep compression
-on):
+The recommended way to stream a response is the `res.stream` template: it opens
+the body with `sendHead` on entry and ends it with `finish` on a clean exit (or
+`abort`, a visible truncation, if the block raises). With an async adapter,
+`await res.write` writes each chunk and awaits the drain, so backpressure is
+handled for you:
 
 ```nim
 proc download(req: Request, res: Response) {.async.} =
@@ -697,7 +647,34 @@ proc download(req: Request, res: Response) {.async.} =
     for chunk in source: await res.write(chunk)   # backpressure handled per chunk
 ```
 
-Call `res.abort()` yourself if you catch an error mid-stream in the manual API:
+The same block works synchronously (`discard res.write(...)` inside it).
+`res.stream` also takes lighter forms: `res.stream(contentType): ...` and
+`res.stream(): ...`, which defaults to `application/octet-stream` (pass a
+`text/*` type to keep compression on).
+
+**Backpressure.** `res.write` returns `false` once the unsent backlog reaches
+`respHighWater` (256 KiB). `await res.write` awaits the drain for you; a sync
+producer that outruns a slow client should instead pause and resume from
+`res.onDrain` (`res.bufferedAmount` reports the current backlog).
+
+**Producing chunks over time.** When chunks are produced over time rather than
+in one straight-line block (from a timer, a worker-pool completion, an upstream
+you are proxying, or an `onDrain` resume), drive the stream directly: `sendHead`
+to open it, `write` per chunk, and `finish` when done. The response outlives the
+handler, which is why file serving and SSE are built on these primitives:
+
+```nim
+proc handler(req: Request, res: Response) =
+  res.sendHead(Http200, "text/plain")   # status + headers, no Content-Length
+  discard res.write("first chunk\n")
+  discard res.write("second chunk\n")
+  res.finish()                          # terminate the body
+```
+
+`sendHead` uses `Transfer-Encoding: chunked` on HTTP/1.1 and open DATA frames on
+HTTP/2 and HTTP/3 (identical framing across all three); pass `contentLength` for
+a length-delimited body instead (as file serving does), and `finish` may carry
+HTTP/1.1 trailers. On a mid-stream error call `res.abort()` rather than `finish`:
 HTTP/1.1 closes the connection before the terminating chunk, HTTP/2 and HTTP/3
 reset the stream, so the client sees the transfer was cut short.
 
@@ -708,7 +685,7 @@ it inherits chunked/streamed framing and backpressure. It needs no router and no
 `streamRoute` predicate (SSE is outbound-only), so it works from any handler:
 
 ```nim
-proc events(req: Request, res: Response) {.gcsafe.} =
+proc events(req: Request, res: Response) =
   let s = res.sse(retry = 3000)               # sends the SSE headers
   discard s.send("hi", event = "greet", id = req.lastEventId())
   discard s.comment("keepalive")              # heartbeat; clients ignore it
@@ -741,12 +718,12 @@ A handler detects the upgrade and calls `req.acceptWebSocket()`; set `onMessage`
 can push to a socket from a worker or a timer:
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   if req.isWebSocketUpgrade:
     let ws = req.acceptWebSocket()
-    ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+    ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) =
       ws.send(data, kind)                 # echo
-    ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) {.gcsafe.} =
+    ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) =
       discard
   else:
     res.send(Http200, "…", "text/html")
@@ -764,7 +741,7 @@ The message is passed in as `msg` (the body cannot capture locals); reply with
 `ws.send`:
 
 ```nim
-ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) =
   ws.blocking(data):
     let rows = db.getAllRows(sql"…")    # blocking is safe here
     ws.send($rows)
@@ -779,7 +756,7 @@ exception closes the socket with 1011):
 ```nim
 import vortex/asyncdispatch   # (or vortex/chronos)
 
-ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) =
   ws.doAsync:
     let user = await db.getUser(data)   # loop keeps serving during the await
     ws.send(user.toJson)
@@ -837,7 +814,7 @@ Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 `Set-Cookie` (see [Cookies](#cookies)):
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   res.send(Http200, body, "application/json",
            securityHeaders(hsts = req.isSecure))   # enable HSTS only over TLS
 ```
