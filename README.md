@@ -117,15 +117,11 @@ They are all off by default, so the standard build keeps its OpenSSL-only footpr
 
 ## Choose an implementation
 
-Vortex is future-agnostic and ships with four implementation options:
+Vortex is future-agnostic and ships with three server options:
 
-1. A sync client via `import navi`
-2. An async client via `import navi/asyncdispatch`
-3. An async client via `import navi/chronos`
-4. A JavaScript-only client via `import navi/js` 
-
-> [!NOTE]
-> If you transpile to JavaScript from any other implementation, the `navi/js` client is used instead.
+1. A sync server via `import vortex`
+2. An async server via `import vortex/asyncdispatch`
+3. An async server via `import vortex/chronos`
 
 **Synchronous**
 ```nim
@@ -639,8 +635,33 @@ directly.
 
 #### Download
 
-Open the body with `sendHead`, append chunks with `write`, and terminate with
-`finish`:
+The recommended way to stream a response is the `res.stream` template: it opens
+the body with `sendHead` on entry and ends it with `finish` on a clean exit (or
+`abort`, a visible truncation, if the block raises). With an async adapter,
+`await res.write` writes each chunk and awaits the drain, so backpressure is
+handled for you:
+
+```nim
+proc download(req: Request, res: Response) {.async.} =
+  res.stream(Http200, "text/csv"):
+    for chunk in source: await res.write(chunk)   # backpressure handled per chunk
+```
+
+The same block works synchronously (`discard res.write(...)` inside it).
+`res.stream` also takes lighter forms: `res.stream(contentType): ...` and
+`res.stream(): ...`, which defaults to `application/octet-stream` (pass a
+`text/*` type to keep compression on).
+
+**Backpressure.** `res.write` returns `false` once the unsent backlog reaches
+`respHighWater` (256 KiB). `await res.write` awaits the drain for you; a sync
+producer that outruns a slow client should instead pause and resume from
+`res.onDrain` (`res.bufferedAmount` reports the current backlog).
+
+**Producing chunks over time.** When chunks are produced over time rather than
+in one straight-line block (from a timer, a worker-pool completion, an upstream
+you are proxying, or an `onDrain` resume), drive the stream directly: `sendHead`
+to open it, `write` per chunk, and `finish` when done. The response outlives the
+handler, which is why file serving and SSE are built on these primitives:
 
 ```nim
 proc handler(req: Request, res: Response) {.gcsafe.} =
@@ -650,54 +671,10 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   res.finish()                          # terminate the body
 ```
 
-`sendHead` opens the body (HTTP/1.1 uses `Transfer-Encoding: chunked`; HTTP/2 and
-HTTP/3 leave the stream open with DATA frames), `write` appends a chunk, and
-`finish` ends it (optionally with HTTP/1.1 trailers). The framing is identical
-across all three protocols. Pass `contentLength` to `sendHead` for a
-length-delimited body instead of chunked (used by file serving).
-
-For the common "produce it all inline" case, the `res.stream` template brackets a
-block with `sendHead`/`finish`, and `abort`s the stream (a visible truncation,
-not a clean end) if the block raises:
-
-```nim
-proc download(req: Request, res: Response) {.gcsafe.} =
-  res.stream(Http200, "application/octet-stream"):
-    var f = open("big.bin")
-    defer: f.close()
-    var buf = newString(64 * 1024)
-    while true:
-      let n = f.readChars(buf)
-      if n == 0: break
-      discard res.write(buf.toOpenArray(0, n - 1))
-```
-
-`write` returns `false` once the unsent backlog reaches `respHighWater` (256 KiB);
-a producer that outruns a slow client should pause and resume from `onDrain`
-(`res.bufferedAmount` reports the current backlog):
-
-```nim
-proc pump(res: Response) {.gcsafe.} =
-  while moreData():
-    if not res.write(nextChunk()):
-      res.onDrain(pump)               # backed up: resume when it empties
-      return
-  res.finish()
-```
-
-With an async adapter, `await res.write(chunk)` writes and awaits the drain for
-you, the awaitable companion to the sync `res.write(...): bool` (`res.stream`
-also takes lighter forms: `res.stream(ct): ...` and `res.stream(): ...`, which
-defaults to `application/octet-stream`; pass a `text/*` type to keep compression
-on):
-
-```nim
-proc download(req: Request, res: Response) {.async.} =
-  res.stream(Http200, "text/csv"):
-    for chunk in source: await res.write(chunk)   # backpressure handled per chunk
-```
-
-Call `res.abort()` yourself if you catch an error mid-stream in the manual API:
+`sendHead` uses `Transfer-Encoding: chunked` on HTTP/1.1 and open DATA frames on
+HTTP/2 and HTTP/3 (identical framing across all three); pass `contentLength` for
+a length-delimited body instead (as file serving does), and `finish` may carry
+HTTP/1.1 trailers. On a mid-stream error call `res.abort()` rather than `finish`:
 HTTP/1.1 closes the connection before the terminating chunk, HTTP/2 and HTTP/3
 reset the stream, so the client sees the transfer was cut short.
 
