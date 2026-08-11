@@ -7,7 +7,7 @@
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
 ## streams are independent.
 
-import std/[httpcore, strutils, uri, tables]
+import std/[httpcore, strutils, uri, tables, json]
 import ./connection
 
 export PathParams
@@ -424,6 +424,33 @@ proc query*(req: Request): Table[string, string] =
         c.rbuf.substr(int(c.parser.pathStart),
                       int(c.parser.pathStart + c.parser.pathLen) - 1)).query)
 
+template lazyJson(store: untyped, raw: string): JsonNode =
+  if not store.jsonCached:
+    store.cachedJson = if raw.len == 0: newJObject() else: parseJson(raw)
+    store.jsonCached = true
+  store.cachedJson
+
+proc json*(req: Request): JsonNode =
+  ## The request body parsed as JSON, cached per request so repeated field
+  ## access (`req.json["a"]`, `req.json["b"]`) parses once. An empty body is
+  ## treated as `{}`. Raises `JsonParsingError` on a malformed body (catch it
+  ## to answer 400; a future middleware can do this globally). Call it on the
+  ## loop thread, not inside `blocking:`.
+  if req.snap != nil:
+    return (if req.snap.body.len == 0: newJObject() else: parseJson(req.snap.body))
+  let raw = req.body
+  if req.fd < 0:
+    when not defined(plainHttp):
+      withH3(req, st):
+        result = lazyJson(st, raw)
+    return
+  withConn(req, c):
+    if req.stream != 0:
+      let st = h2Stream(c, req.stream)
+      if st != nil: result = lazyJson(st, raw)
+    else:
+      result = lazyJson(c, raw)
+
 proc param*(params: PathParams, name: string): string =
   ## Value of a path parameter; "" when absent.
   for (n, v) in params:
@@ -682,6 +709,17 @@ proc send*(res: Response, code: HttpCode) =
 proc send*(res: Response, code: int, body: openArray[char],
            contentType = "", headers: openArray[(string, string)] = []) =
   send(res, HttpCode(code), body, contentType, headers)
+
+proc send*(res: Response, code: HttpCode, json: JsonNode,
+           headers: openArray[(string, string)] = []) =
+  ## Send `json` stringified, with `Content-Type: application/json`. Convert a
+  ## Table, object, seq, etc. at the call site with `%`/`%*`:
+  ## `res.send(Http200, %*{"ok": true})`, `res.send(Http200, %myTable)`.
+  send(res, code, $json, "application/json", headers)
+
+proc send*(res: Response, code: int, json: JsonNode,
+           headers: openArray[(string, string)] = []) =
+  send(res, HttpCode(code), json, headers)
 
 when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
   proc decodeRequestBody*(req: Request, res: Response): bool =

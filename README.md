@@ -366,6 +366,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.headers` | `iterator (string, string)` | every header pair (pseudo-headers skipped) |
 | `req.header(name)` | `string` | one header, case-insensitive; "" if absent |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
+| `req.json` | `JsonNode` | body parsed as JSON, cached per request; empty body is `{}`; raises `JsonParsingError` on malformed input |
 | `req.contentLength` | `int` | body length in bytes |
 | `req.host` | `string` | `:authority` (h2/h3) or `Host` (h1) |
 | `req.origin` | `string` | `Origin` header |
@@ -410,6 +411,7 @@ through a dead connection is a safe no-op.
 | Member | Type | Description |
 |--------|--------|---------------|
 | `res.send(code, body = "", contentType = "", headers = [])` | `void` | queue a buffered response (compressed when eligible); also `res.send(code)` and an `int`-code overload |
+| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified as `application/json` (convert a Table/object with `%`/`%*`) |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
@@ -437,6 +439,19 @@ proc handler(req: Request, res: Response) =
     res.send(Http200, "{}", "application/json",
              @[setCookie("sid", newSession(), maxAge = 3600)])
   else:         res.send(Http404, "not found", "text/plain")
+```
+
+For JSON, `req.json` parses the body (cached per request; `{}` on an empty body,
+raises `JsonParsingError` on malformed input) and `res.send(code, json)` replies
+with `application/json`. Convert a Table/object with `%`/`%*` (both need
+`import std/json`):
+
+```nim
+import std/json
+
+proc create(req: Request, res: Response) =
+  let name = req.json{"name"}.getStr
+  res.send(Http201, %*{"id": 1, "name": name})
 ```
 
 #### Cookies

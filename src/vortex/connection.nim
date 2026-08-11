@@ -3,7 +3,7 @@
 ## worker threads or deferred handlers) can never touch a connection that
 ## has since been closed and reused.
 
-import std/[locks, uri, tables]
+import std/[locks, uri, tables, json]
 from std/selectors import SelectEvent, trigger, newSelectEvent, close
 import ./http1/parser
 
@@ -122,8 +122,10 @@ type
     requestCount*: int        ## HTTP/1 requests served on this connection
     urlCached*: bool          ## lazy per-request caches (see request.url)
     queryCached*: bool
+    jsonCached*: bool
     cachedUrl*: Uri
     cachedQuery*: Table[string, string]
+    cachedJson*: JsonNode
     pathParams*: PathParams   ## written by the router at match time
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
@@ -314,6 +316,7 @@ proc resetForNextRequest*(c: var Connection) =
   c.chunkBody.setLen(0)
   c.urlCached = false
   c.queryCached = false
+  c.jsonCached = false
   c.pathParams.setLen(0)
   c.responded = false
   c.sent100 = false
@@ -360,6 +363,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.closeRequested = false
   c.urlCached = false
   c.queryCached = false
+  c.jsonCached = false
   c.pathParams.setLen(0)
   c.responded = false
   c.sent100 = false
