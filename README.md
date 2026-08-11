@@ -127,7 +127,7 @@ Vortex is future-agnostic and ships with three server options:
 ```nim
 import vortex
 
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   res.send(Http200, "Hello, World!", "text/plain")
 
 newVortex(handler).serve(8080)
@@ -393,7 +393,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.read()` | `Future[string]` | pull the next request-body chunk (async adapter; see [Upload](#upload)) |
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   if req.method == HttpGet and req.path.startsWith("/search"):
     let term = req.query.getOrDefault("q")
     let agent = req.header("user-agent")
@@ -431,7 +431,7 @@ Two helpers build header pairs to pass in `res.send`'s `headers`:
 `setCookie(...)` (see [Cookies](#cookies)).
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   case req.path
   of "/":       res.send(Http200, "hi", "text/plain")
   of "/old":    res.redirect("/new", permanent = true)
@@ -448,7 +448,7 @@ in `res.send`'s `headers`. It defaults to the OWASP session-management baseline
 (`Secure`, `HttpOnly`, `SameSite=Lax`), so a plain call is already hardened:
 
 ```nim
-proc login(req: Request, res: Response) {.gcsafe.} =
+proc login(req: Request, res: Response) =
   res.send(Http200, "{}", "application/json",
            @[setCookie("sid", newSession(), maxAge = 3600)])   # session cookie
 ```
@@ -478,14 +478,14 @@ registration order: the first `use`d is outermost (runs first in, last out).
 ```nim
 proc logging(next: RequestHandler): RequestHandler =
   let inner = next
-  proc(req: Request, res: Response) {.gcsafe.} =
+  proc(req: Request, res: Response) =
     let t0 = getMonoTime()
     inner(req, res)
     echo req.method, " ", req.path, " ", getMonoTime() - t0
 
 proc requireAuth(next: RequestHandler): RequestHandler =
   let inner = next
-  proc(req: Request, res: Response) {.gcsafe.} =
+  proc(req: Request, res: Response) =
     if req.header("authorization").len == 0:
       res.send(Http401, "unauthorized")   # short-circuit: never calls inner
     else:
@@ -509,7 +509,7 @@ path parameters and a trailing `*` wildcard, then hand `router.toHandler` to
 `serve`/`start`:
 
 ```nim
-proc getUser(req: Request, res: Response) {.gcsafe.} =
+proc getUser(req: Request, res: Response) =
   res.send(Http200, "user " & req.param("id"))
 
 var router = newRouter()
@@ -565,7 +565,7 @@ To serve one specific file from any handler, use `res.sendFile(path)` (a
 trusted path, no traversal resolution):
 
 ```nim
-r.get("/favicon.ico", proc(req: Request, res: Response) {.gcsafe.} =
+r.get("/favicon.ico", proc(req: Request, res: Response) =
   res.sendFile("public/favicon.ico"))
 ```
 
@@ -589,8 +589,8 @@ To consume a large upload without buffering it whole, register a route with
 dispatched at headers-complete and reads the body incrementally via `req.onBody`:
 
 ```nim
-proc upload(req: Request, res: Response) {.gcsafe.} =
-  req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+proc upload(req: Request, res: Response) =
+  req.onBody proc(chunk: openArray[char], last: bool) =
     sink(chunk)                     # write to disk, hash, proxy, ...
     if last: res.send(Http200, "ok")
 
@@ -664,7 +664,7 @@ to open it, `write` per chunk, and `finish` when done. The response outlives the
 handler, which is why file serving and SSE are built on these primitives:
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   res.sendHead(Http200, "text/plain")   # status + headers, no Content-Length
   discard res.write("first chunk\n")
   discard res.write("second chunk\n")
@@ -685,7 +685,7 @@ it inherits chunked/streamed framing and backpressure. It needs no router and no
 `streamRoute` predicate (SSE is outbound-only), so it works from any handler:
 
 ```nim
-proc events(req: Request, res: Response) {.gcsafe.} =
+proc events(req: Request, res: Response) =
   let s = res.sse(retry = 3000)               # sends the SSE headers
   discard s.send("hi", event = "greet", id = req.lastEventId())
   discard s.comment("keepalive")              # heartbeat; clients ignore it
@@ -718,12 +718,12 @@ A handler detects the upgrade and calls `req.acceptWebSocket()`; set `onMessage`
 can push to a socket from a worker or a timer:
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   if req.isWebSocketUpgrade:
     let ws = req.acceptWebSocket()
-    ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+    ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) =
       ws.send(data, kind)                 # echo
-    ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) {.gcsafe.} =
+    ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) =
       discard
   else:
     res.send(Http200, "…", "text/html")
@@ -741,7 +741,7 @@ The message is passed in as `msg` (the body cannot capture locals); reply with
 `ws.send`:
 
 ```nim
-ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) =
   ws.blocking(data):
     let rows = db.getAllRows(sql"…")    # blocking is safe here
     ws.send($rows)
@@ -756,7 +756,7 @@ exception closes the socket with 1011):
 ```nim
 import vortex/asyncdispatch   # (or vortex/chronos)
 
-ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
+ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) =
   ws.doAsync:
     let user = await db.getUser(data)   # loop keeps serving during the await
     ws.send(user.toJson)
@@ -814,7 +814,7 @@ Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 `Set-Cookie` (see [Cookies](#cookies)):
 
 ```nim
-proc handler(req: Request, res: Response) {.gcsafe.} =
+proc handler(req: Request, res: Response) =
   res.send(Http200, body, "application/json",
            securityHeaders(hsts = req.isSecure))   # enable HSTS only over TLS
 ```
