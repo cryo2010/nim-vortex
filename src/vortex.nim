@@ -13,6 +13,7 @@
 
 import std/httpcore
 import std/net
+import std/json
 
 import vortex/settings
 import vortex/request
@@ -24,6 +25,7 @@ import vortex/ratelimit
 
 export httpcore
 export net.Port
+export json                 ## so req.json / res.send(json) are usable without a separate import
 export settings
 export request
 export server

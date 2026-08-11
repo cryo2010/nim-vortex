@@ -97,7 +97,7 @@ nimble add https://github.com/cryo2010/nim-vortex
 ```
 
 > [!NOTE]
-> If you plan to use `chronos` futures for async you will need to also install `chronos`.
+> If you plan to use `vortex/chronos`, you will need to also install `chronos`.
 
 ## Build flags
 
@@ -443,12 +443,11 @@ proc handler(req: Request, res: Response) =
 
 For JSON, `req.json` parses the body (cached per request; `{}` on an empty body,
 raises `JsonParsingError` on malformed input) and `res.send(code, json)` replies
-with `application/json`. Convert a Table/object with `%`/`%*` (both need
-`import std/json`):
+with `application/json`. Convert a Table/object with `%`/`%*`. vortex re-exports
+`std/json`, so `JsonNode`, `%`, `%*`, and `parseJson` come with `import vortex`
+(no separate import needed):
 
 ```nim
-import std/json
-
 proc create(req: Request, res: Response) =
   let name = req.json{"name"}.getStr
   res.send(Http201, %*{"id": 1, "name": name})
