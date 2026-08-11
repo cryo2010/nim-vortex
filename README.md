@@ -97,7 +97,7 @@ nimble add https://github.com/cryo2010/nim-vortex
 ```
 
 > [!NOTE]
-> If you plan to use `chronos` futures for async you will need to also install `chronos`.
+> If you plan to use `vortex/chronos`, you will need to also install `chronos`.
 
 ## Build flags
 
