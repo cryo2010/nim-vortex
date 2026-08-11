@@ -261,7 +261,7 @@ proc remoteAddress*(req: Request): string =
 
 proc clientCertSubject*(req: Request): string =
   ## The client certificate's subject DN for an mTLS connection, or "" if none
-  ## was presented. Needs `settings.verifyClient = cvOptional`/`cvRequire`; in
+  ## was presented. Needs `settings.verifyClient = ClientVerify.Optional`/`ClientVerify.Require`; in
   ## those modes OpenSSL has already validated a presented cert during the
   ## handshake, so a non-empty result is a trusted client cert. Always "" over
   ## plaintext (or a -d:plainHttp build).

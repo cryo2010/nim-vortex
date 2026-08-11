@@ -71,7 +71,7 @@ when isMainModule:
                        http3 = false,        # this test is h1/h2 over TLS
                        compress = true)      # gzip (needs -d:httpGzip build)
   if getEnv("INTEROP_MTLS") == "1":
-    s.verifyClient = cvRequire
+    s.verifyClient = ClientVerify.Require
     s.clientCaFile = "/certs/ca.pem"
 
   let srv = newVortex(dispatch, s).start()

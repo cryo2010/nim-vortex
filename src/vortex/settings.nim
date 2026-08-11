@@ -1,29 +1,28 @@
 import std/net
 
 type
-  TlsMinVersion* = enum
-    tlsV12,   ## TLS 1.2 minimum (default; disallows the insecure 1.0/1.1)
-    tlsV13    ## TLS 1.3 only
+  TlsVersion* {.pure.} = enum
+    ## Shared by minTlsVersion and maxTlsVersion. `None` means "unset": as a
+    ## minimum it applies the secure default (TLS 1.2 -- never 1.0/1.1); as a
+    ## maximum it means no cap (up to the newest supported).
+    None,   ## unset (min: default TLS 1.2 floor; max: no cap)
+    V12,    ## TLS 1.2
+    V13     ## TLS 1.3
 
-  TlsMaxVersion* = enum
-    tlsMaxNone,  ## no explicit cap (default; up to the newest supported)
-    tlsMax12,    ## cap at TLS 1.2 (disable 1.3)
-    tlsMax13     ## cap at TLS 1.3
+  ClientVerify* {.pure.} = enum
+    None,      ## no client certificate requested (default)
+    Optional,  ## request a client cert; if presented it must verify (mTLS)
+    Require    ## require a valid client cert or refuse the handshake (mTLS)
 
-  ClientVerify* = enum
-    cvNone,      ## no client certificate requested (default)
-    cvOptional,  ## request a client cert; if presented it must verify (mTLS)
-    cvRequire    ## require a valid client cert or refuse the handshake (mTLS)
-
-  ProxyProtocol* = enum
+  ProxyProtocol* {.pure.} = enum
     ## HAProxy PROXY protocol on the listener, for recovering the real client
     ## address behind an L4 / TLS-passthrough load balancer (feeds
     ## req.remoteAddress). Only honored from a trusted peer (trustedProxies).
-    ppDisabled,  ## never read a PROXY header (default)
-    ppOptional,  ## from a trusted peer, consume a PROXY header if present;
-                 ## otherwise treat the bytes as normal traffic
-    ppRequire    ## require a valid PROXY header from a trusted peer; drop
-                 ## the connection otherwise
+    Disabled,  ## never read a PROXY header (default)
+    Optional,  ## from a trusted peer, consume a PROXY header if present;
+               ## otherwise treat the bytes as normal traffic
+    Require    ## require a valid PROXY header from a trusted peer; drop
+               ## the connection otherwise
 
   SniCertEntry* = object
     ## A per-hostname certificate for SNI. `host` selects it; the cert/key come
@@ -94,8 +93,8 @@ type
     clientCaPem*: string      ## CA (in-memory PEM) to verify client certs against
     sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
-    minTlsVersion*: TlsMinVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
-    maxTlsVersion*: TlsMaxVersion  ## highest accepted TLS version (TCP; default = no cap)
+    minTlsVersion*: TlsVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
+    maxTlsVersion*: TlsVersion  ## highest accepted TLS version (TCP; default = no cap)
     ocspFile*: string         ## DER OCSP response to staple (file; default cert)
     ocspResponse*: string     ## DER OCSP response to staple (in-memory bytes)
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
@@ -108,7 +107,7 @@ proc initVortexConfig*(
     workerThreads = 0,
     listenBacklog = 1024,
     reusePort = true,
-    proxyProtocol = ppDisabled,
+    proxyProtocol = ProxyProtocol.Disabled,
     trustedProxies: seq[string] = @[],
     maxHeaderSize = 16 * 1024,
     maxHeaderCount = 100,
@@ -139,15 +138,15 @@ proc initVortexConfig*(
     keyPassword = "",
     pkcs12File = "",
     pkcs12 = "",
-    verifyClient = cvNone,
+    verifyClient = ClientVerify.None,
     clientCaFile = "",
     clientCaPem = "",
     sni: seq[SniCertEntry] = @[],
-    maxTlsVersion = tlsMaxNone,
+    maxTlsVersion = TlsVersion.None,
     ocspFile = "",
     ocspResponse = "",
     http3 = true,
-    minTlsVersion = tlsV12,
+    minTlsVersion = TlsVersion.V12,
     tlsCipherList = "",
     tlsCipherSuites = ""
 ): VortexConfig =

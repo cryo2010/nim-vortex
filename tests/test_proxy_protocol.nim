@@ -42,11 +42,11 @@ proc v2(): string =
 const v1 = "PROXY TCP4 203.0.113.7 198.51.100.2 12345 443\r\n"
 
 # Server A: optional, trust any direct peer (empty list).
-var srvA = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, proxyProtocol = ppOptional)).start(0)
+var srvA = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, proxyProtocol = ProxyProtocol.Optional)).start(0)
 # Server B: require, loopback trusted.
-var srvB = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, proxyProtocol = ppRequire, trustedProxies = @["127.0.0.0/8"])).start(0)
+var srvB = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, proxyProtocol = ProxyProtocol.Require, trustedProxies = @["127.0.0.0/8"])).start(0)
 # Server C: require, loopback NOT trusted.
-var srvC = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, proxyProtocol = ppRequire, trustedProxies = @["10.0.0.0/8"])).start(0)
+var srvC = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, proxyProtocol = ProxyProtocol.Require, trustedProxies = @["10.0.0.0/8"])).start(0)
 
 suite "PROXY protocol":
   test "v1 header from a trusted peer overrides remoteAddress":
