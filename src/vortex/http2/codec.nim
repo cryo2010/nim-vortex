@@ -3,7 +3,7 @@
 ## One H2Conn per connection, touched only by the owning loop thread
 ## (workers respond through the protocol-neutral outbox).
 
-import std/[tables, strutils, uri]
+import std/[tables, strutils, uri, json]
 import ./frames, ./hpack
 import ../connection
 import ../websocket/codec as wscodec
@@ -21,8 +21,10 @@ type
     contentLength*: int64            ## -1 unknown; validated vs body
     urlCached*: bool                 ## lazy per-request caches
     queryCached*: bool
+    jsonCached*: bool
     cachedUrl*: Uri
     cachedQuery*: Table[string, string]
+    cachedJson*: JsonNode
     pathParams*: PathParams          ## written by the router at match time
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
