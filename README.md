@@ -13,7 +13,7 @@ proc handler(req: Request, res: Response) {.async.} =
   of "/":
     req.blocking: # runs on the worker pool
       let data = expensiveBlockingCall()
-      res.send(Http200, data, %*{"Content-Type": "application/json"})
+      res.send(Http200, data)   # object/JSON body -> application/json automatically
   else:
     res.send(Http404)
 
@@ -350,7 +350,7 @@ you need through `req`:
 proc handler(req: Request, res: Response) {.async.} =
   req.blocking:
     let rows = db.getAllRows(sql"select …")   # blocking is safe here
-    res.send(Http200, $rows, %*{"Content-Type": "application/json"})
+    res.send(Http200, rows)   # seq -> JSON array, application/json automatically
 ```
 
 #### Requests
@@ -829,8 +829,8 @@ Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 
 ```nim
 proc handler(req: Request, res: Response) =
-  res.send(Http200, body,   # enable HSTS only over TLS
-           securityHeaders(hsts = req.isSecure) & @[("Content-Type", "application/json")])
+  # JSON body -> application/json automatically; enable HSTS only over TLS
+  res.send(Http200, %*{"ok": true}, securityHeaders(hsts = req.isSecure))
 ```
 
 Gate cross-site WebSocket hijacking with `req.originAllowed`, and drive a
