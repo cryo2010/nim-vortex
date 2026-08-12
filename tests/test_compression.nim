@@ -22,9 +22,9 @@ const bigText = "The quick brown fox jumps over the lazy dog. ".repeat(120)  # ~
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
-  of "/big":   res.send(Http200, bigText, "text/plain")
-  of "/small": res.send(Http200, "tiny", "text/plain")
-  of "/png":   res.send(Http200, bigText, "image/png")   # not compressible
+  of "/big":   res.send(Http200, bigText)
+  of "/small": res.send(Http200, "tiny")
+  of "/png":   res.send(Http200, bigText, @[("Content-Type", "image/png")])   # not compressible
   else:        res.send(Http404)
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, compress = true)).start(0)

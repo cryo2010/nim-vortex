@@ -68,12 +68,12 @@ proc watch(req: Request, fut: Future[void]) =
     # send already ran inline during dispatch, so skip the callback
     # queue, the pump, and the kick entirely.
     if fut.failed:
-      response(req).send(Http500, "500 Internal Server Error", "text/plain")
+      response(req).send(Http500, "500 Internal Server Error")
     return
   ensurePump(req.core)               # pump only once something suspends
   fut.addCallback proc () {.gcsafe.} =
     if fut.failed:
-      response(req).send(Http500, "500 Internal Server Error", "text/plain")
+      response(req).send(Http500, "500 Internal Server Error")
     if req.core.kick != nil:
       req.core.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
 

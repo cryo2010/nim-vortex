@@ -12,7 +12,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
       ws.send(data, kind)
   else:
-    res.send(Http200, "http", "text/plain")
+    res.send(Http200, "http")
 
 # Small HTTP body limit but a larger WebSocket message limit: a message
 # between the two must still be accepted (the buffer cap is WS-specific).

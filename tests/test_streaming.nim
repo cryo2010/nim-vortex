@@ -57,7 +57,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.sendHead(Http200, "application/octet-stream")
     pump(res)
   else:
-    res.send(Http404, "nope", "text/plain")
+    res.send(Http404, "nope")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port

@@ -13,7 +13,7 @@ proc handler(req: Request, res: Response) {.async.} =
   of "/":
     req.blocking: # runs on the worker pool
       let data = expensiveBlockingCall()
-      res.send(Http200, data, "application/json")
+      res.send(Http200, data, %*{"Content-Type": "application/json"})
   else:
     res.send(Http404)
 
@@ -128,7 +128,7 @@ Vortex is future-agnostic and ships with three server options:
 import vortex
 
 proc handler(req: Request, res: Response) =
-  res.send(Http200, "Hello, World!", "text/plain")
+  res.send(Http200, "Hello, World!")
 
 newVortex(handler).serve(8080)
 ```
@@ -138,7 +138,7 @@ newVortex(handler).serve(8080)
 import vortex/asyncdispatch
 
 proc handler(req: Request, res: Response) {.async.} =
-  res.send(Http200, "Hello, World!", "text/plain")
+  res.send(Http200, "Hello, World!")
 
 newVortex(handler).serve(8080)
 ```
@@ -148,7 +148,7 @@ newVortex(handler).serve(8080)
 import vortex/chronos
 
 proc handler(req: Request, res: Response) {.async.} =
-  res.send(Http200, "Hello, World!", "text/plain")
+  res.send(Http200, "Hello, World!")
 
 newVortex(handler).serve(8080)
 ```
@@ -350,7 +350,7 @@ you need through `req`:
 proc handler(req: Request, res: Response) {.async.} =
   req.blocking:
     let rows = db.getAllRows(sql"select …")   # blocking is safe here
-    res.send(Http200, $rows, "application/json")
+    res.send(Http200, $rows, %*{"Content-Type": "application/json"})
 ```
 
 #### Requests
@@ -397,7 +397,7 @@ proc handler(req: Request, res: Response) =
     let term = req.query.getOrDefault("q")
     let agent = req.header("user-agent")
     echo req.remoteAddress, " ", req.httpVersion, " ", term, " ", agent
-    res.send(Http200, "results for " & term, "text/plain")
+    res.send(Http200, "results for " & term)
   else:
     res.send(Http404)
 ```
@@ -410,8 +410,8 @@ through a dead connection is a safe no-op.
 
 | Member | Type | Description |
 |--------|--------|---------------|
-| `res.send(code, body = "", contentType = "", headers = [])` | `void` | queue a buffered response (compressed when eligible); also `res.send(code)` and an `int`-code overload |
-| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified as `application/json` (convert a Table/object with `%`/`%*`) |
+| `res.send(code, body = "", headers = [])` | `void` | queue a buffered response (compressed when eligible). `Content-Type` defaults to `text/plain` unless present in `headers` (which wins). `headers` may be a JSON object (`%*{...}`); also `res.send(code)` and `int`-code overloads |
+| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json`. Convert a Table/object with `%`/`%*` |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
@@ -433,12 +433,12 @@ Two helpers build header pairs to pass in `res.send`'s `headers`:
 ```nim
 proc handler(req: Request, res: Response) =
   case req.path
-  of "/":       res.send(Http200, "hi", "text/plain")
+  of "/":       res.send(Http200, "hi")
   of "/old":    res.redirect("/new", permanent = true)
   of "/login":
-    res.send(Http200, "{}", "application/json",
+    res.send(Http200, %*{},   # {} body -> application/json automatically
              @[setCookie("sid", newSession(), maxAge = 3600)])
-  else:         res.send(Http404, "not found", "text/plain")
+  else:         res.send(Http404, "not found")
 ```
 
 For JSON, `req.json` parses the body (cached per request; `{}` on an empty body,
@@ -461,7 +461,7 @@ in `res.send`'s `headers`. It defaults to the OWASP session-management baseline
 
 ```nim
 proc login(req: Request, res: Response) =
-  res.send(Http200, "{}", "application/json",
+  res.send(Http200, %*{},
            @[setCookie("sid", newSession(), maxAge = 3600)])   # session cookie
 ```
 
@@ -472,8 +472,9 @@ session cookie); set `secure = false` only for local plaintext development. Emit
 several cookies by passing several pairs:
 
 ```nim
-res.send(Http200, body, "text/html",
-         @[setCookie("sid", sid, maxAge = 3600),
+res.send(Http200, body,
+         @[("Content-Type", "text/html"),
+           setCookie("sid", sid, maxAge = 3600),
            setCookie("theme", "dark", httpOnly = false, maxAge = 31536000)])
 ```
 
@@ -677,7 +678,7 @@ handler, which is why file serving and SSE are built on these primitives:
 
 ```nim
 proc handler(req: Request, res: Response) =
-  res.sendHead(Http200, "text/plain")   # status + headers, no Content-Length
+  res.sendHead(Http200)   # status + headers, no Content-Length
   discard res.write("first chunk\n")
   discard res.write("second chunk\n")
   res.finish()                          # terminate the body
@@ -738,7 +739,7 @@ proc handler(req: Request, res: Response) =
     ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) =
       discard
   else:
-    res.send(Http200, "…", "text/html")
+    res.send(Http200, "…", %*{"Content-Type": "text/html"})
 
 newVortex(handler).serve(8080)
 ```
@@ -827,8 +828,8 @@ Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 
 ```nim
 proc handler(req: Request, res: Response) =
-  res.send(Http200, body, "application/json",
-           securityHeaders(hsts = req.isSecure))   # enable HSTS only over TLS
+  res.send(Http200, body,   # enable HSTS only over TLS
+           securityHeaders(hsts = req.isSecure) & @[("Content-Type", "application/json")])
 ```
 
 Gate cross-site WebSocket hijacking with `req.originAllowed`, and drive a

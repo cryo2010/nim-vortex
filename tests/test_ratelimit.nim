@@ -7,9 +7,9 @@ import vortex/[settings, request, server, ratelimit]
 proc handler(req: Request, res: Response) {.gcsafe.} =
   # ~0 refill so burst is the only budget in the test window; burst 3 per IP.
   if not rateLimit(req.remoteAddress, 0.0001, 3):
-    res.send(Http429, "slow down", "text/plain")
+    res.send(Http429, "slow down")
   else:
-    res.send(Http200, "ok", "text/plain")
+    res.send(Http200, "ok")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port

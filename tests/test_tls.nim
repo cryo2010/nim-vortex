@@ -15,9 +15,9 @@ doAssert genRc == 0, "cert generation failed: " & genOut
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
-    res.send(Http200, "hello over TLS", "text/plain")
+    res.send(Http200, "hello over TLS")
   of "/echo":
-    res.send(Http200, req.body, req.header("Content-Type"))
+    res.send(Http200, req.body, @[("Content-Type", req.header("Content-Type"))])
   else:
     res.send(Http404)
 

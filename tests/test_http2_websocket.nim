@@ -29,7 +29,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       else:
         ws.send(data, kind)                    # echo, same kind
   else:
-    res.send(Http200, "not ws", "text/plain")
+    res.send(Http200, "not ws")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 4)).start(0)
 let port = srv.port

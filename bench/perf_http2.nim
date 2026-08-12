@@ -36,7 +36,7 @@ const
 
 proc serveOurs(port: int, threads: int) =
   proc handler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   newVortex(handler,
     vortex.initVortexConfig(port = net.Port(port), numThreads = threads)).serve()
 
@@ -45,7 +45,7 @@ proc serveOursAsync(port: int) =
   ## independent, so awaits do not pause the connection (unlike h1).
   proc h(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
     await sleepAsync(0)
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   newVortex(toHandler(h),
     vortex.initVortexConfig(port = net.Port(port), numThreads = 0)).serve()
 

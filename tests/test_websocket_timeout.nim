@@ -8,7 +8,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
       ws.send(data, kind)
   else:
-    res.send(Http200, "http", "text/plain")
+    res.send(Http200, "http")
 
 # Fast keepalive so the test runs in a few seconds.
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, wsPingInterval = 1, wsPongTimeout = 1)).start(0)

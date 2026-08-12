@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `req.json` parses the request body as JSON (cached per request; empty body is
+  `{}`, raises `JsonParsingError` on malformed input), and `res.send(code, json)`
+  replies with `application/json`. vortex now re-exports `std/json`, so
+  `JsonNode`/`%`/`%*`/`parseJson` come with `import vortex`.
+- `res.send` accepts `headers` as a JSON object (`res.send(Http200, body,
+  %*{"X-Trace": "abc"})`).
+
+### Changed
+
+- **Breaking:** `res.send` no longer takes a `contentType` parameter; set the
+  content type through `headers` instead. When `headers` has no `Content-Type`,
+  one is injected automatically: `text/plain` for a string body,
+  `application/json` for a `JsonNode` body. A `Content-Type` in `headers` always
+  wins (no more duplicate header when it was passed both ways). Migration:
+  `res.send(code, body, "text/plain")` -> `res.send(code, body)`;
+  `res.send(code, body, "text/html")` -> `res.send(code, body,
+  %*{"Content-Type": "text/html"})` (or a `@[("Content-Type", "text/html")]`
+  seq). `res.sendHead` (streaming) still takes `contentType`.
+
 ## [0.1.0] - 2026-08-10
 
 Initial release: a fast, POSIX HTTP server for Nim speaking HTTP/1.1, HTTP/2,

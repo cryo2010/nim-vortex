@@ -10,7 +10,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       if data == "proto?": ws.send(ws.subprotocol)   # report the negotiated one
       else: ws.send(data, kind)
   else:
-    res.send(Http200, "http", "text/plain")
+    res.send(Http200, "http")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port

@@ -16,7 +16,7 @@ proc hUpload(req: Request, res: Response) {.gcsafe.} =
     acc[].setLen(base + chunk.len)
     for i in 0 ..< chunk.len: acc[][base + i] = chunk[i]
     if last:
-      res.send(Http200, "got " & $acc[].len, "text/plain")
+      res.send(Http200, "got " & $acc[].len)
 
 proc hEchoStream(req: Request, res: Response) {.gcsafe.} =
   let acc = new(string)
@@ -25,15 +25,15 @@ proc hEchoStream(req: Request, res: Response) {.gcsafe.} =
     acc[].setLen(base + chunk.len)
     for i in 0 ..< chunk.len: acc[][base + i] = chunk[i]
     if last:
-      res.send(Http200, acc[], "application/octet-stream")
+      res.send(Http200, acc[], @[("Content-Type", "application/octet-stream")])
 
 proc hBuffered(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "buffered:" & $req.body.len, "text/plain")
+  res.send(Http200, "buffered:" & $req.body.len)
 
 proc hReject(req: Request, res: Response) {.gcsafe.} =
   ## Streaming route that rejects at headers-complete without reading the body,
   ## so no 100 Continue is ever sent (Go's respond-before-read).
-  res.send(Http403, "nope", "text/plain")
+  res.send(Http403, "nope")
 
 var rt = newRouter()
 rt.stream(HttpPost, "/upload", hUpload)

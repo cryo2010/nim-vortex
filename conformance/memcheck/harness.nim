@@ -87,11 +87,11 @@ proc slowH(req: Request, res: Response) {.gcsafe.} =
   # In-flight work on the worker pool: exercises the graceful-drain path.
   req.blocking:
     sleep(40)
-    res.send(Http200, "slow-done", "text/plain")
+    res.send(Http200, "slow-done")
 
 when isAsync:
   proc rootH(req: Request, res: Response) {.async.} =
-    res.send(Http200, bodyText, "text/plain")
+    res.send(Http200, bodyText)
   proc downH(req: Request, res: Response) {.async.} =
     res.stream(Http200, "text/plain"):
       for i in 0 ..< downCount:
@@ -103,7 +103,7 @@ when isAsync:
       discard chunk
 else:
   proc rootH(req: Request, res: Response) {.gcsafe.} =
-    res.send(Http200, bodyText, "text/plain")
+    res.send(Http200, bodyText)
   proc downH(req: Request, res: Response) {.gcsafe.} =
     res.stream(Http200, "text/plain"):
       for i in 0 ..< downCount:
@@ -112,7 +112,7 @@ else:
     var total = 0
     req.stream(chunk, last):
       total += chunk.len
-      if last: res.send(Http200, "up:" & $total, "text/plain")
+      if last: res.send(Http200, "up:" & $total)
 
 proc buildRouter(): Router =
   result = newRouter()

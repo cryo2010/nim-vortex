@@ -22,7 +22,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
                req.body.len + req.remoteAddress.len + req.params.len +
                (if req.isSecure: 1 else: 0)
     doAssert sink >= 0
-    res.send(Http200, "ok", "text/plain")
+    res.send(Http200, "ok")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 4)).start(0)
 let port = srv.port

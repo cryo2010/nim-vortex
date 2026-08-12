@@ -8,7 +8,7 @@ import std/os
 import vortex
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 when isMainModule:
   # HTTP/3 over QUIC on UDP 4433 with a throwaway self-signed cert (the client

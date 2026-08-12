@@ -29,9 +29,9 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     var total = 0
     req.stream(chunk, last):
       total += chunk.len
-      if last: res.send(Http200, "got " & $total, "text/plain")
+      if last: res.send(Http200, "got " & $total)
   else:
-    res.send(Http404, "nope", "text/plain")
+    res.send(Http404, "nope")
 
 # streamPaths (router-free) opts /upload into inbound streaming; /events is a
 # plain buffered handler that happens to stream its *response*.

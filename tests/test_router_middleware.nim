@@ -23,11 +23,11 @@ proc requireKey(next: RequestHandler): RequestHandler =
     if req.header("x-key") == "letmein":
       inner(req, res)
     else:
-      res.send(Http403, "forbidden", "text/plain")   # short-circuit: skip inner
+      res.send(Http403, "forbidden")   # short-circuit: skip inner
 
 proc hOk(req: Request, res: Response) {.gcsafe.} =
   {.cast(gcsafe).}: trace.add "handler"
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 proc req(port: Port, path: string, headers: seq[(string, string)] = @[]):
     tuple[code: int, body: string] =

@@ -22,7 +22,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
         ws.send(msg)                        # echo, in order
         discard concurrent.fetchSub(1)
   else:
-    res.send(Http200, "http", "text/plain")
+    res.send(Http200, "http")
 
 # Several workers so concurrency is possible; a single loop thread owns the
 # one test connection.

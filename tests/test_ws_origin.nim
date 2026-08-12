@@ -10,10 +10,9 @@ const allow = ["https://good.example", "https://also-good.example"]
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
-  of "/strict":  res.send(Http200, $req.originAllowed(allow), "text/plain")
-  of "/lenient": res.send(Http200, $req.originAllowed(allow, allowMissing = true),
-                          "text/plain")
-  of "/origin":  res.send(Http200, req.origin, "text/plain")
+  of "/strict":  res.send(Http200, $req.originAllowed(allow))
+  of "/lenient": res.send(Http200, $req.originAllowed(allow, allowMissing = true))
+  of "/origin":  res.send(Http200, req.origin)
   else: res.send(Http404)
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)

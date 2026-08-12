@@ -6,11 +6,11 @@ import ./helper
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
-    res.send(Http200, "fast", "text/plain")
+    res.send(Http200, "fast")
   of "/slow":
     req.blocking:
       sleep(300)                       # blocking is legal here
-      res.send(Http200, "slow done", "text/plain")
+      res.send(Http200, "slow done")
   of "/slowboom":
     req.blocking:
       sleep(50)
@@ -18,7 +18,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/echo-slow":
     req.blocking:
       sleep(50)
-      res.send(Http200, req.body, req.header("Content-Type"))
+      res.send(Http200, req.body, @[("Content-Type", req.header("Content-Type"))])
   of "/noresp":
     req.blocking:
       sleep(20)                          # finishes without responding at all
@@ -120,7 +120,7 @@ proc hangHandler(req: Request, res: Response) {.gcsafe.} =
   if req.path == "/hang":
     discard                              # never responds
   else:
-    res.send(Http200, "ok", "text/plain")
+    res.send(Http200, "ok")
 
 var tsrv = newVortex(RequestHandler(hangHandler), initVortexConfig(numThreads = 1, responseTimeout = 1)).start(0)
 let tbase = "http://127.0.0.1:" & $tsrv.port

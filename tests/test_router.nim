@@ -3,27 +3,26 @@ import std/httpclient except Response
 import vortex/[settings, request, server, routing]
 
 proc hRoot(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "root", "text/plain")
+  res.send(Http200, "root")
 
 proc hUsers(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "user=" & req.param("id"), "text/plain")
+  res.send(Http200, "user=" & req.param("id"))
 
 proc hUserPosts(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200,
-    "user=" & req.param("id") & " post=" & req.param("post"),
-    "text/plain")
+    "user=" & req.param("id") & " post=" & req.param("post"))
 
 proc hStatic(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "file=" & req.param("*"), "text/plain")
+  res.send(Http200, "file=" & req.param("*"))
 
 proc hCreate(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http201, "created:" & req.body, "text/plain")
+  res.send(Http201, "created:" & req.body)
 
 proc hSlowUser(req: Request, res: Response) {.gcsafe.} =
   req.blocking:
     # Route params are per-request state, so they survive into
     # capture-free worker bodies (impossible with parameter passing).
-    res.send(Http200, "worker user=" & req.param("id"), "text/plain")
+    res.send(Http200, "worker user=" & req.param("id"))
 
 var appRouter = newRouter()
 appRouter.get("/slow-users/:id", hSlowUser)

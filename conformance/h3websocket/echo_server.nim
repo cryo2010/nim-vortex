@@ -14,7 +14,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       if data == "proto?": ws.send(ws.subprotocol)
       else: ws.send(data, kind)               # echo, preserving the kind
   else:
-    res.send(Http200, "vortex h3 websocket echo", "text/plain")
+    res.send(Http200, "vortex h3 websocket echo")
 
 when isMainModule:
   # HTTP/3 over QUIC on UDP 4433; a throwaway self-signed cert (the client

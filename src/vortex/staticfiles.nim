@@ -122,7 +122,7 @@ proc resolveTail(raw: string): (bool, string) =
 
 # --- worker: stat, validate, range, read, send -----------------------------
 
-proc notFound(res: Response) = res.send(Http404, "404 Not Found", "text/plain")
+proc notFound(res: Response) = res.send(Http404, "404 Not Found")
 
 proc readSlice(path: string, start, length: int): string =
   var f = open(path, fmRead)
@@ -230,13 +230,13 @@ proc serveResolved(req: Request, res: Response, data: string)
   if useEtag:
     let inm = req.header("if-none-match")
     if inm.len > 0 and etagMatches(inm, etag):
-      res.send(Http304, "", "", hdrs); return
+      res.send(Http304, "", hdrs); return
   elif useLastMod:
     let ims = req.header("if-modified-since")
     if ims.len > 0:
       let (ok, imsT) = parseHttpDate(ims)
       if ok and mtime.toUnix <= imsT.toUnix:
-        res.send(Http304, "", "", hdrs); return
+        res.send(Http304, "", hdrs); return
 
   # Range (single). If-Range gates it: only apply when the validator still
   # matches, else serve the full 200.
@@ -255,7 +255,7 @@ proc serveResolved(req: Request, res: Response, data: string)
       let (satisfiable, rs, re) = parseRange(rangeHdr, size)
       if not satisfiable:
         hdrs.add ("Content-Range", "bytes */" & $size)
-        res.send(HttpCode(416), "", "text/plain", hdrs); return
+        res.send(HttpCode(416), "", hdrs); return
       if not (rs == 0 and re == size - 1):
         s = rs; e = re; partial = true
 
@@ -282,11 +282,12 @@ proc serveResolved(req: Request, res: Response, data: string)
            else: readFile(real)
   except CatchableError: notFound(res); return
 
+  hdrs.add ("Content-Type", mime)
   if partial:
     hdrs.add ("Content-Range", "bytes " & $s & "-" & $e & "/" & $size)
-    res.send(HttpCode(206), body, mime, hdrs)
+    res.send(HttpCode(206), body, hdrs)
   else:
-    res.send(Http200, body, mime, hdrs)
+    res.send(Http200, body, hdrs)
 
 proc pack(candidate, rootReal: string, opts: StaticOptions): string =
   candidate & '\0' & rootReal & '\0' & opts.index & '\0' & opts.cacheControl &
@@ -322,7 +323,7 @@ proc staticHandler*(rootDir: string, opts = staticOptions()): RequestHandler =
   proc (req: Request, res: Response) {.gcsafe.} =
     let (ok, rel) = resolveTail(req.param("*"))
     if not ok:
-      res.send(Http404, "404 Not Found", "text/plain")
+      res.send(Http404, "404 Not Found")
       return
     let candidate = if rel.len == 0: rootReal else: rootReal / rel
     dispatchBlockingData(req, serveResolved, pack(candidate, rootReal, opts))

@@ -7,7 +7,7 @@ import std/[unittest, net, strutils, httpcore]
 import vortex/[settings, request, server]
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port

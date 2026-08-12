@@ -13,7 +13,7 @@ proc echoJson(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, %*{"hello": name, "age": age})
 
 proc emptyOut(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, $req.json, "text/plain")          # empty body -> {}
+  res.send(Http200, $req.json)          # empty body -> {}
 
 proc tableOut(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, %{"a": "1", "b": "2"}.toTable)     # % converts a Table

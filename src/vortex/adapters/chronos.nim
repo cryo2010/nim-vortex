@@ -86,7 +86,7 @@ proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
   ## if the body already answered).
   if failed:
-    response(req).send(Http500, "500 Internal Server Error", "text/plain")
+    response(req).send(Http500, "500 Internal Server Error")
   if req.core.kick != nil:
     req.core.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
 
@@ -96,7 +96,7 @@ proc watch(req: Request, fut: Future[void]) =
     # Completed without suspending: any send already ran inline during
     # dispatch, so skip the callback queue, the pump, and the kick.
     if fut.failed:
-      response(req).send(Http500, "500 Internal Server Error", "text/plain")
+      response(req).send(Http500, "500 Internal Server Error")
     return
   ensurePump(req.core)               # pump only once something suspends
   inc pendingOps

@@ -33,11 +33,11 @@ proc echoHandler(req: Request, res: Response) {.gcsafe.} =
   if req.body.len > 0:
     body.add "body=" & req.body & "\n"
   body.add "pad ".repeat(400)          # ~1.6 KiB, very compressible
-  res.send(Http200, body, "text/plain", @[("x-echo-method", m)])
+  res.send(Http200, body, @[("x-echo-method", m)])
 
 proc whoami(req: Request, res: Response) {.gcsafe.} =
   let s = req.clientCertSubject
-  res.send(Http200, (if s.len > 0: s else: "-"), "text/plain")
+  res.send(Http200, (if s.len > 0: s else: "-"))
 
 # The router is pinned in a global and dispatched from a top-level proc, so the
 # server's handler is a plain proc with a nil closure environment. A capturing
@@ -52,7 +52,7 @@ proc dispatch(req: Request, res: Response) {.gcsafe.} =
   # api-key gating middleware, then route. `appRouter` is set before start()
   # and GC-pinned, then read-only across threads, so the access is safe.
   if req.header("x-api-key") != "interop":
-    res.send(HttpCode(401), "missing or bad x-api-key", "text/plain")
+    res.send(HttpCode(401), "missing or bad x-api-key")
   else:
     {.gcsafe.}: appRouter.route(req, res)
 

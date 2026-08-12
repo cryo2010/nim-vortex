@@ -8,7 +8,7 @@ import vortex/http2/frames
 import ./h2client
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "hello h2", "text/plain")     # 8-byte body
+  res.send(Http200, "hello h2")     # 8-byte body
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 

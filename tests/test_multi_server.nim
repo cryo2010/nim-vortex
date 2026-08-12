@@ -7,7 +7,7 @@ import std/httpclient except Response
 import vortex/[settings, request, server]
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 proc get(port: Port): string =
   var c = newHttpClient()

@@ -304,8 +304,8 @@ proc securityHeaders*(hsts = false, hstsMaxAge = 63072000,
                       permissionsPolicy = "",
                       noSniff = true): seq[(string, string)] =
   ## OWASP Secure Headers baseline as a header list to pass to `res.send`
-  ## (e.g. `res.send(Http200, body, "application/json", securityHeaders(hsts =
-  ## req.isSecure))`). Defaults suit an API/JSON endpoint (a locked-down CSP);
+  ## (e.g. `res.send(Http200, body, securityHeaders(hsts = req.isSecure))`).
+  ## Defaults suit an API/JSON endpoint (a locked-down CSP);
   ## for an HTML page pass an appropriate `contentSecurityPolicy` and
   ## `frameOptions`. Enable `hsts` only over TLS -- Strict-Transport-Security on
   ## plain HTTP is ignored and misleading, so gate it on `req.isSecure`.
@@ -675,16 +675,28 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc == "gzip": return GzipStream(comp).compress(data, last)
     ""
 
-proc send*(res: Response, code: HttpCode, body: openArray[char],
-           contentType = "", headers: openArray[(string, string)] = []) =
-  ## Queue the response. Safe to call once per request, from the handler,
-  ## later (deferred), or from a worker thread inside `blocking:`; no-op
-  ## if the connection is already gone. With `settings.compress` and a
-  ## compression build (`-d:httpBrotli`, `-d:httpZstd` and/or `-d:httpGzip`), an
-  ## eligible body is compressed with the best encoding the client accepts.
+proc contentTypeOf(headers: openArray[(string, string)]): string =
+  ## The Content-Type already present in `headers` ("" if none, case-insensitive).
+  for (n, v) in headers:
+    if cmpIgnoreCase(n, "content-type") == 0: return v
+
+proc toHeaderPairs(j: JsonNode): seq[(string, string)] =
+  ## Header pairs from a JSON object: string values pass through, others are
+  ## stringified (`{"X-Count": 5}` -> `("X-Count", "5")`).
+  if j == nil or j.kind != JObject: return
+  for k, v in j.pairs:
+    result.add (k, (if v.kind == JString: v.getStr else: $v))
+
+proc sendBody(res: Response, code: HttpCode, body: openArray[char],
+              defaultCt: string, headers: openArray[(string, string)]) =
+  ## Shared send path. Content-Type is `defaultCt` unless `headers` already
+  ## carries one, which then wins (never a duplicate). Compresses when eligible.
+  let ctHdr = contentTypeOf(headers)
+  let effCt = if ctHdr.len > 0: ctHdr else: defaultCt   # for compressibility
+  let writeCt = if ctHdr.len > 0: "" else: defaultCt    # skip if headers have it
   when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if res.core.compress and body.len >= compressMinSize and
-        compressibleType(contentType) and not hasContentEncoding(headers):
+        compressibleType(effCt) and not hasContentEncoding(headers):
       let enc = chooseEncoding(Request(core: res.core, fd: res.fd,
                                        gen: res.gen, stream: res.stream))
       var packed = ""
@@ -699,26 +711,50 @@ proc send*(res: Response, code: HttpCode, body: openArray[char],
         for h in headers: hh.add h
         hh.add ("content-encoding", enc)
         hh.add ("vary", "accept-encoding")
-        sendRaw(res, code, packed, contentType, hh)
+        sendRaw(res, code, packed, writeCt, hh)
         return
-  sendRaw(res, code, body, contentType, headers)
+  sendRaw(res, code, body, writeCt, headers)
 
-proc send*(res: Response, code: HttpCode) =
-  send(res, code, "", "")
-
-proc send*(res: Response, code: int, body: openArray[char],
-           contentType = "", headers: openArray[(string, string)] = []) =
-  send(res, HttpCode(code), body, contentType, headers)
+proc send*(res: Response, code: HttpCode, body: openArray[char],
+           headers: openArray[(string, string)] = []) =
+  ## Queue the response. `Content-Type` defaults to `text/plain` unless a
+  ## `Content-Type` is present in `headers` (which then wins). Safe to call once
+  ## per request -- from the handler, later (deferred), or from a worker inside
+  ## `blocking:` -- and a no-op if the connection is gone. With
+  ## `settings.compress` and a compression build, an eligible body is compressed.
+  sendBody(res, code, body, "text/plain", headers)
 
 proc send*(res: Response, code: HttpCode, json: JsonNode,
            headers: openArray[(string, string)] = []) =
-  ## Send `json` stringified, with `Content-Type: application/json`. Convert a
-  ## Table, object, seq, etc. at the call site with `%`/`%*`:
-  ## `res.send(Http200, %*{"ok": true})`, `res.send(Http200, %myTable)`.
-  send(res, code, $json, "application/json", headers)
+  ## Send `json` stringified; `Content-Type` defaults to `application/json`
+  ## (a `Content-Type` in `headers` overrides it). Convert a Table/object with
+  ## `%`/`%*`: `res.send(Http200, %*{"ok": true})`, `res.send(Http200, %myTable)`.
+  sendBody(res, code, $json, "application/json", headers)
+
+proc send*(res: Response, code: HttpCode, body: openArray[char], headers: JsonNode) =
+  ## As `send` above, with headers as a JSON object:
+  ## `res.send(Http200, "hi", %*{"X-Trace": "abc"})`.
+  send(res, code, body, toHeaderPairs(headers))
+
+proc send*(res: Response, code: HttpCode, json: JsonNode, headers: JsonNode) =
+  send(res, code, json, toHeaderPairs(headers))
+
+proc send*(res: Response, code: HttpCode) =
+  ## An empty-body response (no Content-Type).
+  sendRaw(res, code, "", "", [])
+
+proc send*(res: Response, code: int, body: openArray[char],
+           headers: openArray[(string, string)] = []) =
+  send(res, HttpCode(code), body, headers)
 
 proc send*(res: Response, code: int, json: JsonNode,
            headers: openArray[(string, string)] = []) =
+  send(res, HttpCode(code), json, headers)
+
+proc send*(res: Response, code: int, body: openArray[char], headers: JsonNode) =
+  send(res, HttpCode(code), body, headers)
+
+proc send*(res: Response, code: int, json: JsonNode, headers: JsonNode) =
   send(res, HttpCode(code), json, headers)
 
 when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
@@ -752,9 +788,9 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if isZstd: r = zstdDecode(raw, cap)
     if not r.ok:
       if r.tooLarge:
-        res.send(HttpCode(413), "413 Payload Too Large", "text/plain")
+        res.send(HttpCode(413), "413 Payload Too Large")
       else:
-        res.send(HttpCode(400), "400 Bad Request", "text/plain")
+        res.send(HttpCode(400), "400 Bad Request")
       return false
     # Store the decoded body so req.body returns it (h2/h3 overwrite st.body;
     # h1 uses a dedicated field since its body is a slice of the read buffer).
@@ -779,7 +815,7 @@ proc redirect*(res: Response, location: string, permanent = false,
   ## so subsequent requests skip the plaintext hop entirely.
   var hdrs = @[("Location", location)]
   for h in extraHeaders: hdrs.add h
-  send(res, (if permanent: Http301 else: Http302), "", "text/plain", hdrs)
+  send(res, (if permanent: Http301 else: Http302), "", hdrs)
 
 proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
                 secure = true, httpOnly = true,
@@ -1375,13 +1411,13 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   except Exception:
     # Exception (incl. a catchable Defect): answer 500 rather than let the
     # worker thread abort. The trailing guard still releases the pin.
-    res.send(Http500, "500 Internal Server Error", "text/plain")
+    res.send(Http500, "500 Internal Server Error")
   if onWorker and not workerResponded:
     # The body finished without a response (forgot res.send, or used the
     # loop-thread-only streaming API from a worker, which no-ops here). Emit a
     # default 500 so the client is answered and the outbox push releases the
     # pin this task holds -- otherwise the connection stays pinned forever.
-    res.send(Http500, "500 Internal Server Error", "text/plain")
+    res.send(Http500, "500 Internal Server Error")
 
 proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   ## Pin the connection and hand `fn` to the worker pool. Must be called
@@ -1433,9 +1469,9 @@ proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
   try:
     fn(req, res, data)
   except Exception:
-    res.send(Http500, "500 Internal Server Error", "text/plain")
+    res.send(Http500, "500 Internal Server Error")
   if onWorker and not workerResponded:
-    res.send(Http500, "500 Internal Server Error", "text/plain")
+    res.send(Http500, "500 Internal Server Error")
 
 proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
                            data: sink string) {.raises: [].} =

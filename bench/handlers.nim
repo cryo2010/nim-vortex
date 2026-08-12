@@ -9,9 +9,9 @@ import ../src/vortex
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/plaintext":
-    res.send(Http200, "Hello, World!", "text/plain")
+    res.send(Http200, "Hello, World!")
   of "/json":
-    res.send(Http200, """{"message":"Hello, World!"}""", "application/json")
+    res.send(Http200, """{"message":"Hello, World!"}""", %*{"Content-Type": "application/json"})
   else:
     res.send(Http404)
 

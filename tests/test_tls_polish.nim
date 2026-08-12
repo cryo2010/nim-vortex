@@ -25,7 +25,7 @@ let cert = dir / "cert.pem"
 let key = dir / "key.pem"
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 proc servedSubject(port: Port, servername: string): string =
   let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" & $port &

@@ -23,7 +23,7 @@ proc gen(cert, key, cn: string) =
 gen(liveCert, liveKey, "alpha.vortex")
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 2, certFile = liveCert, keyFile = liveKey)).start(0)
 let port = $srv.port

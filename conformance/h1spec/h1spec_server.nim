@@ -8,7 +8,7 @@ import std/os
 import vortex
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 when isMainModule:
   # Plain HTTP/1.1 on 8080. start() binds before returning, so the
