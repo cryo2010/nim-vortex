@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`res.send(Http200, user)`, `res.send(Http200, (ok: true, n: 3))`).
   `Content-Type` defaults to `application/json`. Anonymous tuples are rejected at
   compile time (use a named tuple, an object, or `%*{...}`).
+- `res.headers` accumulates response headers to send with the eventual `send`
+  (`res.headers["X-Request-Id"] = id`; `add` keeps duplicates like Set-Cookie).
+  Set it from middleware or a handler; the `send` call's `headers` win per name.
+  Buffered `send` only, loop-thread only.
 
 ### Changed
 

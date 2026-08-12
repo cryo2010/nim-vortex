@@ -11,6 +11,17 @@ type
   PathParams* = seq[(string, string)]
     ## Route parameters captured by the router; exposed as req.params.
 
+  ReqKey* = (int32, uint32, uint32)
+    ## Identifies an in-flight request/stream: (fd, generation, stream id).
+    ## HTTP/1 uses stream 0; h2/h3 use the stream id. Keys the pending
+    ## `res.headers` store below.
+
+  ResponseHeaders* = object
+    ## Response headers accumulated via `res.headers` before `send` is called.
+    ## `[]=` overwrites by name (case-insensitive); `add` keeps duplicates (for
+    ## Set-Cookie and friends). Operators live in request.nim (which is exported).
+    s*: seq[(string, string)]
+
   OutMsgKind* = enum
     omHttp,                   ## data is a packed HTTP response (see packResponse)
     omWs,                     ## data is a ready-to-write WebSocket frame
@@ -184,6 +195,10 @@ type
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox
+    respHeaders*: Table[ReqKey, ResponseHeaders]
+      ## Pending `res.headers` per in-flight request, merged in at send and
+      ## dropped once the response is emitted (loop-thread only). Empty for the
+      ## common case, so a non-user pays only one failed lookup per response.
     # Async-adapter integration (see adapters/). All loop-thread only.
     loopPtr*: pointer         ## the owning Loop, for kick
     pumpHook*: proc (): int {.nimcall, gcsafe.}
@@ -303,6 +318,16 @@ proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
 
 proc pendingOut*(c: ptr Connection): int {.inline.} =
   c.wbuf.len - c.wpos
+
+proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
+  ## Drop any pending `res.headers` for a connection/slot being torn down (a
+  ## request that set headers but never sent). No-op when unused; the table is
+  ## normally near-empty, so the scan is cheap.
+  if core.respHeaders.len == 0: return
+  var stale: seq[ReqKey]
+  for k in core.respHeaders.keys:
+    if k[0] == fd and k[1] == gen: stale.add k
+  for k in stale: core.respHeaders.del k
 
 proc resetForNextRequest*(c: var Connection) =
   ## Compact consumed bytes and prepare the parser for a pipelined or

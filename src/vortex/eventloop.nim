@@ -329,6 +329,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
       freeTlsSession(c.ssl)
       c.ssl = nil
   c.h2 = nil
+  clearRespHeaders(addr loop.core, c.fd, c.gen)  # drop pending res.headers, if any
   discard posix.close(cint(c.fd))
   inc c.gen
   c.state = csFree
@@ -983,6 +984,7 @@ when not defined(plainHttp):
     if slot.conn != nil:
       h3Free(H3Conn(slot.conn))
       slot.conn = nil
+    clearRespHeaders(addr loop.core, int32(-(idx + 2)), slot.gen)
     inc slot.gen
     slot.closeReq = false
 
