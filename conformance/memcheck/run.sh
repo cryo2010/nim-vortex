@@ -24,6 +24,21 @@ esac
 # heap. --debugger:native: real symbols/line numbers in tool reports.
 BASE="-p:src -d:plainHttp --mm:$MM --threads:on -d:backend=$TARGET"
 BASE="$BASE -d:useMalloc --debugger:native --hints:off $CODEC"
+
+# chronos is an opt-in dep the CI installs globally (nimble install chronos).
+# Nim's implicit nimble-path discovery is unreliable across container nim builds
+# (e.g. Arch's pacman nim under the tsan job fails `pkg/chronos` even though the
+# install succeeded), so point the compiler at the global package dirs
+# explicitly for the chronos backend.
+if [ "$TARGET" = chronos ]; then
+  NIMBLE_DIR=$(nimble --silent path chronos 2>/dev/null | tail -1)
+  NIMBLE_DIR=${NIMBLE_DIR%/*}                 # .../pkgs2/chronos-x.y.z -> .../pkgs2
+  for d in "$NIMBLE_DIR" "$HOME/.nimble/pkgs2" "$HOME/.nimble/pkgs"; do
+    case " $BASE " in *" --nimblePath:$d "*) continue;; esac
+    [ -n "$d" ] && [ -d "$d" ] && BASE="$BASE --nimblePath:$d"
+  done
+fi
+
 BIN="/tmp/harness_${TOOL}_${SCENARIO}_${TARGET}_${MM}"
 
 echo "== build: TOOL=$TOOL SCENARIO=$SCENARIO TARGET=$TARGET MM=$MM =="
