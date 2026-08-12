@@ -7,7 +7,7 @@
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
 ## streams are independent.
 
-import std/[httpcore, strutils, uri, tables, json]
+import std/[httpcore, strutils, uri, tables, json, options, typetraits]
 import ./connection
 
 export PathParams
@@ -756,6 +756,72 @@ proc send*(res: Response, code: int, body: openArray[char], headers: JsonNode) =
 
 proc send*(res: Response, code: int, json: JsonNode, headers: JsonNode) =
   send(res, HttpCode(code), json, headers)
+
+# --- Structured bodies: send any `%`-able value or a named tuple as JSON ------
+# These forward to the JsonNode overload, so `Content-Type` defaults to
+# application/json (a `Content-Type` in `headers` still wins) and compression
+# applies. `string` keeps its own text/plain overload and `JsonNode` its own;
+# both are concrete matches, so they win over these generics.
+
+type JsonBody* = (object | ref object | Table | OrderedTable | seq | enum | Option)
+  ## Value families std/json's `%` serializes, minus `string` (which has its own
+  ## text/plain overload). Anything you can `%` this way, `res.send` accepts.
+
+proc tupleToJson[T: tuple](t: T): JsonNode   # forward decl (recursion)
+
+proc toJsonField[V](v: V): JsonNode =
+  ## Serialize a tuple field: recurse for nested tuples (std/json's `%` has no
+  ## tuple case), otherwise defer to `%`.
+  when V is tuple: tupleToJson(v) else: %v
+
+proc tupleToJson[T: tuple](t: T): JsonNode =
+  ## Named tuple -> JSON object. A nested anonymous tuple becomes a JSON array; a
+  ## top-level anonymous tuple is rejected at the `send` overload below.
+  when isNamedTuple(T):
+    result = newJObject()
+    for k, v in t.fieldPairs: result[k] = toJsonField(v)
+  else:
+    result = newJArray()
+    for v in t.fields: result.add toJsonField(v)
+
+proc send*[T: JsonBody](res: Response, code: HttpCode, body: T,
+                        headers: openArray[(string, string)] = []) =
+  ## Send any `%`-able value as JSON (`Content-Type` defaults to
+  ## `application/json`): `res.send(Http200, user)`, `res.send(Http200, myTable)`,
+  ## `res.send(Http200, @[1, 2, 3])`. Tables must be string-keyed.
+  send(res, code, %body, headers)
+
+proc send*[T: JsonBody](res: Response, code: HttpCode, body: T, headers: JsonNode) =
+  send(res, code, %body, headers)
+
+proc send*[T: JsonBody](res: Response, code: int, body: T,
+                        headers: openArray[(string, string)] = []) =
+  send(res, HttpCode(code), body, headers)
+
+proc send*[T: JsonBody](res: Response, code: int, body: T, headers: JsonNode) =
+  send(res, HttpCode(code), body, headers)
+
+proc send*[T: tuple](res: Response, code: HttpCode, body: T,
+                     headers: openArray[(string, string)] = []) =
+  ## Send a named tuple as a JSON object: `res.send(Http200, (ok: true, n: 3))`.
+  ## Anonymous tuples are rejected (their array mapping is a footgun) -- use a
+  ## named tuple, an object, or `%*{...}`. Note: a tuple nested inside an object
+  ## or seq you send won't compile (std/json's `%` has no tuple case); wrap it in
+  ## an object or convert with `%*{...}`.
+  when not isNamedTuple(T):
+    {.error: "res.send accepts named tuples only (got an anonymous tuple); " &
+             "use a named tuple, an object, or %*{...}.".}
+  send(res, code, tupleToJson(body), headers)
+
+proc send*[T: tuple](res: Response, code: HttpCode, body: T, headers: JsonNode) =
+  send(res, code, body, toHeaderPairs(headers))
+
+proc send*[T: tuple](res: Response, code: int, body: T,
+                     headers: openArray[(string, string)] = []) =
+  send(res, HttpCode(code), body, headers)
+
+proc send*[T: tuple](res: Response, code: int, body: T, headers: JsonNode) =
+  send(res, HttpCode(code), body, headers)
 
 when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
   proc decodeRequestBody*(req: Request, res: Response): bool =

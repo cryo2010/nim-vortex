@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `JsonNode`/`%`/`%*`/`parseJson` come with `import vortex`.
 - `res.send` accepts `headers` as a JSON object (`res.send(Http200, body,
   %*{"X-Trace": "abc"})`).
+- `res.send` accepts any `%`-able value as a JSON body: an object, `ref object`,
+  string-keyed `Table`/`OrderedTable`, `seq`, `enum`, `Option`, or a named tuple
+  (`res.send(Http200, user)`, `res.send(Http200, (ok: true, n: 3))`).
+  `Content-Type` defaults to `application/json`. Anonymous tuples are rejected at
+  compile time (use a named tuple, an object, or `%*{...}`).
 
 ### Changed
 

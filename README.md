@@ -13,7 +13,7 @@ proc handler(req: Request, res: Response) {.async.} =
   of "/":
     req.blocking: # runs on the worker pool
       let data = expensiveBlockingCall()
-      res.send(Http200, data, %*{"Content-Type": "application/json"})
+      res.send(Http200, data)   # object/JSON body -> application/json automatically
   else:
     res.send(Http404)
 
@@ -350,7 +350,7 @@ you need through `req`:
 proc handler(req: Request, res: Response) {.async.} =
   req.blocking:
     let rows = db.getAllRows(sql"select …")   # blocking is safe here
-    res.send(Http200, $rows, %*{"Content-Type": "application/json"})
+    res.send(Http200, rows)   # seq -> JSON array, application/json automatically
 ```
 
 #### Requests
@@ -411,7 +411,8 @@ through a dead connection is a safe no-op.
 | Member | Type | Description |
 |--------|--------|---------------|
 | `res.send(code, body = "", headers = [])` | `void` | queue a buffered response (compressed when eligible). `Content-Type` defaults to `text/plain` unless present in `headers` (which wins). `headers` may be a JSON object (`%*{...}`); also `res.send(code)` and `int`-code overloads |
-| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json`. Convert a Table/object with `%`/`%*` |
+| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json` |
+| `res.send(code, body: T, headers = [])` | `void` | send any `%`-able value as JSON (object, `ref object`, string-keyed `Table`, `seq`, `enum`, `Option`, or a named tuple): `res.send(Http200, user)`, `res.send(Http200, (ok: true, n: 3))`. `Content-Type` defaults to `application/json` |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
@@ -828,8 +829,8 @@ Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 
 ```nim
 proc handler(req: Request, res: Response) =
-  res.send(Http200, body,   # enable HSTS only over TLS
-           securityHeaders(hsts = req.isSecure) & @[("Content-Type", "application/json")])
+  # JSON body -> application/json automatically; enable HSTS only over TLS
+  res.send(Http200, %*{"ok": true}, securityHeaders(hsts = req.isSecure))
 ```
 
 Gate cross-site WebSocket hijacking with `req.originAllowed`, and drive a
