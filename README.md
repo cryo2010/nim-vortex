@@ -411,7 +411,8 @@ through a dead connection is a safe no-op.
 | Member | Type | Description |
 |--------|--------|---------------|
 | `res.send(code, body = "", headers = [])` | `void` | queue a buffered response (compressed when eligible). `Content-Type` defaults to `text/plain` unless present in `headers` (which wins). `headers` may be a JSON object (`%*{...}`); also `res.send(code)` and `int`-code overloads |
-| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json`. Convert a Table/object with `%`/`%*` |
+| `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json` |
+| `res.send(code, body: T, headers = [])` | `void` | send any `%`-able value as JSON (object, `ref object`, string-keyed `Table`, `seq`, `enum`, `Option`, or a named tuple): `res.send(Http200, user)`, `res.send(Http200, (ok: true, n: 3))`. `Content-Type` defaults to `application/json` |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |

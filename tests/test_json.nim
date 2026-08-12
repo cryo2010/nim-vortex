@@ -18,10 +18,38 @@ proc emptyOut(req: Request, res: Response) {.gcsafe.} =
 proc tableOut(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, %{"a": "1", "b": "2"}.toTable)     # % converts a Table
 
+type
+  Widget = object
+    id: int
+    tags: seq[string]
+  Level = enum lLow, lHigh
+
+proc objOut(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, Widget(id: 7, tags: @["a", "b"]))  # object -> JSON directly
+
+proc tupleOut(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, (ok: true, count: 3))              # named tuple -> JSON object
+
+proc seqOut(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, @[1, 2, 3])                        # seq -> JSON array
+
+proc enumOut(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, lHigh)                             # enum -> JSON string
+
+proc ctOverride(req: Request, res: Response) {.gcsafe.} =
+  # a Content-Type in headers overrides the application/json default
+  res.send(Http200, Widget(id: 1, tags: @[]),
+           %*{"Content-Type": "application/vnd.api+json"})
+
 var rt = newRouter()
 rt.post("/echo", echoJson)
 rt.get("/empty", emptyOut)
 rt.get("/table", tableOut)
+rt.get("/obj", objOut)
+rt.get("/tuple", tupleOut)
+rt.get("/seq", seqOut)
+rt.get("/enum", enumOut)
+rt.get("/ct", ctOverride)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
@@ -44,6 +72,25 @@ suite "json helpers":
     var c = newHttpClient()
     defer: c.close()
     check c.getContent(base & "/table") == """{"a":"1","b":"2"}"""
+
+  test "res.send serializes object/seq/enum, defaulting to application/json":
+    var c = newHttpClient()
+    defer: c.close()
+    let r = c.get(base & "/obj")
+    check "application/json" in r.headers["content-type"]
+    check r.body == """{"id":7,"tags":["a","b"]}"""
+    check c.getContent(base & "/seq") == "[1,2,3]"
+    check c.getContent(base & "/enum") == "\"lHigh\""
+
+  test "res.send accepts a named tuple as a JSON object":
+    var c = newHttpClient()
+    defer: c.close()
+    check c.getContent(base & "/tuple") == """{"ok":true,"count":3}"""
+
+  test "a Content-Type in headers overrides the application/json default":
+    var c = newHttpClient()
+    defer: c.close()
+    check "application/vnd.api+json" in c.get(base & "/ct").headers["content-type"]
 
   test "malformed body: req.json raises -> 500 (not auto-400)":
     var c = newHttpClient()
