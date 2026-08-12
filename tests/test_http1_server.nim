@@ -6,26 +6,26 @@ import ./helper
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.url.path
   of "/":
-    res.send(Http200, "Hello, World!", "text/plain")
+    res.send(Http200, "Hello, World!")
   of "/echo":
-    res.send(Http200, req.body, req.header("Content-Type"))
+    res.send(Http200, req.body, @[("Content-Type", req.header("Content-Type"))])
   of "/headers":
-    res.send(Http200, req.header("X-Probe"), "text/plain")
+    res.send(Http200, req.header("X-Probe"))
   of "/qs":
     var parts: seq[string]
     parts.add "path=" & req.url.path
     for key in ["a", "b", "sp"]:
       if key in req.query:
         parts.add key & "=" & req.query[key]
-    res.send(Http200, parts.join("|"), "text/plain")
+    res.send(Http200, parts.join("|"))
   of "/nm":
     # Bodiless status: must go out with no Content-Length/Content-Type
     # and no body, but keep the validator (RFC 9110 8.6).
-    res.send(Http304, "", "text/plain", @{"ETag": "\"v1\""})
+    res.send(Http304, "", @{"ETag": "\"v1\""})
   of "/boom":
     raise newException(ValueError, "handler exploded")
   else:
-    res.send(Http404, "not found", "text/plain")
+    res.send(Http404, "not found")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 2, headerTimeout = 2, keepAliveTimeout = 2, maxBodySize = 64 * 1024)).start(0)
 

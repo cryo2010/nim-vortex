@@ -8,9 +8,9 @@ import vortex/[settings, request, server]
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/plain":
-    res.send(Http200, "ok", "text/plain")
+    res.send(Http200, "ok")
   of "/override":                       # handler sets its own X-Frame-Options
-    res.send(Http200, "ok", "text/plain", @[("X-Frame-Options", "SAMEORIGIN")])
+    res.send(Http200, "ok", @[("X-Frame-Options", "SAMEORIGIN")])
   of "/stream":
     res.sendHead(Http200, "text/plain")
     discard res.write("chunk")

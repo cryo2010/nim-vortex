@@ -84,7 +84,7 @@ suite "http3 server survives a certificate reload":
       skip()
     else:
       var srv = newVortex(RequestHandler(proc(req: Request, res: Response) {.gcsafe.} =
-                        res.send(Http200, "ok", "text/plain")), initVortexConfig(numThreads = 2, certFile = certA, keyFile = keyA, http3 = true)).start(0)
+                        res.send(Http200, "ok")), initVortexConfig(numThreads = 2, certFile = certA, keyFile = keyA, http3 = true)).start(0)
       defer: srv.close()
       let port = $srv.port
       proc served(): bool =

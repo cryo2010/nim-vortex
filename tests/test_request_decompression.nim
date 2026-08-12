@@ -24,7 +24,7 @@ if curlBin.len == 0:
 
 const maxBody = 1_000_000
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  if req.path == "/echo": res.send(Http200, req.body, "text/plain")
+  if req.path == "/echo": res.send(Http200, req.body)
   else: res.send(Http404)
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, decompressRequest = true, maxBodySize = maxBody)).start(0)

@@ -6,22 +6,22 @@ const bigBody = "0123456789abcdef".repeat(16 * 1024)   # 256 KiB
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.url.path
   of "/":
-    res.send(Http200, "hello h2", "text/plain")
+    res.send(Http200, "hello h2")
   of "/qs":
-    res.send(Http200, req.url.path & "|" & req.query["k"], "text/plain")
+    res.send(Http200, req.url.path & "|" & req.query["k"])
   of "/echo":
-    res.send(Http200, req.body, req.header("Content-Type"),
-                headers = [("X-Proto", $req.httpVersion)])
+    res.send(Http200, req.body, @[("Content-Type", req.header("Content-Type")),
+                                   ("X-Proto", $req.httpVersion)])
   of "/big":
-    res.send(Http200, bigBody, "application/octet-stream")
+    res.send(Http200, bigBody, @[("Content-Type", "application/octet-stream")])
   of "/slow":
     req.blocking:
       sleep(100)
-      res.send(Http200, "slow h2 done", "text/plain")
+      res.send(Http200, "slow h2 done")
   of "/nm":
-    res.send(Http304, "", "text/plain", headers = [("etag", "\"v1\"")])
+    res.send(Http304, "", headers = [("etag", "\"v1\"")])
   else:
-    res.send(Http404, "nope", "text/plain")
+    res.send(Http404, "nope")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 2, workerThreads = 2, maxBodySize = 1024 * 1024)).start(0)
 let base = "http://127.0.0.1:" & $srv.port

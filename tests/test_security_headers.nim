@@ -8,10 +8,10 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/secure":
     # Emitted end to end; header serialization itself is covered elsewhere.
-    res.send(Http200, "ok", "application/json",
-             securityHeaders(hsts = req.isSecure))
+    res.send(Http200, "ok",
+             securityHeaders(hsts = req.isSecure) & @[("Content-Type", "application/json")])
   of "/insecure-flag":
-    res.send(Http200, if req.isSecure: "tls" else: "plain", "text/plain")
+    res.send(Http200, if req.isSecure: "tls" else: "plain")
   else:
     res.send(Http404)
 

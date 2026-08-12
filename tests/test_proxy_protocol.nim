@@ -7,7 +7,7 @@ import std/[unittest, net, httpcore, strutils]
 import vortex/[settings, request, server]
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, req.remoteAddress, "text/plain")
+  res.send(Http200, req.remoteAddress)
 
 # --- raw client: optional PROXY prologue, then a plain GET; return the body,
 # or "" if the server dropped the connection without responding. ---

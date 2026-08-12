@@ -16,7 +16,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
           await sleepAsync(15)                        # loop keeps serving
           ws.send("async: " & data)
   else:
-    res.send(Http200, "http", "text/plain")
+    res.send(Http200, "http")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port

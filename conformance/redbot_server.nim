@@ -28,19 +28,20 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     # Honor conditional requests so REDbot can validate the 304 path.
     if req.header("if-none-match") == etag or
        req.header("if-modified-since") == lastModified:
-      res.send(Http304, "", "", @{"ETag": etag,
-                                   "Last-Modified": lastModified,
-                                   "Cache-Control": cacheControl})
+      res.send(Http304, "", @{"ETag": etag,
+                              "Last-Modified": lastModified,
+                              "Cache-Control": cacheControl})
     else:
-      res.send(Http200, "Hello, World!\n", "text/plain",
+      res.send(Http200, "Hello, World!\n",
                @{"ETag": etag,
                  "Last-Modified": lastModified,
                  "Cache-Control": cacheControl})
   of "/json":
-    res.send(Http200, """{"message":"Hello, World!"}""", "application/json",
-             @{"Cache-Control": cacheControl})
+    res.send(Http200, """{"message":"Hello, World!"}""",
+             @{"Content-Type": "application/json",
+               "Cache-Control": cacheControl})
   else:
-    res.send(Http404, "not found\n", "text/plain")
+    res.send(Http404, "not found\n")
 
 when isMainModule:
   let port = if paramCount() >= 1: Port(parseInt(paramStr(1))) else: Port(8099)

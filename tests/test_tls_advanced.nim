@@ -38,9 +38,9 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   # /whoami reports the mTLS client subject (or "-" if none)
   if req.path == "/whoami":
     let s = req.clientCertSubject
-    res.send(Http200, if s.len > 0: s else: "-", "text/plain")
+    res.send(Http200, if s.len > 0: s else: "-")
   else:
-    res.send(Http200, "ok", "text/plain")
+    res.send(Http200, "ok")
 
 proc curlGet(port: Port, args = ""): (string, int) =
   let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 " & args &

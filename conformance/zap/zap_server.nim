@@ -47,17 +47,17 @@ proc hIndex(req: Request, res: Response) {.gcsafe.} =
     "<h1>vortex</h1><p>OWASP ZAP baseline target.</p><ul>" &
     "<li><a href=\"/about\">About</a></li>" &
     "<li><a href=\"/health\">Health</a></li></ul>"),
-    "text/html; charset=utf-8", secHeaders)
+    secHeaders & @[("Content-Type", "text/html; charset=utf-8")])
 
 proc hAbout(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, page("about",
     "<h1>About</h1><p>A fast HTTP/1.1, HTTP/2 and HTTP/3 server.</p>" &
     "<p><a href=\"/\">Home</a></p>"),
-    "text/html; charset=utf-8", secHeaders)
+    secHeaders & @[("Content-Type", "text/html; charset=utf-8")])
 
 proc hHealth(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "{\"status\":\"ok\"}",
-           "application/json", secHeaders)
+           secHeaders & @[("Content-Type", "application/json")])
 
 when isMainModule:
   var router = newRouter()

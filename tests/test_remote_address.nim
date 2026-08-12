@@ -8,9 +8,9 @@ import vortex/[settings, request, server]
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/ip":
-    res.send(Http200, req.remoteAddress, "text/plain")
+    res.send(Http200, req.remoteAddress)
   of "/xff":
-    res.send(Http200, req.forwardedFor.join("|"), "text/plain")
+    res.send(Http200, req.forwardedFor.join("|"))
   else:
     res.send(Http404)
 

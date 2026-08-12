@@ -24,7 +24,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
         ws.onDrain = proc(ws: WebSocket) {.gcsafe.} =
           ws.send("drained:" & $peak)          # backlog is empty here
   else:
-    res.send(Http200, "http", "text/plain")
+    res.send(Http200, "http")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port

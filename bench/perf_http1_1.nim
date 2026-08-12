@@ -57,7 +57,7 @@ const
 
 proc serveOurs(port: int, threads: int, minimal = false) =
   proc handler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   proc minHandler(req: vortex.Request, res: vortex.Response) {.gcsafe.} =
     vortex.send(res, Http200, "Hello, World!")
   var cfg = vortex.initVortexConfig(port = net.Port(port),
@@ -73,10 +73,10 @@ proc serveOursAsync(port: int, doAwait: bool) =
   ## against the plain inline handler (httpbeast handlers are also
   ## Future-based, making that row directly comparable).
   proc immediate(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   proc suspending(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
     await sleepAsync(0)                  # force a real suspend/resume
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   let handler = if doAwait: toHandler(suspending) else: toHandler(immediate)
   newVortex(handler,
     vortex.initVortexConfig(port = net.Port(port), numThreads = 0)).serve()

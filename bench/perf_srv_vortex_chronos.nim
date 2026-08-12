@@ -13,10 +13,10 @@ proc serveOursChronos*(port: int, doAwait: bool) =
   ## forces a real suspend/resume per request (worst case on pipelined
   ## HTTP/1.1); otherwise the handler answers without suspending.
   proc immediate(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   proc suspending(req: vortex.Request, res: vortex.Response): Future[void] {.async.} =
     await sleepAsync(ZeroDuration)       # force a real suspend/resume
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   let handler =
     if doAwait: nhschronos.toHandler(suspending)
     else: nhschronos.toHandler(immediate)

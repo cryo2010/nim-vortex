@@ -12,7 +12,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
       ws.send(data, kind)               # echo, preserving the message kind
   else:
-    res.send(Http200, "autobahn echo server", "text/plain")
+    res.send(Http200, "autobahn echo server")
 
 when isMainModule:
   # A large message cap so the 9.* limit/performance cases (payloads up to

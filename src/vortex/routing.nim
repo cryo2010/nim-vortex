@@ -36,7 +36,7 @@ type
     middleware: seq[Middleware]
 
 proc defaultNotFound(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http404, "404 Not Found", "text/plain")
+  res.send(Http404, "404 Not Found")
 
 proc newRouter*(): Router =
   Router(root: RouteNode(), notFound: defaultNotFound)
@@ -158,7 +158,7 @@ proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
     else:
       if node.handlers[HttpGet] != nil and "HEAD" notin allow:
         allow.add "HEAD"                       # HEAD is served wherever GET is
-      res.send(HttpCode(405), "405 Method Not Allowed", "text/plain",
+      res.send(HttpCode(405), "405 Method Not Allowed",
                @{"Allow": allow.join(", ")})
     return
   if params.len > 0:

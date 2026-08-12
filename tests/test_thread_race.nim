@@ -17,7 +17,7 @@
 import vortex
 
 proc ok(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 proc withGate(inner: RequestHandler): RequestHandler =
   let h = inner

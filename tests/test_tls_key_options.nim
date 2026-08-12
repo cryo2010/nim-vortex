@@ -29,7 +29,7 @@ let keyData = readFile(key)
 let encKeyData = readFile(enckey)
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 proc get(port: Port): (string, int) =
   # -k: self-signed; --http1.1 keeps it simple.

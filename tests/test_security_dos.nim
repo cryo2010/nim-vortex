@@ -18,7 +18,7 @@ var handlerHits: Atomic[int]
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   discard handlerHits.fetchAdd(1)
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 # The flood server keeps default (large) read buffers so the frame flood is
 # buffered and processed by the h2 codec, but uses modest reset/control

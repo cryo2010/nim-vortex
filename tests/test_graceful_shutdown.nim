@@ -12,9 +12,9 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/slow":
     req.blocking:                          # in-flight work on the worker pool
       sleep(300)
-      res.send(Http200, "done after drain", "text/plain")
+      res.send(Http200, "done after drain")
   else:
-    res.send(Http200, "ok", "text/plain")
+    res.send(Http200, "ok")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2, shutdownGrace = 5)).start(0)
 let port = srv.port

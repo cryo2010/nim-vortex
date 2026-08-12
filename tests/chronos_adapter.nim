@@ -7,24 +7,24 @@ import vortex/chronos as nhschronos
 
 proc hRoot(req: Request, res: Response) {.async.} =
   # No await at all: completes synchronously through the async path.
-  res.send(Http200, "sync-in-async", "text/plain")
+  res.send(Http200, "sync-in-async")
 
 proc hDelay(req: Request, res: Response) {.async.} =
   await sleepAsync(150.milliseconds)      # loop keeps serving meanwhile
-  res.send(Http200, "slept", "text/plain")
+  res.send(Http200, "slept")
 
 proc hCapture(req: Request, res: Response) {.async.} =
   # Captures work: the future never leaves the loop thread.
   let who = req.param("name")
   await sleepAsync(20.milliseconds)
-  res.send(Http200, "hello " & who, "text/plain")
+  res.send(Http200, "hello " & who)
 
 proc hFanIn(req: Request, res: Response) {.async.} =
   var total = 0
   for i in 1 .. 3:
     await sleepAsync(10.milliseconds)
     total += i
-  res.send(Http200, $total, "text/plain")
+  res.send(Http200, $total)
 
 proc hUpload(req: Request, res: Response) {.async.} =
   # Pull-based body streaming: await req.read() until "".
@@ -33,7 +33,7 @@ proc hUpload(req: Request, res: Response) {.async.} =
     let chunk = await req.read()
     if chunk.len == 0: break
     total += chunk.len
-  res.send(Http200, "got " & $total, "text/plain")
+  res.send(Http200, "got " & $total)
 
 proc hStream(req: Request, res: Response) {.async.} =
   # Outbound streaming with awaitable backpressure (write + await drain).
@@ -60,7 +60,7 @@ proc hBlockingInside(req: Request, res: Response) {.async.} =
   await sleepAsync(10.milliseconds)
   req.blocking:                            # sync escape inside async
     sleep(50)
-    res.send(Http200, "worker done", "text/plain")
+    res.send(Http200, "worker done")
 
 proc hWs(req: Request, res: Response) {.gcsafe.} =
   let ws = req.acceptWebSocket()
@@ -253,7 +253,7 @@ suite "chronos adapter":
 
   test "newVortex overload accepts a bare async handler (no toHandler)":
     proc bare(req: Request, res: Response) {.async.} =
-      res.send(Http200, "bare-async", "text/plain")
+      res.send(Http200, "bare-async")
     let s = newVortex(bare).start(0)
     defer: s.close()
     var client = newHttpClient()

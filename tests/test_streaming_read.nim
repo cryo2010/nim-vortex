@@ -15,7 +15,7 @@ proc hUpload(req: Request, res: Response) {.async.} =
     let chunk = await req.read()
     if chunk.len == 0: break
     total += chunk.len
-  res.send(Http200, "got " & $total, "text/plain")
+  res.send(Http200, "got " & $total)
 
 proc hAbortable(req: Request, res: Response) {.async.} =
   var total = 0
@@ -24,7 +24,7 @@ proc hAbortable(req: Request, res: Response) {.async.} =
     if chunk.len == 0: break        # EOF, whether the body completed or the peer left
     total += chunk.len
   finished.atomicInc()             # reached only if the read loop terminated
-  res.send(Http200, "got " & $total, "text/plain")
+  res.send(Http200, "got " & $total)
 
 proc hEcho(req: Request, res: Response) {.async.} =
   var body = ""
@@ -32,7 +32,7 @@ proc hEcho(req: Request, res: Response) {.async.} =
     let chunk = await req.read()
     if chunk.len == 0: break
     body.add chunk
-  res.send(Http200, body, "application/octet-stream")
+  res.send(Http200, body, @[("Content-Type", "application/octet-stream")])
 
 var rt = newRouter()
 rt.stream(HttpPost, "/upload", hUpload)

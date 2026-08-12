@@ -33,20 +33,20 @@ writeFile(bigFilePath, "0123456789abcdef".repeat(64 * 1024))  # 1 MiB, > stream 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/":
-    res.send(Http200, "hello h3", "text/plain")
+    res.send(Http200, "hello h3")
   of "/whoami":
-    res.send(Http200, req.remoteAddress, "text/plain")
+    res.send(Http200, req.remoteAddress)
   of "/bigfile":
     res.sendFile(bigFilePath)   # > stream threshold: streams over h3
   of "/echo":
-    res.send(Http200, req.body, req.header("Content-Type"),
-                headers = [("X-Proto", $req.httpVersion)])
+    res.send(Http200, req.body, @[("Content-Type", req.header("Content-Type")),
+                                   ("X-Proto", $req.httpVersion)])
   of "/big":
-    res.send(Http200, bigBody, "application/octet-stream")
+    res.send(Http200, bigBody, @[("Content-Type", "application/octet-stream")])
   of "/slow":
     req.blocking:
       sleep(100)
-      res.send(Http200, "slow h3 done", "text/plain")
+      res.send(Http200, "slow h3 done")
   of "/stream":
     res.sendHead(Http200, "text/plain")
     res.write("Hello, ")
@@ -68,9 +68,9 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     let acc = new(int)
     req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
       acc[] += chunk.len
-      if last: res.send(Http200, "got " & $acc[], "text/plain")
+      if last: res.send(Http200, "got " & $acc[])
   else:
-    res.send(Http404, "nope", "text/plain")
+    res.send(Http404, "nope")
 
 proc streamPred(core: ptr LoopCore, fd: int32, gen: uint32,
                 stream: uint32): bool {.gcsafe.} =

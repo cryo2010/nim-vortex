@@ -38,11 +38,11 @@ template respond(req, res: untyped) =
   ## Shared routing, used by both the sync and the async handler shapes.
   case req.path
   of "/plaintext":
-    vortex.send(res, Http200, "Hello, World!", "text/plain")
+    vortex.send(res, Http200, "Hello, World!")
   of "/json":
-    vortex.send(res, Http200, """{"message":"Hello, World!"}""", "application/json")
+    vortex.send(res, Http200, """{"message":"Hello, World!"}""", %*{"Content-Type": "application/json"})
   of "/big":
-    vortex.send(res, Http200, bigBody, "text/plain")
+    vortex.send(res, Http200, bigBody)
   else:
     vortex.send(res, Http404)
 

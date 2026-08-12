@@ -10,9 +10,9 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/to-https":
     res.redirect("https://" & req.host & req.url.path, permanent = true)
   of "/host":
-    res.send(Http200, req.host, "text/plain")
+    res.send(Http200, req.host)
   of "/set":
-    res.send(Http200, "ok", "text/plain", @[setCookie("sid", "abc", maxAge = 3600)])
+    res.send(Http200, "ok", @[setCookie("sid", "abc", maxAge = 3600)])
   else:
     res.send(Http404)
 

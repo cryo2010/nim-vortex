@@ -28,7 +28,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     ws.onClose = proc(ws: WebSocket, code: uint16, reason: string) {.gcsafe.} =
       discard
   else:
-    res.send(Http200, "not a websocket", "text/plain")
+    res.send(Http200, "not a websocket")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxWsMessageSize = 1024)).start(0)
 let port = srv.port

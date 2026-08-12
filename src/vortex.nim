@@ -5,7 +5,7 @@
 ##
 ## proc handler(req: Request, res: Response) =
 ##   case req.path
-##   of "/": res.send(Http200, "Hello, World!", "text/plain")
+##   of "/": res.send(Http200, "Hello, World!")
 ##   else: res.send(Http404)
 ##
 ## newVortex(handler).serve(8080)

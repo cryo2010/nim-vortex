@@ -7,7 +7,7 @@ import std/os
 import vortex
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok", "text/plain")
+  res.send(Http200, "ok")
 
 when isMainModule:
   # numThreads 0 = one loop per core (SO_REUSEPORT). start() binds before

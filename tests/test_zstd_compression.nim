@@ -28,7 +28,7 @@ let streamExpected = chunkText.repeat(nChunks)
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/buf":
-    res.send(Http200, bufText, "text/plain")
+    res.send(Http200, bufText)
   of "/stream":
     res.sendHead(Http200, "text/plain")
     for _ in 0 ..< nChunks: discard res.write(chunkText)
