@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `req.blocking(a, b, ...): body` moves the named values into the worker pool,
+  where they are usable by name inside the block (any movable type; they ride in
+  as a tuple). Replaces the old capture-free-only body: instead of "read
+  everything via `req`", you name what crosses. `req.blocking:` (no values) still
+  works, and capturing an unnamed local remains a compile error (the guardrail
+  that keeps loop-thread state off the worker).
+
 - `newVortex()` (no arguments) returns an app (a router) you register routes on,
   then `serve` (blocks) or `start` (non-blocking): `var app = newVortex();
   app.get("/", h); app.serve(8080)`. `serve`/`start` on a router build the server
@@ -44,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `dispatchBlockingData` is no longer part of the public API (`import vortex`);
+  it stays as an internal building block. Use `req.blocking(...)`.
 - **Breaking:** the router's `stream` registrar is replaced by a `streaming`
   parameter on the route registrars: `router.get/post/put/...` and `addRoute`
   now take `streaming = false`. Migration:
