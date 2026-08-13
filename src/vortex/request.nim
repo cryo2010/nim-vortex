@@ -10,7 +10,7 @@
 import std/[httpcore, strutils, uri, tables, json, options, typetraits]
 import ./connection
 
-export PathParams
+export PathParams, ResponseHeaders
 import ./workerpool
 import ./http1/parser as h1parser
 import ./http1/codec as h1codec
@@ -115,6 +115,18 @@ proc currentThreadId(): int {.inline.} =
   if cachedThreadId == 0:
     cachedThreadId = getThreadId()
   cachedThreadId
+
+proc headers*(res: Response): var ResponseHeaders =
+  ## Response headers to send with the eventual `res.send`. Set them from
+  ## middleware or a handler, e.g. `res.headers["X-Request-Id"] = id` or
+  ## `res.headers.add("Set-Cookie", c)`; the `send` call's own `headers`
+  ## argument overrides these per name. Buffered `send` only (not `sendHead`
+  ## streaming). Loop-thread only: do not touch from inside `req.blocking`
+  ## (pass headers to `send` there instead).
+  assert currentThreadId() == res.core.threadId,
+    "res.headers is loop-thread only; set headers before req.blocking, or " &
+    "pass them to send() from the worker"
+  res.core.respHeaders.mgetOrPut((res.fd, res.gen, res.stream), ResponseHeaders())
 
 # --- accessors --------------------------------------------------------------
 
@@ -527,21 +539,76 @@ proc withSecHeaders*(core: ptr LoopCore,
         break
     if not present: result.add (bn, bv)
 
+proc `[]=`*(h: var ResponseHeaders, name, value: string) =
+  ## Set `name` to `value`, replacing any existing value(s) for that name.
+  for i in 0 ..< h.s.len:
+    if cmpIgnoreCase(h.s[i][0], name) == 0:
+      h.s[i] = (name, value)
+      var j = i + 1                       # drop any further duplicates
+      while j < h.s.len:
+        if cmpIgnoreCase(h.s[j][0], name) == 0: h.s.delete(j)
+        else: inc j
+      return
+  h.s.add (name, value)
+
+proc `[]`*(h: ResponseHeaders, name: string): string =
+  ## The first value for `name`, or "" if unset.
+  for (n, v) in h.s:
+    if cmpIgnoreCase(n, name) == 0: return v
+
+proc contains*(h: ResponseHeaders, name: string): bool =
+  for (n, _) in h.s:
+    if cmpIgnoreCase(n, name) == 0: return true
+
+proc add*(h: var ResponseHeaders, name, value: string) =
+  ## Append `name: value` without replacing an existing one (allows duplicates,
+  ## e.g. multiple Set-Cookie).
+  h.s.add (name, value)
+
+proc del*(h: var ResponseHeaders, name: string) =
+  ## Remove every header named `name`.
+  var i = 0
+  while i < h.s.len:
+    if cmpIgnoreCase(h.s[i][0], name) == 0: h.s.delete(i)
+    else: inc i
+
+proc len*(h: ResponseHeaders): int = h.s.len
+proc clear*(h: var ResponseHeaders) = h.s.setLen(0)
+
+iterator pairs*(h: ResponseHeaders): (string, string) =
+  for x in h.s: yield x
+
+proc mergedWith*(h: ResponseHeaders,
+                 sendArg: openArray[(string, string)]): seq[(string, string)] =
+  ## Combine pending `res.headers` with a `send` call's `headers`: the send
+  ## argument wins per name (its own duplicates preserved), while pending
+  ## headers whose name the send argument does not set are kept.
+  for (pn, pv) in h.s:
+    var overridden = false
+    for (sn, _) in sendArg:
+      if cmpIgnoreCase(pn, sn) == 0: overridden = true; break
+    if not overridden: result.add (pn, pv)
+  for pair in sendArg: result.add pair
+
+proc headersHaveCt(h: openArray[(string, string)]): bool =
+  for (n, _) in h:
+    if cmpIgnoreCase(n, "content-type") == 0: return true
+
 proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                     code: int, contentType: string,
                     headers: openArray[(string, string)],
                     body: openArray[char]) =
   ## Serialize a response into the connection's write buffer using the
   ## connection's protocol. Loop thread only.
-  template emit(h: openArray[(string, string)]) =
+  template emit(ct: string, h: openArray[(string, string)]) =
     if stream != 0:
       h2Respond(c, code, stream, core.dateStr, core.serverHeader,
-                contentType, h, body, core.altSvc)
+                ct, h, body, core.altSvc)
     else:
       if c.responded: return
       c.responded = true
       appendResponse(c.wbuf, HttpCode(code), core.dateStr, core.serverHeader,
-                     contentType, body, h,
+                     ct, body, h,
                      keepAlive = c.parser.keepAlive,
                      skipBody = c.parser.httpMethod == HttpHead,
                      announceKeepAlive = c.parser.keepAlive and
@@ -549,8 +616,16 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                      altSvc = core.altSvc)
       if not c.parser.keepAlive:
         c.closeAfterFlush = true
-  if core.secHeaders.len == 0: emit(headers)
-  else: emit(withSecHeaders(core, headers))
+  let key = (c.fd, c.gen, stream)
+  if core.respHeaders.hasKey(key):
+    let merged = core.respHeaders[key].mergedWith(headers)
+    core.respHeaders.del key
+    # a Content-Type among the merged headers wins over the (auto) contentType
+    let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
+    if core.secHeaders.len == 0: emit(ct, merged)
+    else: emit(ct, withSecHeaders(core, merged))
+  elif core.secHeaders.len == 0: emit(contentType, headers)
+  else: emit(contentType, withSecHeaders(core, headers))
 
 proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
               code: int, contentType: string,
@@ -560,7 +635,17 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
   when not defined(plainHttp):
     let h3c = h3ConnOf(core, fd, gen)
     if h3c != nil:
-      if core.secHeaders.len == 0:
+      let key = (fd, gen, stream)
+      if core.respHeaders.hasKey(key):
+        let merged = core.respHeaders[key].mergedWith(headers)
+        core.respHeaders.del key
+        let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
+        if core.secHeaders.len == 0:
+          h3Respond(core, h3c, uint64(stream), code, ct, merged, body)
+        else:
+          h3Respond(core, h3c, uint64(stream), code, ct,
+                    withSecHeaders(core, merged), body)
+      elif core.secHeaders.len == 0:
         h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
       else:
         h3Respond(core, h3c, uint64(stream), code, contentType,

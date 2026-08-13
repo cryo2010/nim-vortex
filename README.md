@@ -413,6 +413,7 @@ through a dead connection is a safe no-op.
 | `res.send(code, body = "", headers = [])` | `void` | queue a buffered response (compressed when eligible). `Content-Type` defaults to `text/plain` unless present in `headers` (which wins). `headers` may be a JSON object (`%*{...}`); also `res.send(code)` and `int`-code overloads |
 | `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json` |
 | `res.send(code, body: T, headers = [])` | `void` | send any `%`-able value as JSON (object, `ref object`, string-keyed `Table`, `seq`, `enum`, `Option`, or a named tuple): `res.send(Http200, user)`, `res.send(Http200, (ok: true, n: 3))`. `Content-Type` defaults to `application/json` |
+| `res.headers` | `var ResponseHeaders` | response headers to send with the eventual `send`: `res.headers["X-Request-Id"] = id`, `res.headers.add("Set-Cookie", c)`. `[]=` overwrites by name, `add` keeps duplicates. The `send` call's own `headers` win per name. Set it from middleware or a handler; loop-thread only (see below) |
 | `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
@@ -515,6 +516,23 @@ newVortex(router.toHandler).serve(8080)
 `use` is sugar over closure composition, so it is not required: since a handler
 is a plain proc, you can wrap one directly without a router:
 `newVortex(logging(requireAuth(handler))).serve(8080)`.
+
+To contribute a header to whatever response the handler eventually sends, set
+`res.headers` before calling `next` (a `Response` is otherwise write-once via
+`send`'s `headers` argument):
+
+```nim
+proc requestId(next: RequestHandler): RequestHandler =
+  let inner = next
+  proc(req: Request, res: Response) =
+    res.headers["X-Request-Id"] = newRequestId()
+    inner(req, res)
+```
+
+`res.headers["Name"] = v` overwrites by name; `res.headers.add("Set-Cookie", c)`
+keeps duplicates. The `send` call's own `headers` still win per name. `res.headers`
+is loop-thread only (buffered `send`, not `sendHead` streaming): set it before a
+`req.blocking:` section, or pass headers to `send` from inside the worker.
 
 ### Routing
 
