@@ -27,7 +27,8 @@ export httpcore
 export net.Port
 export json                 ## so req.json / res.send(json) are usable without a separate import
 export settings
-export request except dispatchBlockingData  # internal (staticfiles); use req.blocking
+export request except dispatchBlockingData, dispatchBlockingResult,
+                      BlockingResultBase, BlockingResultBox  # internal; use req.blocking
 export server
 export routing
 export streaming

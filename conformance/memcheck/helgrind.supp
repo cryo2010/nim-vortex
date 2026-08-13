@@ -3,3 +3,26 @@
 # C11 atomics/fences, which vortex uses for cross-thread signaling (shutdown
 # flags, generation counters, connection pin counts). Those show up as false
 # races here; suppress the confirmed-benign atomic sites, not real bugs.
+#
+# Matched narrowly by call site (atomic op + its immediate vortex caller) so a
+# real race in other code is never masked. The mangled tuple type in the loop
+# thread's frames is intentionally left to the `...` wildcard: it changes with
+# the thread-arg layout and is not what we are keying on.
+
+# The per-loop shutdown flag: main thread stores `true` (requestShutdown) while
+# each loop thread relaxed-loads it in its run loop. An Atomic[bool] is correct
+# lock-free signaling; helgrind just cannot see the C11 ordering.
+{
+   vortex-shutdown-flag-store
+   Helgrind:Race
+   fun:_ZN7atomics5store*
+   fun:_ZN6server15requestShutdown*
+   ...
+}
+{
+   vortex-shutdown-flag-load
+   Helgrind:Race
+   fun:_ZN7atomics4load*
+   fun:_ZN9eventloop3run*
+   ...
+}

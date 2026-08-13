@@ -34,7 +34,7 @@
 ## finishes, the deferred respond is flushed via LoopCore.kick. An
 ## uncaught exception in the body responds 500.
 
-import std/[asyncdispatch, httpcore, tables, deques]
+import std/[asyncdispatch, httpcore, tables, deques, macros, selectors]
 import ../connection
 import ../request
 import ../routing
@@ -55,10 +55,29 @@ proc pump(): int {.nimcall, gcsafe.} =
       inc spins
     if hasPendingOperations(): 5 else: -1
 
+proc teardown() {.nimcall, gcsafe.} =
+  ## Release this loop thread's asyncdispatch dispatcher on exit. Without it the
+  ## dispatcher's epoll fd leaks, and every server restart on a fresh loop thread
+  ## leaks another. Drain ready callbacks so completed futures are released, then
+  ## close the selector fd and drop the dispatcher; the post-run GC_fullCollect in
+  ## runLoopThread (once the Loop is out of scope) collects any remaining cycles.
+  {.gcsafe.}:
+    var spins = 0
+    while hasPendingOperations() and spins < 64:
+      poll(0)
+      inc spins
+    try:
+      selectors.close(getIoHandler(getGlobalDispatcher()))
+      # Drop the dispatcher so anything it still roots becomes unreachable.
+      setGlobalDispatcher(nil)
+    except CatchableError, Defect: discard
+    GC_fullCollect()
+
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
   ## Idempotent; called automatically by the entry points below.
   if core.pumpHook == nil:
     core.pumpHook = pump
+    core.teardownHook = teardown
 
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling: 500 on failure, then flush/resume the
@@ -438,3 +457,81 @@ template messages*(ws: WebSocket, msg, kind, body: untyped) =
         body
     finally:
       clearWsReader(ws)
+
+# --- awaitable req.blocking (async) -----------------------------------------
+# Overrides the core (sync, terminal) `blocking` for async programs: the block
+# runs on the worker pool, its result is moved back, and the returned Future
+# completes on the loop. The `vortex/asyncdispatch` facade re-exports the core
+# API `except blocking`, so async code sees only this awaitable form.
+
+proc blockingRun*[A, R](req: Request,
+    body: proc (req: Request, res: Response, args: A): R {.nimcall, gcsafe.},
+    args: sink A): Future[R] =
+  ## Internal helper behind the async `req.blocking(...)` macro. Runs `body` on
+  ## a worker with the moved-in `args`, resolving the Future with its result (or
+  ## failing it if the body raised).
+  let fut = newFuture[R]("req.blocking")
+  let box = BlockingResultBox[A, R](body: body, args: args)
+  box.onDone = proc (self: BlockingResultBase) {.gcsafe.} =
+    let b = BlockingResultBox[A, R](self)     # downcast; closure captures fut only
+    if b.err != nil: fut.fail(b.err)
+    else: fut.complete(b.value)
+  ensurePump(req.core)
+  dispatchBlockingResult(req, box)
+  fut
+
+proc blockingRun*[A](req: Request,
+    body: proc (req: Request, res: Response, args: A) {.nimcall, gcsafe.},
+    args: sink A): Future[void] =
+  ## Void overload: the block responds itself (no value flows back). A void
+  ## body doesn't infer `R = void` through the generic above, so it binds here.
+  let fut = newFuture[void]("req.blocking")
+  let box = BlockingResultBox[A, void](body: body, args: args)
+  box.onDone = proc (self: BlockingResultBase) {.gcsafe.} =
+    let b = BlockingResultBox[A, void](self)
+    if b.err != nil: fut.fail(b.err)
+    else: fut.complete()
+  ensurePump(req.core)
+  dispatchBlockingResult(req, box)
+  fut
+
+macro blocking*(request: Request, args: varargs[untyped]): untyped =
+  ## Run a block on the worker pool and suspend until it finishes, yielding its
+  ## result (async form). Values named in the call are **moved** in and usable by
+  ## name inside; `req`/`res` are injected. The block's last expression is the
+  ## value; the `await` is implicit, so it reads like the sync form:
+  ##
+  ##   let report = req.blocking(user, cfg):
+  ##     buildReport(user, cfg)          # runs on a worker; handler suspends here
+  ##   res.send(Http200, report)
+  ##
+  ## Use inside an async handler. Capturing an unnamed surrounding local is a
+  ## compile error (the block is a capture-free nimcall body), so only the named
+  ## values cross the thread.
+  let body = args[^1]
+  var names: seq[NimNode]
+  for i in 0 ..< args.len - 1: names.add args[i]
+  let payload = genSym(nskParam, "payload")
+  var tup = nnkTupleConstr.newTree()
+  for n in names: tup.add n
+  var inner = newStmtList()
+  for i, n in names:
+    inner.add newLetStmt(n, nnkBracketExpr.newTree(payload, newLit(i)))
+  inner.add body
+  # Emit the `await` here: `await req.blocking(x): body` would bind the colon
+  # block to `await`, not to `blocking`, so the macro adds it instead.
+  result = newCall(ident"await", quote do:
+    (block:
+      let moved = `tup`
+      blockingRun(`request`, proc (req {.inject.}: Request,
+          res {.inject.}: Response, `payload`: typeof(moved)): auto
+          {.nimcall, gcsafe.} =
+        `inner`, moved)))
+
+template blocking*(socket: WebSocket, message: string, body: untyped) =
+  ## Re-provided for async programs (the facade hides the core `blocking`); same
+  ## as the core WebSocket `blocking`: run `body` on a worker for one message.
+  dispatchWsBlocking(socket, message,
+    proc (ws {.inject.}: WebSocket, msg {.inject.}: string)
+        {.nimcall, gcsafe.} =
+      body)

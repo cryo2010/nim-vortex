@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everything via `req`", you name what crosses. `req.blocking:` (no values) still
   works, and capturing an unnamed local remains a compile error (the guardrail
   that keeps loop-thread state off the worker).
+- In an async handler (`vortex/asyncdispatch` / `vortex/chronos`), `req.blocking`
+  is awaitable and returns the block's value: the handler suspends until the
+  worker finishes and resumes with the result moved back (`let x =
+  req.blocking(user): compute(user)`; the `await` is implicit). A sync handler
+  keeps the terminal form (the block sends the response).
 
 - `newVortex()` (no arguments) returns an app (a router) you register routes on,
   then `serve` (blocks) or `start` (non-blocking): `var app = newVortex();

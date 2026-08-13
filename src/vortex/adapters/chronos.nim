@@ -45,7 +45,8 @@
 ## uncaught exception in the body responds 500.
 
 import pkg/chronos
-import std/[httpcore, tables, deques]
+import pkg/chronos/selectors2 as chronosSelectors   # close(Selector) for teardown
+import std/[httpcore, tables, deques, macros]
 import ../connection
 import ../request
 import ../routing
@@ -77,10 +78,30 @@ proc pump(): int {.nimcall, gcsafe.} =
       inc spins
     if pendingOps > 0: 5 else: -1
 
+proc teardown() {.nimcall, gcsafe.} =
+  ## Release this loop thread's chronos dispatcher on exit. Without it the
+  ## dispatcher's epoll fd leaks, and every server restart on a fresh loop thread
+  ## leaks another. Drain ready callbacks so completed futures are released, then
+  ## close the selector fd and drop the dispatcher; the post-run GC_fullCollect in
+  ## runLoopThread (once the Loop is out of scope) collects any remaining cycles.
+  {.gcsafe.}:
+    var spins = 0
+    while pendingOps > 0 and spins < 64:
+      callSoon(noop)
+      poll()
+      inc spins
+    try:
+      chronosSelectors.close(getIoHandler(getThreadDispatcher()))
+      # Drop the dispatcher so anything it still roots becomes unreachable.
+      setThreadDispatcher(nil)
+    except CatchableError, Defect: discard
+    GC_fullCollect()
+
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
   ## Idempotent; called automatically by the entry points below.
   if core.pumpHook == nil:
     core.pumpHook = pump
+    core.teardownHook = teardown
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
@@ -483,3 +504,64 @@ template messages*(ws: WebSocket, msg, kind, body: untyped) =
         body
     finally:
       clearWsReader(ws)
+
+# --- awaitable req.blocking (async, chronos) --------------------------------
+# Mirrors the asyncdispatch adapter: overrides the core (sync) `blocking` for
+# chronos programs. The `vortex/chronos` facade re-exports the core API
+# `except blocking`, so chronos code sees only this awaitable form.
+
+proc blockingRun*[A, R](req: Request,
+    body: proc (req: Request, res: Response, args: A): R {.nimcall, gcsafe.},
+    args: sink A): Future[R] =
+  let fut = newFuture[R]("req.blocking")
+  let box = BlockingResultBox[A, R](body: body, args: args)
+  box.onDone = proc (self: BlockingResultBase) {.gcsafe.} =
+    let b = BlockingResultBox[A, R](self)     # downcast; closure captures fut only
+    if b.err != nil: fut.fail(b.err)
+    else: fut.complete(b.value)
+  ensurePump(req.core)
+  dispatchBlockingResult(req, box)
+  fut
+
+proc blockingRun*[A](req: Request,
+    body: proc (req: Request, res: Response, args: A) {.nimcall, gcsafe.},
+    args: sink A): Future[void] =
+  ## Void overload (block responds itself); a void body doesn't infer R = void.
+  let fut = newFuture[void]("req.blocking")
+  let box = BlockingResultBox[A, void](body: body, args: args)
+  box.onDone = proc (self: BlockingResultBase) {.gcsafe.} =
+    let b = BlockingResultBox[A, void](self)
+    if b.err != nil: fut.fail(b.err)
+    else: fut.complete()
+  ensurePump(req.core)
+  dispatchBlockingResult(req, box)
+  fut
+
+macro blocking*(request: Request, args: varargs[untyped]): untyped =
+  ## Run a block on the worker pool and suspend until it finishes, yielding its
+  ## result (chronos async form). Named values are moved in and usable by name;
+  ## the `await` is implicit. See the asyncdispatch adapter for details.
+  let body = args[^1]
+  var names: seq[NimNode]
+  for i in 0 ..< args.len - 1: names.add args[i]
+  let payload = genSym(nskParam, "payload")
+  var tup = nnkTupleConstr.newTree()
+  for n in names: tup.add n
+  var inner = newStmtList()
+  for i, n in names:
+    inner.add newLetStmt(n, nnkBracketExpr.newTree(payload, newLit(i)))
+  inner.add body
+  result = newCall(ident"await", quote do:
+    (block:
+      let moved = `tup`
+      blockingRun(`request`, proc (req {.inject.}: Request,
+          res {.inject.}: Response, `payload`: typeof(moved)): auto
+          {.nimcall, gcsafe.} =
+        `inner`, moved)))
+
+template blocking*(socket: WebSocket, message: string, body: untyped) =
+  ## Re-provided for chronos programs (the facade hides the core `blocking`).
+  dispatchWsBlocking(socket, message,
+    proc (ws {.inject.}: WebSocket, msg {.inject.}: string)
+        {.nimcall, gcsafe.} =
+      body)

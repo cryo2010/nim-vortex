@@ -24,11 +24,15 @@ import std/[net, posix, os, osproc, strutils, httpcore]
 const backend {.strdefine.}: string = "sync"
 const isAsync = backend == "async" or backend == "chronos"
 
-import vortex/[settings, request, server, routing]
+# Async backends come through the facade (the core API `except blocking` plus the
+# awaitable `blocking`); importing `vortex/request` too would put both `blocking`
+# macros in scope. Sync uses the umbrella (with the terminal `blocking`).
 when backend == "chronos":
   import vortex/chronos
 elif backend == "async":
   import vortex/asyncdispatch
+else:
+  import vortex
 
 # --- tiny client helpers (inlined; harness lives outside tests/) --------------
 
@@ -83,13 +87,12 @@ proc sseH(req: Request, res: Response) {.gcsafe.} =
     for i in 0 ..< 8:
       discard s.send("event " & $i, event = "tick", id = $i)
 
-proc slowH(req: Request, res: Response) {.gcsafe.} =
-  # In-flight work on the worker pool: exercises the graceful-drain path.
-  req.blocking:
-    sleep(40)
-    res.send(Http200, "slow-done")
-
 when isAsync:
+  # In an async program `req.blocking` is awaitable, so its handler must be async.
+  proc slowH(req: Request, res: Response) {.async.} =
+    req.blocking:
+      sleep(40)
+      res.send(Http200, "slow-done")
   proc rootH(req: Request, res: Response) {.async.} =
     res.send(Http200, bodyText)
   proc downH(req: Request, res: Response) {.async.} =
@@ -102,6 +105,11 @@ when isAsync:
     req.stream(chunk):
       discard chunk
 else:
+  # In-flight work on the worker pool: exercises the graceful-drain path.
+  proc slowH(req: Request, res: Response) {.gcsafe.} =
+    req.blocking:
+      sleep(40)
+      res.send(Http200, "slow-done")
   proc rootH(req: Request, res: Response) {.gcsafe.} =
     res.send(Http200, bodyText)
   proc downH(req: Request, res: Response) {.gcsafe.} =

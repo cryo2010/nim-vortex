@@ -1036,6 +1036,28 @@ proc processOutbox(loop: Loop) =
   drain(loop.core.outbox, loop.outboxScratch)
   var h3Touched = false
   for m in loop.outboxScratch.mitems:
+    if m.kind == omBlockingDone:
+      # An awaitable req.blocking worker finished. Release the boxed result and
+      # complete the future *regardless of connection state* -- on shutdown or
+      # after a client drop the connection may be gone, and the dead-conn
+      # `continue`s below would otherwise skip this and leak the box + future.
+      let base = cast[BlockingResultBase](m.user)
+      if base.onDone != nil: base.onDone(base)   # complete/fail the future (loop)
+      GC_unref(base)                             # release the box
+      if m.fd < 0:
+        when not defined(plainHttp):
+          let idx = int(-m.fd) - 2
+          if idx < loop.core.h3slots.len and loop.core.h3slots[idx].gen == m.gen:
+            let slot = addr loop.core.h3slots[idx]
+            if slot.pinned > 0: dec slot.pinned
+            if slot.closeReq and slot.pinned == 0: loop.h3FreeSlot(idx)
+            h3Touched = true
+      elif int(m.fd) < loop.core.conns.len:
+        let c = addr loop.core.conns[int(m.fd)]
+        if c.gen == m.gen and c.state != csFree:  # unpin/resume only if alive
+          if c.pinned > 0: dec c.pinned
+          if c.closeRequested: loop.closeConn(c)
+      continue
     if m.fd < 0:
       when not defined(plainHttp):
         let idx = int(-m.fd) - 2
@@ -1443,6 +1465,8 @@ proc run*(loop: Loop) =
   loop.selector.close()
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
     discard posix.close(cint(loop.listenFd))
+  if loop.core.teardownHook != nil:      # release the async adapter's dispatcher
+    loop.core.teardownHook()
 
 type LoopThreadArg* = tuple
   ## Plain-data bundle for starting a loop on its own thread; the Loop
