@@ -8,16 +8,18 @@ A fast HTTP/1.1, HTTP/2 and HTTP/3 server for Nim, with TLS, streaming and WebSo
 ```nim
 import vortex/asyncdispatch
 
-proc handler(req: Request, res: Response) {.async.} =
-  case req.path
-  of "/":
-    req.blocking: # runs on the worker pool
-      let data = expensiveBlockingCall()
-      res.send(Http200, data)   # object/JSON body -> application/json automatically
-  else:
-    res.send(Http404)
+proc hello(req: Request, res: Response) {.async.} =
+  res.send(Http200, "Hi.")
 
-newVortex(handler).serve(8080)
+proc report(req: Request, res: Response) {.async.} =
+  req.blocking: # runs on the worker pool
+    let data = expensiveBlockingCall()
+    res.send(Http200, data)   # object/JSON body -> application/json automatically
+
+var app = newVortex()
+app.get("/", hello)
+app.get("/report", report)
+app.serve(8080)
 ```
 
 ## Contents
@@ -127,30 +129,36 @@ Vortex is future-agnostic and ships with three server options:
 ```nim
 import vortex
 
-proc handler(req: Request, res: Response) =
+proc hello(req: Request, res: Response) =
   res.send(Http200, "Hello, World!")
 
-newVortex(handler).serve(8080)
+var app = newVortex()
+app.get("/", hello)
+app.serve(8080)
 ```
 
 **asyncdispatch** - An async server that uses `std/asyncdispatch` futures.
 ```nim
 import vortex/asyncdispatch
 
-proc handler(req: Request, res: Response) {.async.} =
+proc hello(req: Request, res: Response) {.async.} =
   res.send(Http200, "Hello, World!")
 
-newVortex(handler).serve(8080)
+var app = newVortex()
+app.get("/", hello)
+app.serve(8080)
 ```
 
 **chronos**: An async server that uses `/chronos` futures.
 ```nim
 import vortex/chronos
 
-proc handler(req: Request, res: Response) {.async.} =
+proc hello(req: Request, res: Response) {.async.} =
   res.send(Http200, "Hello, World!")
 
-newVortex(handler).serve(8080)
+var app = newVortex()
+app.get("/", hello)
+app.serve(8080)
 ```
 
 > [!IMPORTANT]
@@ -158,31 +166,40 @@ newVortex(handler).serve(8080)
 
 ## Quick start
 
-`newVortex(handler).serve(port)` creates and starts the server.
+`newVortex()` returns an app (a router): register routes on it, then `serve`
+(blocks) or `start` (non-blocking, returns the running server).
 
 ```nim
-newVortex(handler).serve(8080)
+var app = newVortex()
+app.get("/", hello)
+app.post("/users", createUser)
+app.serve(8080)
 ```
+
+For a single handler with no routing, pass it straight to `newVortex`:
+`newVortex(handler).serve(8080)`.
 
 ## Usage
 
 ### Config
 
-The server's `VortexConfig` can optionally be passed into `newVortex`, or you can simply 
-edit `vortex.config` before serving. It carries the TLS material, timeouts, worker/thread
-counts, and the feature toggles used throughout this document.
+The server's `VortexConfig` is passed to `serve`/`start`. It carries the TLS
+material, timeouts, worker/thread counts, and the feature toggles used
+throughout this document.
 
 ```nim
-let config = initVortexConfig(
+var config = initVortexConfig(
   address = "::",                 # dual-stack (default); pin a family with "0.0.0.0"
   numThreads = 0,                 # 0 = one event loop per core
   compress = true,                # response compression
   decompressRequest = true,       # transparently decode gzip/br/zstd request bodies
   responseTimeout = 30,           # seconds a handler may take before the conn is closed
-  shutdownGrace = 10))            # seconds to drain in-flight work on shutdown
-let vortex = newVortex(handler, config)
-vortex.config.serverHeader = "acme"   # config is mutable until you start serving requests
-vortex.serve(8080)
+  shutdownGrace = 10)             # seconds to drain in-flight work on shutdown
+config.serverHeader = "acme"      # fields are settable before serving
+
+var app = newVortex()
+app.get("/", hello)
+app.serve(8080, config = config)
 ```
 
 **Client address behind a proxy.** `req.remoteAddress` is the direct peer.
@@ -214,10 +231,11 @@ The **inbound** direction is opt-in with `config.decompressRequest`: a request
 whose `Content-Encoding` is `gzip`, `br`, or `zstd` is transparently decoded into `req.body`. 
 
 ```nim
-let server = newVortex(handler)
-server.config.compress = true # Enables response compression
-server.config.maxBodySize = 8*1024*1024 # Defends against decompression bomb attacks
-server.config.decompressRequest = true # Enables request decompression
+var config = initVortexConfig()
+config.compress = true              # Enables response compression
+config.maxBodySize = 8*1024*1024    # Defends against decompression bomb attacks
+config.decompressRequest = true     # Enables request decompression
+# ... app.serve(8080, config = config)
 ```
 
 | Algorithm | Compiler Flags | 
@@ -244,8 +262,8 @@ Providing a certificate turns on TLS, which enables HTTP/2 (via ALPN) and
 HTTP/3 (over QUIC):
 
 ```nim
-newVortex(handler, initVortexConfig(
-  certFile = "cert.pem", keyFile = "key.pem")).serve(8443)
+app.serve(8443, config = initVortexConfig(
+  certFile = "cert.pem", keyFile = "key.pem"))
 ```
 
 The cert and key can also come **from memory** instead of files. Pass the PEM
@@ -253,10 +271,10 @@ directly (e.g. loaded from a secret manager), with `keyPassword` for an
 encrypted key:
 
 ```nim
-newVortex(handler, initVortexConfig(
+app.serve(8443, config = initVortexConfig(
   certPem = vault.get("tls/cert"),
   keyPem = vault.get("tls/key"),
-  keyPassword = vault.get("tls/key-pass"))).serve(8443)
+  keyPassword = vault.get("tls/key-pass")))
 ```
 
 `certPem`/`keyPem` take precedence over `certFile`/`keyFile`; either source works
@@ -327,9 +345,9 @@ rejection when exceeded, and the handler never runs for a rejected request:
 | `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/etc. between stream progress (flood defense) |
 
 ```nim
-newVortex(handler, initVortexConfig(
+app.serve(8080, config = initVortexConfig(
   maxBodySize = 64 * 1024 * 1024,     # allow 64 MiB uploads
-  maxHeaderSize = 32 * 1024)).serve(8080)
+  maxHeaderSize = 32 * 1024))
 ```
 
 To accept a large upload without buffering it whole (so `maxBodySize` isn't the
@@ -506,11 +524,11 @@ proc requireAuth(next: RequestHandler): RequestHandler =
     else:
       inner(req, res)
 
-var router = newRouter()
-router.use(logging)         # outermost
-router.use(requireAuth)
-router.get("/users/:id", getUser)
-newVortex(router.toHandler).serve(8080)
+var app = newVortex()
+app.use(logging)         # outermost
+app.use(requireAuth)
+app.get("/users/:id", getUser)
+app.serve(8080)
 ```
 
 `use` is sugar over closure composition, so it is not required: since a handler
@@ -536,19 +554,21 @@ is loop-thread only (buffered `send`, not `sendHead` streaming): set it before a
 
 ### Routing
 
-`newRouter()` gives a path router: register a handler per method, with `:name`
-path parameters and a trailing `*` wildcard, then hand `router.toHandler` to
-`serve`/`start`:
+`newVortex()` gives you an app (a path router): register a handler per method,
+with `:name` path parameters and a trailing `*` wildcard, then `serve`/`start`:
 
 ```nim
 proc getUser(req: Request, res: Response) =
   res.send(Http200, "user " & req.param("id"))
 
-var router = newRouter()
-router.get("/users/:id", getUser)
-router.get("/static/*", staticHandler("public"))
-newVortex(router.toHandler).serve(8080)
+var app = newVortex()
+app.get("/users/:id", getUser)
+app.get("/static/*", staticHandler("public"))
+app.serve(8080)
 ```
+
+(`newRouter()` returns the same thing without the `serve`/`start` sugar; hand its
+`toHandler` to `newVortex` when you want to wire the server yourself.)
 
 Route parameters are stored eagerly at match time, so `req.param` / `req.params`
 work anywhere the handler does, including inside `blocking:` bodies. A path with
@@ -557,21 +577,21 @@ no matching route gets a 404; a path that matches but not the method, a 405.
 Compose routers by mounting one under a prefix with `use`:
 
 ```nim
-var users = newRouter()
+var users = newRouter()                # a child router (no serve of its own)
 users.use(requireAuth)                 # scoped to this router's routes
 users.get("/", listUsers)
 users.get("/:id", getUser)             # relative to the child's own root
 
-var router = newRouter()
-router.get("/", home)
-router.use("/users", users)            # /users -> listUsers, /users/:id -> getUser
-newVortex(router.toHandler).serve(8080)
+var app = newVortex()
+app.get("/", home)
+app.use("/users", users)               # /users -> listUsers, /users/:id -> getUser
+app.serve(8080)
 ```
 
 The child's routes merge into the parent's tree at registration time (so there's
 no per-request delegation, and `:param`/`*` carry over). The child's own `use`
 middleware wraps just its routes, while the parent's `use` still wraps
-everything. Mount after the child is fully configured and before `toHandler`.
+everything. Mount after the child is fully configured and before serving.
 
 ### Static files
 
@@ -580,10 +600,10 @@ route's trailing `*` wildcard. Register it on `/prefix/*` (and the bare
 `/prefix` for the directory index):
 
 ```nim
-let r = newRouter()
+var app = newVortex()
 let assets = staticHandler("public")
-r.get("/assets", assets)     # /assets and /assets/ -> public/index.html
-r.get("/assets/*", assets)   # /assets/<path> -> public/<path>
+app.get("/assets", assets)     # /assets and /assets/ -> public/index.html
+app.get("/assets/*", assets)   # /assets/<path> -> public/<path>
 ```
 
 `/assets/app.js` maps to `public/app.js`; `/assets/` and `/assets` serve the
@@ -636,8 +656,8 @@ not from inside `req.blocking:` (a worker), where it does nothing.
 #### Upload
 
 To consume a large upload without buffering it whole, register the route with
-`streaming = true` (and pass `router.streamPredicate` to `newVortex`). Its handler
-is dispatched at headers-complete and reads the body incrementally via `req.onBody`:
+`streaming = true`. Its handler is dispatched at headers-complete and reads the
+body incrementally via `req.onBody`:
 
 ```nim
 proc upload(req: Request, res: Response) =
@@ -645,10 +665,14 @@ proc upload(req: Request, res: Response) =
     sink(chunk)                     # write to disk, hash, proxy, ...
     if last: res.send(Http200, "ok")
 
-var router = newRouter()
-router.post("/upload", upload, streaming = true)
-newVortex(router.toHandler, streamRoute = router.streamPredicate).serve(8080)
+var app = newVortex()
+app.post("/upload", upload, streaming = true)
+app.serve(8080)                     # serve wires the streaming predicate for you
 ```
+
+(If you build the server by hand instead of `app.serve`, pass
+`router.streamPredicate` to `newVortex` so the loop dispatches streaming routes
+early.)
 
 The `req.stream` template is the inbound mirror of `res.stream` (its block runs
 per chunk, and aborts the response if it raises):
@@ -779,7 +803,9 @@ proc handler(req: Request, res: Response) =
   else:
     res.send(Http200, "…", %*{"Content-Type": "text/html"})
 
-newVortex(handler).serve(8080)
+var app = newVortex()
+app.get("/", handler)
+app.serve(8080)
 ```
 
 To negotiate a subprotocol, pass your supported list (preference order) to

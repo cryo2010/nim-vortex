@@ -3,12 +3,12 @@
 ## ```nim
 ## import vortex
 ##
-## proc handler(req: Request, res: Response) =
-##   case req.path
-##   of "/": res.send(Http200, "Hello, World!")
-##   else: res.send(Http404)
+## proc hello(req: Request, res: Response) =
+##   res.send(Http200, "Hello, World!")
 ##
-## newVortex(handler).serve(8080)
+## var app = newVortex()
+## app.get("/", hello)
+## app.serve(8080)
 ## ```
 
 import std/httpcore
@@ -33,3 +33,28 @@ export routing
 export streaming
 export staticfiles
 export ratelimit
+
+# --- App entry point: a router you build up, then serve --------------------
+# `newVortex()` returns a `Router`; register routes with get/post/... and
+# `serve`/`start` it. The inbound-streaming predicate is wired for you, so
+# `streaming = true` routes work without threading `streamRoute` by hand.
+
+proc newVortex*(): Router =
+  ## Start an app: a `Router` to register routes on, then `serve` or `start`.
+  ##
+  ##   var app = newVortex()
+  ##   app.get("/", hello)
+  ##   app.serve(8080)
+  ##
+  ## For a single handler with no routing, `newVortex(handler)` also works.
+  newRouter()
+
+proc start*(r: Router, port = -1, address = "",
+            config = initVortexConfig()): Vortex {.discardable.} =
+  ## Bind a server built from the router and return it (non-blocking). The
+  ## streaming-route predicate is wired automatically.
+  newVortex(r.toHandler, config, r.streamPredicate).start(port, address)
+
+proc serve*(r: Router, port = -1, address = "", config = initVortexConfig()) =
+  ## Serve the router forever (see `start` for the non-blocking form).
+  newVortex(r.toHandler, config, r.streamPredicate).serve(port, address)
