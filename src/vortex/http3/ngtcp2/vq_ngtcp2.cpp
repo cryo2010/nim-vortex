@@ -351,10 +351,15 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   return 0;
 }
 
-int cbStreamClose(ngtcp2_conn *, uint32_t, int64_t stream_id,
+int cbStreamClose(ngtcp2_conn *conn, uint32_t, int64_t stream_id,
                   uint64_t app_error_code, void *user_data, void *) {
   auto *c = static_cast<Conn *>(user_data);
   if (c->h3) nghttp3_conn_close_stream(c->h3, stream_id, app_error_code);
+  // Grant the client one more bidi stream to replace the finished request one,
+  // via a MAX_STREAMS frame. Without this the peer is capped forever at the
+  // initial budget (each request is a fresh bidi stream) and stalls after it.
+  if ((stream_id & 0x03) == 0)
+    ngtcp2_conn_extend_max_streams_bidi(conn, 1);
   return 0;
 }
 
