@@ -1060,6 +1060,14 @@ proc processOutbox(loop: Loop) =
             h3Touched = true
           continue
         if slot.gen != m.gen or slot.conn == nil: continue
+        if m.kind == omBlockingDone:
+          if slot.pinned > 0: dec slot.pinned
+          let base = cast[BlockingResultBase](m.user)
+          if base.onDone != nil: base.onDone()     # completes the awaiting future
+          GC_unref(base)
+          if slot.closeReq and slot.pinned == 0: loop.h3FreeSlot(idx)
+          h3Touched = true                          # h3Drive resumes + flushes
+          continue
         if m.kind in {omFileStart, omFileChunk}:
           if slot.pinned > 0: dec slot.pinned
           if slot.closeReq:
@@ -1115,6 +1123,18 @@ proc processOutbox(loop: Loop) =
           wsResume(addr loop.core, c, w)
           if c.state != csFree and c.pendingOut > 0:
             loop.flushOut(c)
+      continue
+    if m.kind == omBlockingDone:
+      if c.pinned > 0: dec c.pinned
+      if c.closeRequested:
+        loop.closeConn(c)
+        continue
+      let base = cast[BlockingResultBase](m.user)
+      if base.onDone != nil: base.onDone()          # completes the awaiting future
+      GC_unref(base)
+      # The resumed handler (in the end-of-iteration pump) sends its response;
+      # flush whatever it buffers.
+      if c.state != csFree and c.pendingOut > 0: loop.flushOut(c)
       continue
     if m.kind in {omFileStart, omFileChunk}:
       if c.pinned > 0: dec c.pinned

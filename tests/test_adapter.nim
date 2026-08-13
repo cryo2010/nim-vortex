@@ -1,8 +1,8 @@
 import std/[unittest, net, httpcore, strutils, os, osproc, times]
 import std/httpclient except Response
-import vortex/[settings, request, server, routing]
-import ./helper
-import vortex/asyncdispatch as nhsasync
+import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
+import ./helper                              # macro would clash with the async
+import vortex/asyncdispatch as nhsasync      # adapter's; Request/Response via facade
 
 proc hRoot(req: Request, res: Response) {.async.} =
   # No await at all: completes synchronously through the async path.
@@ -40,6 +40,14 @@ proc hBlockingInside(req: Request, res: Response) {.async.} =
     sleep(50)
     res.send(Http200, "worker done")
 
+proc hBlockingValue(req: Request, res: Response) {.async.} =
+  let name = req.param("name")
+  let n = 3
+  let data = req.blocking(name, n):      # awaitable: values moved in, result back
+    sleep(20)
+    name & ":" & $(n * 2)
+  res.send(Http200, data)                # loop-side send after the await
+
 const streamChunk = "0123456789abcdef".repeat(1024)   # 16 KiB
 const streamCount = 100                                # 1.6 MiB, > respHighWater
 
@@ -76,6 +84,7 @@ appRouter.get("/fan", hFanIn)
 appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
+appRouter.get("/worker-value/:name", hBlockingValue)
 appRouter.get("/stream", hStream)
 appRouter.post("/upload", hUpload, streaming = true)
 appRouter.post("/upload-reject", hUploadReject, streaming = true)
@@ -140,6 +149,9 @@ suite "asyncdispatch adapter":
 
   test "blocking: works inside an async handler":
     check fetch("/worker") == "worker done"
+
+  test "awaitable req.blocking moves values in and returns the result":
+    check fetch("/worker-value/ada") == "ada:6"
 
   test "res.stream + await res.write streams with backpressure, body intact":
     let body = fetch("/stream")

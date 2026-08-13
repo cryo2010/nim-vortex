@@ -10,9 +10,9 @@ import vortex/asyncdispatch
 
 proc report(req: Request, res: Response) {.async.} =
   let user = await loadUser(req.param("id"))   # async work on the loop
-  req.blocking(user):            # move `user` to the worker pool
-    let data = buildReport(user) # blocking / CPU work is safe here
-    res.send(Http200, data)      # object/JSON body -> application/json automatically
+  let data = req.blocking(user):   # move `user` to the worker pool, suspend here
+    buildReport(user)              # blocking / CPU work is safe here; result moves back
+  res.send(Http200, data)          # object/JSON body -> application/json automatically
 
 var app = newVortex()
 app.get("/report/:id", report)
@@ -374,6 +374,23 @@ Pass several values (`req.blocking(a, b, c):`); they ride in as a tuple, each
 usable by name. Anything not named in the call and not read from `req` is a
 compile error (that is the guardrail that keeps loop-thread state off the
 worker). With no values, `req.blocking:` just runs the block on a worker.
+
+**In an async handler** (`import vortex/asyncdispatch` or `vortex/chronos`),
+`req.blocking` is *awaitable and returns the block's value*: the handler
+suspends until the worker finishes (the loop keeps serving others), then resumes
+with the result moved back. The `await` is implicit, so it reads the same as the
+sync form:
+
+```nim
+proc report(req: Request, res: Response) {.async.} =
+  let user = await loadUser(req.param("id"))
+  let data = req.blocking(user):     # runs on a worker; handler suspends here
+    buildReport(user)                # whatever the block returns...
+  res.send(Http200, data)            # ...is available back on the loop
+```
+
+Returning a value is async-only: a pure sync handler can't suspend, so there
+`req.blocking` is terminal (the block sends the response itself).
 
 #### Requests
 

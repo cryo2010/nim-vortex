@@ -1,9 +1,9 @@
 import std/[unittest, net, httpcore, strutils, os, osproc, posix]
 import std/httpclient except Response
 import std/times except milliseconds
-import vortex/[settings, request, server, routing]
-import ./helper
-import vortex/chronos as nhschronos
+import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
+import ./helper                              # macro would clash with the async
+import vortex/chronos as nhschronos          # adapter's; Request/Response via facade
 
 proc hRoot(req: Request, res: Response) {.async.} =
   # No await at all: completes synchronously through the async path.

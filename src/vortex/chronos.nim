@@ -9,6 +9,6 @@
 ## `requires "chronos >= 4.0.0"` to your project. For asyncdispatch use
 ## `import vortex/asyncdispatch` instead (pick one runtime per program).
 import ../vortex
-export vortex
+export vortex except blocking     # the awaitable `blocking` comes from the adapter
 import ./adapters/chronos
 export chronos

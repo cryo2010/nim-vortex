@@ -28,7 +28,9 @@ type
     omWsClose,                ## data is a WebSocket close frame; close after flush
     omWsDone,                 ## a ws.blocking worker finished: unpin and resume
     omFileStart,              ## begin a streamed file: head + first chunk
-    omFileChunk               ## one more chunk of a streamed file
+    omFileChunk,              ## one more chunk of a streamed file
+    omBlockingDone            ## an awaitable req.blocking worker finished: `user`
+                              ## is a BlockingResultBase; run its completion
 
   OutMsg* = object
     ## A message produced off-loop (worker thread), routed back to the

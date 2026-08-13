@@ -1756,6 +1756,67 @@ proc dispatchBlockingArgs[T](req: Request,
   except Exception:
     discard
 
+type
+  BlockingResultBase* = ref object of RootObj
+    ## Type-erased handle for an awaitable `req.blocking` result. The worker
+    ## fills the typed subtype and posts it back; the loop calls `onDone` (which
+    ## closes over the adapter's `Future[R]`) to complete it. Internal.
+    onDone*: proc () {.gcsafe.}
+  BlockingResultBox*[A, R] = ref object of BlockingResultBase
+    ## `body` runs on the worker with the moved-in `args`; its result lands in
+    ## `value` (or `err`), read back on the loop. Internal. A `void` body (the
+    ## block responds itself) has no `value`.
+    body*: proc (req: Request, res: Response, args: A): R {.nimcall, gcsafe.}
+    args*: A
+    when R isnot void:
+      value*: R
+    err*: ref CatchableError
+
+proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
+                                    stream: uint32, ignored: string) {.nimcall, gcsafe.} =
+  let box = cast[BlockingResultBox[A, R]](user)
+  let lc = cast[ptr LoopCore](core)
+  let req = workerReq(lc, fd, gen, stream)
+  let res = response(req)
+  try:
+    when R is void:
+      box.body(req, res, box.args)
+    else:
+      box.value = box.body(req, res, box.args)
+  except CatchableError as e:
+    box.err = e
+  push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
+                         stream: stream, user: cast[pointer](box)))
+
+proc dispatchBlockingResult*[A, R](req: Request,
+                                   box: BlockingResultBox[A, R]) {.raises: [].} =
+  ## Internal: run an awaitable blocking `box` on the worker; the result is moved
+  ## back and `box.onDone` runs on the loop (see the drain). Backs the async
+  ## `req.blocking(...)` overload; not a public API. `box` must outlive the hop,
+  ## so it is GC-pinned here and released in the drain.
+  try:
+    GC_ref(box)
+    if req.core.pool == nil:
+      blockingResultTrampoline[A, R](cast[pointer](box), cast[pointer](req.core),
+                                     req.fd, req.gen, req.stream, "")   # inline
+      return
+    if req.fd < 0:
+      let idx = int(-req.fd) - 2
+      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+        GC_unref(box); return
+      inc req.core.h3slots[idx].pinned
+    else:
+      let c = conn(req.core, req.fd, req.gen)
+      if c == nil: (GC_unref(box); return)
+      inc c.pinned
+    enqueue(cast[ptr WorkerPool](req.core.pool),
+            WorkerTask(fn: blockingResultTrampoline[A, R],
+                       user: cast[pointer](box), core: cast[pointer](req.core),
+                       fd: req.fd, gen: req.gen, stream: req.stream,
+                       snap: snapshotRequest(req)))
+  except Exception:
+    discard
+
 # --- file streaming (loop-pull; large static files, see staticfiles.nim) ----
 # The worker reads one chunk and hands it back via the outbox (emitFile*); the
 # loop writes it and pulls the next read (applyFile*), throttled by write
