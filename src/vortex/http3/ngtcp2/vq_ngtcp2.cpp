@@ -127,9 +127,8 @@ ngtcp2_conn *getConnFromRef(ngtcp2_crypto_conn_ref *ref) {
 
 // --- ngtcp2 non-crypto callbacks -------------------------------------------
 
-int cbRand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *) {
+void cbRand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *) {
   RAND_bytes(dest, static_cast<int>(destlen));
-  return 0;
 }
 
 int cbGetNewCid(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,

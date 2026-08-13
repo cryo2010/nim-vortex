@@ -8,8 +8,11 @@
 import std/[tables, strutils, uri, json, os]
 import ../../connection
 
-{.passC: "-std=c++20 -I" & currentSourcePath().parentDir.}
-{.passL: "-lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -lssl -lcrypto".}
+# The shim is a C++ TU compiled by g++ (via {.compile.} on a .cpp), while the
+# rest of vortex stays on the C backend -- so no -std on passC (it would reach
+# Nim's generated .c files). -lstdc++ links the C++ runtime the shim needs.
+{.passC: "-I" & currentSourcePath().parentDir.}
+{.passL: "-lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -lssl -lcrypto -lstdc++".}
 {.compile: "vq_ngtcp2.cpp".}
 
 # --- shim ABI ---------------------------------------------------------------
