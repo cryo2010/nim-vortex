@@ -1,0 +1,180 @@
+      Info: using /Users/cryo/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/bin/nim for compilation
+  Executing task h3load in /Users/cryo/projects/nim/nim-http-server/vortex.nimble
+building HTTP/3 server image...
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.27kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/menci/archlinuxarm:latest
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/7] FROM docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359
+#4 resolve docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359 done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 332.90kB 0.0s done
+#5 DONE 0.0s
+
+#6 [2/7] RUN for i in 1 2 3 4 5; do       pacman -Syu --noconfirm --needed --disable-sandbox         nim gcc openssl && break;       [ "$i" = 5 ] && exit 1;       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15;     done &&     pacman -Scc --noconfirm
+#6 CACHED
+
+#7 [3/7] WORKDIR /vortex
+#7 CACHED
+
+#8 [4/7] COPY src ./src
+#8 DONE 0.0s
+
+#9 [5/7] COPY conformance/h3load/h3load_server.nim ./h3load_server.nim
+#9 DONE 0.0s
+
+#10 [6/7] RUN nim c --mm:orc --threads:on -d:release -p:src       -o:h3load_server h3load_server.nim
+#10 0.241 Hint: used config file '/etc/nim/nim.cfg' [Conf]
+#10 0.241 Hint: used config file '/etc/nim/config.nims' [Conf]
+#10 0.248 ..................................................................................................................................................................
+#10 0.760 /vortex/src/vortex/transport/tls.nim(114, 6) Hint: 'SSL_get_verify_result' is declared but not used [XDeclaredButNotUsed]
+#10 0.760 /vortex/src/vortex/transport/tls.nim(52, 3) Hint: 'SSL_VERIFY_PEER' is declared but not used [XDeclaredButNotUsed]
+#10 0.760 /vortex/src/vortex/transport/tls.nim(53, 3) Hint: 'SSL_VERIFY_FAIL_IF_NO_PEER_CERT' is declared but not used [XDeclaredButNotUsed]
+#10 0.760 /vortex/src/vortex/transport/tls.nim(57, 3) Hint: 'X509_V_OK' is declared but not used [XDeclaredButNotUsed]
+#10 0.765 /vortex/src/vortex/transport/quic.nim(34, 6) Hint: 'SSL_set_fd' is declared but not used [XDeclaredButNotUsed]
+#10 0.820 /vortex/src/vortex/request.nim(831, 7) Hint: 'effCt' is declared but not used [XDeclaredButNotUsed]
+#10 0.831 ..........
+#10 0.968 CC: system/exceptions.nim
+#10 0.968 CC: std/private/threadtypes.nim
+#10 0.968 CC: std/private/digitsutils.nim
+#10 0.969 CC: std/assertions.nim
+#10 0.969 CC: system/dollars.nim
+#10 0.969 CC: std/typedthreads.nim
+#10 0.970 CC: std/syncio.nim
+#10 0.970 CC: system.nim
+#10 0.970 CC: parseutils.nim
+#10 0.971 CC: math.nim
+#10 0.971 CC: std/strbasics.nim
+#10 0.971 CC: strutils.nim
+#10 0.971 CC: std/oserrors.nim
+#10 0.972 CC: std/private/ospaths2.nim
+#10 1.144 CC: times.nim
+#10 1.145 CC: std/envvars.nim
+#10 1.147 CC: std/cmdline.nim
+#10 1.147 CC: os.nim
+#10 1.148 CC: hashes.nim
+#10 1.149 CC: tables.nim
+#10 1.150 CC: httpcore.nim
+#10 1.152 CC: nativesockets.nim
+#10 1.153 CC: std/monotimes.nim
+#10 1.180 CC: net.nim
+#10 1.193 CC: json.nim
+#10 1.196 CC: vortex/settings.nim
+#10 1.197 CC: selectors.nim
+#10 1.204 CC: vortex/http1/parser.nim
+#10 1.207 CC: vortex/connection.nim
+#10 1.221 CC: deques.nim
+#10 1.229 CC: vortex/workerpool.nim
+#10 1.229 CC: vortex/http1/codec.nim
+#10 1.330 CC: vortex/http2/frames.nim
+#10 1.337 CC: vortex/http2/hpack_tables.nim
+#10 1.369 CC: vortex/http2/hpack.nim
+#10 1.371 CC: vortex/websocket/frames.nim
+#10 1.383 CC: vortex/websocket/codec.nim
+#10 1.386 CC: vortex/http2/codec.nim
+#10 1.387 CC: vortex/http3/frames.nim
+#10 1.401 CC: vortex/http3/qpack_tables.nim
+#10 1.418 CC: vortex/http3/qpack.nim
+#10 1.436 CC: dynlib.nim
+#10 1.455 CC: vortex/transport/tls.nim
+#10 1.471 CC: vortex/transport/quic.nim
+#10 1.474 CC: vortex/http3/codec.nim
+#10 1.507 CC: vortex/request.nim
+#10 1.555 CC: cpuinfo.nim
+#10 1.576 CC: vortex/proxyprotocol.nim
+#10 1.588 CC: vortex/eventloop.nim
+#10 1.618 CC: vortex/server.nim
+#10 1.630 CC: vortex/ratelimit.nim
+#10 1.650 CC: h3load_server.nim
+#10 2.509 Hint:  [Link]
+#10 2.546 Hint: mm: orc; threads: on; opt: speed; options: -d:release
+#10 2.546 81625 lines; 2.305s; 140.699MiB peakmem; proj: /vortex/h3load_server.nim; out: /vortex/h3load_server [SuccessX]
+#10 DONE 2.6s
+
+#11 [7/7] RUN openssl req -x509 -newkey rsa:2048 -nodes -days 3650       -keyout key.pem -out cert.pem       -subj "/CN=localhost"       -addext "subjectAltName=DNS:server,DNS:localhost"
+#11 0.141 .......+.............+++++++++++++++++++++++++++++++++++++++*...+++++++++++++++++++++++++++++++++++++++*...+..........+..+..........+............+..................+........+......+...+.+............+...+..+.........+......+...+....+..+....+..+.......+......+.........+..+..........+........+.+.....+......+.+........+.+.....+.+...+......++++++
+#11 0.150 .+..............+.+......+..+++++++++++++++++++++++++++++++++++++++*..+..+...+....+..+++++++++++++++++++++++++++++++++++++++*...+.....+...+.+...+...+...........................+..+.+..+.+..+...............+.......+.....+......+.+.....+...+............+...+......+......+......+....+...+........+...+.......+...+......+...+......+..+.......+...+............+...+..................+..+...+.+........+...+....+...+..+....+.........+.....+..........+............+.....................+...............+...+..+....+...+...+........+.+.........+..+...+......+.....................+....+....................+.........+.+........+.+..+.........+.+.........+...+...........+..........+.........+......+.........+...+.....+....+......+..+......+.........+.......+.....+..........+.........+..+.......+........+....+...+..+...+...+....+...+...........+.+.....+...+......+.+.........+..+...+......++++++
+#11 0.181 -----
+#11 DONE 0.2s
+
+#12 exporting to image
+#12 exporting layers 0.1s done
+#12 exporting manifest sha256:cfb8d792756dee396622deba6643d37286a12c1a00645d3952f9eb8ee5f3c894
+#12 exporting manifest sha256:cfb8d792756dee396622deba6643d37286a12c1a00645d3952f9eb8ee5f3c894 done
+#12 exporting config sha256:ebd096081944653e2e6f9f8a295988c48704e5183c3e98704b3ec32b2c9546c0 done
+#12 exporting attestation manifest sha256:9ec37591634d28d7889ccf9ecf28222c955b03e9ecf7b4612f329c025b85060c done
+#12 exporting manifest list sha256:3c8a1225282cec8e0bba3043b5300e259a56730fae7c71f6c28c18825d7a6944 done
+#12 naming to docker.io/library/vortex-h3load-server-img:latest done
+#12 unpacking to docker.io/library/vortex-h3load-server-img:latest 0.0s done
+#12 DONE 0.2s
+building h2load-http3 client image (builds the QUIC stack from source)...
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from client.Dockerfile
+#1 transferring dockerfile: 3.24kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/menci/archlinuxarm:latest
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/9] FROM docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359
+#4 resolve docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359 done
+#4 DONE 0.0s
+
+#5 [8/9] RUN cd nghttp2 && autoreconf -i &&     ./configure --prefix=/usr/local --enable-app --enable-http3       --with-openssl --with-libngtcp2 --with-libnghttp3       --without-jemalloc --without-libxml2 &&     make -j"$(nproc)" && make install && ldconfig &&     cd / && rm -rf /build
+#5 CACHED
+
+#6 [6/9] RUN cd nghttp3 && autoreconf -i &&     ./configure --prefix=/usr/local --enable-lib-only &&     make -j"$(nproc)" && make install && ldconfig
+#6 CACHED
+
+#7 [2/9] RUN for i in 1 2 3 4 5; do       pacman -Syu --noconfirm --needed --disable-sandbox         base-devel git cmake openssl libev zlib c-ares && break;       [ "$i" = 5 ] && exit 1;       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15;     done &&     pacman -Scc --noconfirm
+#7 CACHED
+
+#8 [4/9] RUN git clone --depth 1 -b v1.11.0 https://github.com/ngtcp2/nghttp3 &&     git clone --depth 1 -b v1.15.0  https://github.com/ngtcp2/ngtcp2 &&     git clone --depth 1 -b v1.66.0 https://github.com/nghttp2/nghttp2 &&     (cd nghttp3 && git submodule update --init --depth 1) &&     (cd ngtcp2  && git submodule update --init --depth 1) &&     (cd nghttp2 && git submodule update --init --depth 1)
+#8 CACHED
+
+#9 [5/9] RUN echo /usr/local/lib > /etc/ld.so.conf.d/usrlocal.conf
+#9 CACHED
+
+#10 [3/9] WORKDIR /build
+#10 CACHED
+
+#11 [7/9] RUN cd ngtcp2 && autoreconf -i &&     ./configure --prefix=/usr/local --enable-lib-only --with-openssl &&     make -j"$(nproc)" && make install && ldconfig
+#11 CACHED
+
+#12 [9/9] RUN h2load --version &&     ldd "$(command -v h2load)" | grep -q nghttp3
+#12 CACHED
+
+#13 exporting to image
+#13 exporting layers done
+#13 exporting manifest sha256:124928b4b1bdebfb6fef3ffe4f253bcabc3b7611e6ed55d7ceeba69ec74693bb done
+#13 exporting config sha256:548fd41634e7e8350c6463dacad656ae94639bffbc2236cb2ef3a01093883417 done
+#13 exporting attestation manifest sha256:0a8cb55ba8ba40bde67658ae78389b62e7050a577ecbc63090c1b811729ba5b9 done
+#13 exporting manifest list sha256:9f9f29c55a70510a45430b0228d2ce4360be871627fddca8f617f0b9cd9c5447 done
+#13 naming to docker.io/library/vortex-h3load-client-img:latest done
+#13 unpacking to docker.io/library/vortex-h3load-client-img:latest done
+#13 DONE 0.0s
+vortex HTTP/3 server up on the docker network
+=== h2load HTTP/3: 100000 requests, 32 connections, up to 32 streams/conn ===
+finished in 382.10ms, 261715.02 req/s, 12.01MB/s
+requests: 100000 total, 100000 started, 100000 done, 100000 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 100000 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 4.59MB (4811942) total, 3.73MB (3908192) headers (space savings 57.52%), 195.31KB (200000) data
+req/s           :    8199.31     8927.72     8761.38      132.30    87.50%
+
+RESULT: h3load passed (100000 requests x 32 connections over HTTP/3, all 2xx).

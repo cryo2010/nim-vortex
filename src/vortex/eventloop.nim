@@ -41,8 +41,11 @@ import ./websocket/codec as wscodec
 from ./http2/frames import connectionPreface
 when not defined(plainHttp):
   import ./transport/tls
-  import ./transport/quic
-  import ./http3/codec as h3codec
+  when defined(quicNgtcp2):
+    import ./http3/ngtcp2/backend as h3codec
+  else:
+    import ./transport/quic
+    import ./http3/codec as h3codec
 
   proc tlsVerifyMode*(v: ClientVerify): cint =
     ## Map the public verify enum to OpenSSL's SSL_VERIFY_* mode.
@@ -255,28 +258,38 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
   when not defined(plainHttp):
     if udpFd != osInvalidSocket:
       # A valid udpFd means the server enabled h3 and validated the QUIC cert.
-      # Build this loop's own QUIC ctx (from the same configured cert) so a
-      # certificate hot-reload can update it in place on this thread, with no
-      # cross-loop race and without dropping in-flight h3 connections.
-      let ownCfg = newQuicConfig(settings.certFile, settings.keyFile,
-                                 settings.tlsCipherSuites,
-                                 certPem = settings.certPem,
-                                 keyPem = settings.keyPem,
-                                 keyPassword = settings.keyPassword,
-                                 pkcs12File = settings.pkcs12File,
-                                 pkcs12 = settings.pkcs12,
-                                 verify = tlsVerifyMode(settings.verifyClient),
-                                 clientCaFile = settings.clientCaFile,
-                                 clientCaPem = settings.clientCaPem,
-                                 sni = toSniCerts(settings),
-                                 ocsp = ocspBytes(settings))
-      result.quicOwnCfg = cast[pointer](ownCfg)
       result.quicReload = quicReload
-      result.quicListener = newQuicListener(ownCfg, cint(udpFd))
-      if result.quicListener != nil:
-        result.udpFd = int(udpFd)
-        result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
-        result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
+      when defined(quicNgtcp2):
+        # ngtcp2/nghttp3 transport: the C++ shim owns the QUIC engine + TLS.
+        if ngSetup(addr result.core, cint(udpFd), settings.certFile,
+                   settings.keyFile, settings.maxBodySize,
+                   settings.maxConcurrentStreams, settings.maxHeaderSize):
+          result.udpFd = int(udpFd)
+          result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
+          result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
+      else:
+        # OpenSSL QUIC: build this loop's own QUIC ctx (from the same configured
+        # cert) so a certificate hot-reload can update it in place on this
+        # thread, with no cross-loop race and without dropping in-flight h3
+        # connections.
+        let ownCfg = newQuicConfig(settings.certFile, settings.keyFile,
+                                   settings.tlsCipherSuites,
+                                   certPem = settings.certPem,
+                                   keyPem = settings.keyPem,
+                                   keyPassword = settings.keyPassword,
+                                   pkcs12File = settings.pkcs12File,
+                                   pkcs12 = settings.pkcs12,
+                                   verify = tlsVerifyMode(settings.verifyClient),
+                                   clientCaFile = settings.clientCaFile,
+                                   clientCaPem = settings.clientCaPem,
+                                   sni = toSniCerts(settings),
+                                   ocsp = ocspBytes(settings))
+        result.quicOwnCfg = cast[pointer](ownCfg)
+        result.quicListener = newQuicListener(ownCfg, cint(udpFd))
+        if result.quicListener != nil:
+          result.udpFd = int(udpFd)
+          result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
+          result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
 
 const drainTimeoutSec = 5    # bound on how long a lingering close waits
 
@@ -991,44 +1004,68 @@ when not defined(plainHttp):
   proc h3Drive(loop: Loop) =
     ## Advance the QUIC stack: timers/retransmits, new connections, and
     ## all request streams; dispatch completed requests.
-    quicHandleEvents(loop.quicListener)
-    while true:
-      let connSsl = quicAcceptConnection(loop.quicListener)
-      if connSsl == nil: break
-      var idx = -1
-      for i in 0 ..< loop.core.h3slots.len:
-        if loop.core.h3slots[i].conn == nil and
-            loop.core.h3slots[i].pinned == 0:
-          idx = i
-          break
-      if idx < 0:
-        loop.core.h3slots.add H3SlotEntry()
-        idx = loop.core.h3slots.len - 1
-      loop.core.h3slots[idx].conn =
-        newH3Conn(addr loop.core, connSsl, idx, loop.settings.maxBodySize,
-                  loop.settings.maxConcurrentStreams)
-    for idx in 0 ..< loop.core.h3slots.len:
-      let slot = addr loop.core.h3slots[idx]
-      if slot.conn == nil: continue
-      if slot.closeReq:
-        loop.h3FreeSlot(idx)
-        continue
-      if slot.pinned > 0: continue     # paused while a worker holds it
-      let conn = H3Conn(slot.conn)
-      if quicConnDead(conn.ssl):
-        loop.h3FreeSlot(idx)
-        continue
-      loop.h3Ready.setLen(0)
-      h3Pump(conn, loop.h3Ready)
-      for sid in loop.h3Ready:
-        let req = Request(core: addr loop.core, fd: int32(-(idx + 2)),
-                          gen: slot.gen, stream: uint32(sid))
-        try:
-          {.gcsafe.}:
-            loop.callHandler(req, response(req))
-        except CatchableError:
-          h3Apply(addr loop.core, int32(-(idx + 2)), slot.gen, uint32(sid),
-                  500, "text/plain", [], "500 Internal Server Error")
+    when defined(quicNgtcp2):
+      # ngtcp2/nghttp3: the shim accepts connections and parses HTTP/3 via its
+      # callbacks (which fill h3slots and the ready list); we drain UDP in, run
+      # timers, dispatch ready requests, and flush UDP out.
+      ngReceive()
+      for (slot, gen, sid) in ngTakeReady():
+        if slot < loop.core.h3slots.len and
+            loop.core.h3slots[slot].gen == gen and
+            loop.core.h3slots[slot].conn != nil:
+          let req = Request(core: addr loop.core, fd: int32(-(slot + 2)),
+                            gen: gen, stream: uint32(sid))
+          try:
+            {.gcsafe.}:
+              loop.callHandler(req, response(req))
+          except CatchableError:
+            h3Apply(addr loop.core, int32(-(slot + 2)), gen, uint32(sid),
+                    500, "text/plain", [], "500 Internal Server Error")
+      ngHandleExpiry()
+      ngPump()
+      for idx in 0 ..< loop.core.h3slots.len:
+        if loop.core.h3slots[idx].conn != nil and
+            loop.core.h3slots[idx].closeReq and loop.core.h3slots[idx].pinned == 0:
+          loop.h3FreeSlot(idx)
+    else:
+      quicHandleEvents(loop.quicListener)
+      while true:
+        let connSsl = quicAcceptConnection(loop.quicListener)
+        if connSsl == nil: break
+        var idx = -1
+        for i in 0 ..< loop.core.h3slots.len:
+          if loop.core.h3slots[i].conn == nil and
+              loop.core.h3slots[i].pinned == 0:
+            idx = i
+            break
+        if idx < 0:
+          loop.core.h3slots.add H3SlotEntry()
+          idx = loop.core.h3slots.len - 1
+        loop.core.h3slots[idx].conn =
+          newH3Conn(addr loop.core, connSsl, idx, loop.settings.maxBodySize,
+                    loop.settings.maxConcurrentStreams)
+      for idx in 0 ..< loop.core.h3slots.len:
+        let slot = addr loop.core.h3slots[idx]
+        if slot.conn == nil: continue
+        if slot.closeReq:
+          loop.h3FreeSlot(idx)
+          continue
+        if slot.pinned > 0: continue     # paused while a worker holds it
+        let conn = H3Conn(slot.conn)
+        if quicConnDead(conn.ssl):
+          loop.h3FreeSlot(idx)
+          continue
+        loop.h3Ready.setLen(0)
+        h3Pump(conn, loop.h3Ready)
+        for sid in loop.h3Ready:
+          let req = Request(core: addr loop.core, fd: int32(-(idx + 2)),
+                            gen: slot.gen, stream: uint32(sid))
+          try:
+            {.gcsafe.}:
+              loop.callHandler(req, response(req))
+          except CatchableError:
+            h3Apply(addr loop.core, int32(-(idx + 2)), slot.gen, uint32(sid),
+                    500, "text/plain", [], "500 Internal Server Error")
 
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing.
@@ -1167,8 +1204,12 @@ proc processOutbox(loop: Loop) =
                   headers, m.data.toOpenArray(bodyStart, m.data.len - 1))
     loop.resumeAfterRespond(c, m.stream)
   when not defined(plainHttp):
-    if h3Touched and loop.quicListener != nil:
-      loop.h3Drive()             # flush unpinned conns, dispatch new work
+    when defined(quicNgtcp2):
+      if h3Touched and loop.udpFd >= 0:
+        loop.h3Drive()           # flush unpinned conns, dispatch new work
+    else:
+      if h3Touched and loop.quicListener != nil:
+        loop.h3Drive()           # flush unpinned conns, dispatch new work
 
 proc sweepWsPing(loop: Loop, c: ptr Connection) =
   ## A WebSocket has been idle: send a keepalive ping and wait for any
@@ -1217,8 +1258,12 @@ proc sweepWsIdle(loop: Loop) =
     if not done: survivors.add r
   loop.core.wsIdle = survivors
   when not defined(plainHttp):
-    if h3Touched and loop.quicListener != nil:
-      loop.h3Drive()
+    when defined(quicNgtcp2):
+      if h3Touched and loop.udpFd >= 0:
+        loop.h3Drive()
+    else:
+      if h3Touched and loop.quicListener != nil:
+        loop.h3Drive()
 
 proc applyQuicReload(loop: Loop) =
   ## Loop thread: apply a pending QUIC certificate reload to this loop's private
@@ -1227,17 +1272,33 @@ proc applyQuicReload(loop: Loop) =
   ## the generation is consumed either way, so a permanently-bad cert does not
   ## spin -- the operator fixes the files and re-issues the reload.
   when not defined(plainHttp):
-    if loop.quicReload == nil or loop.quicOwnCfg == nil: return
-    var cf, kf: string
-    let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
-                                loop.quicReloadSeen, cf, kf)
-    if gen != loop.quicReloadSeen:
-      if not reloadQuicCert(cast[ptr TlsConfig](loop.quicOwnCfg), cf, kf):
-        try:
-          stderr.writeLine("vortex: HTTP/3 certificate reload failed; " &
-                           "keeping the current certificate on this loop")
-        except IOError, OSError: discard
-      loop.quicReloadSeen = gen
+    when defined(quicNgtcp2):
+      if loop.quicReload == nil or loop.udpFd < 0: return
+      var cf, kf: string
+      let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
+                                  loop.quicReloadSeen, cf, kf)
+      if gen != loop.quicReloadSeen:
+        var ok = false
+        try: ok = ngReloadCert(readFile(cf), readFile(kf))
+        except CatchableError: ok = false
+        if not ok:
+          try:
+            stderr.writeLine("vortex: HTTP/3 certificate reload failed; " &
+                             "keeping the current certificate on this loop")
+          except IOError, OSError: discard
+        loop.quicReloadSeen = gen
+    else:
+      if loop.quicReload == nil or loop.quicOwnCfg == nil: return
+      var cf, kf: string
+      let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
+                                  loop.quicReloadSeen, cf, kf)
+      if gen != loop.quicReloadSeen:
+        if not reloadQuicCert(cast[ptr TlsConfig](loop.quicOwnCfg), cf, kf):
+          try:
+            stderr.writeLine("vortex: HTTP/3 certificate reload failed; " &
+                             "keeping the current certificate on this loop")
+          except IOError, OSError: discard
+        loop.quicReloadSeen = gen
 
 proc tick(loop: Loop) =
   let now = monoSec()
@@ -1372,10 +1433,16 @@ proc run*(loop: Loop) =
       # timer/IO completions from its dispatcher aren't starved.
       timeoutMs = min(timeoutMs, max(1, loop.pumpCap))
     when not defined(plainHttp):
-      if loop.quicListener != nil:
-        let qt = quicEventTimeoutMs(loop.quicListener)
-        if qt >= 0:
-          timeoutMs = max(1, min(timeoutMs, qt))
+      when defined(quicNgtcp2):
+        if loop.udpFd >= 0:
+          let qt = ngTimeoutMs()
+          if qt >= 0:
+            timeoutMs = max(1, min(timeoutMs, qt))
+      else:
+        if loop.quicListener != nil:
+          let qt = quicEventTimeoutMs(loop.quicListener)
+          if qt >= 0:
+            timeoutMs = max(1, min(timeoutMs, qt))
     var n = 0
     try:
       n = loop.selector.selectInto(timeoutMs, keys)
@@ -1424,14 +1491,18 @@ proc run*(loop: Loop) =
         if c.state != csFree:
           loop.closeConn(c)
     when not defined(plainHttp):
-      if loop.quicListener != nil:
-        # Drive QUIC on datagrams, timer expiry, and every wakeup: the
-        # stack owns its own retransmission/idle timers.
-        discard quicWork
-        try:
-          loop.h3Drive()
-        except Exception:
-          discard
+      # Drive QUIC on datagrams, timer expiry, and every wakeup: the stack owns
+      # its own retransmission/idle timers.
+      when defined(quicNgtcp2):
+        if loop.udpFd >= 0:
+          discard quicWork
+          try: loop.h3Drive()
+          except Exception: discard
+      else:
+        if loop.quicListener != nil:
+          discard quicWork
+          try: loop.h3Drive()
+          except Exception: discard
     if loop.core.pumpHook != nil:
       # Pump at the end of the iteration so callbacks scheduled while
       # handling this batch (e.g. an await that completed immediately)
@@ -1451,17 +1522,25 @@ proc run*(loop: Loop) =
         # processing the outbox until the workers finish and unpin, rather than
         # freeing the loop's memory under them (use-after-free).
   when not defined(plainHttp):
-    if loop.quicListener != nil:
-      for i in 0 ..< loop.core.h3slots.len:
-        loop.core.h3slots[i].pinned = 0
-        loop.h3FreeSlot(i)
-      quicFree(loop.quicListener)
-      discard posix.close(cint(loop.udpFd))
-    # Free the per-loop QUIC ctx even if the listener failed to create (the ctx
-    # is built first): otherwise it leaks on that error path. Ordered after the
-    # listener free above so the listener's ctx ref is already dropped.
-    if loop.quicOwnCfg != nil:
-      freeTlsConfig(cast[ptr TlsConfig](loop.quicOwnCfg))
+    when defined(quicNgtcp2):
+      if loop.udpFd >= 0:
+        for i in 0 ..< loop.core.h3slots.len:
+          loop.core.h3slots[i].pinned = 0
+          loop.h3FreeSlot(i)
+        ngEngineFree()            # frees the shim engine (all conns + TLS ctx)
+        discard posix.close(cint(loop.udpFd))
+    else:
+      if loop.quicListener != nil:
+        for i in 0 ..< loop.core.h3slots.len:
+          loop.core.h3slots[i].pinned = 0
+          loop.h3FreeSlot(i)
+        quicFree(loop.quicListener)
+        discard posix.close(cint(loop.udpFd))
+      # Free the per-loop QUIC ctx even if the listener failed to create (the ctx
+      # is built first): otherwise it leaks on that error path. Ordered after the
+      # listener free above so the listener's ctx ref is already dropped.
+      if loop.quicOwnCfg != nil:
+        freeTlsConfig(cast[ptr TlsConfig](loop.quicOwnCfg))
   loop.selector.close()
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
     discard posix.close(cint(loop.listenFd))

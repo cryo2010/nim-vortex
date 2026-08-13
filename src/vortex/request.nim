@@ -18,7 +18,10 @@ import ./http2/codec as h2codec
 import ./websocket/codec as wscodec
 export wscodec
 when not defined(plainHttp):
-  import ./http3/codec as h3codec
+  when defined(quicNgtcp2):
+    import ./http3/ngtcp2/backend as h3codec
+  else:
+    import ./http3/codec as h3codec
   import ./transport/tls as tlscodec
 when defined(httpGzip):
   import ./gzip

@@ -1,0 +1,24 @@
+# The ngtcp2/nghttp3 HTTP/3 server built with AddressSanitizer/LeakSanitizer for
+# the memcheck run (conformance/memcheck/h3ngtcp2.sh). ASan is compiled in, so it
+# works on the Arch deps image -- unlike valgrind, which cannot run there (Arch's
+# ld.so is stripped) and whose ngtcp2 `ossl` backend needs OpenSSL >= 3.5 (absent
+# on Debian, where valgrind would work). numThreads=1 (h3spec_server) keeps the
+# sanitizer output simple.
+
+FROM vortex-ngtcp2-deps
+WORKDIR /vortex
+COPY src ./src
+COPY conformance/h3spec/h3spec_server.nim ./h3spec_server.nim
+RUN nim c --mm:orc --threads:on -d:release -d:quicNgtcp2 -d:ssl -p:src \
+      -d:useMalloc --debugger:native \
+      --passC:-fsanitize=address --passL:-fsanitize=address \
+      -o:h3asan_server h3spec_server.nim
+
+RUN openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout key.pem -out cert.pem \
+      -subj "/CN=localhost" \
+      -addext "subjectAltName=DNS:server,DNS:localhost"
+
+# LSan needs the process to exit cleanly (SIGTERM -> graceful shutdown) to report.
+EXPOSE 4433/udp
+CMD ["./h3asan_server"]
