@@ -1,0 +1,19 @@
+# The vortex HTTP/3 WebSocket echo server on the ngtcp2/nghttp3 backend
+# (-d:quicNgtcp2) for the RFC 9220 conformance run. Selected by
+# `NGTCP2=1 sh conformance/h3websocket/run.sh`. Based on the deps image (Nim +
+# ngtcp2 + nghttp3 ossl backend); run.sh builds it first.
+
+FROM vortex-ngtcp2-deps
+WORKDIR /vortex
+COPY src ./src
+COPY conformance/h3websocket/echo_server.nim ./echo_server.nim
+RUN nim c --mm:orc --threads:on -d:release -d:quicNgtcp2 -d:ssl -p:src \
+      -o:echo_server echo_server.nim
+
+RUN openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -keyout key.pem -out cert.pem \
+      -subj "/CN=localhost" \
+      -addext "subjectAltName=DNS:server,DNS:localhost"
+
+EXPOSE 4433/udp
+CMD ["./echo_server"]

@@ -7,6 +7,7 @@
 
 import std/[tables, strutils, uri, json, os, monotimes]
 import ../../connection
+import ../../websocket/codec as wscodec
 
 # The shim is a C++ TU compiled by g++ (via {.compile.} on a .cpp), while the
 # rest of vortex stays on the C backend -- so no -std on passC (it would reach
@@ -247,6 +248,11 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   let usid = uint64(sid)
   if usid notin h3c.streams: return
   template st: H3Stream = h3c.streams[usid]
+  if st.ws != nil:
+    # RFC 9220 tunnel: DATA payload is WebSocket framing.
+    let arr = cast[ptr UncheckedArray[char]](data)
+    wsFeed(h3c.core, nil, WsConn(st.ws), arr.toOpenArray(0, int(len) - 1))
+    return
   let old = st.body.len
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
@@ -258,7 +264,9 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   if usid notin h3c.streams: return
   template st: H3Stream = h3c.streams[usid]
   st.finSeen = true
-  if st.streamingReq:
+  if st.ws != nil:
+    wsPeerClosed(h3c.core, nil, WsConn(st.ws))
+  elif st.streamingReq:
     deliverBody(h3c, usid, true)
   elif not st.dispatched and st.headersDone:
     st.dispatched = true
@@ -269,6 +277,9 @@ proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} 
   let usid = uint64(sid)
   if usid in h3c.streams:
     template st: H3Stream = h3c.streams[usid]
+    if st.ws != nil:
+      wsStreamClosed(h3c.core, nil, WsConn(st.ws))
+      st.ws = nil
     if st.onBodyCb != nil:
       let cb = st.onBodyCb
       st.onBodyCb = nil
@@ -451,6 +462,9 @@ proc h3Goaway*(conn: H3Conn) =
 proc h3Free*(conn: H3Conn) =
   var empty: string
   for sid, st in conn.streams.mpairs:
+    if st.ws != nil:                  # onClose(1006) for any open ws stream
+      wsStreamClosed(conn.core, nil, WsConn(st.ws))
+      st.ws = nil
     if st.onBodyCb != nil:
       let cb = st.onBodyCb
       st.onBodyCb = nil
@@ -461,14 +475,67 @@ proc h3Free*(conn: H3Conn) =
     vqConnClose(conn.vq, 0)
     conn.vq = nil
 
-# --- WebSocket over HTTP/3 (Phase 5) ----------------------------------------
+# --- WebSocket over HTTP/3 (RFC 9220 Extended CONNECT) ----------------------
+proc wsFlushH3ng(core: ptr LoopCore, c: ptr Connection, w: WsConn) {.nimcall, gcsafe.} =
+  ## WsConn.flush for HTTP/3: push produced frames as DATA (nghttp3 serves them),
+  ## then finalize on close or fire onDrain when the backlog empties.
+  let conn = H3Conn(w.h3conn)
+  let sid = uint64(w.stream)
+  if conn == nil or sid notin conn.streams:
+    w.outBuf.setLen 0
+    return
+  if w.outBuf.len > 0:
+    discard vqStreamWrite(conn.vq, int64(sid),
+                          cast[ptr uint8](addr w.outBuf[0]), csize_t(w.outBuf.len))
+    w.outBuf.setLen 0
+  let backlog = int(vqStreamBacklog(conn.vq, int64(sid)))
+  w.h2Pending = backlog
+  if backlog == 0:
+    if w.wantClose:
+      wsStreamClosed(core, nil, w)
+      if sid in conn.streams: conn.streams[sid].ws = nil
+      vqStreamFinish(conn.vq, int64(sid))
+    elif w.backedUp:
+      w.backedUp = false
+      if w.onDrain != nil:
+        w.onDrain(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream))
+  else:
+    w.backedUp = true
+
 proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
                  gen: uint32, maxMessage: int, extensionsOffer, protocolsOffer: string,
                  serverProtocols: openArray[string]): bool =
-  false   # not yet implemented on the ngtcp2 path
-
-proc installH3WsHooks*(core: ptr LoopCore) =
-  discard   # ws-over-h3 lookup wired in Phase 5
+  ## Accept an Extended CONNECT WebSocket: 200 headers (no FIN, stream stays
+  ## open) and attach a WsConn whose frames tunnel through h3 DATA.
+  if sid notin conn.streams: return false
+  template st: H3Stream = conn.streams[sid]
+  if not st.isWsConnect or st.responded or st.ws != nil: return false
+  st.responded = true
+  let (w, proto, ext) = wsSetup(core, fd, gen, maxMessage, uint32(sid),
+                                extensionsOffer, protocolsOffer, serverProtocols)
+  w.flush = wsFlushH3ng
+  w.h3conn = conn
+  st.ws = w
+  var hdrs: seq[(string, string)] = @[(":status", "200")]
+  if core.serverHeader.len > 0: hdrs.add ("server", core.serverHeader)
+  hdrs.add ("date", core.dateStr)
+  if proto.len > 0: hdrs.add ("sec-websocket-protocol", proto)
+  if ext.len > 0: hdrs.add ("sec-websocket-extensions", ext)
+  var nv = toVq(hdrs)
+  vqSubmitHead(conn.vq, int64(sid), cint(200), addr nv[0], csize_t(nv.len))
+  true
 
 proc h3WsResume*(core: ptr LoopCore, conn: H3Conn, sid: uint64) =
-  discard   # ws-over-h3 (Phase 5)
+  if sid in conn.streams and conn.streams[sid].ws != nil:
+    wsResume(core, nil, WsConn(conn.streams[sid].ws))
+
+proc h3WsLookup(corep: pointer, fd: int32, gen: uint32,
+                stream: uint32): RootRef {.nimcall, gcsafe.} =
+  let core = cast[ptr LoopCore](corep)
+  let conn = h3ConnOf(core, fd, gen)
+  if conn != nil and uint64(stream) in conn.streams:
+    return conn.streams[uint64(stream)].ws
+  nil
+
+proc installH3WsHooks*(core: ptr LoopCore) =
+  core.wsH3Lookup = h3WsLookup

@@ -286,6 +286,7 @@ int setupHttpConn(Conn *c) {
   nghttp3_settings_default(&settings);
   settings.qpack_blocked_streams = 0;
   settings.qpack_max_dtable_capacity = 4096;
+  settings.enable_connect_protocol = 1;   // RFC 9220 WebSockets over HTTP/3
 
   static const nghttp3_callbacks cbs = {
       h3AckedStreamData,   // acked_stream_data
