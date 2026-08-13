@@ -88,6 +88,27 @@ proc use*(r: Router, mw: Middleware) =
   ## (a `stream` route has no body yet when it is dispatched).
   r.middleware.add mw
 
+proc use*(parent: Router, prefix: string, child: Router) =
+  ## Mount `child`'s routes under `prefix`: `parent.use("/users", userRouter)`
+  ## makes the child's `/:id` reachable at `/users/:id`. Routes are merged into
+  ## `parent`'s tree at registration time (no per-request delegation, and the
+  ## child's `:param`/`*` carry over). The child's own `use` middleware wraps
+  ## just its routes; `parent`'s middleware still wraps everything. This is a
+  ## snapshot: fully configure `child` before mounting, and mount before
+  ## `toHandler`.
+  proc wrap(h: RequestHandler): RequestHandler =
+    result = h                                   # no child middleware -> unchanged
+    for i in countdown(child.middleware.high, 0):
+      result = child.middleware[i](result)
+  proc walk(node: RouteNode, path: string) =
+    for m in HttpMethod:
+      if node.handlers[m] != nil:
+        parent.addRoute(m, prefix & path, wrap(node.handlers[m]), node.streaming[m])
+    for c in node.children:
+      let seg = if c.isWild: "*" elif c.isParam: ":" & c.segment else: c.segment
+      walk(c, path & "/" & seg)
+  walk(child.root, "")
+
 proc get*(r: Router, path: string, h: RequestHandler, streaming = false) =
   r.addRoute(HttpGet, path, h, streaming)
 proc post*(r: Router, path: string, h: RequestHandler, streaming = false) =

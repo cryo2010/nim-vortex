@@ -554,6 +554,25 @@ Route parameters are stored eagerly at match time, so `req.param` / `req.params`
 work anywhere the handler does, including inside `blocking:` bodies. A path with
 no matching route gets a 404; a path that matches but not the method, a 405.
 
+Compose routers by mounting one under a prefix with `use`:
+
+```nim
+var users = newRouter()
+users.use(requireAuth)                 # scoped to this router's routes
+users.get("/", listUsers)
+users.get("/:id", getUser)             # relative to the child's own root
+
+var router = newRouter()
+router.get("/", home)
+router.use("/users", users)            # /users -> listUsers, /users/:id -> getUser
+newVortex(router.toHandler).serve(8080)
+```
+
+The child's routes merge into the parent's tree at registration time (so there's
+no per-request delegation, and `:param`/`*` carry over). The child's own `use`
+middleware wraps just its routes, while the parent's `use` still wraps
+everything. Mount after the child is fully configured and before `toHandler`.
+
 ### Static files
 
 `staticHandler(rootDir)` returns a handler that serves a directory, keyed off a
