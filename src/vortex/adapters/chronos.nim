@@ -247,13 +247,6 @@ proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
         bodyReaders.del(k)
       watch(req, fut)
 
-proc stream*(r: Router, meth: HttpMethod, path: string,
-             h: AsyncRequestHandler) =
-  ## Register an async streaming route: the handler runs at headers-complete
-  ## and pulls the body with `await req.read()`. Pass `router.streamPredicate`
-  ## to `start` for the loop to dispatch it early.
-  r.stream(meth, path, streamToHandler(h))
-
 proc wsToHandler(inner: AsyncRequestHandler): RequestHandler =
   ## Like toHandler, but with WebSocket completion semantics: an unhandled
   ## exception closes the socket with 1011 (not an HTTP 500), and there is no
@@ -311,23 +304,28 @@ proc newVortex*(h: AsyncRequestHandler, config = initVortexConfig(),
   newVortex(toHandler(h), config, streamRoute)
 
 proc route(r: Router, meth: HttpMethod, path: string,
-           h: AsyncRequestHandler) =
-  r.addRoute(meth, path, toHandler(h))
+           h: AsyncRequestHandler, streaming: bool) =
+  # A streaming route is dispatched at headers-complete and pulls the body with
+  # `await req.read()`, so it wraps with streamToHandler; a buffered route uses
+  # the plain adapter. Pass `router.streamPredicate` to `start` so the loop
+  # dispatches streaming routes early.
+  if streaming: r.addRoute(meth, path, streamToHandler(h), streaming = true)
+  else: r.addRoute(meth, path, toHandler(h))
 
-proc get*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpGet, path, h)
-proc post*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpPost, path, h)
-proc put*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpPut, path, h)
-proc delete*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpDelete, path, h)
-proc patch*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpPatch, path, h)
-proc head*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpHead, path, h)
-proc options*(r: Router, path: string, h: AsyncRequestHandler) =
-  r.route(HttpOptions, path, h)
+proc get*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpGet, path, h, streaming)
+proc post*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpPost, path, h, streaming)
+proc put*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpPut, path, h, streaming)
+proc delete*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpDelete, path, h, streaming)
+proc patch*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpPatch, path, h, streaming)
+proc head*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpHead, path, h, streaming)
+proc options*(r: Router, path: string, h: AsyncRequestHandler, streaming = false) =
+  r.route(HttpOptions, path, h, streaming)
 
 # --- pull-loop sugar + SSE backpressure -------------------------------------
 

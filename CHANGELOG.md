@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** the router's `stream` registrar is replaced by a `streaming`
+  parameter on the route registrars: `router.get/post/put/...` and `addRoute`
+  now take `streaming = false`. Migration:
+  `router.stream(HttpPost, path, h)` -> `router.post(path, h, streaming = true)`.
+  Same for the async adapters. This aligns streaming-route registration with the
+  per-verb shape (no more passing `HttpPost` positionally).
 - **Breaking:** `res.send` no longer takes a `contentType` parameter; set the
   content type through `headers` instead. When `headers` has no `Content-Type`,
   one is injected automatically: `text/plain` for a string body,

@@ -77,9 +77,9 @@ appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
 appRouter.get("/stream", hStream)
-appRouter.stream(HttpPost, "/upload", hUpload)
-appRouter.stream(HttpPost, "/upload-reject", hUploadReject)
-appRouter.stream(HttpPost, "/upload-boom", hUploadBoom)
+appRouter.post("/upload", hUpload, streaming = true)
+appRouter.post("/upload-reject", hUploadReject, streaming = true)
+appRouter.post("/upload-boom", hUploadBoom, streaming = true)
 
 var srv = newVortex(appRouter.toHandler,
                     initVortexConfig(numThreads = 1, workerThreads = 2),
