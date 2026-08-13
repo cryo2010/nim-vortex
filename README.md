@@ -8,17 +8,14 @@ A fast HTTP/1.1, HTTP/2 and HTTP/3 server for Nim, with TLS, streaming and WebSo
 ```nim
 import vortex/asyncdispatch
 
-proc hello(req: Request, res: Response) {.async.} =
-  res.send(Http200, "Hi.")
-
 proc report(req: Request, res: Response) {.async.} =
-  req.blocking: # runs on the worker pool
-    let data = expensiveBlockingCall()
-    res.send(Http200, data)   # object/JSON body -> application/json automatically
+  let user = await loadUser(req.param("id"))   # async work on the loop
+  req.blocking(user):            # move `user` to the worker pool
+    let data = buildReport(user) # blocking / CPU work is safe here
+    res.send(Http200, data)      # object/JSON body -> application/json automatically
 
 var app = newVortex()
-app.get("/", hello)
-app.get("/report", report)
+app.get("/report/:id", report)
 app.serve(8080)
 ```
 
@@ -360,16 +357,23 @@ A handler is a plain `proc (req: Request, res: Response)` or `proc (req: Request
 `sleep`). Read the request through `req`, reply through `res`.
 
 For synchronous work (a sync DB driver, file IO, CPU-bound work), `req.blocking:`
-moves the body to a worker pool. Inside it, `req`/`res` are available but the
-body cannot capture surrounding locals (it runs on another thread); read what
-you need through `req`:
+moves the body to a worker pool. Inside it, `req`/`res` are injected and the
+block must call `res.send`. The block runs on another thread, so it **cannot
+capture surrounding locals**; instead, name the values you need in the call and
+they are **moved** into the worker, usable by name inside:
 
 ```nim
-proc handler(req: Request, res: Response) {.async.} =
-  req.blocking:
-    let rows = db.getAllRows(sql"select …")   # blocking is safe here
+proc handler(req: Request, res: Response) =
+  let limit = req.query.getOrDefault("limit")
+  req.blocking(limit):                          # `limit` moved into the worker
+    let rows = db.getAllRows(sql"select … limit ?", limit)
     res.send(Http200, rows)   # seq -> JSON array, application/json automatically
 ```
+
+Pass several values (`req.blocking(a, b, c):`); they ride in as a tuple, each
+usable by name. Anything not named in the call and not read from `req` is a
+compile error (that is the guardrail that keeps loop-thread state off the
+worker). With no values, `req.blocking:` just runs the block on a worker.
 
 #### Requests
 
@@ -400,7 +404,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
-| `req.blocking: body` | `template` | run `body` on the worker pool (see above) |
+| `req.blocking(vals…): body` | `macro` | run `body` on the worker pool; named `vals` are moved in and usable by name (see above) |
 | `req.isWebSocketUpgrade` | `bool` | is this request a WebSocket handshake (see [WebSockets](#websockets)) |
 | `req.acceptWebSocket(protocols = [])` | `WebSocket` | complete the WebSocket handshake (see [WebSockets](#websockets)) |
 | `req.onBody(cb, manualAck = false)` | `void` | register an inbound body sink (see [Upload](#upload)) |

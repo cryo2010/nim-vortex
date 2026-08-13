@@ -7,7 +7,7 @@
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
 ## streams are independent.
 
-import std/[httpcore, strutils, uri, tables, json, options, typetraits]
+import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros]
 import ./connection
 
 export PathParams, ResponseHeaders
@@ -1702,6 +1702,60 @@ proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
   except Exception:
     discard
 
+type
+  BlockingArgsBox[T] = ref object
+    ## Carries a capture-free body plus the values moved into the worker. Boxed
+    ## so an arbitrary `T` (the `req.blocking(a, b, ...)` argument tuple) can
+    ## cross to the worker without a per-type WorkerTask field.
+    body: proc (req: Request, res: Response, data: T) {.nimcall, gcsafe.}
+    data: T
+
+proc blockingArgsTrampoline[T](user, core: pointer, fd: int32, gen: uint32,
+                               stream: uint32, ignored: string) {.nimcall, gcsafe.} =
+  let box = cast[BlockingArgsBox[T]](user)
+  let lc = cast[ptr LoopCore](core)
+  let req = workerReq(lc, fd, gen, stream)
+  let res = response(req)
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: workerResponded = false
+  try:
+    box.body(req, res, box.data)
+  except Exception:
+    res.send(Http500, "500 Internal Server Error")
+  if onWorker and not workerResponded:
+    res.send(Http500, "500 Internal Server Error")
+  GC_unref(box)
+
+proc dispatchBlockingArgs[T](req: Request,
+    body: proc (req: Request, res: Response, data: T) {.nimcall, gcsafe.},
+    data: sink T) {.raises: [].} =
+  ## Internal: move `data` (the blocking args as a tuple) into the worker and run
+  ## the capture-free `body` there. Backs the `req.blocking(a, b, ...)` macro;
+  ## not a public API. Pin/enqueue bookkeeping mirrors dispatchBlocking.
+  try:
+    let box = BlockingArgsBox[T](body: body, data: data)
+    GC_ref(box)                                   # keep alive across the hop
+    if req.core.pool == nil:
+      blockingArgsTrampoline[T](cast[pointer](box), cast[pointer](req.core),
+                                req.fd, req.gen, req.stream, "")   # inline; unrefs
+      return
+    if req.fd < 0:
+      let idx = int(-req.fd) - 2
+      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+        GC_unref(box); return
+      inc req.core.h3slots[idx].pinned
+    else:
+      let c = conn(req.core, req.fd, req.gen)
+      if c == nil: (GC_unref(box); return)
+      inc c.pinned
+    enqueue(cast[ptr WorkerPool](req.core.pool),
+            WorkerTask(fn: blockingArgsTrampoline[T], user: cast[pointer](box),
+                       core: cast[pointer](req.core), fd: req.fd,
+                       gen: req.gen, stream: req.stream,
+                       snap: snapshotRequest(req)))
+  except Exception:
+    discard
+
 # --- file streaming (loop-pull; large static files, see staticfiles.nim) ----
 # The worker reads one chunk and hands it back via the outbox (emitFile*); the
 # loop writes it and pulls the next read (applyFile*), throttled by write
@@ -1762,23 +1816,51 @@ proc applyFileStart*(res: Response, status: int, contentType: string,
                contentLength = int(totalLen))
   applyFileChunk(res, firstChunk, nextRead, reader, last)
 
-template blocking*(request: Request, body: untyped) =
-  ## Run `body` on the worker pool, where blocking calls (sync DB drivers,
-  ## file IO, CPU work) are safe. Inside `body` the request and response
-  ## are available as `req` and `res`; `body` must eventually call
-  ## `res.send` (an uncaught exception sends 500). `body` cannot capture
-  ## surrounding locals; read what you need via `req` inside the body.
+macro blocking*(request: Request, args: varargs[untyped]): untyped =
+  ## Run a block on the worker pool, where blocking calls (sync DB drivers, file
+  ## IO, CPU work) are safe. Values named in the call are **moved** into the
+  ## worker and are available inside the block by name; `req` and `res` are
+  ## injected. The block must call `res.send` (an uncaught exception sends 500).
+  ## Only the named values cross the thread boundary -- capturing other
+  ## surrounding locals is rejected, which keeps loop-thread state unshared.
   ##
   ## ```nim
   ## proc handler(req: Request, res: Response) =
-  ##   req.blocking:
-  ##     let rows = db.getAllRows(sql"...")   # blocking is fine here
-  ##     res.send(Http200, $rows)
+  ##   let user = req.param("id")
+  ##   req.blocking(user):                    # user moved into the worker
+  ##     res.send(Http200, render(loadFrom(db, user)))
   ## ```
-  dispatchBlocking(request,
-    proc (req {.inject.}: Request, res {.inject.}: Response)
-        {.nimcall, gcsafe.} =
-      body)
+  ##
+  ## Pass several values (they ride in as a tuple, each usable by name):
+  ## `req.blocking(user, cfg): ...`. With no values, `req.blocking: ...` just
+  ## runs the block on a worker.
+  let body = args[^1]
+  var names: seq[NimNode]
+  for i in 0 ..< args.len - 1: names.add args[i]
+  # bindSym so the expansion reaches these even though `dispatchBlockingArgs`
+  # is not exported (kept off the public API).
+  let dispatchArgs = bindSym"dispatchBlockingArgs"
+  if names.len == 0:
+    result = quote do:
+      dispatchBlocking(`request`,
+        proc (req {.inject.}: Request, res {.inject.}: Response)
+            {.nimcall, gcsafe.} =
+          `body`)
+  else:
+    let payload = genSym(nskParam, "payload")
+    var tup = nnkTupleConstr.newTree()
+    for n in names: tup.add n
+    var inner = newStmtList()
+    for i, n in names:
+      inner.add newLetStmt(n, nnkBracketExpr.newTree(payload, newLit(i)))
+    inner.add body
+    result = quote do:
+      block:
+        let moved = `tup`
+        `dispatchArgs`(`request`, proc (req {.inject.}: Request,
+            res {.inject.}: Response, `payload`: typeof(moved))
+            {.nimcall, gcsafe.} =
+          `inner`, moved)
 
 # --- WebSockets -------------------------------------------------------------
 
