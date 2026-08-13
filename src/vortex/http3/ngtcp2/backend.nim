@@ -5,7 +5,7 @@
 ## the framing/QPACK; this module holds per-request state and translates
 ## request/response calls to the shim. Loop-thread only (one engine per thread).
 
-import std/[tables, strutils, uri, json, os]
+import std/[tables, strutils, uri, json, os, monotimes]
 import ../../connection
 
 # The shim is a C++ TU compiled by g++ (via {.compile.} on a .cpp), while the
@@ -121,7 +121,11 @@ var
   gEngine {.threadvar.}: ptr VqEngine
   gCore {.threadvar.}: ptr LoopCore
   gUdpFd {.threadvar.}: cint
+  gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
+  gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
+
+proc nowNs(): uint64 = getMonoTime().ticks.uint64
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -289,6 +293,9 @@ proc cbConnClose(user, connUd: pointer) {.cdecl.} =
 
 proc sendtoUdp(fd: cint, data: pointer, len: csize_t, flags: cint, peer: pointer,
                peerLen: cuint): int {.importc: "sendto", header: "<sys/socket.h>".}
+proc recvfromUdp(fd: cint, buf: pointer, n: csize_t, flags: cint, peer: pointer,
+                 peerLen: ptr cuint): int {.importc: "recvfrom", header: "<sys/socket.h>".}
+proc getsocknameC(fd: cint, a: pointer, l: ptr cuint): cint {.importc: "getsockname", header: "<sys/socket.h>".}
 
 proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
             peer: pointer, peerLen: csize_t): cint {.cdecl.} =
@@ -311,20 +318,32 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.max_concurrent_streams = uint64(maxStreams)
   cfg.max_field_section_size = cint(maxFieldSection)
   gEngine = vqEngineNew(addr cfg)
-  gEngine != nil
+  if gEngine == nil: return false
+  gLocalLen = cuint(sizeof(gLocalSa))
+  discard getsocknameC(udpFd, addr gLocalSa[0], addr gLocalLen)
+  true
 
-proc ngRecv*(pkt: pointer, len: int, peer: pointer, peerLen: int,
-             local: pointer, localLen: int, nowNs: uint64) =
-  vqEngineRecv(gEngine, cast[ptr uint8](pkt), csize_t(len), peer, csize_t(peerLen),
-               local, csize_t(localLen), nowNs)
+proc ngReceive*() =
+  ## Drain all pending datagrams from the loop's (nonblocking) UDP socket into
+  ## the engine; the shim's callbacks populate connections and the ready list.
+  var buf: array[2048, uint8]
+  var peer: array[128, byte]
+  while true:
+    var plen = cuint(sizeof(peer))
+    let n = recvfromUdp(gUdpFd, addr buf[0], csize_t(buf.len), cint(0),
+                        addr peer[0], addr plen)
+    if n <= 0: break
+    vqEngineRecv(gEngine, addr buf[0], csize_t(n), addr peer[0], csize_t(plen),
+                 addr gLocalSa[0], csize_t(gLocalLen), nowNs())
 
-proc ngPump*(nowNs: uint64) = vqEnginePump(gEngine, nowNs)
-proc ngHandleExpiry*(nowNs: uint64) = vqEngineHandleExpiry(gEngine, nowNs)
-proc ngTimeoutMs*(nowNs: uint64): int =
-  let e = vqEngineNextExpiry(gEngine, nowNs)
+proc ngPump*() = vqEnginePump(gEngine, nowNs())
+proc ngHandleExpiry*() = vqEngineHandleExpiry(gEngine, nowNs())
+proc ngTimeoutMs*(): int =
+  let now = nowNs()
+  let e = vqEngineNextExpiry(gEngine, now)
   if e == high(uint64): -1
-  elif e <= nowNs: 0
-  else: int((e - nowNs) div 1_000_000) + 1
+  elif e <= now: 0
+  else: int((e - now) div 1_000_000) + 1
 proc ngReloadCert*(certPem, keyPem: string): bool =
   gEngine != nil and vqEngineReloadCert(gEngine, certPem.cstring, keyPem.cstring) == 0
 proc ngTakeReady*(): seq[tuple[slot: int, gen: uint32, sid: uint64]] =
@@ -450,3 +469,6 @@ proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
 
 proc installH3WsHooks*(core: ptr LoopCore) =
   discard   # ws-over-h3 lookup wired in Phase 5
+
+proc h3WsResume*(core: ptr LoopCore, conn: H3Conn, sid: uint64) =
+  discard   # ws-over-h3 (Phase 5)

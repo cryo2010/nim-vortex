@@ -53,16 +53,18 @@ typedef struct {
   /* A new QUIC connection finished its handshake. Return an opaque per-conn
    * context (vortex's h3 slot handle); returning NULL rejects the connection.
    * peer_ip is a numeric string (no port), valid for the call only. */
-  void *(*on_accept)(void *user, VqConn *conn, const char *peer_ip);
+  void *(*on_accept)(void *user, VqConn *conn, char *peer_ip);
 
   /* HTTP/3 request headers for a stream, delivered once complete. hdrs points
-   * to n contiguous VqHeader (pseudo-headers first), borrowed for the call. */
+   * to n contiguous VqHeader (pseudo-headers first), borrowed for the call.
+   * (Params are non-const so Nim {.nimcall.} callback types match exactly; the
+   * callee must still treat the buffers as read-only and copy what it keeps.) */
   void (*on_headers)(void *user, void *conn_ud, int64_t stream_id,
-                     const VqHeader *hdrs, size_t n);
+                     VqHeader *hdrs, size_t n);
 
   /* A DATA chunk (request body). data borrowed for the call. */
   void (*on_body)(void *user, void *conn_ud, int64_t stream_id,
-                  const uint8_t *data, size_t len);
+                  uint8_t *data, size_t len);
 
   /* The request stream is fully received (peer FIN after headers/body). */
   void (*on_stream_end)(void *user, void *conn_ud, int64_t stream_id);
@@ -83,8 +85,8 @@ typedef struct {
   /* Emit one outbound UDP datagram. peer is the destination sockaddr (the
    * packet's path remote), valid for the call only. Return 0 on success, <0 to
    * signal a send error. */
-  int (*on_send)(void *user, VqConn *conn, const uint8_t *data, size_t len,
-                 const void *peer, size_t peer_len);
+  int (*on_send)(void *user, VqConn *conn, uint8_t *data, size_t len,
+                 void *peer, size_t peer_len);
 } VqCallbacks;
 
 /* ---- engine config -------------------------------------------------------- */

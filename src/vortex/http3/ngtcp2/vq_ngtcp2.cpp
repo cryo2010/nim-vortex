@@ -206,7 +206,8 @@ int h3RecvData(nghttp3_conn *, int64_t stream_id, const uint8_t *data,
   auto *c = static_cast<Conn *>(cud);
   auto &cb = c->engine->cfg.cb;
   if (cb.on_body)
-    cb.on_body(c->engine->cfg.user, c->conn_ud, stream_id, data, datalen);
+    cb.on_body(c->engine->cfg.user, c->conn_ud, stream_id,
+               const_cast<uint8_t *>(data), datalen);
   return 0;
 }
 
@@ -459,7 +460,7 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
 
   if (e->cfg.cb.on_accept)
     c->conn_ud = e->cfg.cb.on_accept(e->cfg.user, reinterpret_cast<VqConn *>(c),
-                                     c->peer_ip.c_str());
+                                     const_cast<char *>(c->peer_ip.c_str()));
 
   e->conns.push_back(std::move(owned));
   return c;
