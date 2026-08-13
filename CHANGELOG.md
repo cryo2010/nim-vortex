@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Router composition: `parent.use(prefix, childRouter)` mounts a child router's
+  routes under `prefix` (e.g. `root.use("/users", userRouter)` makes the child's
+  `/:id` reachable at `/users/:id`). Routes merge into the parent tree at
+  registration time; the child's own `use` middleware scopes to just its routes,
+  and `:param`/`*` carry over.
+
 - `req.json` parses the request body as JSON (cached per request; empty body is
   `{}`, raises `JsonParsingError` on malformed input), and `res.send(code, json)`
   replies with `application/json`. vortex now re-exports `std/json`, so
