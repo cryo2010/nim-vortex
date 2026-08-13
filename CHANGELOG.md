@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `newVortex()` (no arguments) returns an app (a router) you register routes on,
+  then `serve` (blocks) or `start` (non-blocking): `var app = newVortex();
+  app.get("/", h); app.serve(8080)`. `serve`/`start` on a router build the server
+  and wire the streaming-route predicate automatically, so `streaming = true`
+  routes work without passing `streamRoute` by hand. `newVortex(handler)` still
+  works for a single handler with no routing.
+
 - Router composition: `parent.use(prefix, childRouter)` mounts a child router's
   routes under `prefix` (e.g. `root.use("/users", userRouter)` makes the child's
   `/:id` reachable at `/users/:id`). Routes merge into the parent tree at
