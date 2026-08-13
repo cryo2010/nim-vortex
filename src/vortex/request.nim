@@ -253,8 +253,37 @@ proc `[]`*(h: RequestHeaders, name: string): string =
 
 proc contains*(h: RequestHeaders, name: string): bool =
   ## True if the header is present (case-insensitive), even with an empty value.
-  for (n, _) in h:
-    if cmpIgnoreCase(n, name) == 0: return true
+  ## Scans in place (byte-compare on HTTP/1, name compare on h2/h3): no
+  ## per-header allocation, unlike iterating the pairs.
+  let req = h.req
+  template scanSeq(hs: untyped): bool =
+    var found = false
+    for pair in hs:
+      if pair[0].len > 0 and pair[0][0] != ':' and cmpIgnoreCase(pair[0], name) == 0:
+        found = true; break
+    found
+  if req.snap != nil:
+    return scanSeq(req.snap.headers)
+  if req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        let st = h3StreamPtr(h3c, uint64(req.stream))
+        if st != nil: return scanSeq(st.headers)
+    return false
+  let c = conn(req.core, req.fd, req.gen)
+  if c == nil: return false
+  if req.stream != 0:
+    let st = h2Stream(c, req.stream)
+    return st != nil and scanSeq(st.headers)
+  for hs in c.parser.headers:                 # HTTP/1: compare against the read buffer
+    if int(hs.nameLen) == name.len:
+      var match = true
+      for i in 0 ..< name.len:
+        if lowerA(c.rbuf[int(hs.nameStart) + i]) != lowerA(name[i]):
+          match = false; break
+      if match: return true
+  false
 
 proc body*(req: Request): string =
   if req.snap != nil: return req.snap.body
