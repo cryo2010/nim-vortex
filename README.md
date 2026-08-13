@@ -363,8 +363,8 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.path` | `string` | raw request target, query string included |
 | `req.url` | `Uri` | parsed target; `req.url.path` excludes the query (lazy, cached) |
 | `req.query` | `Table[string, string]` | decoded query params, last value wins (lazy, cached) |
-| `req.headers` | `iterator (string, string)` | every header pair (pseudo-headers skipped) |
-| `req.header(name)` | `string` | one header, case-insensitive; "" if absent |
+| `req.headers[name]` | `string` | one header, case-insensitive; "" if absent. `name in req.headers` tests presence; `for (n, v) in req.headers` iterates (pseudo-headers skipped). Read-only view (no allocation) mirroring `res.headers[name]` |
+| `req.header(name)` | `string` | alias of `req.headers[name]` |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
 | `req.json` | `JsonNode` | body parsed as JSON, cached per request; empty body is `{}`; raises `JsonParsingError` on malformed input |
 | `req.contentLength` | `int` | body length in bytes |

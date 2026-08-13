@@ -28,12 +28,19 @@ proc cookies(req: Request, res: Response) {.gcsafe.} =
   res.headers.add("Set-Cookie", "b=2")
   res.send(Http200, "ok")
 
+proc echoReq(req: Request, res: Response) {.gcsafe.} =
+  # req.headers[name] matches the res.headers[name] shape (read-only,
+  # case-insensitive); "has" via `in`.
+  let present = if "x-custom" in req.headers: "yes" else: "no"
+  res.send(Http200, req.headers["X-Custom"] & "|" & present)
+
 var rt = newRouter()
 rt.use(poweredBy)
 rt.get("/plain", plain)
 rt.get("/html", html)
 rt.get("/override", override)
 rt.get("/cookies", cookies)
+rt.get("/echo-req", echoReq)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
@@ -63,6 +70,17 @@ suite "res.headers":
     var c = newHttpClient()
     defer: c.close()
     check c.get(base & "/cookies").headers.table["set-cookie"].len == 2
+
+  test "req.headers[name] reads request headers, case-insensitively":
+    var c = newHttpClient()
+    defer: c.close()
+    c.headers = newHttpHeaders({"X-Custom": "hello"})
+    check c.getContent(base & "/echo-req") == "hello|yes"
+
+  test "req.headers[name] is '' and not-present when the header is absent":
+    var c = newHttpClient()
+    defer: c.close()
+    check c.getContent(base & "/echo-req") == "|no"
 
   test "res.headers works over HTTP/2 (h2c)":
     let (output, rc) = execCmdEx(

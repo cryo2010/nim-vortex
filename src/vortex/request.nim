@@ -49,6 +49,12 @@ type
 
   RequestHandler* = proc (req: Request, res: Response) {.gcsafe.}
 
+  RequestHeaders* = object
+    ## A read-only, case-insensitive view of a request's headers, mirroring the
+    ## `res.headers[name]` shape. Just a handle: `[]` looks up on demand over the
+    ## zero-copy parser slices, so it allocates nothing.
+    req: Request
+
 proc response*(req: Request): Response =
   ## The Response paired with a Request. Dispatch hands handlers both;
   ## this exists for code that stored only the read half.
@@ -178,9 +184,10 @@ proc path*(req: Request): string =
       result = c.rbuf.substr(int(c.parser.pathStart),
                              int(c.parser.pathStart + c.parser.pathLen) - 1)
 
-iterator headers*(req: Request): (string, string) =
-  ## Yields (name, value) pairs. HTTP/2 and /3 names are lowercase on the
-  ## wire; pseudo-headers are skipped.
+iterator items*(h: RequestHeaders): (string, string) =
+  ## Yields (name, value) pairs (`for (n, v) in req.headers`). HTTP/2 and /3
+  ## names are lowercase on the wire; pseudo-headers are skipped.
+  let req = h.req
   if req.snap != nil:
     for (n, v) in req.snap.headers:
       if n.len > 0 and n[0] != ':': yield (n, v)
@@ -203,11 +210,11 @@ iterator headers*(req: Request): (string, string) =
             if n.len > 0 and n[0] != ':':
               yield (n, v)
       else:
-        for h in c.parser.headers:
-          yield (c.rbuf.substr(int(h.nameStart),
-                               int(h.nameStart + h.nameLen) - 1),
-                 c.rbuf.substr(int(h.valStart),
-                               int(h.valStart + h.valLen) - 1))
+        for hs in c.parser.headers:
+          yield (c.rbuf.substr(int(hs.nameStart),
+                               int(hs.nameStart + hs.nameLen) - 1),
+                 c.rbuf.substr(int(hs.valStart),
+                               int(hs.valStart + hs.valLen) - 1))
 
 proc header*(req: Request, name: string): string =
   ## Case-insensitive single-header lookup; "" when absent.
@@ -233,6 +240,21 @@ proc header*(req: Request, name: string): string =
         if match:
           return c.rbuf.substr(int(h.valStart),
                                int(h.valStart + h.valLen) - 1)
+
+proc headers*(req: Request): RequestHeaders {.inline.} =
+  ## A read-only, case-insensitive view of the request headers, matching the
+  ## `res.headers[name]` shape: `req.headers["Content-Type"]`,
+  ## `"authorization" in req.headers`, `for (n, v) in req.headers`.
+  RequestHeaders(req: req)
+
+proc `[]`*(h: RequestHeaders, name: string): string =
+  ## Case-insensitive lookup; "" when absent (same zero-copy path as `header`).
+  h.req.header(name)
+
+proc contains*(h: RequestHeaders, name: string): bool =
+  ## True if the header is present (case-insensitive), even with an empty value.
+  for (n, _) in h:
+    if cmpIgnoreCase(n, name) == 0: return true
 
 proc body*(req: Request): string =
   if req.snap != nil: return req.snap.body
