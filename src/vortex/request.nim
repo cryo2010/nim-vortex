@@ -18,10 +18,7 @@ import ./http2/codec as h2codec
 import ./websocket/codec as wscodec
 export wscodec
 when not defined(plainHttp):
-  when defined(quicNgtcp2):
-    import ./http3/ngtcp2/backend as h3codec
-  else:
-    import ./http3/codec as h3codec
+  import ./http3/ngtcp2/backend as h3codec   # HTTP/3 over ngtcp2 + nghttp3
   import ./transport/tls as tlscodec
 when defined(httpGzip):
   import ./gzip

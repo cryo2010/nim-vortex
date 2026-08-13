@@ -1,9 +1,9 @@
 ## HTTP/3 backend over ngtcp2 (QUIC) + nghttp3, via the vq_ngtcp2 C++ shim.
-## Drop-in for http3/codec.nim on the `-d:quicNgtcp2` build: it mirrors codec's
-## public H3Conn/H3Stream shape and proc surface so request.nim and eventloop.nim
-## use it unchanged (only eventloop's transport *drive* branches). nghttp3 does
-## the framing/QPACK; this module holds per-request state and translates
-## request/response calls to the shim. Loop-thread only (one engine per thread).
+## The HTTP/3 implementation for vortex: request.nim and eventloop.nim import it
+## as `h3codec`. nghttp3 does the framing/QPACK; this module holds per-request
+## state and translates request/response calls to the shim. Loop-thread only
+## (one engine per thread). Building HTTP/3 (any non -d:plainHttp build) links
+## ngtcp2 + nghttp3 (see the passL below).
 
 import std/[tables, strutils, uri, json, os, monotimes]
 import ../../connection

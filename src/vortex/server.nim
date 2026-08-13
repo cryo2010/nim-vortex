@@ -15,9 +15,8 @@ else:
 import ./settings, ./request, ./eventloop, ./connection, ./workerpool
 when not defined(plainHttp):
   import ./transport/tls
-  import ./transport/quic
-  # tlsVerifyMode / toSniCerts come from eventloop (shared with the per-loop
-  # QUIC config there).
+  # CertReload lives in transport/tls; the per-loop ngtcp2 engine is built in
+  # eventloop.newLoop.
 
 # Each Server owns its own stop flag (shared memory, one per instance) so that
 # stopping or starting one server never disturbs another in the same process.
@@ -156,21 +155,10 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
 
     when not defined(plainHttp):
       if result.tls != nil and settings.http3:
-        # Validate the QUIC cert/method once up front (raises on failure), then
-        # discard the probe: each loop builds its own private ctx for in-place
-        # hot-reload, and a valid udpFd is the loops' "h3 enabled" signal.
-        freeTlsConfig(newQuicConfig(settings.certFile, settings.keyFile,
-                                    cipherSuites = settings.tlsCipherSuites,
-                                    certPem = settings.certPem,
-                                    keyPem = settings.keyPem,
-                                    keyPassword = settings.keyPassword,
-                                    pkcs12File = settings.pkcs12File,
-                                    pkcs12 = settings.pkcs12,
-                                    verify = tlsVerifyMode(settings.verifyClient),
-                                    clientCaFile = settings.clientCaFile,
-                                    clientCaPem = settings.clientCaPem,
-                                    sni = toSniCerts(settings),
-                                    ocsp = ocspBytes(settings)))
+        # The TCP TLS config above already validated the same cert/key, so no
+        # separate QUIC probe is needed: each loop builds its own ngtcp2 engine
+        # (which loads the cert) in newLoop, and a valid udpFd is the loops'
+        # "h3 enabled" signal.
         result.quicReload = createShared(CertReload)
         initCertReload(cast[ptr CertReload](result.quicReload))
         for i in 0 ..< numLoops:

@@ -2,25 +2,14 @@
 # conformance run. conformance/h3websocket/run.sh (or `nimble h3websocket`)
 # starts this alongside the aioquic client image on a private docker network.
 #
-# Built from the repository root by run.sh; archlinux ships OpenSSL >= 3.5,
-# which vortex needs for the QUIC server API. Base defaults to arm64 and is
-# overridden to archlinux:latest on x86_64 hosts.
+# Based on the deps image (Nim + ngtcp2 + nghttp3 with the ossl crypto backend);
+# run.sh builds that first. vortex's HTTP/3 runs on ngtcp2 + nghttp3.
 
-ARG BASE=menci/archlinuxarm:latest
-FROM ${BASE}
-
-RUN for i in 1 2 3 4 5; do \
-      pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc openssl && break; \
-      [ "$i" = 5 ] && exit 1; \
-      echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
-    done && \
-    pacman -Scc --noconfirm
-
+FROM vortex-ngtcp2-deps
 WORKDIR /vortex
 COPY src ./src
 COPY conformance/h3websocket/echo_server.nim ./echo_server.nim
-RUN nim c --mm:orc --threads:on -d:release -p:src \
+RUN nim c --mm:orc --threads:on -d:release -d:ssl -p:src \
       -o:echo_server echo_server.nim
 
 # Throwaway self-signed cert; the client runs without verification.
