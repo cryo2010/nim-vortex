@@ -299,8 +299,13 @@ proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
 
 proc cbConnClose(user, connUd: pointer) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
-  if h3c != nil and h3c.slot >= 0 and h3c.slot < h3c.core.h3slots.len:
-    h3c.core.h3slots[h3c.slot].closeReq = true
+  if h3c != nil:
+    # The shim frees the VqConn immediately after this returns, so drop our
+    # dangling pointer to it now: h3Free and the response procs must not touch
+    # a freed VqConn (use-after-free otherwise).
+    h3c.vq = nil
+    if h3c.slot >= 0 and h3c.slot < h3c.core.h3slots.len:
+      h3c.core.h3slots[h3c.slot].closeReq = true
 
 proc sendtoUdp(fd: cint, data: pointer, len: csize_t, flags: cint, peer: pointer,
                peerLen: cuint): int {.importc: "sendto", header: "<sys/socket.h>".}
@@ -383,7 +388,7 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
                 body: openArray[char]) =
-  if sid notin conn.streams or conn.streams[sid].responded: return
+  if conn.vq == nil or sid notin conn.streams or conn.streams[sid].responded: return
   template st: H3Stream = conn.streams[sid]
   st.responded = true
   let bodiless = code in 100 .. 199 or code == 204 or code == 304
@@ -397,7 +402,7 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
 
 proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                  contentType: string, extraHeaders: openArray[(string, string)]) =
-  if sid notin conn.streams or conn.streams[sid].responded: return
+  if conn.vq == nil or sid notin conn.streams or conn.streams[sid].responded: return
   template st: H3Stream = conn.streams[sid]
   st.responded = true
   st.streaming = not st.isHead
@@ -412,24 +417,24 @@ proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   if st.isHead: vqStreamFinish(conn.vq, int64(sid))
 
 proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
-  if sid notin conn.streams or not conn.streams[sid].streaming: return 0
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return 0
   if data.len > 0:
     return int(vqStreamWrite(conn.vq, int64(sid),
                              cast[ptr uint8](unsafeAddr data[0]), csize_t(data.len)))
   int(vqStreamBacklog(conn.vq, int64(sid)))
 
 proc h3StreamFinish*(conn: H3Conn, sid: uint64) =
-  if sid notin conn.streams or not conn.streams[sid].streaming: return
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return
   conn.streams[sid].streaming = false
   conn.streams[sid].onRespDrain = nil
   vqStreamFinish(conn.vq, int64(sid))
 
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
-  if sid notin conn.streams: return 0
+  if conn.vq == nil or sid notin conn.streams: return 0
   int(vqStreamBacklog(conn.vq, int64(sid)))
 
 proc h3StreamAbort*(conn: H3Conn, sid: uint64) =
-  if sid notin conn.streams or not conn.streams[sid].streaming: return
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return
   conn.streams[sid].streaming = false
   conn.streams[sid].onRespDrain = nil
   vqStreamReset(conn.vq, int64(sid), 0x0102)   # H3_INTERNAL_ERROR
@@ -455,7 +460,7 @@ proc h3AckBody*(conn: H3Conn, sid: uint64, n: int) =
   discard
 
 proc h3Goaway*(conn: H3Conn) =
-  if conn.goneAway: return
+  if conn.vq == nil or conn.goneAway: return
   conn.goneAway = true
   vqConnGoaway(conn.vq)
 
@@ -481,7 +486,7 @@ proc wsFlushH3ng(core: ptr LoopCore, c: ptr Connection, w: WsConn) {.nimcall, gc
   ## then finalize on close or fire onDrain when the backlog empties.
   let conn = H3Conn(w.h3conn)
   let sid = uint64(w.stream)
-  if conn == nil or sid notin conn.streams:
+  if conn == nil or conn.vq == nil or sid notin conn.streams:
     w.outBuf.setLen 0
     return
   if w.outBuf.len > 0:
