@@ -99,6 +99,8 @@ struct Conn {
   std::unordered_map<int64_t, std::unique_ptr<Stream>> streams;
   bool closed = false;                // scheduled for reaping
   bool draining = false;
+  bool wantClose = false;             // emit CONNECTION_CLOSE(ccerr) then close
+  ngtcp2_ccerr ccerr{};               // application error for the close
 
   Stream *stream(int64_t id) {
     auto it = streams.find(id);
@@ -123,6 +125,15 @@ std::string cidKey(const uint8_t *d, size_t n) {
 
 ngtcp2_conn *getConnFromRef(ngtcp2_crypto_conn_ref *ref) {
   return static_cast<Conn *>(ref->user_data)->conn;
+}
+
+// Schedule an HTTP/3/QPACK CONNECTION_CLOSE carrying the app error code inferred
+// from an nghttp3 error (so h3spec sees the right code); emitted by writeConn.
+void failConn(Conn *c, int nghttp3_rv) {
+  if (c->wantClose || c->closed) return;
+  ngtcp2_ccerr_set_application_error(
+      &c->ccerr, nghttp3_err_infer_quic_app_error_code(nghttp3_rv), nullptr, 0);
+  c->wantClose = true;
 }
 
 // --- ngtcp2 non-crypto callbacks -------------------------------------------
@@ -343,7 +354,13 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   if (!c->h3) return 0;
   nghttp3_ssize n =
       nghttp3_conn_read_stream(c->h3, stream_id, data, datalen, fin);
-  if (n < 0) return NGTCP2_ERR_CALLBACK_FAILURE;
+  if (n < 0) {
+    // nghttp3 detected an HTTP/3/QPACK protocol error: close the connection
+    // with the corresponding application error code (RFC 9114/9204), not a
+    // generic transport failure.
+    failConn(c, static_cast<int>(n));
+    return 0;
+  }
   // nghttp3 tells us via deferred_consume how much QPACK-blocked data it kept;
   // the bytes it did consume are extended here.
   ngtcp2_conn_extend_max_stream_offset(conn, stream_id, static_cast<uint64_t>(n));
@@ -480,6 +497,18 @@ void writeConn(Conn *c, uint64_t now_ns) {
   ngtcp2_path_storage_zero(&ps);
   ngtcp2_pkt_info pi{};
   auto &send = c->engine->cfg.cb.on_send;
+
+  // A pending HTTP/3/QPACK error: emit one CONNECTION_CLOSE with the app error
+  // code, then reap the connection.
+  if (c->wantClose) {
+    ngtcp2_ssize nw = ngtcp2_conn_write_connection_close(
+        c->conn, &ps.path, &pi, buf, sizeof buf, &c->ccerr, now_ns);
+    if (nw > 0 && send)
+      send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
+           static_cast<size_t>(nw), ps.path.remote.addr, ps.path.remote.addrlen);
+    c->closed = true;
+    return;
+  }
 
   for (;;) {
     int64_t sid = -1;
@@ -620,6 +649,7 @@ void vq_engine_recv(VqEngine *eng, const uint8_t *pkt, size_t len,
     c = acceptConn(e, pkt, len, &vc, now_ns);
     if (!c) return;
   }
+  if (c->wantClose || c->closed) return;   // closing: don't feed more packets
 
   ngtcp2_path_storage ps;
   ngtcp2_path_storage_init(&ps,
