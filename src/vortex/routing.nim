@@ -70,17 +70,14 @@ proc addRouteNode(router: Router, path: string): RouteNode =
   node
 
 proc addRoute*(router: Router, meth: HttpMethod, path: string,
-               handler: RequestHandler) =
-  router.addRouteNode(path).handlers[meth] = handler
-
-proc stream*(router: Router, meth: HttpMethod, path: string,
-             handler: RequestHandler) =
-  ## Register a streaming route: its handler is dispatched at headers-complete
-  ## (before the body) so it can `req.onBody(...)` to consume the body
-  ## incrementally instead of it being buffered into `req.body`.
+               handler: RequestHandler, streaming = false) =
+  ## Register `handler` for `meth path`. With `streaming = true` the handler is
+  ## dispatched at headers-complete (before the body) so it can `req.onBody(...)`
+  ## to consume the body incrementally instead of it being buffered into
+  ## `req.body`; only meaningful for body-bearing methods (POST/PUT/PATCH).
   let node = router.addRouteNode(path)
   node.handlers[meth] = handler
-  node.streaming[meth] = true
+  node.streaming[meth] = streaming
 
 proc use*(r: Router, mw: Middleware) =
   ## Register a middleware. Middleware run in registration order (the first
@@ -91,20 +88,20 @@ proc use*(r: Router, mw: Middleware) =
   ## (a `stream` route has no body yet when it is dispatched).
   r.middleware.add mw
 
-proc get*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpGet, path, h)
-proc post*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpPost, path, h)
-proc put*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpPut, path, h)
-proc delete*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpDelete, path, h)
-proc patch*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpPatch, path, h)
-proc head*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpHead, path, h)
-proc options*(r: Router, path: string, h: RequestHandler) =
-  r.addRoute(HttpOptions, path, h)
+proc get*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpGet, path, h, streaming)
+proc post*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpPost, path, h, streaming)
+proc put*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpPut, path, h, streaming)
+proc delete*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpDelete, path, h, streaming)
+proc patch*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpPatch, path, h, streaming)
+proc head*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpHead, path, h, streaming)
+proc options*(r: Router, path: string, h: RequestHandler, streaming = false) =
+  r.addRoute(HttpOptions, path, h, streaming)
 
 proc match(node: RouteNode, path: string, start: int,
            params: var PathParams): RouteNode =

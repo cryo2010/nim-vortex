@@ -84,7 +84,7 @@ appRouter.get("/fan", hFanIn)
 appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
-appRouter.stream(HttpPost, "/upload", hUpload)
+appRouter.post("/upload", hUpload, streaming = true)
 appRouter.get("/stream", hStream)
 appRouter.get("/streamemit", hStreamEmit)
 

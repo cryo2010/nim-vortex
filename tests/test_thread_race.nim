@@ -29,7 +29,7 @@ when isMainModule:
   for i in 0 ..< 50:
     var router = newRouter()
     router.get("/", ok)
-    router.stream(HttpPost, "/upload", ok)   # also crosses streamRoute per loop
+    router.post("/upload", ok, streaming = true)   # also crosses streamRoute per loop
     var srv = newVortex(withGate(router.toHandler), initVortexConfig(numThreads = 8, reusePort = true)).start(0)
     srv.close()                              # concurrent decrefs at shutdown
   echo "thread race regression ok"

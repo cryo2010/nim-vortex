@@ -36,9 +36,9 @@ proc hReject(req: Request, res: Response) {.gcsafe.} =
   res.send(Http403, "nope")
 
 var rt = newRouter()
-rt.stream(HttpPost, "/upload", hUpload)
-rt.stream(HttpPost, "/echo", hEchoStream)
-rt.stream(HttpPost, "/reject", hReject)
+rt.post("/upload", hUpload, streaming = true)
+rt.post("/echo", hEchoStream, streaming = true)
+rt.post("/reject", hReject, streaming = true)
 rt.post("/buffered", hBuffered)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1, maxBodySize = 8 * 1024 * 1024), rt.streamPredicate).start(0)

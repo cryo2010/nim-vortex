@@ -121,7 +121,7 @@ proc buildRouter(): Router =
   result.get("/sse", sseH)
   result.get("/ws", wsEcho)
   result.get("/slow", slowH)
-  result.stream(HttpPost, "/up", upH)
+  result.post("/up", upH, streaming = true)
 
 # --- client workloads ---------------------------------------------------------
 

@@ -35,9 +35,9 @@ proc hEcho(req: Request, res: Response) {.async.} =
   res.send(Http200, body, @[("Content-Type", "application/octet-stream")])
 
 var rt = newRouter()
-rt.stream(HttpPost, "/upload", hUpload)
-rt.stream(HttpPost, "/echo", hEcho)
-rt.stream(HttpPost, "/abortable", hAbortable)
+rt.post("/upload", hUpload, streaming = true)
+rt.post("/echo", hEcho, streaming = true)
+rt.post("/abortable", hAbortable, streaming = true)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1, maxBodySize = 8 * 1024 * 1024), rt.streamPredicate).start(0)
 let port = srv.port

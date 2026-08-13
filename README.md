@@ -616,9 +616,9 @@ not from inside `req.blocking:` (a worker), where it does nothing.
 
 #### Upload
 
-To consume a large upload without buffering it whole, register a route with
-`router.stream` (or pass a `streamRoute` predicate to `newVortex`). Its handler is
-dispatched at headers-complete and reads the body incrementally via `req.onBody`:
+To consume a large upload without buffering it whole, register the route with
+`streaming = true` (and pass `router.streamPredicate` to `newVortex`). Its handler
+is dispatched at headers-complete and reads the body incrementally via `req.onBody`:
 
 ```nim
 proc upload(req: Request, res: Response) =
@@ -627,7 +627,7 @@ proc upload(req: Request, res: Response) =
     if last: res.send(Http200, "ok")
 
 var router = newRouter()
-router.stream(HttpPost, "/upload", upload)
+router.post("/upload", upload, streaming = true)
 newVortex(router.toHandler, streamRoute = router.streamPredicate).serve(8080)
 ```
 
