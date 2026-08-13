@@ -1759,9 +1759,12 @@ proc dispatchBlockingArgs[T](req: Request,
 type
   BlockingResultBase* = ref object of RootObj
     ## Type-erased handle for an awaitable `req.blocking` result. The worker
-    ## fills the typed subtype and posts it back; the loop calls `onDone` (which
-    ## closes over the adapter's `Future[R]`) to complete it. Internal.
-    onDone*: proc () {.gcsafe.}
+    ## fills the typed subtype and posts it back; the loop calls `onDone` to
+    ## complete it. `onDone` takes the box as a parameter (not a capture) so the
+    ## box does not form a reference cycle with its own completion closure --
+    ## a cycle would drag ORC's cycle collector into this cross-thread object.
+    ## Internal.
+    onDone*: proc (self: BlockingResultBase) {.gcsafe.}
   BlockingResultBox*[A, R] = ref object of BlockingResultBase
     ## `body` runs on the worker with the moved-in `args`; its result lands in
     ## `value` (or `err`), read back on the loop. Internal. A `void` body (the
@@ -1774,7 +1777,17 @@ type
 
 proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
                                     stream: uint32, ignored: string) {.nimcall, gcsafe.} =
-  let box = cast[BlockingResultBox[A, R]](user)
+  # Access the box through a raw `ptr` to its object payload, never a counted
+  # ref-bind. `box` outlives the hop via the single GC_ref in
+  # dispatchBlockingResult (released by the drain's GC_unref on the loop). ORC
+  # refcounts are non-atomic, so touching the box's header here -- on a worker
+  # thread, concurrently with the loop thread's own inc/dec -- is a genuine data
+  # race that can corrupt the count (caught by helgrind). A `ptr` view reads
+  # `body`/`args` and writes `value`/`err` (payload, ordered by the outbox
+  # channel) without ever touching the refcount. `ptr <objectType>` (not
+  # `ptr <refType>`, which would be a ptr-to-ref double indirection) keeps the
+  # RootObj m_type offset correct.
+  let box = cast[ptr typeof(BlockingResultBox[A, R]()[])](user)
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = response(req)
@@ -1786,7 +1799,7 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
   except CatchableError as e:
     box.err = e
   push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
-                         stream: stream, user: cast[pointer](box)))
+                         stream: stream, user: user))
 
 proc dispatchBlockingResult*[A, R](req: Request,
                                    box: BlockingResultBox[A, R]) {.raises: [].} =

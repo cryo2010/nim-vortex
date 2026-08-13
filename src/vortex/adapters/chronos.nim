@@ -45,6 +45,7 @@
 ## uncaught exception in the body responds 500.
 
 import pkg/chronos
+import pkg/chronos/selectors2 as chronosSelectors   # close(Selector) for teardown
 import std/[httpcore, tables, deques, macros]
 import ../connection
 import ../request
@@ -77,10 +78,30 @@ proc pump(): int {.nimcall, gcsafe.} =
       inc spins
     if pendingOps > 0: 5 else: -1
 
+proc teardown() {.nimcall, gcsafe.} =
+  ## Release this loop thread's chronos dispatcher on exit. Without it the
+  ## dispatcher's epoll fd leaks, and every server restart on a fresh loop thread
+  ## leaks another. Drain ready callbacks so completed futures are released, then
+  ## close the selector fd and drop the dispatcher; the post-run GC_fullCollect in
+  ## runLoopThread (once the Loop is out of scope) collects any remaining cycles.
+  {.gcsafe.}:
+    var spins = 0
+    while pendingOps > 0 and spins < 64:
+      callSoon(noop)
+      poll()
+      inc spins
+    try:
+      chronosSelectors.close(getIoHandler(getThreadDispatcher()))
+      # Drop the dispatcher so anything it still roots becomes unreachable.
+      setThreadDispatcher(nil)
+    except CatchableError, Defect: discard
+    GC_fullCollect()
+
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
   ## Idempotent; called automatically by the entry points below.
   if core.pumpHook == nil:
     core.pumpHook = pump
+    core.teardownHook = teardown
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
@@ -494,9 +515,10 @@ proc blockingRun*[A, R](req: Request,
     args: sink A): Future[R] =
   let fut = newFuture[R]("req.blocking")
   let box = BlockingResultBox[A, R](body: body, args: args)
-  box.onDone = proc () {.gcsafe.} =
-    if box.err != nil: fut.fail(box.err)
-    else: fut.complete(box.value)
+  box.onDone = proc (self: BlockingResultBase) {.gcsafe.} =
+    let b = BlockingResultBox[A, R](self)     # downcast; closure captures fut only
+    if b.err != nil: fut.fail(b.err)
+    else: fut.complete(b.value)
   ensurePump(req.core)
   dispatchBlockingResult(req, box)
   fut
@@ -507,8 +529,9 @@ proc blockingRun*[A](req: Request,
   ## Void overload (block responds itself); a void body doesn't infer R = void.
   let fut = newFuture[void]("req.blocking")
   let box = BlockingResultBox[A, void](body: body, args: args)
-  box.onDone = proc () {.gcsafe.} =
-    if box.err != nil: fut.fail(box.err)
+  box.onDone = proc (self: BlockingResultBase) {.gcsafe.} =
+    let b = BlockingResultBox[A, void](self)
+    if b.err != nil: fut.fail(b.err)
     else: fut.complete()
   ensurePump(req.core)
   dispatchBlockingResult(req, box)

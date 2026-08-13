@@ -207,6 +207,11 @@ type
       ## Registered by an adapter; called once per loop iteration to run
       ## ready async callbacks. Returns a max selector timeout in ms, or
       ## -1 for no constraint.
+    teardownHook*: proc () {.nimcall, gcsafe.}
+      ## Registered by an adapter alongside pumpHook; called once when the loop
+      ## thread exits, to release the adapter's thread-local dispatcher (its
+      ## selector fd and any lingering futures). Without it, a loop thread that
+      ## used async leaks the dispatcher on exit (each server restart leaks one).
     kick*: proc (loopPtr: pointer, fd: int32, gen: uint32,
                  stream: uint32) {.nimcall, gcsafe.}
       ## Flush/resume after a deferred same-thread respond (async

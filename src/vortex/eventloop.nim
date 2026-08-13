@@ -1042,7 +1042,7 @@ proc processOutbox(loop: Loop) =
       # after a client drop the connection may be gone, and the dead-conn
       # `continue`s below would otherwise skip this and leak the box + future.
       let base = cast[BlockingResultBase](m.user)
-      if base.onDone != nil: base.onDone()      # complete/fail the future (loop)
+      if base.onDone != nil: base.onDone(base)   # complete/fail the future (loop)
       GC_unref(base)                             # release the box
       if m.fd < 0:
         when not defined(plainHttp):
@@ -1465,6 +1465,8 @@ proc run*(loop: Loop) =
   loop.selector.close()
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
     discard posix.close(cint(loop.listenFd))
+  if loop.core.teardownHook != nil:      # release the async adapter's dispatcher
+    loop.core.teardownHook()
 
 type LoopThreadArg* = tuple
   ## Plain-data bundle for starting a loop on its own thread; the Loop
