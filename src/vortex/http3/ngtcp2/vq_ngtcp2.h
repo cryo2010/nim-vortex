@@ -80,9 +80,11 @@ typedef struct {
    * conn_ud / the VqConn after this returns. */
   void (*on_conn_close)(void *user, void *conn_ud);
 
-  /* Emit one outbound UDP datagram to peer (an opaque sockaddr pointer the shim
-   * captured on ingress). Return 0 on success, <0 to signal a send error. */
-  int (*on_send)(void *user, VqConn *conn, const uint8_t *data, size_t len);
+  /* Emit one outbound UDP datagram. peer is the destination sockaddr (the
+   * packet's path remote), valid for the call only. Return 0 on success, <0 to
+   * signal a send error. */
+  int (*on_send)(void *user, VqConn *conn, const uint8_t *data, size_t len,
+                 const void *peer, size_t peer_len);
 } VqCallbacks;
 
 /* ---- engine config -------------------------------------------------------- */
