@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`res.headers["X-Request-Id"] = id`; `add` keeps duplicates like Set-Cookie).
   Set it from middleware or a handler; the `send` call's `headers` win per name.
   Buffered `send` only, loop-thread only.
+- `req.headers[name]` reads request headers (case-insensitive, "" if absent),
+  matching the `res.headers[name]` shape: `name in req.headers` tests presence
+  and `for (n, v) in req.headers` iterates. A zero-copy read-only view;
+  `req.header(name)` is now an alias.
 
 ### Changed
 
