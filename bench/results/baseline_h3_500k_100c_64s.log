@@ -1,0 +1,111 @@
+      Info: using /Users/cryo/.nimble/pkgs2/nim-2.2.10-17ec440fdb89f8903db29a17898af590087d2b64/bin/nim for compilation
+  Executing task h3load in /Users/cryo/projects/nim/nim-http-server/vortex.nimble
+building HTTP/3 server image...
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.27kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/menci/archlinuxarm:latest
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/7] FROM docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359
+#4 resolve docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359 done
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 5.49kB done
+#5 DONE 0.0s
+
+#6 [2/7] RUN for i in 1 2 3 4 5; do       pacman -Syu --noconfirm --needed --disable-sandbox         nim gcc openssl && break;       [ "$i" = 5 ] && exit 1;       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15;     done &&     pacman -Scc --noconfirm
+#6 CACHED
+
+#7 [3/7] WORKDIR /vortex
+#7 CACHED
+
+#8 [4/7] COPY src ./src
+#8 CACHED
+
+#9 [6/7] RUN nim c --mm:orc --threads:on -d:release -p:src       -o:h3load_server h3load_server.nim
+#9 CACHED
+
+#10 [5/7] COPY conformance/h3load/h3load_server.nim ./h3load_server.nim
+#10 CACHED
+
+#11 [7/7] RUN openssl req -x509 -newkey rsa:2048 -nodes -days 3650       -keyout key.pem -out cert.pem       -subj "/CN=localhost"       -addext "subjectAltName=DNS:server,DNS:localhost"
+#11 CACHED
+
+#12 exporting to image
+#12 exporting layers done
+#12 exporting manifest sha256:cfb8d792756dee396622deba6643d37286a12c1a00645d3952f9eb8ee5f3c894 done
+#12 exporting config sha256:ebd096081944653e2e6f9f8a295988c48704e5183c3e98704b3ec32b2c9546c0 done
+#12 exporting attestation manifest sha256:60d13a4402b49f5c7573580b545ee5b700129312a05cd6ddd0f6af86327e232c done
+#12 exporting manifest list sha256:59f76359a44eaf7551a11789145d416c3b23878c7f63a8aaa062ad88ff124959 done
+#12 naming to docker.io/library/vortex-h3load-server-img:latest done
+#12 unpacking to docker.io/library/vortex-h3load-server-img:latest done
+#12 DONE 0.0s
+building h2load-http3 client image (builds the QUIC stack from source)...
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from client.Dockerfile
+#1 transferring dockerfile: 3.24kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/menci/archlinuxarm:latest
+#2 DONE 0.0s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/9] FROM docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359
+#4 resolve docker.io/menci/archlinuxarm:latest@sha256:c6d576c2606e632126c42c626c80f9ba61540d3a28212ac1180cea938458e359 done
+#4 DONE 0.0s
+
+#5 [4/9] RUN git clone --depth 1 -b v1.11.0 https://github.com/ngtcp2/nghttp3 &&     git clone --depth 1 -b v1.15.0  https://github.com/ngtcp2/ngtcp2 &&     git clone --depth 1 -b v1.66.0 https://github.com/nghttp2/nghttp2 &&     (cd nghttp3 && git submodule update --init --depth 1) &&     (cd ngtcp2  && git submodule update --init --depth 1) &&     (cd nghttp2 && git submodule update --init --depth 1)
+#5 CACHED
+
+#6 [3/9] WORKDIR /build
+#6 CACHED
+
+#7 [5/9] RUN echo /usr/local/lib > /etc/ld.so.conf.d/usrlocal.conf
+#7 CACHED
+
+#8 [6/9] RUN cd nghttp3 && autoreconf -i &&     ./configure --prefix=/usr/local --enable-lib-only &&     make -j"$(nproc)" && make install && ldconfig
+#8 CACHED
+
+#9 [2/9] RUN for i in 1 2 3 4 5; do       pacman -Syu --noconfirm --needed --disable-sandbox         base-devel git cmake openssl libev zlib c-ares && break;       [ "$i" = 5 ] && exit 1;       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15;     done &&     pacman -Scc --noconfirm
+#9 CACHED
+
+#10 [7/9] RUN cd ngtcp2 && autoreconf -i &&     ./configure --prefix=/usr/local --enable-lib-only --with-openssl &&     make -j"$(nproc)" && make install && ldconfig
+#10 CACHED
+
+#11 [8/9] RUN cd nghttp2 && autoreconf -i &&     ./configure --prefix=/usr/local --enable-app --enable-http3       --with-openssl --with-libngtcp2 --with-libnghttp3       --without-jemalloc --without-libxml2 &&     make -j"$(nproc)" && make install && ldconfig &&     cd / && rm -rf /build
+#11 CACHED
+
+#12 [9/9] RUN h2load --version &&     ldd "$(command -v h2load)" | grep -q nghttp3
+#12 CACHED
+
+#13 exporting to image
+#13 exporting layers done
+#13 exporting manifest sha256:124928b4b1bdebfb6fef3ffe4f253bcabc3b7611e6ed55d7ceeba69ec74693bb done
+#13 exporting config sha256:548fd41634e7e8350c6463dacad656ae94639bffbc2236cb2ef3a01093883417 done
+#13 exporting attestation manifest sha256:ada3ab44301812acc6ac0dbf36d354f1dd173d8d78baa21c746f622189432c3d done
+#13 exporting manifest list sha256:3a9bb9b0794119f872a3750c38f2e4745d4c57b95f426f3278163d95a760028d done
+#13 naming to docker.io/library/vortex-h3load-client-img:latest done
+#13 unpacking to docker.io/library/vortex-h3load-client-img:latest done
+#13 DONE 0.0s
+vortex HTTP/3 server up on the docker network
+=== h2load HTTP/3: 500000 requests, 100 connections, up to 64 streams/conn ===
+finished in 2.09s, 239632.65 req/s, 11.04MB/s
+requests: 500000 total, 500000 started, 500000 done, 500000 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 500000 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 23.03MB (24147169) total, 18.64MB (19542272) headers (space savings 57.52%), 976.56KB (1000000) data
+req/s           :    2397.16     2510.31     2409.66       15.96    96.00%
+
+RESULT: h3load passed (500000 requests x 100 connections over HTTP/3, all 2xx).
