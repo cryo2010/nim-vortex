@@ -107,6 +107,8 @@ type
     connCount: int               # live TCP connections (maxConnections cap)
     draining: bool               # graceful shutdown in progress
     drainDeadline: int64         # monotonic sec; force-close remaining after
+    asyncDrainDeadline: int64    # monotonic sec; bound the wait for pending async
+                                 # continuations once all connections are gone
 
 proc monoSec(): int64 {.inline.} =
   getMonoTime().ticks div 1_000_000_000
@@ -1317,6 +1319,23 @@ proc forceCloseAll(loop: Loop) =
 proc drainDone(loop: Loop): bool {.inline.} =
   loop.connCount == 0 and loop.activeH3Conns == 0
 
+proc drainComplete(loop: Loop): bool =
+  ## Can the drain loop exit? All connections must be gone AND the async adapter
+  ## must have no pending operations. A `blocking:` worker's result is delivered
+  ## via the outbox, which completes the awaiting future and *then* frees the
+  ## connection; the future's own continuation is scheduled on the adapter's
+  ## dispatcher and runs on a later pump. If we exited on connCount alone, that
+  ## in-flight continuation (and the future + blocking box it holds) would be
+  ## orphaned at teardown instead of released -- a shutdown-time leak. So keep
+  ## pumping until the adapter drains (pumpCap < 0), bounded by a short deadline
+  ## so a never-completing future can't wedge shutdown.
+  if not loop.drainDone(): return false
+  if loop.pumpCap < 0: return true
+  if loop.asyncDrainDeadline == 0:
+    loop.asyncDrainDeadline = loop.core.nowSec + 3
+    return false
+  loop.core.nowSec >= loop.asyncDrainDeadline
+
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.kick = kickImpl
@@ -1330,7 +1349,7 @@ proc run*(loop: Loop) =
     if loop.stopFlag[].load(moRelaxed) and not loop.draining:
       loop.tick()                     # refresh nowSec before arming the deadline
       loop.beginDrain()
-    if loop.draining and loop.drainDone():
+    if loop.draining and loop.drainComplete():
       break
     var timeoutMs = 1000
     if loop.draining:
@@ -1406,11 +1425,11 @@ proc run*(loop: Loop) =
     loop.tick()
     if loop.draining:
       loop.drainSweep()               # close connections that just finished
-      if loop.drainDone():
+      if loop.drainComplete():
         break
       if loop.core.nowSec >= loop.drainDeadline:
         loop.forceCloseAll()          # grace expired: drop the rest
-        if loop.drainDone():
+        if loop.drainComplete():
           break
         # Everything else is a connection still pinned by a running blocking:
         # worker; forceCloseAll deferred its teardown. Keep the loop alive and
