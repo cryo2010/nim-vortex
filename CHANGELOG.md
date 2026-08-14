@@ -56,6 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Security docs split:** `SECURITY.md` is now a focused vulnerability-reporting
+  policy (GitHub private vulnerability reporting); the threat analysis moved to a
+  new STRIDE-based `THREAT_MODEL.md`, and defensive configuration to a new
+  `HARDENING.md`.
 - **HTTP/3 now runs on ngtcp2 + nghttp3** (with OpenSSL >= 3.5 as ngtcp2's `ossl`
   crypto backend) instead of OpenSSL's QUIC server API. The OpenSSL-QUIC path and
   the hand-rolled HTTP/3 codec/QPACK are removed. **New build dependency:**

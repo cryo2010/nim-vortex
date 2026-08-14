@@ -159,6 +159,10 @@ and compare, rather than trusting a single figure.
 - `nimble test` passes.
 - If you touched TLS, HTTP/2, HTTP/3, or OpenSSL usage, confirm the
   `-d:plainHttp` build still compiles.
+- If you changed a defense or a security-relevant setting, update
+  [THREAT_MODEL.md](THREAT_MODEL.md) (the analysis) and [HARDENING.md](HARDENING.md)
+  (the config guide) to match. To report a vulnerability, see
+  [SECURITY.md](SECURITY.md).
 - If you touched the HTTP/1.1 response path, `nimble redbot` still comes
   back clean.
 - Use semantic branch names and commit messages (for example
