@@ -5,7 +5,7 @@
 # server, and runs h3spec against it over a private docker network (QUIC is
 # UDP). Scoped to the "HTTP/3 servers" group -- the HTTP/3 + QPACK error
 # cases that vortex's codec owns. The "QUIC servers" group (RFC 9000
-# transport conformance) is OpenSSL's QUIC stack, not vortex, so it is
+# transport conformance) is ngtcp2's QUIC stack, not vortex, so it is
 # excluded. h3spec exits non-zero on any failure, which fails this script.
 #
 # Usage:  sh conformance/h3spec/run.sh        (or `nimble h3spec`)

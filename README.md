@@ -116,7 +116,7 @@ nim c --mm:orc --threads:on -d:danger --passC:-flto app.nim
 | `-d:wsDeflate` (`--passL:-lz`) | Off | WebSocket permessage-deflate compression via zlib |
 | `-d:httpGzip` / `-d:httpBrotli` / `-d:httpZstd` | Off | Response + request compression codecs (see [Compression](#compression) for link flags) |
 
-They are all off by default, so the standard build keeps its OpenSSL-only footprint.
+They are all off by default, so the standard build pulls in no extra compression libraries.
 
 ## Choose an implementation
 

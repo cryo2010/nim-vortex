@@ -9,6 +9,6 @@ ADD https://github.com/kazu-yamamoto/h3spec/releases/download/${H3SPEC_VERSION}/
 RUN chmod +x /usr/local/bin/h3spec
 
 # Only the HTTP/3-server group is vortex's responsibility; the QUIC transport
-# group is OpenSSL's QUIC stack. --no-validate: the server uses a self-signed
+# group is ngtcp2's QUIC stack. --no-validate: the server uses a self-signed
 # cert.
 CMD ["h3spec", "-n", "-m", "HTTP/3 servers", "server", "4433"]

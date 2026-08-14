@@ -2,7 +2,7 @@
 ##
 ## Compiled only under `-d:wsDeflate` (link with `--passL:-lz`); without the
 ## flag the WebSocket layer never imports this and no zlib is linked, so the
-## default and `-d:plainHttp` builds keep their OpenSSL-only footprint.
+## default and `-d:plainHttp` builds pull in no compression library.
 ##
 ## Raw deflate/inflate is used (negative windowBits: no zlib header/trailer),
 ## which is what RFC 7692 requires and also sidesteps zlib's gzip-header

@@ -108,7 +108,8 @@ type
 
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore
-    ssl*: pointer            ## nil: no per-conn OpenSSL handle on this path
+    ssl*: pointer            ## always nil: the shim owns the TLS handle; kept
+                             ## for the H3Conn shape request.nim expects
     remoteAddr*: string
     slot*: int
     vq: ptr VqConn
