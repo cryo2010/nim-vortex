@@ -55,7 +55,7 @@ denial of service in vortex's bounded parsing paths.
 **Out of scope** (still welcome as regular issues where they apply, but not
 handled as vortex vulnerabilities):
 
-- Vulnerabilities in dependencies (OpenSSL, ngtcp2/nghttp3).
+- Vulnerabilities in dependencies (chronos/BearSSL, ngtcp2/nghttp3).
   Report those to the respective upstream projects; we will pick up the fixed
   release.
 - Application misuse such as missing authentication or authorization, or unvalidated
