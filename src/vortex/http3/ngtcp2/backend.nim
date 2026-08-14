@@ -298,8 +298,16 @@ proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
   if usid in h3c.streams:
     template st: H3Stream = h3c.streams[usid]
     if st.onRespDrain != nil and vqStreamBacklog(h3c.vq, sid) == 0:
-      st.onRespDrain(h3c.core, int32(-(h3c.slot + 2)),
-                     h3c.core.h3slots[h3c.slot].gen, uint32(usid))
+      # One-shot: clear the callback before firing. nghttp3's acked_stream_data
+      # can fire on_stream_writable more than once while the backlog is 0 (before
+      # the drain callback has queued and written the next chunk); re-firing would
+      # dispatch the next file read twice (two workers reading the same offset ->
+      # duplicate bytes past Content-Length -> the client aborts the stream). The
+      # drain re-registers itself per chunk (res.onDrain in applyFileChunk).
+      let cb = st.onRespDrain
+      st.onRespDrain = nil
+      cb(h3c.core, int32(-(h3c.slot + 2)),
+         h3c.core.h3slots[h3c.slot].gen, uint32(usid))
 
 proc cbConnClose(user, connUd: pointer) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
