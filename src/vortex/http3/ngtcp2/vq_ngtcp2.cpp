@@ -787,6 +787,11 @@ void vq_conn_goaway(VqConn *conn) {
 void vq_conn_close(VqConn *conn, uint64_t app_error) {
   auto *c = reinterpret_cast<Conn *>(conn);
   (void)app_error;
+  // Called by h3Free as the Nim H3Conn (our conn_ud) is being torn down, e.g.
+  // from drainSweep at shutdown -- before the engine has reaped this conn. Drop
+  // conn_ud so the later pump reap does NOT fire on_conn_close on the now-freed
+  // H3Conn (heap-use-after-free otherwise).
+  c->conn_ud = nullptr;
   c->closed = true;
 }
 
