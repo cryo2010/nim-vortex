@@ -53,8 +53,8 @@ app.serve(8080)
   `100-continue`.
 - **HTTP/2**: over TLS (ALPN) and h2c prior knowledge; h2spec-clean, with
   rapid-reset and framing-flood defenses.
-- **HTTP/3 over QUIC**: on the OpenSSL >= 3.5 server API, with automatic
-  `Alt-Svc` advertisement so clients upgrade.
+- **HTTP/3 over QUIC**: on ngtcp2 + nghttp3 (with OpenSSL >= 3.5 as ngtcp2's
+  crypto backend), with automatic `Alt-Svc` advertisement so clients upgrade.
 - **WebSockets** (RFC 6455) over `ws://`/`wss://`, and over HTTP/2 (RFC 8441)
   and HTTP/3 (RFC 9220) via Extended CONNECT, with the same handler API.
 - **TLS**: certs from files, memory, or PKCS#12; SNI, mTLS client certs, OCSP
@@ -80,9 +80,13 @@ app.serve(8080)
 
 - **Linux or macOS** host environment. Windows requires running via Docker.
 - **Nim >= 2.2.10**.
-- **OpenSSL >= 3.5** at runtime, for TLS, HTTP/2-over-TLS, and HTTP/3 (the QUIC
-  server API landed in 3.5). A `-d:plainHttp` build needs no OpenSSL at all (see
+- **OpenSSL >= 3.5** at runtime, for TLS and HTTP/2-over-TLS (and as ngtcp2's
+  crypto backend for HTTP/3). A `-d:plainHttp` build needs no OpenSSL at all (see
   [Build flags](#build-flags)).
+- **ngtcp2 + nghttp3** (with the ngtcp2 `ossl` crypto backend) to build HTTP/3.
+  Only needed for a TLS build; a `-d:plainHttp` build needs neither. On Arch
+  `pacman -S libngtcp2 libnghttp3`; elsewhere build from source with
+  `--with-openssl` (see `conformance/h3load/deps.Dockerfile`).
 - The chronos adapter additionally needs `chronos >= 4.0.0` in your own project
   (it is never a dependency of a bare `import vortex`).
 
