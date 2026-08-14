@@ -77,12 +77,8 @@ proc TLS_server_method(): pointer
 proc SSL_CTX_new(m: pointer): SslCtxPtr
 proc SSL_CTX_free(ctx: SslCtxPtr)
 proc SSL_CTX_use_certificate_chain_file(ctx: SslCtxPtr, file: cstring): cint
-proc SSL_CTX_use_PrivateKey_file(ctx: SslCtxPtr, file: cstring,
-                                 typ: cint): cint
 proc SSL_CTX_use_certificate(ctx: SslCtxPtr, x: pointer): cint   # up-refs x
 proc SSL_CTX_use_PrivateKey(ctx: SslCtxPtr, pkey: pointer): cint # up-refs pkey
-proc SSL_CTX_set_default_passwd_cb(ctx: SslCtxPtr, cb: PemPasswordCb)
-proc SSL_CTX_set_default_passwd_cb_userdata(ctx: SslCtxPtr, u: pointer)
 proc SSL_CTX_check_private_key(ctx: SslCtxPtr): cint
 proc SSL_CTX_ctrl(ctx: SslCtxPtr, cmd: cint, larg: clong,
                   parg: pointer): clong
@@ -176,13 +172,20 @@ proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
 
 proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   ## Load a PEM private key from memory, decrypting with `password` if set.
+  if pem.len == 0: return false
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
   defer: discard BIO_free(bio)
-  let cb = if password.len > 0: passwdCb else: nil
+  # Always pass our own callback (never nil). If it were nil, OpenSSL falls back
+  # to its built-in PEM_def_callback, which prompts for a passphrase on the
+  # controlling tty (blocking) whenever the key is encrypted. With no password
+  # the callback yields an empty passphrase, so an encrypted key fails to load
+  # cleanly instead of prompting; an unencrypted key never consults it.
   let ud = if password.len > 0: cast[pointer](password.cstring) else: nil
-  let pkey = PEM_read_bio_PrivateKey(bio, nil, cb, ud)
-  if pkey == nil: return false
+  let pkey = PEM_read_bio_PrivateKey(bio, nil, passwdCb, ud)
+  if pkey == nil:
+    ERR_clear_error()
+    return false
   result = SSL_CTX_use_PrivateKey(ctx, pkey) == 1      # up-refs pkey
   EVP_PKEY_free(pkey)
 
@@ -357,14 +360,21 @@ proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
                  try: readFile(m.pkcs12File)
                  except CatchableError: return false
     return loadPkcs12(ctx, data, m.keyPassword)
-  if m.keyPassword.len > 0:
-    SSL_CTX_set_default_passwd_cb(ctx, passwdCb)
-    SSL_CTX_set_default_passwd_cb_userdata(ctx, m.keyPassword.cstring)
   let certOk = if m.certPem.len > 0: loadCertChainMem(ctx, m.certPem)
                else: SSL_CTX_use_certificate_chain_file(ctx, m.certFile.cstring) == 1
   if not certOk: return false
-  if m.keyPem.len > 0: loadKeyMem(ctx, m.keyPem, m.keyPassword)
-  else: SSL_CTX_use_PrivateKey_file(ctx, m.keyFile.cstring, SSL_FILETYPE_PEM) == 1
+  # Both the in-memory and file key paths go through loadKeyMem, which passes an
+  # explicit passphrase callback to PEM_read_bio_PrivateKey. Reading keyFile into
+  # memory here (rather than SSL_CTX_use_PrivateKey_file) keeps that single path:
+  # the file loader routes through OpenSSL 3's decoder machinery, whose legacy
+  # default-passwd-cb bridge can still fire OpenSSL's interactive tty prompt for
+  # an encrypted key even when a callback is registered.
+  if m.keyPem.len > 0:
+    loadKeyMem(ctx, m.keyPem, m.keyPassword)
+  else:
+    let keyData = try: readFile(m.keyFile)
+                  except CatchableError: return false
+    loadKeyMem(ctx, keyData, m.keyPassword)
 
 proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
                  clientCaFile, clientCaPem: string,

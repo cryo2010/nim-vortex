@@ -324,7 +324,8 @@ proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
 
 # --- transport drive (called by eventloop's ngtcp2 h3Drive branch) ----------
 proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
-              maxBody, maxStreams, maxFieldSection: int): bool =
+              maxBody, maxStreams, maxFieldSection: int,
+              certPem = "", keyPem = "", keyPassword = ""): bool =
   gCore = core
   gUdpFd = udpFd
   var cfg: VqConfig
@@ -332,8 +333,14 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.cb = VqCallbacks(on_accept: cbAccept, on_headers: cbHeaders, on_body: cbBody,
     on_stream_end: cbStreamEnd, on_stream_close: cbStreamClose,
     on_stream_writable: cbStreamWritable, on_conn_close: cbConnClose, on_send: cbSend)
+  # The shim reads these only during vqEngineNew below (synchronous), so the
+  # cstring views into these parameters stay valid for the call. In-memory PEM
+  # takes precedence over the file paths; key_password decrypts an encrypted key.
   cfg.cert_file = certFile.cstring
   cfg.key_file = keyFile.cstring
+  cfg.cert_pem = certPem.cstring
+  cfg.key_pem = keyPem.cstring
+  cfg.key_password = keyPassword.cstring
   cfg.max_body = uint64(maxBody)
   cfg.max_concurrent_streams = uint64(maxStreams)
   cfg.max_field_section_size = cint(maxFieldSection)
