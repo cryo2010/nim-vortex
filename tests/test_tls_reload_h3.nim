@@ -1,17 +1,17 @@
 ## HTTP/3 (QUIC) certificate hot-reload. The cross-thread reload signal
-## (CertReload) is pure and always tested. The in-place ctx update
-## (reloadQuicCert) and a full http3 server surviving a reload need OpenSSL's
-## QUIC server API, so they're skipped when it isn't available on the host.
+## (CertReload) is pure and always tested. The full-server reload (a running h3
+## server surviving a TCP+h3 cert swap) needs ngtcp2/nghttp3, which a TLS build
+## links, so it runs whenever this suite is built (i.e. not -d:plainHttp).
 ##
 ## The actual cert *presented* over h3 is verified by CI's curl-h3 suite (which
-## exercises the per-loop QUIC ctx); locally there is no h3 client that reports
-## the peer certificate.
+## exercises the per-loop ngtcp2 engine); locally there is no h3 client that
+## reports the peer certificate, so this checks the server keeps serving (and the
+## TCP side presents the new cert) after a reload with h3 enabled.
 
 import std/[unittest, os, osproc, net, httpcore, strutils]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 import vortex/transport/tls
-import vortex/transport/quic
 
 let dir = getTempDir() / "vortex_h3reload_" & $getCurrentProcessId()
 createDir(dir)
@@ -24,15 +24,6 @@ proc gen(cert, key, cn: string) =
 let certA = dir / "a.pem"
 let keyA = dir / "akey.pem"
 gen(certA, keyA, "alpha.vortex")
-
-# Detect QUIC support once.
-var quicOk = false
-try:
-  let c = newQuicConfig(certA, keyA)
-  quicOk = c != nil
-  if c != nil: freeTlsConfig(c)
-except CatchableError:
-  quicOk = false
 
 suite "QUIC cert reload signaling":
   test "request/pending carries paths and advances the generation":
@@ -54,57 +45,30 @@ suite "QUIC cert reload signaling":
     check pendingCertReload(r, seen, cf, kf) == 2
     check cf == "" and kf == ""
 
-suite "reloadQuicCert (in-place update)":
-  test "accepts a valid cert, rejects missing and mismatched":
-    if not quicOk:
-      skip()
-    else:
-      let cfg = newQuicConfig(certA, keyA)
-      check cfg != nil
-      if cfg != nil:
-        defer: freeTlsConfig(cfg)
-        # ctxCertSubject reads the cert actually installed on the QUIC ctx, so
-        # these assertions prove the in-place reload reached the ctx (new h3
-        # connections read that ctx at accept, the same way the TCP suite proves
-        # end to end via s_client).
-        check "alpha.vortex" in ctxCertSubject(cfg)      # initial cert
-        let certB = dir / "b.pem"
-        let keyB = dir / "bkey.pem"
-        gen(certB, keyB, "bravo.vortex")
-        check reloadQuicCert(cfg, certB, keyB)           # valid swap
-        check "bravo.vortex" in ctxCertSubject(cfg)      # ctx now holds it
-        check not reloadQuicCert(cfg, dir / "nope.pem", dir / "nope.key")
-        check "bravo.vortex" in ctxCertSubject(cfg)      # unchanged on failure
-        check not reloadQuicCert(cfg, certA, keyB)       # cert/key mismatch
-        check reloadQuicCert(cfg, "", "")                # re-read current paths
-
 suite "http3 server survives a certificate reload":
   test "TCP cert swaps and the server keeps serving with h3 enabled":
-    if not quicOk:
-      skip()
-    else:
-      var srv = newVortex(RequestHandler(proc(req: Request, res: Response) {.gcsafe.} =
-                        res.send(Http200, "ok")), initVortexConfig(numThreads = 2, certFile = certA, keyFile = keyA, http3 = true)).start(0)
-      defer: srv.close()
-      let port = $srv.port
-      proc served(): bool =
-        var c = newHttpClient(sslContext = newContext(verifyMode = CVerifyNone))
-        defer: c.close()
-        try: c.getContent("https://127.0.0.1:" & port & "/") == "ok"
-        except CatchableError: false
-      proc cn(): string =
-        let (o, _) = execCmdEx("echo | openssl s_client -connect 127.0.0.1:" &
-          port & " 2>/dev/null | openssl x509 -noout -subject 2>/dev/null")
-        o
-      check served()
-      check "alpha.vortex" in cn()
-      let certC = dir / "c.pem"
-      let keyC = dir / "ckey.pem"
-      gen(certC, keyC, "charlie.vortex")
-      check srv.reloadTls(certC, keyC)      # TCP + signals h3 loops
-      sleep(1500)                           # let the loop ticks apply the h3 swap
-      check "charlie.vortex" in cn()         # TCP presents the new cert
-      check served()                         # and the server is still up
+    var srv = newVortex(RequestHandler(proc(req: Request, res: Response) {.gcsafe.} =
+                      res.send(Http200, "ok")), initVortexConfig(numThreads = 2, certFile = certA, keyFile = keyA, http3 = true)).start(0)
+    defer: srv.close()
+    let port = $srv.port
+    proc served(): bool =
+      var c = newHttpClient(sslContext = newContext(verifyMode = CVerifyNone))
+      defer: c.close()
+      try: c.getContent("https://127.0.0.1:" & port & "/") == "ok"
+      except CatchableError: false
+    proc cn(): string =
+      let (o, _) = execCmdEx("echo | openssl s_client -connect 127.0.0.1:" &
+        port & " 2>/dev/null | openssl x509 -noout -subject 2>/dev/null")
+      o
+    check served()
+    check "alpha.vortex" in cn()
+    let certC = dir / "c.pem"
+    let keyC = dir / "ckey.pem"
+    gen(certC, keyC, "charlie.vortex")
+    check srv.reloadTls(certC, keyC)      # TCP + signals h3 loops
+    sleep(1500)                           # let the loop ticks apply the h3 swap
+    check "charlie.vortex" in cn()         # TCP presents the new cert
+    check served()                         # and the server is still up
 
 removeDir(dir)
-echo "h3 cert reload ok (quic=", quicOk, ")"
+echo "h3 cert reload ok"

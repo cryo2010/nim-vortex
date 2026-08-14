@@ -142,9 +142,12 @@ proc h3StreamAlive*(conn: H3Conn, sid: uint64): bool = sid in conn.streams
 proc h3StreamCount*(conn: H3Conn): int = conn.streams.len
 
 # --- header validation (RFC 9114 pseudo-header rules; pure) -----------------
-type H3HeaderKind = enum h3hInvalid, h3hRequest, h3hWebSocket
+type H3HeaderKind* = enum h3hInvalid, h3hRequest, h3hWebSocket
 
-proc classify(headers: openArray[(string, string)]): H3HeaderKind =
+proc classifyH3Headers*(headers: openArray[(string, string)]): H3HeaderKind =
+  ## Validate the pseudo-header set and classify it as a normal request, an
+  ## RFC 9220 Extended CONNECT websocket, or invalid. Pure (no live connection),
+  ## so it is unit-testable. nghttp3 also enforces its own checks on the wire.
   var meth, path, scheme, protocol: string
   var seenMethod, seenPath, seenScheme, seenAuthority, seenProtocol = false
   var hasHost = false
@@ -213,7 +216,7 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   for i in 0 ..< int(n):
     st.headers.add (toStr(arr[i].name, arr[i].name_len),
                     toStr(arr[i].value, arr[i].value_len))
-  case classify(st.headers)
+  case classifyH3Headers(st.headers)
   of h3hInvalid:
     vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
     h3c.streams.del(usid)

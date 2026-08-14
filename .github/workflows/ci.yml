@@ -244,7 +244,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Fuzz the parser/HPACK/QPACK decoders
+      - name: Fuzz the parser/HPACK decoders
         # 30s per target; a crash writes a reproducer and exits non-zero.
         run: |
           docker build -f fuzz/Dockerfile -t vortex-fuzz \

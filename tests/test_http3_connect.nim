@@ -7,7 +7,7 @@
 import std/unittest
 
 when not defined(plainHttp):
-  import vortex/http3/codec
+  import vortex/http3/ngtcp2/backend
 
   suite "HTTP/3 Extended CONNECT classification (RFC 9220)":
     test "a normal request is classified as a request":
