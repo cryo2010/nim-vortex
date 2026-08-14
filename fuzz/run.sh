@@ -13,7 +13,7 @@
 set -e
 DUR="${DUR:-30}"
 CLANG="${CLANG:-clang}"
-targets="${*:-http1 hpack qpack wsdeflate}"
+targets="${*:-http1 hpack wsdeflate}"
 
 for t in $targets; do
   # The permessage-deflate inflate path needs zlib + the compile flag.

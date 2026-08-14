@@ -575,37 +575,6 @@ proc pendingCertReload*(r: ptr CertReload, seen: int,
     keyFile = getPath(r.keyPath)
   release(r.lock)
 
-proc reloadQuicCert*(cfg: ptr TlsConfig, certFile, keyFile: string): bool =
-  ## In-place certificate update on a per-loop QUIC ctx, called on the owning
-  ## loop thread (so no handshake on that listener interleaves the two apply
-  ## calls, and no other thread touches the ctx). Validates the new material in
-  ## a throwaway ctx first, then applies cert+key to the live ctx. Returns false
-  ## on bad material.
-  ##
-  ## Caveat: the probe and the apply each read the files, so a *concurrent*
-  ## replacement of the files between the two (a renewal racing this call) can
-  ## get past the probe and then fail the apply, briefly leaving the live ctx
-  ## with a mismatched cert/key. The caller reports the false result, and a
-  ## subsequent reload (retried against stable files) restores a consistent
-  ## ctx. New connections read the ctx's current cert at accept time (the same
-  ## mechanism as SSL_new on TCP); in-flight connections keep theirs.
-  var m = cfg.material
-  if certFile.len > 0:
-    m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
-  if keyFile.len > 0:
-    m.keyFile = keyFile; m.keyPem = ""
-  try:
-    SSL_CTX_free(buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
-                             cfg.clientCaPem, cfg.minProtoVersion,
-                             cfg.maxProtoVersion, cfg.cipherList,
-                             cfg.cipherSuites))  # probe only
-  except CatchableError:
-    return false
-  discard SSL_CTX_ctrl(cfg.ctx, SSL_CTRL_CLEAR_CHAIN_CERTS, 0, nil)  # replace chain
-  if not loadCertKey(cfg.ctx, m): return false
-  if SSL_CTX_check_private_key(cfg.ctx) != 1: return false
-  cfg.material = m
-  true
 
 proc ctxCertSubject*(cfg: ptr TlsConfig): string =
   ## The subject line of the certificate currently installed on `cfg.ctx`, for

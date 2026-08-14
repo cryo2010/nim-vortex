@@ -25,16 +25,11 @@ else
   basearg=""
 fi
 
-if [ "${NGTCP2:-}" = 1 ]; then
-  echo "building ngtcp2/nghttp3 deps image (if missing)..."
-  docker image inspect vortex-ngtcp2-deps >/dev/null 2>&1 || \
-    docker build -f "$root/conformance/h3load/deps.Dockerfile" -t vortex-ngtcp2-deps $basearg "$root"
-  echo "building HTTP/3 server image (ngtcp2/nghttp3 backend)..."
-  docker build -f "$here/Dockerfile.ngtcp2" -t "$simg" "$root"
-else
-  echo "building HTTP/3 server image (OpenSSL QUIC)..."
-  docker build -f "$here/Dockerfile" -t "$simg" $basearg "$root"
-fi
+echo "building ngtcp2/nghttp3 deps image (if missing)..."
+docker image inspect vortex-ngtcp2-deps >/dev/null 2>&1 || \
+  docker build -f "$root/conformance/h3load/deps.Dockerfile" -t vortex-ngtcp2-deps $basearg "$root"
+echo "building HTTP/3 server image..."
+docker build -f "$here/Dockerfile" -t "$simg" "$root"
 echo "building h3spec client image..."
 docker build -f "$here/client.Dockerfile" -t "$cimg" "$here"
 

@@ -8,7 +8,7 @@
 #   docker build -f fuzz/Dockerfile -t vortex-fuzz \
 #     --build-arg BASE=archlinux:latest .
 # Run (DUR seconds per target, default 30; optional target list):
-#   docker run --rm vortex-fuzz                 # http1 hpack qpack
+#   docker run --rm vortex-fuzz                 # http1 hpack wsdeflate
 #   docker run --rm -e DUR=120 vortex-fuzz      # 120s per target
 #   docker run --rm vortex-fuzz hpack           # a single target
 

@@ -9,7 +9,7 @@ FROM vortex-ngtcp2-deps
 WORKDIR /vortex
 COPY src ./src
 COPY conformance/h3spec/h3spec_server.nim ./h3spec_server.nim
-RUN nim c --mm:orc --threads:on -d:release -d:quicNgtcp2 -d:ssl -p:src \
+RUN nim c --mm:orc --threads:on -d:release -d:ssl -p:src \
       -d:useMalloc --debugger:native \
       --passC:-fsanitize=address --passL:-fsanitize=address \
       -o:h3asan_server h3spec_server.nim

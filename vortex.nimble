@@ -177,18 +177,12 @@ task h2load, "HTTP/1.1 + HTTP/2 load/stress smoke via h2load (Docker)":
   exec "sh conformance/h2load/run.sh"
 
 task h3load, "HTTP/3 (QUIC) throughput/stress via h2load-http3 (Docker)":
-  # run.sh builds a vortex HTTP/3 server image and an h2load client image built
-  # with HTTP/3 (ngtcp2 + nghttp3 on OpenSSL >= 3.5), then drives many concurrent
-  # QUIC connections/streams at it, printing req/s and failing on any
-  # failed/errored/timed-out or non-2xx request. A real QUIC client, so the
-  # number reflects the server -- the HTTP/3 throughput/regression measurement.
+  # run.sh builds the vortex HTTP/3 server image (ngtcp2 + nghttp3) and an h2load
+  # client image built with HTTP/3, then drives many concurrent QUIC connections/
+  # streams at it, printing req/s and failing on any failed/errored/timed-out or
+  # non-2xx request. A real QUIC client, so the number reflects the server -- the
+  # HTTP/3 throughput/regression measurement.
   exec "sh conformance/h3load/run.sh"
-
-task h3loadNgtcp2, "HTTP/3 throughput vs the ngtcp2/nghttp3 server build (Docker)":
-  # Same h2load driver as `h3load`, but the server under test is built on the
-  # ngtcp2/nghttp3 backend (-d:quicNgtcp2). Use alongside `h3load` for the
-  # OpenSSL-QUIC-vs-ngtcp2 before/after comparison. Same H3LOAD_* env knobs.
-  exec "NGTCP2=1 sh conformance/h3load/run.sh"
 
 task loadtest, "Configurable k6 load test with live Grafana/Prometheus charts (Docker)":
   # run.sh brings up Prometheus + Grafana, builds the selected vortex backend

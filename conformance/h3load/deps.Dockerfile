@@ -1,4 +1,4 @@
-# Build environment for the ngtcp2/nghttp3 HTTP/3 backend (-d:quicNgtcp2).
+# Build environment for vortex's HTTP/3 (ngtcp2 + nghttp3).
 #
 # Nim + ngtcp2 (QUIC transport) + nghttp3 (HTTP/3 framing/QPACK), the ngtcp2
 # `ossl` crypto backend on OpenSSL >= 3.5 -- the same TLS stack vortex already
@@ -10,8 +10,8 @@
 #   1. Dev/CI build+link check and unit tests, with the repo bind-mounted:
 #        docker build -f conformance/h3load/deps.Dockerfile -t vortex-ngtcp2-deps .
 #        docker run --rm -v "$PWD":/work -w /work vortex-ngtcp2-deps \
-#          nim c --mm:orc --threads:on -d:quicNgtcp2 -p:src ...
-#   2. As the base image for the ngtcp2 h3 server (server.ngtcp2.Dockerfile).
+#          nim c --mm:orc --threads:on -d:ssl -p:src ...
+#   2. As the base image for the h3 server images (the conformance Dockerfiles).
 #
 # Base defaults to arm64 and is overridden to archlinux:latest on x86_64 hosts
 # (archlinux ships OpenSSL >= 3.5, which the `ossl` crypto backend requires).

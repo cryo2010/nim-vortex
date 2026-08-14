@@ -1,9 +1,15 @@
-# HTTP/3: ngtcp2 + nghttp3 migration evaluation
+# HTTP/3: ngtcp2 + nghttp3
 
-Status of evaluating **ngtcp2** (QUIC transport) + **nghttp3** (HTTP/3
-framing/QPACK) as a replacement for the OpenSSL-QUIC + hand-rolled-codec HTTP/3
-stack. Built on branch `feat/quic-ngtcp2`, gated behind `-d:quicNgtcp2` so it
-coexists with the default OpenSSL path for A/B comparison.
+**Status: shipped.** **ngtcp2** (QUIC transport) + **nghttp3** (HTTP/3
+framing/QPACK) is vortex's HTTP/3 implementation. It was first evaluated behind
+`-d:quicNgtcp2` alongside the old OpenSSL-QUIC + hand-rolled-codec stack; that
+path has since been retired, so ngtcp2/nghttp3 is now the only one (the flag is
+gone). This doc records the architecture and the evaluation that justified it.
+
+Building HTTP/3 (any non `-d:plainHttp` build) now requires ngtcp2 + nghttp3 with
+the ngtcp2 `ossl` crypto backend (OpenSSL >= 3.5); a `-d:plainHttp` build needs
+neither. On Arch: `pacman -S libngtcp2 libnghttp3`; elsewhere build from source
+with `--with-openssl` (see `conformance/h3load/deps.Dockerfile`).
 
 ## Architecture
 
@@ -51,25 +57,26 @@ Two bugs the deeper checks caught (the handshake smoke did not):
   -- fixed by nulling that pointer in the `on_conn_close` callback (and guarding
   the response procs against a freed connection).
 
-## Remaining before flipping the default
+## Done
 
-- **CI wiring** — add the `NGTCP2=1` variants of the h3 suites (and the memcheck
-  h3 run) to `.github/workflows/ci.yml` so the ngtcp2 path is gated on every PR.
-- **Request-body flow-control acks** — `h3AckBody` is currently a no-op (the shim
-  auto-extends stream offsets on receive); fine functionally, but real
-  backpressure for large uploads is a refinement.
-- **Cert hot-reload** — implemented (`ngReloadCert` reads the PEM files); verify
-  under the reload test.
+- **Flip + retirement** — ngtcp2/nghttp3 is the only HTTP/3 path; the OpenSSL
+  QUIC transport (`transport/quic.nim`) and the hand-rolled `http3/codec.nim` +
+  `qpack*.nim` + `frames.nim` are deleted, and the `-d:quicNgtcp2` flag is gone.
+- **CI** — the `-d:ssl` unit/conformance jobs install `libngtcp2 libnghttp3`
+  (Arch ships the `ossl` crypto backend); the h3 conformance suites build the
+  ngtcp2 server directly (no `NGTCP2=1` selector anymore).
+
+## Still open (tracked in todo.txt)
+
+- **Request-body flow-control acks** — `h3AckBody` is a no-op (the shim
+  auto-extends stream offsets on receive); real backpressure for large uploads
+  is a refinement.
 - **helgrind/tsan** — the C++ shim is single-threaded per loop (no locks); worker
-  responses still cross threads via the existing outbox. Run the race tooling
-  against the ngtcp2 build to confirm.
+  responses cross threads via the existing outbox. Run the race tooling to confirm.
 
-## Recommendation
+## Why (the evaluation that justified it)
 
-The evaluation is strongly positive: the ngtcp2/nghttp3 backend is materially
-faster (~2.4x on these configs), passes the HTTP/3 error-conformance suite, and
-drops the maintenance burden of the hand-rolled QUIC peer-address tap and the
-capacity-0 QPACK codec. Recommend proceeding: finish WebSocket-over-h3 parity and
-the memcheck/tsan pass, then flip `-d:quicNgtcp2` to the default and retire the
-OpenSSL-QUIC path (`transport/quic.nim` + `http3/codec.nim`) in a follow-up once
-it has soaked in CI.
+Strongly positive: the ngtcp2/nghttp3 backend is materially faster (~2.4x on the
+h3load configs), passes the HTTP/3 error-conformance suite (h3spec 15/15) and RFC
+9220 WebSockets (aioquic), is ASan-clean under load, and drops the maintenance
+burden of the hand-rolled QUIC peer-address tap and the capacity-0 QPACK codec.
