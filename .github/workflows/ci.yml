@@ -43,8 +43,33 @@ jobs:
         # Run the suite directly (not `nimble test`): nimble does not reliably
         # propagate a task's exit code (nim-lang/nimble#1802), so a failing test
         # would still exit 0 and report green. tests/run.sh runs `nim c -r` per
-        # suite under `set -e`, so the first failure fails the job.
+        # suite under `set -e`, so the first failure fails the job. This also
+        # exercises the TLS material matrix over HTTP/1.1 + HTTP/3
+        # (test_tls_h3_material), so a QUIC key-load regression fails here even
+        # though CI is headless.
         run: bash tests/run.sh
+
+      - name: TLS material never prompts for a passphrase (tty guard)
+        # The suites above run without a controlling tty, so a private key that
+        # (re)introduces OpenSSL's interactive "Enter PEM pass phrase" prompt
+        # reads EOF and passes silently -- exactly how the QUIC engine's missing
+        # passphrase callback hid for so long. Re-run the prompt-prone suites
+        # under a real PTY (util-linux `script`) with a timeout: a prompt now
+        # blocks -> timeout -> failure, and any prompt text also fails the grep.
+        # Reuses the binaries `nim c -r` already built next to each source.
+        run: |
+          set -euo pipefail
+          for t in test_tls_key_options test_tls_h3_material; do
+            echo "== pty guard: $t =="
+            if [ ! -x "tests/$t" ]; then echo "missing tests/$t"; exit 1; fi
+            out=$(timeout 90 script -qec "tests/$t" /dev/null) || {
+              echo "$out"
+              echo "FAIL: $t hung or errored under a PTY (passphrase prompt?)"
+              exit 1; }
+            if grep -qiE "pass ?phrase" <<<"$out"; then
+              echo "$out"; echo "FAIL: $t emitted a passphrase prompt"; exit 1
+            fi
+          done
 
       - name: Build zero-dependency variant
         run: >-

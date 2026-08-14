@@ -254,7 +254,9 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
       result.quicReload = quicReload
       if ngSetup(addr result.core, cint(udpFd), settings.certFile,
                  settings.keyFile, settings.maxBodySize,
-                 settings.maxConcurrentStreams, settings.maxHeaderSize):
+                 settings.maxConcurrentStreams, settings.maxHeaderSize,
+                 certPem = settings.certPem, keyPem = settings.keyPem,
+                 keyPassword = settings.keyPassword):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
