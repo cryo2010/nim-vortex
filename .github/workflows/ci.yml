@@ -32,7 +32,7 @@ jobs:
         # compression tests link and decode with.
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc git curl openssl zlib brotli zstd
+          nim gcc git curl openssl zlib brotli zstd libngtcp2 libnghttp3
 
       - uses: actions/checkout@v7
 
@@ -71,7 +71,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc git curl openssl zlib brotli zstd
+          nim gcc git curl openssl zlib brotli zstd libngtcp2 libnghttp3
       - uses: actions/checkout@v7
       - name: Run the test suite under ASan + UBSan
         # Extends the fuzzer's ASan coverage from the parser targets to the whole
@@ -87,7 +87,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc git curl openssl
+          nim gcc git curl openssl libngtcp2 libnghttp3
       - uses: actions/checkout@v7
       - name: Test the chronos adapter
         # chronos is an opt-in dependency kept out of the default suite; install
@@ -107,7 +107,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib
+          nim gcc openssl zlib libngtcp2 libnghttp3
       - uses: actions/checkout@v7
       - name: Test WebSocket permessage-deflate
         # Opt-in -d:wsDeflate feature (links zlib), so its suite is separate
@@ -129,7 +129,7 @@ jobs:
         # and the CLIs decode the streamed responses.
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli curl
+          nim gcc openssl zlib brotli curl libngtcp2 libnghttp3
       - uses: actions/checkout@v7
       - name: Test streaming response compression (gzip + brotli)
         # res.sendHead/write/finish (SSE, file streaming) compressed with gzip
@@ -148,7 +148,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli zstd curl
+          nim gcc openssl zlib brotli zstd curl libngtcp2 libnghttp3
       - uses: actions/checkout@v7
       - name: Test request-body decompression (gzip + brotli + zstd)
         # Inbound gzip/br/zstd request bodies decoded into req.body, bounded by
@@ -169,7 +169,7 @@ jobs:
         # zstd/brotli provide the encoders + CLIs; curl fetches, the CLIs decode.
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli zstd curl
+          nim gcc openssl zlib brotli zstd curl libngtcp2 libnghttp3
       - uses: actions/checkout@v7
       - name: Test zstd response compression
         # Buffered + streamed zstd over HTTP/1.1 and h2c, plus br/zstd/gzip
