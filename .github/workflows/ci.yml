@@ -66,7 +66,9 @@ jobs:
               echo "$out"
               echo "FAIL: $t hung or errored under a PTY (passphrase prompt?)"
               exit 1; }
-            if grep -qiE "pass ?phrase" <<<"$out"; then
+            # Match OpenSSL's actual prompt ("Enter PEM pass phrase:"), not the
+            # word "passphrase" that appears in these suites' test-case names.
+            if grep -qiE "enter[^\n]*pass ?phrase" <<<"$out"; then
               echo "$out"; echo "FAIL: $t emitted a passphrase prompt"; exit 1
             fi
           done
