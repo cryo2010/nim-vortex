@@ -145,11 +145,9 @@ suite "HTTP/3 (QUIC, via curl)":
     check output == "got " & $(300 * 1024)
 
   test "remoteAddress reports the QUIC peer IP":
-    # Best-effort over h3: quicPeerAddr captures the peer from a datagram tap
-    # keyed by our local CID, which needs OpenSSL's internal ossl_quic_* CID
-    # diagnostics to be resolvable at runtime. Some libssl builds don't export
-    # them, so an empty result is the documented gap; when reported it must be
-    # a loopback address.
+    # Over h3 the peer address comes from ngtcp2 (the connection path's remote
+    # sockaddr), reported at accept; it must be a loopback here (empty allowed
+    # only defensively for a stale handle).
     let (output, rc) = h3curl(base & "/whoami")
     check rc == 0
     check output in ["", "127.0.0.1", "::1"]

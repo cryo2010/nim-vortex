@@ -21,7 +21,7 @@ FROM ${BASE}
 # clang + compiler-rt provide the libFuzzer runtime for fuzz/run.sh.
 # --disable-sandbox: pacman's Landlock sandbox cannot apply in a container.
 RUN pacman -Syu --noconfirm --needed --disable-sandbox \
-      nim gcc git curl openssl clang compiler-rt && \
+      nim gcc git curl openssl clang compiler-rt libngtcp2 libnghttp3 && \
     pacman -Scc --noconfirm
 
 WORKDIR /nhs

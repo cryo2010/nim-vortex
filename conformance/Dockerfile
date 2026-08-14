@@ -13,12 +13,12 @@
 ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
 
-# nim/gcc build the server under test; openssl is vortex's TLS/h2/h3
+# nim/gcc build the server under test; openssl + ngtcp2/nghttp3 are vortex's TLS/h3
 # dependency; curl is the readiness probe; python + git install REDbot.
 # --disable-sandbox: pacman's Landlock sandbox cannot apply in a container.
 RUN for i in 1 2 3 4 5; do \
       pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc git curl openssl python && break; \
+        nim gcc git curl openssl python libngtcp2 libnghttp3 && break; \
       [ "$i" = 5 ] && exit 1; \
       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
     done && \

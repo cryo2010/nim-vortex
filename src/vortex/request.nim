@@ -311,8 +311,7 @@ proc remoteAddress*(req: Request): string =
   ## policy (see forwardedFor), never from an untrusted header alone. When the
   ## listener has `settings.proxyProtocol` enabled and the connection came from a
   ## trusted proxy, this is already the real client IP from the PROXY header.
-  ## Empty for a stale handle (and, over HTTP/3, if OpenSSL can't report the QUIC
-  ## peer).
+  ## Empty for a stale handle.
   if req.snap != nil: return req.snap.remoteAddr
   if req.fd < 0:
     when not defined(plainHttp):

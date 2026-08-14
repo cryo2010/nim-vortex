@@ -4,8 +4,8 @@
 # the server, and drives many concurrent QUIC connections and streams at it,
 # printing the achieved req/s and failing if any request does not complete 2xx.
 #
-# This uses a real QUIC client stack (ngtcp2 + nghttp3) over the same
-# OpenSSL >= 3.5 QUIC API as the server, so the number reflects the server --
+# This uses a real QUIC client stack (ngtcp2 + nghttp3) -- the same stack the
+# server runs -- so the number reflects the server --
 # the HTTP/3 throughput/regression measurement.
 #
 # Usage:  sh conformance/h3load/run.sh        (or `nimble h3load`)

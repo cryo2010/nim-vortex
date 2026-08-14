@@ -16,7 +16,7 @@ Needs Docker. `run.sh` builds two images and connects them over a private
 docker network (QUIC is UDP):
 
 - **server** (`Dockerfile`, `echo_server.nim`) — a vortex HTTP/3 WebSocket
-  echo server on `archlinux` (for OpenSSL >= 3.5, which the QUIC server API
+  echo server on `archlinux` (for OpenSSL >= 3.5, which ngtcp2's ossl crypto backend
   needs). It advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` and echoes each
   message with its kind.
 - **client** (`client.Dockerfile`, `client.py`) — an aioquic client that

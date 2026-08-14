@@ -6,8 +6,9 @@ and, in detail, how to run the tests and benchmarks.
 ## Prerequisites
 
 - **Nim >= 2.2.10** and a C compiler (gcc or clang).
-- **OpenSSL >= 3.5** at build and run time for TLS, HTTP/2 over TLS, and
-  HTTP/3 (the QUIC server API landed in 3.5). Build with `-d:plainHttp`
+- **OpenSSL >= 3.5** at build and run time for TLS and HTTP/2 over TLS (and as
+  ngtcp2's crypto backend for HTTP/3), plus **ngtcp2 + nghttp3** to build HTTP/3.
+  Build with `-d:plainHttp`
   for a zero-dependency cleartext build (HTTP/1.1 + h2c) that does not
   link OpenSSL at all.
 - The suite builds with `--mm:orc --threads:on -d:ssl`. `tests/config.nims`

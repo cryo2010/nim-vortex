@@ -24,7 +24,7 @@ h3spec has two groups. Only the **"HTTP/3 servers"** group (HTTP/3 + QPACK,
 15 cases) is vortex's responsibility, and the harness runs exactly that
 (`-m "HTTP/3 servers"`). The **"QUIC servers"** group (RFC 9000 transport:
 transport parameters, flow control, frame encoding, TLS) is enforced by
-**OpenSSL's QUIC stack**, which vortex delegates to — those cases are out of
+**ngtcp2's QUIC stack**, which vortex delegates to — those cases are out of
 vortex's control and are excluded.
 
 Note: h3spec resolves a plain hostname; run it against an IPv4 address or a

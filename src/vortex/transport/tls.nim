@@ -514,12 +514,11 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
 
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
 #
-# A QUIC listener binds its SSL_CTX at creation, so the atomic pointer swap the
-# TCP path uses would not reach it. Instead each loop thread owns a private QUIC
-# ctx and updates it *in place* on its own thread (so no handshake on that
-# listener interleaves the update, and no other thread touches the ctx). New
-# connections read the ctx's current cert at accept time -- the same mechanism
-# as SSL_new on the TCP side -- while in-flight connections keep theirs.
+# The h3 stack (ngtcp2 + nghttp3) owns a per-loop TLS context that the atomic
+# pointer swap the TCP path uses would not reach, so each loop thread reloads its
+# own engine *in place* on its own thread (eventloop.applyQuicReload ->
+# ngReloadCert). New handshakes present the new cert; in-flight connections keep
+# theirs.
 #
 # The main thread signals a reload through this plain-memory struct (fixed
 # buffers, never GC strings, so it is safe to read from the loop threads).

@@ -114,8 +114,8 @@ close`, bounding how long one connection is amortized across requests.
 
 ### Transport security (TLS)
 
-TLS, ALPN, and QUIC are handled by OpenSSL (>= 3.5), so the transport
-cryptography is OpenSSL's. vortex adds a small policy surface on top:
+TLS and ALPN are handled by OpenSSL (>= 3.5), and QUIC by ngtcp2 (with OpenSSL
+as its crypto backend), so the transport cryptography is OpenSSL's. vortex adds a small policy surface on top:
 
 - **Minimum version.** `minTlsVersion` defaults to `tlsV12`, which is set
   explicitly on the context so the insecure TLS 1.0 and 1.1 are refused
