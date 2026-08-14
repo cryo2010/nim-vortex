@@ -907,9 +907,12 @@ suites and `nimble h3websocket` (aioquic).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the threat model, mitigations (Rapid Reset,
-framing floods, decompression bombs, request smuggling, slowloris, resource
-exhaustion), and security-related settings.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability (private disclosure).
+- [THREAT_MODEL.md](THREAT_MODEL.md): what vortex defends against, as a STRIDE
+  analysis (Rapid Reset, framing floods, decompression bombs, request smuggling,
+  slowloris, resource exhaustion, and more), with how each defense is verified.
+- [HARDENING.md](HARDENING.md): how to configure vortex defensively, with
+  deployment recipes (behind a proxy, public edge, TLS/mTLS, web app, API).
 
 Two helpers make secure responses easy: `securityHeaders(...)` returns the OWASP
 Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
