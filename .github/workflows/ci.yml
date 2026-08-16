@@ -78,6 +78,70 @@ jobs:
           nim c --mm:${{ matrix.mm }} --threads:on -d:plainHttp
           -o:/tmp/vortex_plain src/vortex.nim
 
+  tls:
+    # Per-configuration TLS smoke: one config-driven harness, built once, then
+    # one step per TLS configuration. Each starts a real HTTPS server and makes
+    # a request (curl / openssl s_client), so every config is proven end to end
+    # -- including clientCaPem, ocspResponse and tlsCipherList, which had no test.
+    # `if: ${{ !cancelled() }}` runs every step even after one fails, so a single
+    # run surfaces all broken configs. TCP/OpenSSL checks only (http3 = false); h3
+    # cert/key material is covered by test_tls_h3_material in the `test` job.
+    runs-on: ubuntu-latest
+    container: archlinux:latest    # OpenSSL >= 3.5, HTTP/3-capable curl, QUIC deps
+    steps:
+      - name: Install toolchain
+        run: >-
+          pacman -Syu --noconfirm --needed --disable-sandbox
+          nim gcc git curl openssl libngtcp2 libnghttp3
+      - uses: actions/checkout@v7
+      - name: Build TLS config harness
+        run: >-
+          nim c --mm:orc --threads:on -p:src --hints:off
+          -o:/tmp/tls_harness conformance/tls/harness.nim
+
+      - name: certFile
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=certFile /tmp/tls_harness
+      - name: certPem
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=certPem /tmp/tls_harness
+      - name: pkcs12File
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=pkcs12File /tmp/tls_harness
+      - name: verifyClient
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=verifyClient /tmp/tls_harness
+      - name: clientCaFile
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=clientCaFile /tmp/tls_harness
+      - name: clientCaPem
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=clientCaPem /tmp/tls_harness
+      - name: sni
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=sni /tmp/tls_harness
+      - name: minTlsVersion
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=minTlsVersion /tmp/tls_harness
+      - name: maxTlsVersion
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=maxTlsVersion /tmp/tls_harness
+      - name: ocspFile
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=ocspFile /tmp/tls_harness
+      - name: ocspResponse
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=ocspResponse /tmp/tls_harness
+      - name: tlsCipherSuites
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=tlsCipherSuites /tmp/tls_harness
+      - name: tlsCipherList
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=tlsCipherList /tmp/tls_harness
+      - name: hot reload
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=hotReload /tmp/tls_harness
+
   sanitize:
     runs-on: ubuntu-latest
     # Privileged so we can lower the host's mmap randomization (see below);
