@@ -2,10 +2,18 @@ name: CI
 
 # pull_request gates PRs; push only fires for main (a PR merge is a push
 # to main), giving a post-merge run without duplicating the PR check.
+#
+# paths-ignore skips the whole workflow when a push/PR touches ONLY docs
+# (Markdown, docs/, LICENSE) -- a mixed change that also touches code still runs
+# in full. Safe because main has no required status checks (a skipped required
+# check would otherwise block a docs-only PR); revisit if branch protection is
+# added.
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
 
 concurrency:
   group: ci-${{ github.ref }}

@@ -99,8 +99,8 @@ app.serve(8080)
 nimble add https://github.com/cryo2010/nim-vortex
 ```
 
-> [!NOTE]
-> If you plan to use `vortex/chronos`, you will need to also install `chronos`.
+> [!IMPORTANT]
+> You must add `chronos` to your project in order to use the `vortex/chronos` server.
 
 ## Build flags
 
@@ -161,9 +161,6 @@ var app = newVortex()
 app.get("/", hello)
 app.serve(8080)
 ```
-
-> [!IMPORTANT]
-> You must add `chronos` to your project in order to use the `vortex/chronos` server.
 
 ## Quick start
 
