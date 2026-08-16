@@ -322,14 +322,32 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   dec loop.connCount
 
 proc armWrite(loop: Loop, c: ptr Connection) =
-  if not c.writeArmed:
+  if not c.registered:
+    # Re-arm a connection unregistered while it waited half-closed for a
+    # deferred response (see disarmForResponse): there is output to flush now.
+    loop.selector.registerHandle(int(c.fd), {Event.Write}, fkClient)
+    c.registered = true
+    c.writeArmed = true
+  elif not c.writeArmed:
     c.writeArmed = true
     loop.selector.updateHandle(int(c.fd), {Event.Read, Event.Write})
 
 proc disarmWrite(loop: Loop, c: ptr Connection) =
   if c.writeArmed:
     c.writeArmed = false
-    loop.selector.updateHandle(int(c.fd), {Event.Read})
+    if c.registered:
+      loop.selector.updateHandle(int(c.fd), {Event.Read})
+
+proc disarmForResponse(loop: Loop, c: ptr Connection) =
+  ## The peer half-closed and we are waiting for a deferred/worker response.
+  ## The selector always arms EPOLLRDHUP, so a half-closed fd is persistently
+  ## EOF-ready and leaving it registered busy-spins the loop for the whole wait.
+  ## Unregister it -- the response arrives via the outbox/kick, not this fd, and
+  ## armWrite re-registers it if the flush needs write interest.
+  if c.registered:
+    loop.selector.unregister(int(c.fd))
+    c.registered = false
+    c.writeArmed = false
 
 proc beginLingerClose(loop: Loop, c: ptr Connection) =
   ## Half-close after flushing an error response, then drain the peer's
@@ -805,6 +823,11 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     # half-close its write side and keep reading; finish() closes it.
     if c.awaitingResponse or c.pendingOut > 0:
       c.closeAfterFlush = true
+      if c.awaitingResponse and c.pendingOut == 0:
+        # No output yet -- the deferred/worker response arrives via the outbox
+        # or kick, not this fd. Stop watching the fd so the persistent EOF
+        # (EPOLLRDHUP) does not busy-spin the loop until the response lands.
+        loop.disarmForResponse(c)
     else:
       loop.closeConn(c)
 
