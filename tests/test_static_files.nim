@@ -136,10 +136,21 @@ suite "static file serving":
     check body.len == 1048576
     check body == bigPattern.repeat(64 * 1024)         # every byte correct
 
-  test "range on a large file stays buffered and correct":
+  test "small range on a large file stays buffered and correct":
     let resp = raw("/assets/big.dat", "Range: bytes=1048570-1048575\r\n")
     check "206" in resp.status
     check resp.bodyOf == "ABCDEF"                       # the last 6 bytes
+
+  test "large range on a large file streams the slice (not buffered)":
+    # Regression: a partial range used to bypass the streaming path and load the
+    # whole requested slice into memory. `Range: bytes=1-` spans ~1 MiB (> the
+    # stream threshold), so it must stream a length-delimited 206 with exact bytes.
+    let resp = raw("/assets/big.dat", "Range: bytes=1-\r\n")
+    check "206" in resp.status
+    check resp.headerVal("Content-Length") == "1048575"
+    check resp.headerVal("Content-Range") == "bytes 1-1048575/1048576"
+    check "chunked" notin resp.toLowerAscii             # length-delimited, streamed
+    check resp.bodyOf == bigPattern.repeat(64 * 1024)[1..^1]
 
   test "HEAD on a large file: Content-Length, no body":
     let resp = rawHead("/assets/big.dat")

@@ -260,34 +260,45 @@ proc serveResolved(req: Request, res: Response, data: string)
         s = rs; e = re; partial = true
 
   let mime = mimeType(real)
-  # Stream large full-file GETs so the whole file never sits in memory at once.
-  # HEAD, ranges, and small files stay buffered: a range is already bounded by
-  # the requested slice, and small files are cheaper to send in one shot.
-  if not partial and req.method != HttpHead and size > fileStreamThreshold:
+  # The byte window to serve: the requested range, or the whole file.
+  let startOff = if partial: s else: 0'i64
+  let respLen  = if partial: e - s + 1 else: size
+  let status   = if partial: 206 else: 200
+  if partial:
+    hdrs.add ("Content-Range", "bytes " & $s & "-" & $e & "/" & $size)
+
+  # HEAD: report the headers (with the Content-Length a GET would return) and no
+  # body -- never read the file. The response codec drops the body for HEAD, so
+  # this streams zero bytes and just carries the right Content-Length/-Range.
+  if req.method == HttpHead:
+    emitFileStart(res, status, mime, hdrs, respLen, "", "",
+                  cast[pointer](readChunkTramp), true)
+    return
+
+  # Stream any large window -- full file OR a large range -- so the whole thing
+  # never sits in memory at once (a partial range is NOT inherently small: e.g.
+  # `Range: bytes=1-` on a multi-GB file). Only small responses are buffered.
+  if respLen > fileStreamThreshold:
     var first: string
-    try: first = readSlice(real, 0, int(min(int64(fileStreamChunk), size)))
+    try: first = readSlice(real, int(startOff),
+                           int(min(int64(fileStreamChunk), respLen)))
     except CatchableError: notFound(res); return
     let got = int64(first.len)
-    let remaining = size - got
+    let remaining = respLen - got
     let last = got == 0 or remaining <= 0
-    let nextRead = if last: "" else: real & '\0' & $got & '\0' & $remaining
-    emitFileStart(res, 200, mime, hdrs, size, first, nextRead,
+    let nextRead = if last: ""
+                   else: real & '\0' & $(startOff + got) & '\0' & $remaining
+    emitFileStart(res, status, mime, hdrs, respLen, first, nextRead,
                   cast[pointer](readChunkTramp), last)
     return
 
-  let length = int(e - s + 1)
   var body: string
   try:
-    body = if partial: readSlice(real, int(s), length)
+    body = if partial: readSlice(real, int(startOff), int(respLen))
            else: readFile(real)
   except CatchableError: notFound(res); return
-
   hdrs.add ("Content-Type", mime)
-  if partial:
-    hdrs.add ("Content-Range", "bytes " & $s & "-" & $e & "/" & $size)
-    res.send(HttpCode(206), body, hdrs)
-  else:
-    res.send(Http200, body, hdrs)
+  res.send(HttpCode(status), body, hdrs)
 
 proc pack(candidate, rootReal: string, opts: StaticOptions): string =
   candidate & '\0' & rootReal & '\0' & opts.index & '\0' & opts.cacheControl &

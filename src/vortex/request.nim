@@ -1161,8 +1161,22 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     if c.responded: return
     c.responded = true
     if c.parser.httpMethod == HttpHead:
-      # HEAD carries no body: emit the head as a normal empty response.
-      applyResponse(res.core, c, 0, int(code), contentType, headers, "")
+      # HEAD carries no body. When the caller declared a length (file serving),
+      # report it as the Content-Length a GET would return -- length-delimited
+      # and keep-alive, but with no body -- rather than forcing Content-Length:
+      # 0. finish() completes it (write() is a no-op on HEAD). With no declared
+      # length, fall back to a plain empty response.
+      if effLen >= 0:
+        c.respStreaming = true
+        c.respCLDelimited = true
+        let ka = c.parser.keepAlive
+        appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                         contentType, hdrs, chunked = false, keepAlive = ka,
+                         announceKeepAlive = ka and c.parser.minor == 0,
+                         altSvc = res.core.altSvc, contentLength = effLen)
+        flushConn(res)
+      else:
+        applyResponse(res.core, c, 0, int(code), contentType, headers, "")
       return
     c.respStreaming = true
     let ka = c.parser.keepAlive

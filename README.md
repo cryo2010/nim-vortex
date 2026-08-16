@@ -915,15 +915,6 @@ Two helpers make secure responses easy: `securityHeaders(...)` returns the OWASP
 Secure Headers baseline as a header list, and `setCookie(...)` builds a hardened
 `Set-Cookie` (see [Cookies](#cookies)):
 
-```nim
-proc handler(req: Request, res: Response) =
-  # JSON body -> application/json automatically; enable HSTS only over TLS
-  res.send(Http200, %*{"ok": true}, securityHeaders(hsts = req.isSecure))
-```
-
-Gate cross-site WebSocket hijacking with `req.originAllowed`, and drive a
-plaintext → HTTPS redirect with `req.isSecure` + `res.redirect`.
-
 ## Thanks
 
 - [httpbeast](https://github.com/dom96/httpbeast) proved the
