@@ -137,6 +137,7 @@ proc OPENSSL_sk_num(st: pointer): cint
 proc OPENSSL_sk_value(st: pointer, i: cint): pointer
 proc OPENSSL_sk_pop_free(st: pointer, freefn: proc (p: pointer) {.cdecl.})
 proc CRYPTO_malloc(num: csize_t, file: cstring, line: cint): pointer
+proc CRYPTO_free(p: pointer, file: cstring, line: cint)
 {.pop.}
 
 proc passwdCb(buf: cstring, size: cint, rwflag: cint,
@@ -294,7 +295,13 @@ proc statusCb(ssl: SslPtr, arg: pointer): cint {.cdecl.} =
   let buf = CRYPTO_malloc(csize_t(n), nil, 0)
   if buf == nil: return SSL_TLSEXT_ERR_NOACK
   copyMem(buf, unsafeAddr cfg.ocsp[0], n)
-  discard SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP, clong(n), buf)
+  # SSL_set_tlsext_status_ocsp_resp (via SSL_ctrl) transfers ownership of `buf`
+  # to OpenSSL -- but only on success (returns 1), when it frees the copy after
+  # sending. On failure ownership stays with us, so free it and NOACK rather
+  # than leaking the buffer and falsely reporting a staple we didn't set (R9).
+  if SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_STATUS_REQ_OCSP_RESP, clong(n), buf) != 1:
+    CRYPTO_free(buf, nil, 0)
+    return SSL_TLSEXT_ERR_NOACK
   SSL_TLSEXT_ERR_OK
 
 proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
