@@ -1126,15 +1126,26 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
   ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
   try:
     if currentThreadId() != res.core.threadId: return
+    # Merge any pending res.headers (set via res.headers[...] before this call)
+    # with the send-arg headers, exactly as the buffered path does in
+    # applyResponse/h3Apply -- the streaming/file head used to drop them (R14).
+    # The send argument wins per name. Consume the entry so the HEAD fallback's
+    # applyResponse (which also merges) does not double-apply it.
+    let hkey = (res.fd, res.gen, res.stream)
+    var userHeaders: seq[(string, string)]
+    if res.core.respHeaders.hasKey(hkey):
+      userHeaders = res.core.respHeaders[hkey].mergedWith(headers)
+      res.core.respHeaders.del hkey
+    else:
+      userHeaders = @headers
     # Inject the security-headers baseline here too (a streaming response's head;
-    # merged once, not per chunk). The HEAD fallback below routes through
-    # applyResponse, which does its own merge, so it keeps the original headers.
-    var hdrs = withSecHeaders(res.core, headers)
+    # merged once, not per chunk).
+    var hdrs = withSecHeaders(res.core, userHeaders)
     # Negotiate streaming compression up front: it drops Content-Length (the
     # compressed size is unknown -> chunked) and adds Content-Encoding + Vary.
     var enc = ""
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-      enc = negotiateStreamEnc(res, contentType, headers)
+      enc = negotiateStreamEnc(res, contentType, userHeaders)
       if enc.len > 0:
         hdrs.add ("content-encoding", enc)
         hdrs.add ("vary", "accept-encoding")
@@ -1182,7 +1193,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
                          altSvc = res.core.altSvc, contentLength = effLen)
         flushConn(res)
       else:
-        applyResponse(res.core, c, 0, int(code), contentType, headers, "")
+        applyResponse(res.core, c, 0, int(code), contentType, userHeaders, "")
       return
     c.respStreaming = true
     let ka = c.parser.keepAlive
