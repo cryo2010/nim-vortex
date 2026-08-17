@@ -1763,23 +1763,36 @@ proc dispatchBlockingArgs[T](req: Request,
   ## the capture-free `body` there. Backs the `req.blocking(a, b, ...)` macro;
   ## not a public API. Pin/enqueue bookkeeping mirrors dispatchBlocking.
   try:
-    let box = BlockingArgsBox[T](body: body, data: data)
-    GC_ref(box)                                   # keep alive across the hop
+    var box = BlockingArgsBox[T](body: body, data: data)
     if req.core.pool == nil:
+      # Inline (no pool): the trampoline runs on THIS thread and unrefs the box;
+      # GC_ref so it survives that unref until this scope's own decref. Both are
+      # on the loop thread, so there is no cross-thread refcount access.
+      GC_ref(box)
       blockingArgsTrampoline[T](cast[pointer](box), cast[pointer](req.core),
                                 req.fd, req.gen, req.stream, "")   # inline; unrefs
       return
+    # Pool path: hand the box's sole reference to the worker. ORC refcounts are
+    # non-atomic, so the box's header must be touched on exactly one thread. The
+    # worker's trampoline inc/decs it (bind + GC_unref); `wasMoved` drops this
+    # thread's local WITHOUT a decref, so the loop never races the worker on the
+    # count (previously the loop's scope-exit decref raced the worker's bind
+    # incref -- a genuine data race and the ASan use-after-free in the
+    # blocking(args) path). An early return below (dead conn) still decs the
+    # local here, but only on the loop thread, which is safe.
     if req.fd < 0:
       let idx = int(-req.fd) - 2
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        GC_unref(box); return
+        return
       inc req.core.h3slots[idx].pinned
     else:
       let c = conn(req.core, req.fd, req.gen)
-      if c == nil: (GC_unref(box); return)
+      if c == nil: return
       inc c.pinned
+    let raw = cast[pointer](box)
+    wasMoved(box)                                 # transfer ownership; no loop dec
     enqueue(cast[ptr WorkerPool](req.core.pool),
-            WorkerTask(fn: blockingArgsTrampoline[T], user: cast[pointer](box),
+            WorkerTask(fn: blockingArgsTrampoline[T], user: raw,
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream,
                        snap: snapshotRequest(req)))
