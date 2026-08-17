@@ -712,6 +712,12 @@ proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
              contentType: string, headers: openArray[(string, string)]) =
   if currentThreadId() != res.core.threadId:
     # Worker thread: pack protocol-neutrally; the loop serializes.
+    # Idempotent (R3): a blocking: body that calls send twice must not push a
+    # second response. Each push is one OutMsg, and the loop decrements the
+    # connection pin once per OutMsg (eventloop.processOutbox), so a duplicate
+    # would both corrupt the pipeline (a spurious extra response) and
+    # over-release the pin. First send wins; later ones are dropped.
+    if workerResponded: return
     push(res.core.outbox, OutMsg(
       fd: res.fd, gen: res.gen, stream: res.stream, code: int32(code),
       data: packResponse(contentType, headers, body)))
