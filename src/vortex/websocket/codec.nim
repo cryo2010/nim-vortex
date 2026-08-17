@@ -633,6 +633,10 @@ proc wsFlushRaw*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   if w.flush != nil:
     w.flush(core, c, w)
 
+proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [].}
+  ## Forward declaration: sendFrame closes the connection if permessage-deflate
+  ## compression fails (see below).
+
 proc sendFrame(ws: WebSocket, op: WsOpcode,
                data: openArray[char]) {.raises: [].} =
   # Declared {.raises: [].} (the flushHook proc pointer otherwise gives an
@@ -653,7 +657,17 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
       # frames and empty messages go out uncompressed. (Off-loop sends above
       # are always uncompressed: the deflate stream is loop-thread state.)
       if w.pmd and (op == opText or op == opBinary) and data.len > 0:
-        w.outBuf.appendFrame(op, w.deflate.compress(data), rsv1 = true)
+        var comp: string
+        try:
+          comp = w.deflate.compress(data)
+        except CatchableError:
+          # A deflate failure corrupts the stateful pmd stream (context takeover
+          # carries state across messages), so every later message would be
+          # undecodable. Close with 1011 rather than dropping silently or
+          # emitting a frame the peer can't decode (R13).
+          ws.close(1011)
+          return
+        w.outBuf.appendFrame(op, comp, rsv1 = true)
         w.flush(ws.core, c, w)
         if ws.core.flushHook != nil:
           ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
@@ -676,7 +690,7 @@ proc ping*(ws: WebSocket, data: openArray[char] = "") {.raises: [].} =
   if data.len > 125: sendFrame(ws, opPing, data.toOpenArray(0, 124))
   else: sendFrame(ws, opPing, data)
 
-proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.raises: [].} =
+proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [].} =
   ## Start the closing handshake: queue a close frame and close the transport
   ## (the connection for HTTP/1.1, the stream for HTTP/2) once it flushes.
   ## Safe from any thread.

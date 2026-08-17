@@ -102,8 +102,11 @@ proc close*(inf: var Inflator) =
     inf.inited = false
 
 proc compress*(d: var Deflator, data: openArray[char]): string =
-  ## Deflate one message: sync-flush, then strip the 4-byte tail. `data`
-  ## must be non-empty (callers send empty messages uncompressed).
+  ## Deflate one message: sync-flush, then strip the 4-byte tail. Empty input
+  ## returns "" (callers send empty messages uncompressed anyway) rather than
+  ## dereferencing data[0] out of bounds. A deflate error raises, so a truncated
+  ## frame is never emitted onto the (stateful) pmd stream (R13).
+  if data.len == 0: return ""
   d.strm.nextIn = cast[ptr uint8](unsafeAddr data[0])
   d.strm.availIn = cuint(data.len)
   var outbuf = newString(max(64, data.len div 2 + 16))
@@ -113,7 +116,9 @@ proc compress*(d: var Deflator, data: openArray[char]): string =
       outbuf.setLen(outbuf.len * 2)
     d.strm.nextOut = cast[ptr uint8](addr outbuf[total])
     d.strm.availOut = cuint(outbuf.len - total)
-    discard deflate(addr d.strm, zSyncFlush)
+    let rc = deflate(addr d.strm, zSyncFlush)
+    if rc == zStreamError or rc == zMemError:
+      raise newException(ValueError, "permessage-deflate: deflate failed")
     total = outbuf.len - int(d.strm.availOut)
     if d.strm.availOut != 0:
       break                      # flush complete, all input consumed
