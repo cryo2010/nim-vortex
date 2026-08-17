@@ -327,8 +327,12 @@ proc getsocknameC(fd: cint, a: pointer, l: ptr cuint): cint {.importc: "getsockn
 
 proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
             peer: pointer, peerLen: csize_t): cint {.cdecl.} =
-  discard sendtoUdp(gUdpFd, data, len, cint(0), peer, cuint(peerLen))
-  0
+  # Return < 0 on any send failure (notably EWOULDBLOCK, a full UDP socket
+  # buffer) so writeConn stops this cycle instead of spinning out datagrams that
+  # the kernel drops. QUIC loss recovery retransmits and the next pump retries
+  # the drained socket -- swallowing the failure just wasted work (R15).
+  if sendtoUdp(gUdpFd, data, len, cint(0), peer, cuint(peerLen)) < 0: cint(-1)
+  else: cint(0)
 
 # --- transport drive (called by eventloop's ngtcp2 h3Drive branch) ----------
 proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
