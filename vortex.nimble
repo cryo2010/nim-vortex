@@ -105,13 +105,16 @@ task testzstd, "Test zstd response compression (needs zstd + zlib + brotli)":
        "-o:tests/test_zstd_compression tests/test_zstd_compression.nim"
 
 task testrace, "ThreadSanitizer regressions for the cross-thread races":
-  # Two TSan stress tests; TSan aborts the process on any data race, failing the
+  # TSan stress tests; TSan aborts the process on any data race, failing the
   # task. -d:plainHttp keeps OpenSSL out of the report; -d:useMalloc lets TSan
   # see all allocations.
   #  - test_thread_race: start()/shutdown handler-closure refcount race.
   #  - test_blocking_race: a req.blocking: worker reading a snapshot, not live
   #    h2 state (C3 / IMP2) -- concurrent h2c blocking requests.
-  for t in ["test_thread_race", "test_blocking_race"]:
+  #  - test_blocking_args: req.blocking(a, b, ...) box ORC refcount must be
+  #    touched on one thread only (loop wasMoves it to the worker) -- guards the
+  #    loop-decref vs worker-incref race that surfaced as an ASan use-after-free.
+  for t in ["test_thread_race", "test_blocking_race", "test_blocking_args"]:
     exec "nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc " &
          "--passC:-fsanitize=thread --passL:-fsanitize=thread --debugger:native " &
          "-p:src -o:tests/" & t & " tests/" & t & ".nim"

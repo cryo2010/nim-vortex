@@ -307,7 +307,7 @@ jobs:
         env:
           TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
         run: |
-          for t in test_thread_race test_blocking_race; do
+          for t in test_thread_race test_blocking_race test_blocking_args; do
             nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc \
               --passC:-fsanitize=thread --passL:-fsanitize=thread \
               --debugger:native -p:src -o:tests/$t tests/$t.nim
