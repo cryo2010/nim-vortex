@@ -918,7 +918,17 @@ proc handleAccept(loop: Loop) =
       dec loop.connCount
       continue
     c.setDeadline(loop, dkHeader)   # handshake counts toward header timeout
-    loop.selector.registerHandle(int(client), {Event.Read}, fkClient)
+    try:
+      loop.selector.registerHandle(int(client), {Event.Read}, fkClient)
+    except CatchableError:
+      # registerHandle can raise (selector limits, a stale duplicate fd). Clean
+      # up the fd and the connCount/slot we reserved rather than leaking them
+      # and letting the exception unwind out of the loop thread (R11).
+      discard posix.close(client)
+      inc c.gen
+      c.state = csFree
+      dec loop.connCount
+      continue
     c.registered = true
 
 proc beginAfterProxy(loop: Loop, c: ptr Connection) =
@@ -1395,10 +1405,15 @@ proc run*(loop: Loop) =
     for i in 0 ..< n:
       let key = keys[i]
       if Event.User in key.events:
-        loop.processOutbox()
+        # Guard like the per-connection block below: a raise while applying a
+        # worker response or accepting a connection must never take down the
+        # whole loop thread (R11).
+        try: loop.processOutbox()
+        except Exception: discard
         continue
       if key.fd == loop.listenFd:
-        loop.handleAccept()
+        try: loop.handleAccept()
+        except Exception: discard
         continue
       if key.fd == loop.udpFd:
         quicWork = true
