@@ -30,6 +30,15 @@ suite "rate limiting (SEC3)":
     for i in 0 ..< 50:
       check rateLimit("d", 0, 0)
 
+  test "distinct-key flood keeps the table bounded (R5)":
+    # A spoofed/rotated source-address flood used to grow the per-thread table
+    # without bound within the 60s prune window. The hard size cap must hold it.
+    let before = rateLimitTrackedKeys()
+    for i in 0 ..< 250_000:
+      discard rateLimit("flood-" & $i, 0.0001, 1)
+    check rateLimitTrackedKeys() >= before      # sanity: it did track some
+    check rateLimitTrackedKeys() <= 100_000     # capped, not ~250k
+
   test "handler enforces the per-IP burst end to end":
     var c = newHttpClient()                  # keep-alive: one loop thread
     defer: c.close()
