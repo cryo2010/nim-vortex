@@ -27,6 +27,13 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     req.blocking:
       sleep(120)
       res.send(Http200, "slow done")
+  of "/double":
+    # Regression (R3): a worker body that sends twice must be idempotent. The
+    # second send must not push another response (pipeline corruption + pin
+    # double-decrement). First send wins; the duplicate is dropped.
+    req.blocking:
+      res.send(Http200, "first")
+      res.send(Http200, "second")
   of "/boom":
     raise newException(ValueError, "handler exploded")
   else:
@@ -165,6 +172,19 @@ suite "http/1.1 integration":
   test "handler exception gives 500":
     let resp = rawExchange(port, "GET /boom HTTP/1.1\r\nHost: x\r\n\r\n")
     check "HTTP/1.1 500" in resp
+
+  test "worker double-send is idempotent (R3: no duplicate response)":
+    # Keep-alive (no Connection: close) so a duplicate response has somewhere to
+    # land: with the bug the second send lands as a second response on the open
+    # connection; the fix drops it, so exactly one response goes out.
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.send("GET /double HTTP/1.1\r\nHost: x\r\n\r\n")
+    let resp = s.recvUntilClose(700)         # quiet gap, then the keep-alive idle
+    check "first" in resp
+    check "second" notin resp                # the duplicate send is dropped
+    check resp.count("HTTP/1.1 200") == 1    # exactly one response, not two
 
   test "half-closed client still gets a deferred (worker) response":
     # Regression: after the client half-closes its write side (SHUT_WR) while a
