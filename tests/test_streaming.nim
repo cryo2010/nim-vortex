@@ -33,6 +33,13 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/tmplhdr":
     res.stream(Http200, "text/plain", {"X-Made-By": "vortex"}):
       res.write("with headers")
+  of "/pendinghdr":
+    # R14: a header set via res.headers[...] before sendHead must appear in the
+    # streamed head, like it does for buffered res.send.
+    res.headers["X-Pending"] = "yes"
+    res.sendHead(Http200, "text/plain")
+    res.write("body")
+    res.finish()
   of "/boom":
     # The body raises after committing a 200 and some data: the stream must be
     # aborted (no chunked terminator / RST_STREAM), not finished cleanly.
@@ -102,6 +109,13 @@ suite "HTTP/1 streaming responses":
     check "Transfer-Encoding: chunked" in head
     check "Content-Length:" notin head
     check dechunk(body) == "Hello, streamed world!"
+
+  test "pending res.headers appear in a streamed head (R14)":
+    let resp = rawGet("/pendinghdr")
+    let (head, body) = splitHeadBody(resp)
+    check "HTTP/1.1 200" in head
+    check "X-Pending: yes" in head          # set before sendHead, not dropped
+    check dechunk(body) == "body"
 
   test "a large body streams intact under backpressure":
     let resp = rawGet("/big")
