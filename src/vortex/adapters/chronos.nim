@@ -436,6 +436,11 @@ proc installWsReader*(ws: WebSocket) {.raises: [].} =
         let w = r.waiter; r.waiter = nil
         w.complete(WsMessage(closed: true, code: code, reason: reason))
         wsReaders.del(key)
+      elif r.msgs.len == 0:
+        # Close with no parked receive() and nothing left to drain: drop the
+        # reader now so its per-handle entry can't leak in wsReaders (R12). A
+        # non-empty queue is left for receive() to drain, which deletes on eof.
+        wsReaders.del(key)
   except Exception:
     discard
 
