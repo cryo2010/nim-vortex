@@ -16,7 +16,11 @@ writeFile(dir / "data.bin", "0123456789")            # 10 bytes
 const bigPattern = "0123456789ABCDEF"
 writeFile(dir / "big.dat", bigPattern.repeat(64 * 1024))   # 1 MiB, > stream threshold
 # a secret outside the served root, for the traversal test
-writeFile(dir.parentDir / ("vortex_secret_" & $getCurrentProcessId()), "TOPSECRET")
+let secret = dir.parentDir / ("vortex_secret_" & $getCurrentProcessId())
+writeFile(secret, "TOPSECRET")
+# a directory whose index is a symlink pointing at the secret outside the root
+createDir(dir / "trap")
+createSymlink(secret, dir / "trap" / "index.html")
 
 proc oneFile(path: string): RequestHandler =
   proc (req: Request, res: Response) {.gcsafe.} =
@@ -97,6 +101,14 @@ suite "static file serving":
     check "TOPSECRET" notin resp
     # encoded traversal too
     check "404" in raw("/assets/%2e%2e/etc/passwd").status
+
+  test "a directory index that is a symlink out of the root is refused (R8)":
+    # Requesting the directory appends the index (index.html), which is a symlink
+    # to a secret outside the root. Containment must be re-checked after the
+    # append, or getFileInfo follows the link and serves the secret.
+    let resp = raw("/assets/trap/")
+    check "404" in resp.status
+    check "TOPSECRET" notin resp
 
   test "conditional GET returns 304 for a matching ETag":
     let etag = raw("/assets/hello.txt").headerVal("ETag")

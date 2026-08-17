@@ -211,6 +211,14 @@ proc serveResolved(req: Request, res: Response, data: string)
   if info.kind == pcDir:
     if index.len == 0: notFound(res); return
     real = real / index
+    # Re-resolve + re-check containment (R8): the index entry may itself be a
+    # symlink pointing outside the root. Without this, getFileInfo would follow
+    # it and serve a file outside the served directory.
+    if rootReal.len > 0:
+      try: real = expandFilename(real)
+      except CatchableError: notFound(res); return
+      if real != rootReal and not real.isRelativeTo(rootReal):
+        notFound(res); return
     try: info = getFileInfo(real)
     except CatchableError: notFound(res); return
     if info.kind == pcDir: notFound(res); return
