@@ -106,6 +106,18 @@ struct Conn {
     auto it = streams.find(id);
     return it == streams.end() ? nullptr : it->second.get();
   }
+
+  // Free the ngtcp2/nghttp3/OpenSSL resources this Conn owns, in the same order
+  // the reap path used (h3, conn, ossl, ssl). A destructor (RAII) means every
+  // exit unwinds them -- including acceptConn's early returns, which previously
+  // leaked c->ssl/c->ossl because Conn had no destructor (R7). Member
+  // destructors (streams etc.) run afterwards, as before.
+  ~Conn() {
+    if (h3) nghttp3_conn_del(h3);
+    if (conn) ngtcp2_conn_del(conn);
+    if (ossl) ngtcp2_crypto_ossl_ctx_del(ossl);
+    if (ssl) SSL_free(ssl);
+  }
 };
 
 struct Engine {
@@ -389,6 +401,19 @@ int cbAckedStreamDataOffset(ngtcp2_conn *, int64_t stream_id, uint64_t,
   return 0;
 }
 
+// The peer extended this stream's flow-control window. writeConn blocks a stream
+// in nghttp3 (nghttp3_conn_block_stream) when ngtcp2 reports
+// STREAM_DATA_BLOCKED; without a matching unblock the stream stays parked in
+// nghttp3 forever and a response larger than the peer's per-stream window stalls
+// permanently (R6). Unblock it so the next writev offers it again.
+int cbExtendMaxStreamData(ngtcp2_conn *, int64_t stream_id, uint64_t,
+                          void *user_data, void *) {
+  auto *c = static_cast<Conn *>(user_data);
+  if (c->h3 && nghttp3_conn_unblock_stream(c->h3, stream_id) != 0)
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  return 0;
+}
+
 // --- connection creation ----------------------------------------------------
 
 Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
@@ -466,6 +491,7 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   cbs.handshake_completed = cbHandshakeCompleted;
   cbs.recv_stream_data = cbRecvStreamData;
   cbs.acked_stream_data_offset = cbAckedStreamDataOffset;
+  cbs.extend_max_stream_data = cbExtendMaxStreamData;
   cbs.stream_open = cbStreamOpen;
   cbs.stream_close = cbStreamClose;
   cbs.rand = cbRand;
@@ -656,12 +682,7 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
 void vq_engine_free(VqEngine *eng) {
   if (!eng) return;
   auto *e = reinterpret_cast<Engine *>(eng);
-  for (auto &c : e->conns) {
-    if (c->h3) nghttp3_conn_del(c->h3);
-    if (c->conn) ngtcp2_conn_del(c->conn);
-    if (c->ossl) ngtcp2_crypto_ossl_ctx_del(c->ossl);
-    if (c->ssl) SSL_free(c->ssl);
-  }
+  // ~Conn frees each connection's h3/conn/ossl/ssl as the unique_ptrs unwind.
   if (e->ssl_ctx) SSL_CTX_free(e->ssl_ctx);
   delete e;
 }
@@ -726,11 +747,7 @@ void vq_engine_pump(VqEngine *eng, uint64_t now_ns) {
         e->cfg.cb.on_conn_close(e->cfg.user, c->conn_ud);
       for (auto it = e->byCid.begin(); it != e->byCid.end();)
         it = (it->second == c) ? e->byCid.erase(it) : std::next(it);
-      if (c->h3) nghttp3_conn_del(c->h3);
-      if (c->conn) ngtcp2_conn_del(c->conn);
-      if (c->ossl) ngtcp2_crypto_ossl_ctx_del(c->ossl);
-      if (c->ssl) SSL_free(c->ssl);
-      i = e->conns.erase(i);
+      i = e->conns.erase(i);   // ~Conn frees h3/conn/ossl/ssl in order
     } else {
       ++i;
     }
