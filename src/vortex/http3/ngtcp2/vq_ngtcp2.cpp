@@ -729,8 +729,32 @@ void vq_engine_recv(VqEngine *eng, const uint8_t *pkt, size_t len,
   ngtcp2_pkt_info pi{};
   int r = ngtcp2_conn_read_pkt(c->conn, &ps.path, &pi, pkt, len, now_ns);
   if (r != 0) {
-    if (r == NGTCP2_ERR_DRAINING) c->draining = true;
-    else c->closed = true;
+    switch (r) {
+    case NGTCP2_ERR_DRAINING:
+      c->draining = true;              // peer is closing: enter the drain period
+      break;
+    case NGTCP2_ERR_DROP_CONN:
+      c->closed = true;                // unrecoverable: drop without a close
+      break;
+    case NGTCP2_ERR_CRYPTO:
+      // TLS handshake failure: close with the TLS alert as the reason so the
+      // peer learns why instead of idle-timing-out (R15).
+      if (!c->wantClose) {
+        ngtcp2_ccerr_set_tls_alert(&c->ccerr,
+            ngtcp2_conn_get_tls_alert(c->conn), nullptr, 0);
+        c->wantClose = true;
+      }
+      break;
+    default:
+      // Any other transport error: emit a CONNECTION_CLOSE carrying the mapped
+      // transport error code on the next writeConn, instead of going silent and
+      // forcing the peer to wait out its idle timeout (R15).
+      if (!c->wantClose) {
+        ngtcp2_ccerr_set_liberr(&c->ccerr, r, nullptr, 0);
+        c->wantClose = true;
+      }
+      break;
+    }
   }
 }
 
