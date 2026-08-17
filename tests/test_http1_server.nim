@@ -1,4 +1,4 @@
-import std/[unittest, net, httpcore, strutils, tables]
+import std/[unittest, net, httpcore, strutils, tables, os, posix]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 import ./helper
@@ -22,6 +22,11 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     # Bodiless status: must go out with no Content-Length/Content-Type
     # and no body, but keep the validator (RFC 9110 8.6).
     res.send(Http304, "", @{"ETag": "\"v1\""})
+  of "/slow":
+    # Deferred (worker) response: the reply is produced off the loop thread.
+    req.blocking:
+      sleep(120)
+      res.send(Http200, "slow done")
   of "/boom":
     raise newException(ValueError, "handler exploded")
   else:
@@ -160,6 +165,24 @@ suite "http/1.1 integration":
   test "handler exception gives 500":
     let resp = rawExchange(port, "GET /boom HTTP/1.1\r\nHost: x\r\n\r\n")
     check "HTTP/1.1 500" in resp
+
+  test "half-closed client still gets a deferred (worker) response":
+    # Regression: after the client half-closes its write side (SHUT_WR) while a
+    # worker response is in flight, the loop unregisters the fd rather than
+    # busy-spinning on the persistent EOF; it must still deliver the response and
+    # then close (re-arming the fd only to flush).
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.send("GET /slow HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+    check posix.shutdown(s.getFd, SHUT_WR) == 0    # request done; only read now
+    var resp = ""
+    var chunk = s.recv(4096, timeout = 3000)
+    while chunk.len > 0:
+      resp.add chunk
+      chunk = s.recv(4096, timeout = 3000)
+    check "HTTP/1.1 200" in resp
+    check "slow done" in resp
 
   test "idle connection times out":
     let s = newSocket(buffered = false)
