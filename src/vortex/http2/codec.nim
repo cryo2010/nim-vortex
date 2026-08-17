@@ -8,6 +8,12 @@ import ./frames, ./hpack
 import ../connection
 import ../websocket/codec as wscodec
 
+const h2FieldNameDelims = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
+                           '?', '@', '[', '\\', ']', '{', '}'}
+  ## RFC 9110 5.6.2 token separators forbidden in a field name. Mirrors the h1
+  ## parser's tokenDelims, kept local so the h2 codec has no dependency on the
+  ## h1 parser.
+
 type
   H2Stream* = object
     headers*: seq[(string, string)]  ## request fields incl. pseudo-headers
@@ -570,6 +576,14 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       if name.len == 0:
         h2.streamError(c, sid, errProtocol)
         return
+      # RFC 9113 8.2.1: no field (pseudo or regular) may carry NUL, CR, or LF in
+      # its value -- a header-injection / smuggling vector if reflected or
+      # proxied to h1. The strict h1 parser rejects these bytes outright.
+      for ch in val:
+        let b = uint8(ch)
+        if b == 0x00'u8 or b == 0x0a'u8 or b == 0x0d'u8:
+          h2.streamError(c, sid, errProtocol)
+          return
       if name[0] == ':':
         if pseudoDone:
           h2.streamError(c, sid, errProtocol)  # pseudo after regular
@@ -595,8 +609,13 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
           return
       else:
         pseudoDone = true
+        # RFC 9113 8.2.1: a regular field name must be a valid lowercase token;
+        # uppercase, controls, or separators make it malformed (mirrors the h1
+        # parser's token check so h2 cannot smuggle a name h1 would reject).
         for ch in name:
-          if ch in 'A'..'Z':
+          let b = uint8(ch)
+          if ch in 'A'..'Z' or b <= 0x20'u8 or b >= 0x7f'u8 or
+             ch in h2FieldNameDelims:
             h2.streamError(c, sid, errProtocol)
             return
         case name
@@ -609,11 +628,20 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
             h2.streamError(c, sid, errProtocol)
             return
         of "content-length":
+          var n: BiggestInt
           try:
-            st.contentLength = parseBiggestInt(val)
+            n = parseBiggestInt(val)
           except ValueError:
             h2.streamError(c, sid, errProtocol)
             return
+          # RFC 9113 8.1.1: a negative length, or a second content-length whose
+          # value differs from the first, is malformed. A negative value would
+          # also disable the body-length reconciliation below (a smuggling
+          # vector when proxied to h1). st.contentLength starts at -1 (unset).
+          if n < 0 or (st.contentLength >= 0 and st.contentLength != n):
+            h2.streamError(c, sid, errProtocol)
+            return
+          st.contentLength = n
         else: discard
     # RFC 8441: an Extended CONNECT websocket carries :protocol plus a full
     # :scheme/:path/:authority (unlike a plain CONNECT, which omits them and

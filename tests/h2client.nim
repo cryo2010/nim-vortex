@@ -83,6 +83,18 @@ proc addExtendedConnect*(buf: var string, sid: uint32,
   buf.addFrameHeader(hb.len, ftHeaders, flagEndHeaders, sid)
   buf.add hb
 
+proc addRequest*(buf: var string, sid: uint32,
+                 headers: openArray[(string, string)], endStream = true) =
+  ## HEADERS frame with an explicit HPACK-literal field list (END_HEADERS, and
+  ## END_STREAM unless told otherwise). Encodes names/values verbatim -- HPACK is
+  ## length-prefixed, so malformed bytes (CR/LF/NUL, bad names) reach the server's
+  ## validator intact. For malformed-header security tests.
+  var hb = ""
+  for (n, v) in headers: hb.encodeHeader(n, v)
+  let flags = flagEndHeaders or (if endStream: flagEndStream else: 0'u8)
+  buf.addFrameHeader(hb.len, ftHeaders, flags, sid)
+  buf.add hb
+
 proc addData*(buf: var string, sid: uint32, payload: string,
               endStream = false) =
   buf.addFrameHeader(payload.len, ftData,
@@ -155,6 +167,13 @@ proc goawayError*(frames: seq[Frame]): int =
 proc count*(frames: seq[Frame], typ: FrameType): int =
   for f in frames:
     if f.typ == uint8(typ): inc result
+
+proc rstError*(frames: seq[Frame], sid: uint32): int =
+  ## Error code of the first RST_STREAM on `sid`, or -1 if none.
+  for f in frames:
+    if f.typ == uint8(ftRstStream) and f.streamId == sid and f.payload.len >= 4:
+      return int(get32(f.payload, 0))
+  -1
 
 proc close*(c: var H2TestConn) =
   c.sock.close()
