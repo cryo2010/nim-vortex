@@ -42,20 +42,27 @@ taskRequires "perf", "powpow >= 0.1.8"
 
 task perf, "Run the HTTP/1.1 throughput comparison benchmark":
   ensureNimblePath()
+  # -d:plainHttp: this is a plaintext HTTP/1.1 benchmark, so build vortex without
+  # TLS and the ngtcp2/nghttp3 HTTP/3 shim. That keeps the h1 hot path identical
+  # while dropping the QUIC C++ shim, whose headers are not on the default macOS
+  # search path (they live under Homebrew) -- otherwise the build fails with
+  # "ngtcp2/ngtcp2.h file not found".
   var extra = ""
   when defined(macosx):
-    # powpow links -lssl/-lcrypto directly (vortex loads OpenSSL dynamically),
-    # so point the linker at Homebrew's OpenSSL. Missing -L dirs are ignored, so
-    # listing both Apple-silicon and Intel prefixes is harmless.
+    # powpow (a comparison server) still links -lssl/-lcrypto directly, so point
+    # the linker at Homebrew's OpenSSL. Missing -L dirs are ignored, so listing
+    # both Apple-silicon and Intel prefixes is harmless.
     extra = " --passL:-L/opt/homebrew/lib --passL:-L/usr/local/lib"
-  exec "nim c -r --mm:orc --threads:on -d:danger" & extra &
+  exec "nim c -r --mm:orc --threads:on -d:danger -d:plainHttp" & extra &
        " -o:bench/perf_http1_1 bench/perf_http1_1.nim"
 
 taskRequires "perf2", "chronos >= 4.0.0"
 
 task perf2, "Run the HTTP/2 throughput benchmark":
   ensureNimblePath()
-  exec "nim c -r --mm:orc --threads:on -d:danger -o:bench/perf_http2 bench/perf_http2.nim"
+  # h2c (cleartext prior-knowledge) benchmark, so -d:plainHttp: no TLS, no QUIC
+  # shim to compile (its headers are off the default macOS search path).
+  exec "nim c -r --mm:orc --threads:on -d:danger -d:plainHttp -o:bench/perf_http2 bench/perf_http2.nim"
 
 # HTTP/3 throughput is measured with a real QUIC client via `nimble h3load`
 # (conformance/h3load, Docker): an in-process hand-rolled QUIC client is
