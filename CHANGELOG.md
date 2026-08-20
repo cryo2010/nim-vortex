@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-19
+
 ### Added
 
 - `req.blocking(a, b, ...): body` moves the named values into the worker pool,
@@ -83,6 +85,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `res.send(code, body, "text/html")` -> `res.send(code, body,
   %*{"Content-Type": "text/html"})` (or a `@[("Content-Type", "text/html")]`
   seq). `res.sendHead` (streaming) still takes `contentType`.
+
+### Fixed
+
+- HTTP/3 now loads encrypted and in-memory-PEM (`keyPem` / PKCS#12) TLS keys
+  without prompting on the controlling tty, which previously blocked h3 startup.
+- Static file serving streams large byte ranges and answers `HEAD` from the file
+  size, instead of reading the whole file or slice into memory.
+- The event loop no longer busy-spins at 100% CPU when a client half-closes
+  (`SHUT_WR`) while a worker or async response is still in flight.
+- HTTP/3 responses larger than the peer's per-stream flow-control window no
+  longer stall permanently: blocked streams are unblocked when the window
+  reopens. Also fixes a flaky streamed-response drain on large-file responses.
+- A `req.blocking:` worker that calls `res.send` more than once is now idempotent
+  (the first response wins) instead of corrupting the connection pipeline.
+- Response headers set via `res.headers[...]` before a streaming or file response
+  (`res.sendHead`) are no longer dropped.
+- permessage-deflate handles an empty message and a compressor error without
+  crashing or emitting a corrupt frame.
+- HTTP/3 emits a `CONNECTION_CLOSE` on transport errors (instead of forcing the
+  peer to idle-time-out) and honors UDP send backpressure.
+- Fixed several teardown and lifecycle leaks: an HTTP/3 connection on a failed
+  accept, the OCSP staple buffer on a set failure, a WebSocket reader entry on an
+  abnormal close, and an accept-path fd/counter leak; a raise while accepting a
+  connection or applying a worker response no longer tears down the loop thread.
+- Fixed a cross-thread reference-count race in `req.blocking(a, b, ...)` that
+  could corrupt an ORC refcount under the worker pool.
+
+### Security
+
+Following a package-wide security review, this release closes:
+
+- **HTTP/2 request smuggling and header injection:** reject duplicate and
+  negative `Content-Length`, and validate header names/values for `CR`/`LF`/`NUL`,
+  matching the strict HTTP/1 parser.
+- **Rate-limiter denial of service:** the per-thread token-bucket table is now
+  size-capped, so a distinct-key flood (spoofed or rotated source addresses)
+  cannot grow it without bound.
+- **Static-file path traversal:** a directory whose index is a symlink pointing
+  outside the served root is now refused (containment is re-checked after the
+  index is appended).
+- **Memory-amplification denial of service:** a large-file `Range` or `HEAD`
+  request no longer buffers the whole file or slice into memory.
 
 ## [0.1.0] - 2026-08-10
 
@@ -168,5 +212,6 @@ the public API may still change before 1.0.
   memcheck/helgrind race-and-leak matrix, and libFuzzer fuzzing of the
   parser / HPACK / QPACK decoders.
 
-[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/cryo2010/nim-vortex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cryo2010/nim-vortex/releases/tag/v0.1.0
