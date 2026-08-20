@@ -157,9 +157,8 @@ proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
   defer: discard BIO_free(bio)
   let leaf = PEM_read_bio_X509(bio, nil, nil, nil)
   if leaf == nil: return false
-  let used = SSL_CTX_use_certificate(ctx, leaf) == 1   # up-refs leaf
-  X509_free(leaf)
-  if not used: return false
+  defer: X509_free(leaf)                               # up-ref'd by use; free ours
+  if SSL_CTX_use_certificate(ctx, leaf) != 1: return false
   while true:
     let extra = PEM_read_bio_X509(bio, nil, nil, nil)
     if extra == nil:
@@ -187,8 +186,8 @@ proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   if pkey == nil:
     ERR_clear_error()
     return false
-  result = SSL_CTX_use_PrivateKey(ctx, pkey) == 1      # up-refs pkey
-  EVP_PKEY_free(pkey)
+  defer: EVP_PKEY_free(pkey)                            # up-ref'd by use below
+  result = SSL_CTX_use_PrivateKey(ctx, pkey) == 1
 
 type
   TlsMaterial* = object
@@ -316,18 +315,22 @@ proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
   var pkey, cert, ca: pointer
   if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, addr ca) != 1:
     return false
+  # Free our references once parse succeeded (cert/pkey are up-ref'd into the ctx
+  # below; the ca stack is up-ref'd per entry). defer keeps the frees next to the
+  # allocation and covers every exit, like the BIO/p12 defers above.
+  defer:
+    if cert != nil: X509_free(cert)
+    if pkey != nil: EVP_PKEY_free(pkey)
+    if ca != nil: OPENSSL_sk_pop_free(ca, X509_free)
   result = cert != nil and pkey != nil and
            SSL_CTX_use_certificate(ctx, cert) == 1 and
            SSL_CTX_use_PrivateKey(ctx, pkey) == 1
   if result and ca != nil:
     for i in 0 ..< OPENSSL_sk_num(ca):
-      # add1 (up-ref) so the whole stack is freed uniformly below
+      # add1 (up-ref) so the whole stack is freed uniformly by the defer above
       if SSL_CTX_ctrl(ctx, SSL_CTRL_CHAIN_CERT, 1, OPENSSL_sk_value(ca, i)) != 1:
         result = false
         break
-  if cert != nil: X509_free(cert)
-  if pkey != nil: EVP_PKEY_free(pkey)
-  if ca != nil: OPENSSL_sk_pop_free(ca, X509_free)
 
 proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
   ## Add PEM CA cert(s) from memory to the ctx trust store (client verification).
@@ -573,10 +576,10 @@ proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string) =
   ## generation, as one locked update. Empty paths mean "re-read the configured
   ## ones".
   acquire(r.lock)
+  defer: release(r.lock)
   setPath(r.certPath, certFile)
   setPath(r.keyPath, keyFile)
   inc r.gen
-  release(r.lock)
 
 proc pendingCertReload*(r: ptr CertReload, seen: int,
                         certFile, keyFile: var string): int =
@@ -585,11 +588,11 @@ proc pendingCertReload*(r: ptr CertReload, seen: int,
   ## snapshot under the lock). The caller advances its own `seen` once it has
   ## acted on the result.
   acquire(r.lock)
+  defer: release(r.lock)
   result = r.gen
   if result != seen:
-    certFile = getPath(r.certPath)
+    certFile = getPath(r.certPath)   # allocates: a raise here must not hold the lock
     keyFile = getPath(r.keyPath)
-  release(r.lock)
 
 
 proc ctxCertSubject*(cfg: ptr TlsConfig): string =
