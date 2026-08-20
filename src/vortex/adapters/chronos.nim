@@ -550,14 +550,21 @@ macro blocking*(request: Request, args: varargs[untyped]): untyped =
   var names: seq[NimNode]
   for i in 0 ..< args.len - 1: names.add args[i]
   let payload = genSym(nskParam, "payload")
+  # prepArg statically rejects ref/ptr/closure args and extracts an isolate(...);
+  # prepare into locals first, then build the tuple from them.
+  var prelude = newStmtList()
   var tup = nnkTupleConstr.newTree()
-  for n in names: tup.add n
+  for n in names:
+    let a = genSym(nskLet, "barg")
+    prelude.add newLetStmt(a, newCall(bindSym"prepArg", n))
+    tup.add a
   var inner = newStmtList()
   for i, n in names:
     inner.add newLetStmt(n, nnkBracketExpr.newTree(payload, newLit(i)))
   inner.add body
   result = newCall(ident"await", quote do:
     (block:
+      `prelude`
       let moved = `tup`
       blockingRun(`request`, proc (req {.inject.}: Request,
           res {.inject.}: Response, `payload`: typeof(moved)): auto

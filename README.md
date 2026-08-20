@@ -376,6 +376,23 @@ usable by name. Anything not named in the call and not read from `req` is a
 compile error (that is the guardrail that keeps loop-thread state off the
 worker). With no values, `req.blocking:` just runs the block on a worker.
 
+Only **value data** may cross to the worker. A `ref`, `ptr`, or `closure` (or a
+value that has one nested in a field, e.g. an object with a `ref` field) is
+**rejected at compile time**: it would be *shared* with the worker, not copied,
+so mutating it there races the loop thread. Value types are deep-copied and
+safe, including `string`, `seq`, `Table`, and objects/tuples built from them. To
+move a *uniquely-owned* reference in, wrap it with `isolate(...)` (from the
+re-exported `std/isolation`) as a `var`; inside the block it is the plain type:
+
+```nim
+var user = isolate(loadUser(id))   # compiler-checked proof of unique ownership
+req.blocking(user):                # allowed; `user` is a User inside the block
+  render(user)
+```
+
+Otherwise, pass the value data the block needs and return the result rather than
+sharing a reference across the boundary.
+
 **In an async handler** (`import vortex/asyncdispatch` or `vortex/chronos`),
 `req.blocking` is *awaitable and returns the block's value*: the handler
 suspends until the worker finishes (the loop keeps serving others), then resumes
