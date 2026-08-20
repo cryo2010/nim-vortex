@@ -9,6 +9,9 @@
 
 import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros]
 import ./connection
+import ./blockingguard
+export blockingguard   # prepArg/assertBlockingType for the blocking macros, and
+                       # the re-exported std/isolation (isolate/extract/Isolated)
 
 export PathParams, ResponseHeaders
 import ./workerpool
@@ -1951,6 +1954,14 @@ macro blocking*(request: Request, args: varargs[untyped]): untyped =
   ## Pass several values (they ride in as a tuple, each usable by name):
   ## `req.blocking(user, cfg): ...`. With no values, `req.blocking: ...` just
   ## runs the block on a worker.
+  ##
+  ## Only **value** data may cross to the worker. A `ref`/`ptr`/`closure`
+  ## argument (or a value that has one nested in a field) is rejected at compile
+  ## time: it would be shared, not copied, and mutating it on the worker races
+  ## the loop thread. To move a uniquely-owned reference in, wrap it with
+  ## `isolate(...)` (from the re-exported `std/isolation`), as a `var`; inside
+  ## the block it is the plain type: `var u = isolate(load()); req.blocking(u):
+  ## use(u)`.
   let body = args[^1]
   var names: seq[NimNode]
   for i in 0 ..< args.len - 1: names.add args[i]
@@ -1965,14 +1976,23 @@ macro blocking*(request: Request, args: varargs[untyped]): untyped =
           `body`)
   else:
     let payload = genSym(nskParam, "payload")
+    # Prepare each named value into a local first (prepArg statically rejects
+    # ref/ptr/closure types and extracts an isolate(...)), then build the tuple
+    # from the locals -- moving a move-only Isolated straight into a tuple
+    # constructor defeats the optimizer.
+    var prelude = newStmtList()
     var tup = nnkTupleConstr.newTree()
-    for n in names: tup.add n
+    for n in names:
+      let a = genSym(nskLet, "barg")
+      prelude.add newLetStmt(a, newCall(bindSym"prepArg", n))
+      tup.add a
     var inner = newStmtList()
     for i, n in names:
       inner.add newLetStmt(n, nnkBracketExpr.newTree(payload, newLit(i)))
     inner.add body
     result = quote do:
       block:
+        `prelude`
         let moved = `tup`
         `dispatchArgs`(`request`, proc (req {.inject.}: Request,
             res {.inject.}: Response, `payload`: typeof(moved))
