@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-20
+
+### Added
+
+- `req.blocking(...)` accepts a value wrapped in `isolate(...)` to move a
+  *uniquely-owned* reference into the worker; inside the block it is the plain
+  type (`var u = isolate(load()); req.blocking(u): use(u)`). vortex re-exports
+  `std/isolation`, so `isolate`/`extract`/`Isolated` come with `import vortex`.
+
+### Changed
+
+- **`req.blocking(...)` now rejects `ref`/`ptr`/`closure` arguments at compile
+  time** (top-level or nested in a field). Such a value would be *shared* with
+  the worker thread, not copied, and mutating it there races the loop thread (a
+  silent data race). Value data still crosses freely -- numbers, `string`,
+  `seq`, `Table`, and objects/tuples built from them are deep-copied. Migration:
+  pass the value data the block needs and return the result, or move a
+  uniquely-owned reference in with `isolate(...)`. Note that a value which
+  transitively holds a `ref` is rejected too -- e.g. `std/times.DateTime` (it
+  carries a `ref Timezone`), whose cross-thread use was already unsafe.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added
@@ -212,6 +233,7 @@ the public API may still change before 1.0.
   memcheck/helgrind race-and-leak matrix, and libFuzzer fuzzing of the
   parser / HPACK / QPACK decoders.
 
-[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/cryo2010/nim-vortex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cryo2010/nim-vortex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cryo2010/nim-vortex/releases/tag/v0.1.0
