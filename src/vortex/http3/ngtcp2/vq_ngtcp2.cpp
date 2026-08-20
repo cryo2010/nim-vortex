@@ -31,6 +31,18 @@ namespace {
 constexpr size_t kMaxUdpPayload = 1452;   // conservative IPv4 path MTU
 constexpr size_t kScidLen = 18;           // our connection-id length
 
+// unique_ptr deleters for the C OpenSSL handles the shim owns. Scoped locals
+// (loadKey/loadCertChain/makeCtx) then free on every path, and the Engine's
+// SSL_CTX is released by RAII instead of a manual SSL_CTX_free.
+struct SslCtxDeleter  { void operator()(SSL_CTX *p) const noexcept { SSL_CTX_free(p); } };
+struct BioDeleter     { void operator()(BIO *p) const noexcept { BIO_free(p); } };
+struct X509Deleter    { void operator()(X509 *p) const noexcept { X509_free(p); } };
+struct EvpPkeyDeleter { void operator()(EVP_PKEY *p) const noexcept { EVP_PKEY_free(p); } };
+using SslCtxPtr  = std::unique_ptr<SSL_CTX, SslCtxDeleter>;
+using BioPtr     = std::unique_ptr<BIO, BioDeleter>;
+using X509Ptr    = std::unique_ptr<X509, X509Deleter>;
+using EvpPkeyPtr = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
+
 // A response body: a FIFO of chunks with absolute offsets. nghttp3 borrows the
 // buffers we hand it via read_data until they are acknowledged, so chunk storage
 // must stay put until acked -- a deque of separately-allocated std::strings is
@@ -122,7 +134,7 @@ struct Conn {
 
 struct Engine {
   VqConfig cfg{};
-  SSL_CTX *ssl_ctx = nullptr;
+  SslCtxPtr ssl_ctx;                   // RAII: freed when the Engine is deleted
   std::string key_pw;   // owns the passphrase (cfg.key_password char* may dangle)
   // Every CID that routes to a conn (our SCIDs + the client's original DCID).
   std::unordered_map<std::string, Conn *> byCid;
@@ -442,7 +454,7 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   }
 
   // TLS per-connection state (ossl crypto backend).
-  c->ssl = SSL_new(e->ssl_ctx);
+  c->ssl = SSL_new(e->ssl_ctx.get());
   if (!c->ssl) return nullptr;
   SSL_set_app_data(c->ssl, &c->conn_ref);
   SSL_set_accept_state(c->ssl);
@@ -615,76 +627,72 @@ static int vqPasswdCb(char *buf, int size, int /*rwflag*/, void *u) {
 // PEM file (`file`), decrypting with `pw` if set. Never prompts (see vqPasswdCb).
 static bool loadKey(SSL_CTX *ctx, const char *pem, const char *file,
                     const char *pw) {
-  BIO *b = nullptr;
-  if (pem && pem[0]) b = BIO_new_mem_buf(pem, -1);
-  else if (file && file[0]) b = BIO_new_file(file, "r");
+  BioPtr b((pem && pem[0])   ? BIO_new_mem_buf(pem, -1)
+           : (file && file[0]) ? BIO_new_file(file, "r")
+                               : nullptr);
   if (!b) return false;
-  EVP_PKEY *k = PEM_read_bio_PrivateKey(b, nullptr, vqPasswdCb,
-                                        const_cast<char *>(pw));
-  BIO_free(b);
+  EvpPkeyPtr k(PEM_read_bio_PrivateKey(b.get(), nullptr, vqPasswdCb,
+                                       const_cast<char *>(pw)));
   if (!k) { ERR_clear_error(); return false; }
-  bool ok = SSL_CTX_use_PrivateKey(ctx, k) == 1;
-  EVP_PKEY_free(k);
-  return ok;
+  return SSL_CTX_use_PrivateKey(ctx, k.get()) == 1;
 }
 
 // Load the leaf cert (+ any following chain certs) into `ctx` from a PEM blob.
 static bool loadCertChain(SSL_CTX *ctx, const char *pem) {
-  BIO *b = BIO_new_mem_buf(pem, -1);
+  BioPtr b(BIO_new_mem_buf(pem, -1));
   if (!b) return false;
-  X509 *leaf = PEM_read_bio_X509(b, nullptr, nullptr, nullptr);
-  bool ok = leaf && SSL_CTX_use_certificate(ctx, leaf) == 1;
-  if (leaf) X509_free(leaf);
+  X509Ptr leaf(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
+  bool ok = leaf && SSL_CTX_use_certificate(ctx, leaf.get()) == 1;
   while (ok) {
-    X509 *x = PEM_read_bio_X509(b, nullptr, nullptr, nullptr);
+    X509Ptr x(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
     if (!x) { ERR_clear_error(); break; }   // expected: end of PEM data
-    if (SSL_CTX_add0_chain_cert(ctx, x) != 1) { X509_free(x); ok = false; }
+    // add0 takes ownership on success, so release; on failure the unique_ptr frees.
+    if (SSL_CTX_add0_chain_cert(ctx, x.get()) != 1) ok = false;
+    else (void)x.release();
   }
-  BIO_free(b);
   return ok;
 }
 
-static SSL_CTX *makeCtx(const VqConfig *cfg) {
-  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+static SslCtxPtr makeCtx(const VqConfig *cfg) {
+  SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
   if (!ctx) return nullptr;
-  SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
-  SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
+  SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+  SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
-  SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, nullptr);
+  SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);
   bool ok = true;
   // Cert: in-memory PEM takes precedence over the file (matches the TCP path).
   if (cfg->cert_pem && cfg->cert_pem[0])
-    ok = ok && loadCertChain(ctx, cfg->cert_pem);
+    ok = ok && loadCertChain(ctx.get(), cfg->cert_pem);
   else if (cfg->cert_file && cfg->cert_file[0])
-    ok = ok && SSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) == 1;
+    ok = ok && SSL_CTX_use_certificate_chain_file(ctx.get(), cfg->cert_file) == 1;
   // Key: PEM blob or file, decrypted with key_password, never prompting.
   if (ok && ((cfg->key_pem && cfg->key_pem[0]) ||
              (cfg->key_file && cfg->key_file[0])))
-    ok = ok && loadKey(ctx, cfg->key_pem, cfg->key_file, cfg->key_password);
-  if (!ok) { SSL_CTX_free(ctx); return nullptr; }
+    ok = ok && loadKey(ctx.get(), cfg->key_pem, cfg->key_file, cfg->key_password);
+  if (!ok) return nullptr;   // unique_ptr frees the half-built ctx
   return ctx;
 }
 
 VqEngine *vq_engine_new(const VqConfig *cfg) {
   if (ngtcp2_crypto_ossl_init() != 0) return nullptr;
-  auto *e = new Engine();
+  auto e = std::make_unique<Engine>();
   e->cfg = *cfg;
   e->key_pw = cfg->key_password ? cfg->key_password : "";
   // Don't retain the caller's (possibly transient) TLS-material pointers.
   e->cfg.cert_pem = e->cfg.key_pem = e->cfg.key_password = nullptr;
   e->cfg.cert_file = e->cfg.key_file = nullptr;
   e->ssl_ctx = makeCtx(cfg);
-  if (!e->ssl_ctx) { delete e; return nullptr; }
-  return reinterpret_cast<VqEngine *>(e);
+  if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
+  return reinterpret_cast<VqEngine *>(e.release());
 }
 
 void vq_engine_free(VqEngine *eng) {
   if (!eng) return;
-  auto *e = reinterpret_cast<Engine *>(eng);
-  // ~Conn frees each connection's h3/conn/ossl/ssl as the unique_ptrs unwind.
-  if (e->ssl_ctx) SSL_CTX_free(e->ssl_ctx);
-  delete e;
+  // delete runs ~Engine: the SSL_CTX (unique_ptr member) and every connection's
+  // h3/conn/ossl/ssl (~Conn via the conns vector) are freed as it unwinds.
+  delete reinterpret_cast<Engine *>(eng);
 }
 
 int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
@@ -692,11 +700,11 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
   auto *e = reinterpret_cast<Engine *>(eng);
   bool ok = true;
   if (cert_pem && cert_pem[0])
-    ok = ok && loadCertChain(e->ssl_ctx, cert_pem);
+    ok = ok && loadCertChain(e->ssl_ctx.get(), cert_pem);
   // Reuse the passphrase from engine construction: a hot cert/key swap keeps the
   // same encryption passphrase. loadKey never prompts on an encrypted key.
   if (ok && key_pem && key_pem[0])
-    ok = ok && loadKey(e->ssl_ctx, key_pem, nullptr, e->key_pw.c_str());
+    ok = ok && loadKey(e->ssl_ctx.get(), key_pem, nullptr, e->key_pw.c_str());
   return ok ? 0 : -1;
 }
 
