@@ -27,7 +27,7 @@ proc openWs(): Socket =
     let k = recv(result.getFd, addr one[0], 1, cint(0))
     if k <= 0: break
     hdr.add one[0]
-  doAssert "101" in hdr, hdr
+  check "101" in hdr
 
 proc recvN(s: Socket, n: int): string =
   result = newString(n)

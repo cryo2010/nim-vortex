@@ -118,7 +118,7 @@ let certDir = getTempDir() / "nhs_cookie_certs_" & $getCurrentProcessId()
 createDir(certDir)
 let certFile = certDir / "cert.pem"
 let keyFile = certDir / "key.pem"
-doAssert execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
+check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
   keyFile & " -out " & certFile & " -days 2 -subj /CN=localhost")[1] == 0
 
 var srvH3 = newVortex(handler, initVortexConfig(

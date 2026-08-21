@@ -40,7 +40,7 @@ proc post(h2: bool, enc, file: string): (int, string) =
     " -w '%{http_code}' --data-binary @" & file &
     " -H 'Content-Encoding: " & enc & "' -H 'Content-Type: text/plain' " &
     base & "/echo")
-  doAssert rc == 0
+  check rc == 0
   (parseInt(outp.strip), readFile(bodyf))
 
 let expected = "the quick brown fox. ".repeat(300)   # ~6 KB, well under the cap

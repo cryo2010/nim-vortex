@@ -58,7 +58,7 @@ proc openWs(path: string): Socket =
     let k = recv(result.getFd, addr one[0], 1, cint(0))
     if k <= 0: break
     hdr.add one[0]
-  doAssert "101" in hdr, hdr
+  check "101" in hdr
 
 suite "websocket ws.messages (plain async handler via router.ws)":
   test "iterates messages and echoes each in order":

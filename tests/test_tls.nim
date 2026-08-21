@@ -10,7 +10,7 @@ let keyFile = certDir / "key.pem"
 let (genOut, genRc) = execCmdEx(
   "openssl req -x509 -newkey rsa:2048 -nodes -keyout " & keyFile &
   " -out " & certFile & " -days 2 -subj /CN=localhost")
-doAssert genRc == 0, "cert generation failed: " & genOut
+check genRc == 0
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path

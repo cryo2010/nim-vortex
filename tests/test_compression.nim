@@ -38,7 +38,7 @@ proc fetch(path, acceptEnc: string): (string, string) =
   let bodyf = tmp / "body.bin"
   let (hdrs, rc) = execCmdEx(curlBin & " -s -H 'Accept-Encoding: " & acceptEnc &
     "' -D - -o " & bodyf & " " & base & path)
-  doAssert rc == 0
+  check rc == 0
   let ce = block:
     var v = ""
     for ln in hdrs.splitLines:
@@ -51,7 +51,7 @@ proc fetch(path, acceptEnc: string): (string, string) =
       # Decompress to a file and read it back byte-exactly (capturing gunzip's
       # stdout through a pipe is not byte-faithful).
       let outf = tmp / "plain.out"
-      doAssert execCmdEx("gunzip -c " & bodyf & " > " & outf)[1] == 0
+      check execCmdEx("gunzip -c " & bodyf & " > " & outf)[1] == 0
       readFile(outf)
     else: readFile(bodyf)
   (hdrs.toLowerAscii, body)

@@ -1,4 +1,4 @@
-import std/[unittest, net, httpcore]
+import std/[unittest, net, httpcore, strutils]
 import std/httpclient except Response
 import vortex/[settings, request, server, routing]
 
@@ -69,7 +69,7 @@ suite "router":
     let resp = client.get(base & "/users")     # GET on a POST-only resource
     check resp.code == HttpCode(405)
     check resp.headers.hasKey("Allow")
-    check "POST" in resp.headers["Allow"]
+    check "POST" in $resp.headers["Allow"]   # joined form ("POST, OPTIONS")
 
   test "HEAD falls back to GET":
     var client = newHttpClient()

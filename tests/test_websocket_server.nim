@@ -52,7 +52,7 @@ proc recvFrame(s: Socket): tuple[fin: bool, op: int, payload: string] =
   ## Read one server (unmasked) frame.
   let h = recvN(s, 2)
   let b0 = uint8(h[0]); let b1 = uint8(h[1])
-  doAssert (b1 and 0x80) == 0, "server frames must be unmasked"
+  check (b1 and 0x80) == 0
   var length = int(b1 and 0x7f)
   if length == 126:
     let e = recvN(s, 2)
@@ -90,8 +90,8 @@ proc openWs(key = "dGhlIHNhbXBsZSBub25jZQ=="): Socket =
               "Sec-WebSocket-Version: 13\r\n\r\n")
   result.setRecvTimeout(2000)
   let resp = result.recvAvailable(2000)
-  doAssert "101 Switching Protocols" in resp, resp
-  doAssert ("Sec-WebSocket-Accept: " & expectedAccept(key)) in resp, resp
+  check "101 Switching Protocols" in resp
+  check ("Sec-WebSocket-Accept: " & expectedAccept(key)) in resp
 
 suite "websocket server":
   test "handshake completes with the right accept key":

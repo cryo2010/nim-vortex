@@ -39,9 +39,9 @@ createDir(dir)
 let certPath = dir / "cert.pem"
 let keyPath = dir / "key.pem"          # unencrypted
 let encKeyPath = dir / "enc.pem"       # same key, AES-256 encrypted
-doAssert execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
+check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
   keyPath & " -out " & certPath & " -days 2 -subj /CN=localhost")[1] == 0
-doAssert execCmdEx("openssl rsa -in " & keyPath & " -aes256 -out " & encKeyPath &
+check execCmdEx("openssl rsa -in " & keyPath & " -aes256 -out " & encKeyPath &
   " -passout pass:" & pass)[1] == 0
 
 let certData = readFile(certPath)

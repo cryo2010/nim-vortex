@@ -35,6 +35,12 @@ type
     notFound*: RequestHandler ## default: plain 404
     middleware: seq[Middleware]
 
+  RouteConflictError* = object of CatchableError
+    ## Raised at registration when the same (method, path) is registered twice
+    ## (directly or via a sub-router mount). A route table is built once at
+    ## startup, so a duplicate is a programming error worth failing hard on
+    ## rather than silently letting the last registration win.
+
 proc defaultNotFound(req: Request, res: Response) {.gcsafe.} =
   res.send(Http404, "404 Not Found")
 
@@ -76,6 +82,9 @@ proc addRoute*(router: Router, meth: HttpMethod, path: string,
   ## to consume the body incrementally instead of it being buffered into
   ## `req.body`; only meaningful for body-bearing methods (POST/PUT/PATCH).
   let node = router.addRouteNode(path)
+  if node.handlers[meth] != nil:
+    raise newException(RouteConflictError,
+      "duplicate route: " & $meth & " " & path & " is already registered")
   node.handlers[meth] = handler
   node.streaming[meth] = streaming
 
@@ -166,16 +175,24 @@ proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
   if h == nil and req.method == HttpHead:
     h = node.handlers[HttpGet]   # HEAD falls back to GET; the codec drops the body
   if h == nil:
-    # Path exists but not for this method. RFC 9110 10.2.1 requires an Allow
-    # header listing the methods this resource does support.
+    # Path exists but not for this method. Build the Allow header (RFC 9110
+    # 10.2.1 / 15.5.6): the methods this resource supports, plus HEAD wherever
+    # GET is and OPTIONS (which the router answers automatically).
     var allow: seq[string]
     for m in HttpMethod:
       if node.handlers[m] != nil: allow.add $m
     if allow.len == 0:
-      router.notFound(req, res)
+      router.notFound(req, res)                 # intermediate node, no handlers
+      return
+    if node.handlers[HttpGet] != nil and "HEAD" notin allow:
+      allow.add "HEAD"                          # HEAD is served wherever GET is
+    if "OPTIONS" notin allow:
+      allow.add "OPTIONS"                        # answered automatically below
+    if req.method == HttpOptions:
+      # Automatic OPTIONS: a bodiless 204 advertising the allowed methods. An
+      # explicitly registered OPTIONS handler wins (h would be non-nil above).
+      res.send(HttpCode(204), "", @{"Allow": allow.join(", ")})
     else:
-      if node.handlers[HttpGet] != nil and "HEAD" notin allow:
-        allow.add "HEAD"                       # HEAD is served wherever GET is
       res.send(HttpCode(405), "405 Method Not Allowed",
                @{"Allow": allow.join(", ")})
     return

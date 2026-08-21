@@ -54,9 +54,9 @@ proc fetch(h2: bool, enc: string): (string, string) =
   let proto = if h2: " --http2-prior-knowledge" else: ""
   let (hdrs, rc) = execCmdEx(curlBin & " -s" & proto & " -H 'Accept-Encoding: " &
     enc & "' -D - -o " & bodyf & " " & base & "/stream")
-  doAssert rc == 0, "curl failed"
+  check rc == 0
   let outf = tmp / "plain.out"
-  doAssert execCmdEx(decoderCmd(enc) & bodyf & " > " & outf)[1] == 0, enc & " decode failed"
+  check execCmdEx(decoderCmd(enc) & bodyf & " > " & outf)[1] == 0
   (hdrs.toLowerAscii, readFile(outf))
 
 var encodings: seq[string]

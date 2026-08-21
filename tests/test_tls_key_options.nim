@@ -19,9 +19,9 @@ let key = dir / "key.pem"          # unencrypted
 let enckey = dir / "enc.pem"       # same key, AES-encrypted with a passphrase
 const pass = "s3cr3t-pass"
 
-doAssert execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
+check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
   key & " -out " & cert & " -days 2 -subj /CN=localhost")[1] == 0
-doAssert execCmdEx("openssl rsa -in " & key & " -aes256 -out " & enckey &
+check execCmdEx("openssl rsa -in " & key & " -aes256 -out " & enckey &
   " -passout pass:" & pass)[1] == 0
 
 let certData = readFile(cert)

@@ -55,14 +55,14 @@ proc fetch(path: string, h2: bool, accept: string): (string, string) =
   let proto = if h2: " --http2-prior-knowledge" else: ""
   let (hdrs, rc) = execCmdEx(curlBin & " -s" & proto & " -H 'Accept-Encoding: " &
     accept & "' -D - -o " & bodyf & " " & base & path)
-  doAssert rc == 0
+  check rc == 0
   let low = hdrs.toLowerAscii
   var enc = ""
   for ln in low.splitLines:
     let c = ln.find(':')
     if c > 0 and ln[0 ..< c].strip == "content-encoding": enc = ln[c+1 .. ^1].strip
   let outf = tmp / "plain.out"
-  doAssert execCmdEx(decoderCmd(enc) & bodyf & " > " & outf)[1] == 0, "decode " & enc
+  check execCmdEx(decoderCmd(enc) & bodyf & " > " & outf)[1] == 0
   (low, readFile(outf))
 
 suite "zstd response compression":

@@ -425,7 +425,10 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.cookies[name]` | `string` | one request cookie, first match; "" if absent. `for v in req.cookies.all(name)` yields every value. Case-sensitive; see [Cookies](#cookies) |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
 | `req.json` | `JsonNode` | body parsed as JSON, cached per request; empty body is `{}`; raises `JsonParsingError` on malformed input |
+| `req.form` | `Table[string, string]` | `application/x-www-form-urlencoded` body fields (decoded, `+` is a space, last value wins); empty for other content types |
+| `req.mediaType` | `string` | Content-Type media type without parameters (`"application/json"`); "" if absent |
 | `req.contentLength` | `int` | body length in bytes |
+| `req.accepts(offered…)` | `string` | best of `offered` per `Accept` (q-values, `type/*`, `*/*`); "" if none, first offer if no header. Also `req.acceptsLanguage` / `req.acceptsCharset` |
 | `req.host` | `string` | `:authority` (h2/h3) or `Host` (h1) |
 | `req.origin` | `string` | `Origin` header |
 | `req.originAllowed(allowed, allowMissing = false)` | `bool` | Origin allowlist check (CSWSH defense) |
@@ -561,6 +564,22 @@ A single matched pair of surrounding double quotes is stripped
 (`sid="abc"` reads as `abc`), per RFC 6265 §4.1.1; interior or unbalanced
 quotes are left untouched. No other decoding is done (no percent-decoding).
 
+**Signed (tamper-proof) cookies.** `setSignedCookie` appends an HMAC-SHA1
+signature so the client cannot forge or alter the value; read it back with
+`req.cookies.signed(name, secret)`, which verifies the signature in constant
+time and returns `none` when the cookie is absent, unsigned, or tampered:
+
+```nim
+res.send(Http200, "ok", @[setSignedCookie("sid", sessionId, secret)])
+
+let sid = req.cookies.signed("sid", secret)   # Option[string]
+if sid.isSome: use(sid.get)
+```
+
+This is integrity, not confidentiality: the value stays readable, only
+unforgeable. Keep `secret` private and stable (rotating it invalidates live
+cookies). Works in every build, including `-d:plainHttp` (no OpenSSL).
+
 ### Middleware
 
 `router.use(mw)` wraps every route (and the 404/405 responses) with a
@@ -612,6 +631,23 @@ keeps duplicates. The `send` call's own `headers` still win per name. `res.heade
 is loop-thread only (buffered `send`, not `sendHead` streaming): set it before a
 `req.blocking:` section, or pass headers to `send` from inside the worker.
 
+#### CORS
+
+`cors(...)` is a bundled middleware for Cross-Origin Resource Sharing. It adds
+the `Access-Control-*` headers on requests from an allowed `Origin` and answers a
+CORS preflight (an `OPTIONS` carrying `Access-Control-Request-Method`) directly
+with 204, before the request reaches a route:
+
+```nim
+app.use(cors(initCorsOptions(
+  origins = @["https://app.example"],   # or @["*"] (the default) for any origin
+  allowCredentials = true,              # echoes the Origin (a wildcard is invalid with credentials)
+  maxAge = 600)))                       # preflight cache seconds
+```
+
+A request from a disallowed origin is served normally but without CORS headers
+(its preflight gets 403). Requests with no `Origin` pass through untouched.
+
 ### Routing
 
 `newVortex()` gives you an app (a path router): register a handler per method,
@@ -632,7 +668,14 @@ app.serve(8080)
 
 Route parameters are stored eagerly at match time, so `req.param` / `req.params`
 work anywhere the handler does, including inside `blocking:` bodies. A path with
-no matching route gets a 404; a path that matches but not the method, a 405.
+no matching route gets a 404; a path that matches but not the method, a 405 with
+an `Allow` header.
+
+An unhandled `OPTIONS` on a known path is answered automatically with a 204 and
+an `Allow` header listing the resource's methods (register an `options` handler
+to override it). Registering the same `(method, path)` twice, directly or via a
+mount, raises `RouteConflictError` at registration rather than silently
+overwriting.
 
 Compose routers by mounting one under a prefix with `use`:
 
