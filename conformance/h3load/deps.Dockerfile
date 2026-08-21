@@ -27,6 +27,9 @@ RUN for i in 1 2 3 4 5; do \
     done && \
     pacman -Scc --noconfirm
 
+# vortex core dep: HMAC for signed cookies (pure Nim; needed even in plainHttp).
+RUN nimble install -y "nimcrypto@>= 0.6.0"
+
 # Keep these in lockstep with conformance/h3load/client.Dockerfile so the client
 # and server run the same QUIC/HTTP3 versions.
 ARG NGHTTP3_VERSION=v1.11.0

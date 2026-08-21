@@ -12,6 +12,7 @@ srcDir        = "src"
 import std/strutils
 
 requires "nim >= 2.2.10"
+requires "nimcrypto >= 0.6.0"   # HMAC for signed cookies (pure Nim; plainHttp-safe)
 
 task bench, "Build benchmark server with release flags":
   exec "nim c --mm:orc --threads:on -d:danger --passC:-flto -o:bench/handlers bench/handlers.nim"

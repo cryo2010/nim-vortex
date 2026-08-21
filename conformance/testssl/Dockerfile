@@ -10,13 +10,14 @@ FROM ${BASE}
 
 RUN for i in 1 2 3 4 5; do \
       pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc openssl libngtcp2 libnghttp3 && break; \
+        nim gcc git openssl libngtcp2 libnghttp3 && break; \
       [ "$i" = 5 ] && exit 1; \
       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
     done && \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
+RUN nimble install -y "nimcrypto@>= 0.6.0"   # core dep (HMAC for signed cookies)
 COPY src ./src
 COPY conformance/testssl/testssl_server.nim ./testssl_server.nim
 RUN nim c --mm:orc --threads:on -d:release -p:src \

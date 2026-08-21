@@ -11,13 +11,14 @@ FROM ${BASE}
 
 RUN for i in 1 2 3 4 5; do \
       pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc && break; \
+        nim gcc git && break; \
       [ "$i" = 5 ] && exit 1; \
       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
     done && \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
+RUN nimble install -y "nimcrypto@>= 0.6.0"   # core dep (HMAC for signed cookies)
 COPY src ./src
 COPY conformance/zap/zap_server.nim ./zap_server.nim
 RUN nim c --mm:orc --threads:on -d:release -d:plainHttp -p:src \

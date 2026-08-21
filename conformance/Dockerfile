@@ -33,6 +33,7 @@ RUN python -m venv /opt/redbot && \
 ENV PATH="/opt/redbot/bin:${PATH}"
 
 WORKDIR /vortex
+RUN nimble install -y "nimcrypto@>= 0.6.0"   # core dep (HMAC for signed cookies)
 COPY src ./src
 COPY conformance ./conformance
 

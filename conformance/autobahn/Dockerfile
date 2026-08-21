@@ -11,13 +11,14 @@ FROM ${BASE}
 
 RUN for i in 1 2 3 4 5; do \
       pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc openssl zlib libngtcp2 libnghttp3 && break; \
+        nim gcc git openssl zlib libngtcp2 libnghttp3 && break; \
       [ "$i" = 5 ] && exit 1; \
       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
     done && \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
+RUN nimble install -y "nimcrypto@>= 0.6.0"   # core dep (HMAC for signed cookies)
 COPY src ./src
 COPY conformance/autobahn/echo_server.nim ./echo_server.nim
 # -d:wsDeflate + zlib so the permessage-deflate cases (12-13) are covered.
