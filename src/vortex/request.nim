@@ -522,6 +522,106 @@ proc json*(req: Request): JsonNode =
     else:
       result = lazyJson(c, raw)
 
+proc mediaType*(req: Request): string =
+  ## The request's Content-Type media type, lowercased and without parameters
+  ## (`"application/json"` from `"application/json; charset=utf-8"`); "" when the
+  ## header is absent.
+  let ct = req.header("content-type")
+  let semi = ct.find(';')
+  result = (if semi >= 0: ct[0 ..< semi] else: ct).strip.toLowerAscii
+
+proc form*(req: Request): Table[string, string] =
+  ## Parse an `application/x-www-form-urlencoded` request body into fields:
+  ## percent-decoded, `+` is a space (form encoding), last value wins on a
+  ## duplicate key. Empty for any other content type; use `decodeQuery(req.body)`
+  ## directly if you need every occurrence of a repeated key. Call on the loop
+  ## thread (it reads req.body), not inside `blocking:`.
+  if req.mediaType != "application/x-www-form-urlencoded": return
+  for (k, v) in decodeQuery(req.body): result[k] = v
+
+# --- content negotiation (Accept / Accept-Language / Accept-Charset) ---------
+
+proc parseAcceptHeader(h: string): seq[tuple[tok: string, q: float]] =
+  ## Split an Accept-style header into (token, q) pairs, lowercased. A missing
+  ## q defaults to 1.0; an unparseable q means 0.0 (the entry is not acceptable).
+  for part in h.split(','):
+    let s = part.strip
+    if s.len == 0: continue
+    var tok = s
+    var q = 1.0
+    let semi = s.find(';')
+    if semi >= 0:
+      tok = s[0 ..< semi].strip
+      for p in s[semi + 1 .. ^1].split(';'):     # parameters after the token
+        let eq = p.find('=')
+        if eq > 0 and p[0 ..< eq].strip.toLowerAscii == "q":
+          try: q = parseFloat(p[eq + 1 .. ^1].strip)
+          except ValueError: q = 0.0
+    result.add (tok.toLowerAscii, q)
+
+proc negotiate(header: string, offered: openArray[string],
+               match: proc(entry, offered: string): int {.nimcall, gcsafe.}): string =
+  ## Pick the value from `offered` (in server-preference order) that the client
+  ## most prefers. The most specific matching range determines an offer's q; the
+  ## highest q wins, ties broken by offer order. No header -> the first offer.
+  if header.strip.len == 0:
+    return (if offered.len > 0: offered[0] else: "")
+  let entries = parseAcceptHeader(header)
+  var bestQ = 0.0
+  for off in offered:
+    let o = off.toLowerAscii
+    var q = 0.0
+    var spec = -1
+    for e in entries:
+      let s = match(e.tok, o)
+      if s > spec:                               # most specific match sets q
+        spec = s
+        q = e.q
+    if spec >= 0 and q > bestQ:
+      bestQ = q
+      result = off
+
+proc matchMedia(entry, offered: string): int {.nimcall, gcsafe.} =
+  ## exact "type/subtype" = 2, "type/*" = 1, "*/*" = 0, no match = -1.
+  if entry == offered: return 2
+  if entry == "*/*": return 0
+  let slash = entry.find('/')
+  if slash > 0 and entry[slash + 1 .. ^1] == "*":
+    let oslash = offered.find('/')
+    if oslash > 0 and offered[0 ..< oslash] == entry[0 ..< slash]: return 1
+  -1
+
+proc matchLang(entry, offered: string): int {.nimcall, gcsafe.} =
+  ## exact = 2, prefix range ("en" matches "en-US") = 1, "*" = 0, none = -1.
+  if entry == "*": return 0
+  if entry == offered: return 2
+  if offered.startsWith(entry & "-"): return 1
+  -1
+
+proc matchCharset(entry, offered: string): int {.nimcall, gcsafe.} =
+  ## exact = 1, "*" = 0, none = -1.
+  if entry == "*": return 0
+  if entry == offered: return 1
+  -1
+
+proc accepts*(req: Request, offered: varargs[string]): string =
+  ## The media type from `offered` (server-preference order) the client accepts
+  ## best per the Accept header, honoring q-values and `type/*` / `*/*` wildcards
+  ## (`req.accepts("application/json", "text/html")`). "" if none is acceptable;
+  ## the first offer if there is no Accept header.
+  negotiate(req.header("accept"), offered, matchMedia)
+
+proc acceptsLanguage*(req: Request, offered: varargs[string]): string =
+  ## The language tag from `offered` the client prefers per Accept-Language; a
+  ## range like `en` matches an offered `en-US`. "" if none; first offer if no
+  ## header.
+  negotiate(req.header("accept-language"), offered, matchLang)
+
+proc acceptsCharset*(req: Request, offered: varargs[string]): string =
+  ## The charset from `offered` the client prefers per Accept-Charset. "" if
+  ## none; first offer if no header.
+  negotiate(req.header("accept-charset"), offered, matchCharset)
+
 proc param*(params: PathParams, name: string): string =
   ## Value of a path parameter; "" when absent.
   for (n, v) in params:
