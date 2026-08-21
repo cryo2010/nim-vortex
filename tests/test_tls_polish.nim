@@ -14,7 +14,7 @@ if opensslBin.len == 0:
 let dir = getTempDir() / "vortex_tlspol_" & $getCurrentProcessId()
 removeDir(dir); createDir(dir)
 proc sh(cmd: string): int = execCmdEx(cmd)[1]
-proc must(cmd: string) = doAssert sh(cmd) == 0, cmd
+proc must(cmd: string) = check sh(cmd) == 0
 
 # default cert (CN=localhost) and a wildcard cert (CN=*.example.com)
 must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/key.pem -out " &

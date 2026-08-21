@@ -14,7 +14,7 @@ if curlBin.len == 0 or opensslBin.len == 0:
 
 let dir = getTempDir() / "vortex_tlsadv_" & $getCurrentProcessId()
 removeDir(dir); createDir(dir)
-proc sh(cmd: string) = doAssert execCmdEx(cmd)[1] == 0, cmd
+proc sh(cmd: string) = check execCmdEx(cmd)[1] == 0
 
 # server cert (CN=localhost), a PKCS#12 bundle of it, and an alt cert for SNI
 sh("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/key.pem -out " &

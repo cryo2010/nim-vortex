@@ -19,7 +19,7 @@ proc gen(cert, key, cn: string) =
   let (o, rc) = execCmdEx(
     "openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
     " -out " & cert & " -days 2 -subj /CN=" & cn)
-  doAssert rc == 0, "cert gen failed: " & o
+  check rc == 0
 
 let certA = dir / "a.pem"
 let keyA = dir / "akey.pem"

@@ -40,7 +40,7 @@ proc wsClient(op: uint8, payload: string, fin = true): string =
   ## A masked client WebSocket frame (RFC 6455) to place in a DATA payload.
   result = newStringOfCap(payload.len + 6)
   result.add char((if fin: 0x80'u8 else: 0'u8) or op)
-  doAssert payload.len < 126
+  check payload.len < 126
   result.add char(0x80 or payload.len)         # mask bit + 7-bit length
   let mask = [0x21'u8, 0x43, 0x65, 0x87]
   for b in mask: result.add char(b)
@@ -56,7 +56,7 @@ proc parseWs(buf: string): (seq[WsMsg], int) =
   while pos + 2 <= buf.len:
     let b0 = uint8(buf[pos])
     let b1 = uint8(buf[pos + 1])
-    doAssert (b1 and 0x80) == 0                 # server frames are unmasked
+    check (b1 and 0x80) == 0                 # server frames are unmasked
     var ln = int(b1 and 0x7f)
     var hdr = 2
     if ln == 126:

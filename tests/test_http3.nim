@@ -23,7 +23,7 @@ let certDir = getTempDir() / "nhs_h3_certs_" & $getCurrentProcessId()
 createDir(certDir)
 let certFile = certDir / "cert.pem"
 let keyFile = certDir / "key.pem"
-doAssert execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
+check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
   keyFile & " -out " & certFile & " -days 2 -subj /CN=localhost")[1] == 0
 
 const bigBody = "0123456789abcdef".repeat(8 * 1024)   # 128 KiB

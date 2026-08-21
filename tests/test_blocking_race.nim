@@ -5,7 +5,7 @@
 ## requests across several loop threads + the worker pool; built under TSan by
 ## `nimble testrace`, TSan aborts on any data race.
 
-import std/[net, atomics]
+import std/[net, atomics, unittest]
 import vortex
 import ./h2client
 from vortex/http2/frames import FrameType, ftHeaders
@@ -21,7 +21,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     let sink = req.method.int + req.path.len + req.header("x-test").len +
                req.body.len + req.remoteAddress.len + req.params.len +
                (if req.isSecure: 1 else: 0)
-    doAssert sink >= 0
+    doAssert sink >= 0        # worker thread: keep doAssert (check mutates
+                              # unittest globals and would race under TSan)
     res.send(Http200, "ok")
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 4)).start(0)
@@ -46,6 +47,5 @@ for i in 0 ..< clients:
 joinThreads(threads)
 
 srv.close()
-doAssert okCount.load == clients * itersPer,
-  "expected " & $(clients * itersPer) & " responses, got " & $okCount.load
+check okCount.load == clients * itersPer
 echo "blocking race regression ok (", okCount.load, " h2 blocking requests)"

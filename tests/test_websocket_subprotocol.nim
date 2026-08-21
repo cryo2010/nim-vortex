@@ -25,7 +25,7 @@ proc recvN(s: Socket, n: int): string =
 
 proc recvText(s: Socket): string =
   let h = recvN(s, 2)
-  doAssert (int(uint8(h[0])) and 0x0f) == 0x1        # text frame
+  check (int(uint8(h[0])) and 0x0f) == 0x1        # text frame
   var ln = int(uint8(h[1]) and 0x7f)
   if ln == 126:
     let e = recvN(s, 2); ln = (int(uint8(e[0])) shl 8) or int(uint8(e[1]))
@@ -55,7 +55,7 @@ proc openWs(protocolOffer = ""): tuple[s: Socket, resp: string] =
     let k = recv(result.s.getFd, addr one[0], 1, cint(0))
     if k <= 0: break
     hdr.add one[0]
-  doAssert "101" in hdr, hdr
+  check "101" in hdr
   result.resp = hdr
 
 suite "websocket subprotocol negotiation":
