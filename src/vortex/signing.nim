@@ -1,33 +1,25 @@
-## HMAC-SHA1 message authentication, used for tamper-proof (signed) cookies.
+## HMAC message authentication for tamper-proof (signed) cookies.
 ##
-## Built on the bundled pure-Nim SHA-1 so it works in every build mode,
-## including `-d:plainHttp` where OpenSSL is absent. HMAC-SHA1 is a sound MAC
-## for this purpose: the SHA-1 collision attacks do not weaken HMAC-SHA1's
-## unforgeability. It provides integrity/authenticity only, not confidentiality
-## (a signed cookie value is readable, just not forgeable without the secret).
+## Backed by nimcrypto (pure Nim), so it works in every build mode, including
+## `-d:plainHttp` where OpenSSL is absent. HMAC provides integrity/authenticity
+## only, not confidentiality (a signed cookie value is readable, just not
+## forgeable without the secret). HMAC-SHA256 is the default; SHA-1 is kept for
+## interop and SHA-512 for a larger tag.
 
 import std/[base64, strutils]
-import ./websocket/sha1
+import nimcrypto/[hmac, sha, sha2]
 
-const blockSize = 64   # SHA-1 block size, in bytes
+type
+  CookieMac* = enum   ## HMAC hash used to sign a cookie
+    macSha256         ## HMAC-SHA256 (default)
+    macSha512         ## HMAC-SHA512
+    macSha1           ## HMAC-SHA1 (interop with older tags)
 
-proc hmacSha1*(key, msg: string): Sha1Digest =
-  ## HMAC-SHA1(key, msg) per RFC 2104.
-  var k = newString(blockSize)                 # key, zero-padded to the block
-  if key.len > blockSize:
-    let kh = sha1(key)                          # long keys are hashed first
-    for i in 0 ..< kh.len: k[i] = char(kh[i])
-  else:
-    for i in 0 ..< key.len: k[i] = key[i]
-  var ipad = newString(blockSize)
-  var opad = newString(blockSize)
-  for i in 0 ..< blockSize:
-    ipad[i] = char(uint8(k[i]) xor 0x36'u8)
-    opad[i] = char(uint8(k[i]) xor 0x5c'u8)
-  let inner = sha1(ipad & msg)
-  var innerStr = newString(inner.len)
-  for i in 0 ..< inner.len: innerStr[i] = char(inner[i])
-  result = sha1(opad & innerStr)
+proc rawHmac(algo: CookieMac, secret, msg: string): seq[byte] =
+  case algo
+  of macSha256: @(hmac(sha256, secret, msg).data)
+  of macSha512: @(hmac(sha512, secret, msg).data)
+  of macSha1:   @(hmac(sha1, secret, msg).data)
 
 proc constantTimeEq*(a, b: string): bool =
   ## Length-independent-of-content compare: no early return on the first
@@ -37,17 +29,18 @@ proc constantTimeEq*(a, b: string): bool =
   for i in 0 ..< a.len: diff = diff or (uint8(a[i]) xor uint8(b[i]))
   diff == 0
 
-proc b64url(d: Sha1Digest): string =
-  var s = newString(d.len)
-  for i in 0 ..< d.len: s[i] = char(d[i])
+proc b64url(bytes: openArray[byte]): string =
+  var s = newString(bytes.len)
+  for i in 0 ..< bytes.len: s[i] = char(bytes[i])
   # URL/cookie-safe base64 without padding: no '+', '/', or '=' to collide with
   # cookie syntax or the value/signature '.' separator.
   encode(s).replace('+', '-').replace('/', '_').strip(chars = {'='})
 
-proc sign*(secret, msg: string): string =
-  ## A URL-safe, unpadded base64 HMAC-SHA1 tag for `msg` under `secret`.
-  b64url(hmacSha1(secret, msg))
+proc sign*(secret, msg: string, algo = macSha256): string =
+  ## A URL-safe, unpadded base64 HMAC tag for `msg` under `secret`.
+  b64url(rawHmac(algo, secret, msg))
 
-proc verify*(secret, msg, sig: string): bool =
-  ## True if `sig` is the correct tag for `msg` under `secret` (constant time).
-  constantTimeEq(sign(secret, msg), sig)
+proc verify*(secret, msg, sig: string, algo = macSha256): bool =
+  ## True if `sig` is the correct tag for `msg` under `secret` and `algo`
+  ## (constant time). Use the same `algo` that produced the tag.
+  constantTimeEq(sign(secret, msg, algo), sig)

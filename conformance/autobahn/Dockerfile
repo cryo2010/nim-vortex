@@ -18,6 +18,7 @@ RUN for i in 1 2 3 4 5; do \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
+RUN nimble install -y "nimcrypto@>= 0.6.0"   # core dep (HMAC for signed cookies)
 COPY src ./src
 COPY conformance/autobahn/echo_server.nim ./echo_server.nim
 # -d:wsDeflate + zlib so the permessage-deflate cases (12-13) are covered.
