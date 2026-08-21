@@ -41,6 +41,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git curl openssl zlib brotli zstd libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
 
       - uses: actions/checkout@v7
 
@@ -101,6 +102,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git curl openssl libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Build TLS config harness
         run: >-
@@ -171,6 +173,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git curl openssl zlib brotli zstd libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Run the test suite under ASan + UBSan
         # Extends the fuzzer's ASan coverage from the parser targets to the whole
@@ -187,6 +190,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git curl openssl libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test the chronos adapter
         # chronos is an opt-in dependency kept out of the default suite; install
@@ -207,6 +211,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc openssl zlib libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test WebSocket permessage-deflate
         # Opt-in -d:wsDeflate feature (links zlib), so its suite is separate
@@ -229,6 +234,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc openssl zlib brotli curl libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test streaming response compression (gzip + brotli)
         # res.sendHead/write/finish (SSE, file streaming) compressed with gzip
@@ -248,6 +254,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc openssl zlib brotli zstd curl libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test request-body decompression (gzip + brotli + zstd)
         # Inbound gzip/br/zstd request bodies decoded into req.body, bounded by
@@ -269,6 +276,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc openssl zlib brotli zstd curl libngtcp2 libnghttp3
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test zstd response compression
         # Buffered + streamed zstd over HTTP/1.1 and h2c, plus br/zstd/gzip
@@ -295,6 +303,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: ThreadSanitizer handler-race regression
         # Builds the start()/shutdown and blocking-request stress under TSan;
@@ -506,6 +515,7 @@ jobs:
         run: >-
           apt-get update && apt-get install -y --no-install-recommends
           valgrind libc6-dbg gcc git curl zlib1g-dev ca-certificates
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Install chronos
         if: matrix.target == 'chronos'
@@ -541,6 +551,7 @@ jobs:
         run: >-
           apt-get update && apt-get install -y --no-install-recommends
           valgrind libc6-dbg gcc git curl zlib1g-dev ca-certificates
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Install chronos
         if: matrix.target == 'chronos'
@@ -581,6 +592,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
           nim gcc git zlib curl
+          && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Install chronos
         if: matrix.target == 'chronos'

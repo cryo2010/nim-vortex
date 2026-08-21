@@ -34,10 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wildcard or exact-allowlist of origins, credentials, exposed headers, and
   Max-Age.
 - Signed (tamper-proof) cookies: `setSignedCookie(name, value, secret, ...)`
-  writes an HMAC-SHA1 signed value and `req.cookies.signed(name, secret)` returns
-  it only if the signature verifies (constant-time), else `none`. Works in every
-  build mode including `-d:plainHttp` (no OpenSSL). This is integrity, not
-  confidentiality. `sign`/`verify`/`hmacSha1` are exported for other uses.
+  writes an HMAC signed value and `req.cookies.signed(name, secret)` returns it
+  only if the signature verifies (constant-time), else `none`. The HMAC hash
+  defaults to SHA-256 and is selectable via `CookieMac` (`macSha256`/`macSha512`/
+  `macSha1`). Signing uses nimcrypto (pure Nim), so it works in every build mode
+  including `-d:plainHttp` (no OpenSSL). This is integrity, not confidentiality.
+  `sign`/`verify` are exported for other uses. Adds a `nimcrypto` dependency.
 - Router: an unhandled `OPTIONS` on a known path is now answered automatically
   with a 204 and an `Allow` header (an explicit `options` handler still wins;
   `OPTIONS` is also added to the `Allow` header on 405 responses).

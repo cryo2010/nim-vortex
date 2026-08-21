@@ -564,8 +564,8 @@ A single matched pair of surrounding double quotes is stripped
 (`sid="abc"` reads as `abc`), per RFC 6265 §4.1.1; interior or unbalanced
 quotes are left untouched. No other decoding is done (no percent-decoding).
 
-**Signed (tamper-proof) cookies.** `setSignedCookie` appends an HMAC-SHA1
-signature so the client cannot forge or alter the value; read it back with
+**Signed (tamper-proof) cookies.** `setSignedCookie` appends an HMAC signature
+so the client cannot forge or alter the value; read it back with
 `req.cookies.signed(name, secret)`, which verifies the signature in constant
 time and returns `none` when the cookie is absent, unsigned, or tampered:
 
@@ -576,9 +576,12 @@ let sid = req.cookies.signed("sid", secret)   # Option[string]
 if sid.isSome: use(sid.get)
 ```
 
-This is integrity, not confidentiality: the value stays readable, only
-unforgeable. Keep `secret` private and stable (rotating it invalidates live
-cookies). Works in every build, including `-d:plainHttp` (no OpenSSL).
+The HMAC hash defaults to SHA-256 and is selectable via `CookieMac`
+(`macSha256` / `macSha512` / `macSha1`); pass the same `algo` to `setSignedCookie`
+and `signed`. This is integrity, not confidentiality: the value stays readable,
+only unforgeable. Keep `secret` private and stable (rotating it invalidates live
+cookies). Signing uses [nimcrypto](https://github.com/cheatfate/nimcrypto) (pure
+Nim), so it works in every build, including `-d:plainHttp` (no OpenSSL).
 
 ### Middleware
 

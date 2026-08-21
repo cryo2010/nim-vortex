@@ -18,6 +18,7 @@ RUN for i in 1 2 3 4 5; do \
     pacman -Scc --noconfirm
 
 WORKDIR /vortex
+RUN nimble install -y "nimcrypto@>= 0.6.0"   # core dep (HMAC for signed cookies)
 COPY src ./src
 COPY conformance/zap/zap_server.nim ./zap_server.nim
 RUN nim c --mm:orc --threads:on -d:release -d:plainHttp -p:src \
