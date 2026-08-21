@@ -1055,12 +1055,13 @@ proc cookies*(req: Request): Cookies {.inline.} =
   ## client (the request side of `setCookie`).
   Cookies(req: req)
 
-proc `[]`*(c: Cookies, name: string): string =
-  ## Value of the named cookie ("" when absent). Cookie names are case-sensitive
-  ## (RFC 6265); if the same name appears more than once, the LAST occurrence
-  ## wins. All `cookie` header fields are scanned, since HTTP/2 and /3 may split
-  ## the client's cookies across several of them. Values are returned as-is (no
-  ## quote or percent decoding).
+iterator all*(c: Cookies, name: string): string =
+  ## Yields the value of every cookie named `name`, in the order the client sent
+  ## them (RFC 6265 5.4: most-specific path first). Use this to detect a
+  ## duplicate/shadowed cookie (e.g. a cookie-tossing attack sets a second,
+  ## broader-scoped cookie of the same name); `[]` returns only the first.
+  ## Cookie names are case-sensitive; all `cookie` header fields are scanned
+  ## (HTTP/2 and /3 may split them). Values are yielded as-is (no decoding).
   for (n, v) in c.req.headers:
     if cmpIgnoreCase(n, "cookie") == 0:
       for part in v.split(';'):
@@ -1069,7 +1070,16 @@ proc `[]`*(c: Cookies, name: string): string =
         let eq = kv.find('=')
         let key = if eq < 0: kv else: kv[0 ..< eq].strip()
         if key == name:
-          result = if eq < 0: "" else: kv[eq+1 .. ^1].strip()  # last wins
+          yield (if eq < 0: "" else: kv[eq+1 .. ^1].strip())
+
+proc `[]`*(c: Cookies, name: string): string =
+  ## Value of the named cookie ("" when absent). If the same name appears more
+  ## than once (distinct cookies sharing a name, e.g. different paths), the FIRST
+  ## occurrence wins: per RFC 6265 5.4 the client sends the most-specific-path
+  ## cookie first, so it is the safer pick against shadowing. Use `all` to see
+  ## every value. Case-sensitive names; values returned as-is (no decoding).
+  for v in c.all(name):
+    return v
 
 # --- streaming request bodies (inbound) -------------------------------------
 

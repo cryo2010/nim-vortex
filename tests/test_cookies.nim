@@ -10,8 +10,14 @@ import std/httpclient except Response
 import vortex/[settings, request, server, routing]
 
 proc echoCookies(req: Request, res: Response) {.gcsafe.} =
-  # last-match-wins is exercised by sending sid twice; theme absent -> ""
+  # first-match wins on duplicate names; theme absent -> ""
   res.send(Http200, req.cookies["sid"] & "|" & req.cookies["theme"])
+
+proc allSids(req: Request, res: Response) {.gcsafe.} =
+  # every value of the "sid" cookie, in client order (for shadow detection)
+  var vals: seq[string]
+  for v in req.cookies.all("sid"): vals.add v
+  res.send(Http200, vals.join(","))
 
 proc setCookies(req: Request, res: Response) {.gcsafe.} =
   let (k, v) = setCookie("sid", "abc", maxAge = 3600)       # full attributes
@@ -21,6 +27,7 @@ proc setCookies(req: Request, res: Response) {.gcsafe.} =
 
 var rt = newRouter()
 rt.get("/echo", echoCookies)
+rt.get("/all", allSids)
 rt.get("/set", setCookies)
 let handler = rt.toHandler
 
@@ -42,10 +49,15 @@ suite "cookies over HTTP/1.1":
     var c = newHttpClient(); defer: c.close()
     check c.getContent(base & "/echo") == "|"
 
-  test "duplicate cookie name: last wins":
+  test "duplicate cookie name: first wins (RFC 6265 5.4 most-specific first)":
     var c = newHttpClient(); defer: c.close()
     c.headers = newHttpHeaders({"Cookie": "sid=first; sid=second"})
-    check c.getContent(base & "/echo") == "second|"
+    check c.getContent(base & "/echo") == "first|"
+
+  test "all() yields every value of a duplicated cookie, in order":
+    var c = newHttpClient(); defer: c.close()
+    c.headers = newHttpHeaders({"Cookie": "sid=first; sid=second"})
+    check c.getContent(base & "/all") == "first,second"
 
   test "server Set-Cookie reaches the client (duplicates preserved)":
     var c = newHttpClient(); defer: c.close()
