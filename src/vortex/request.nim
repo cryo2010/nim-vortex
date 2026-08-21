@@ -10,7 +10,9 @@
 import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros]
 import ./connection
 import ./blockingguard
-export blockingguard   # prepArg/assertBlockingType for the blocking macros, and
+export blockingguard
+import ./signing
+export signing        # sign/verify/hmacSha1 for signed cookies (and app use)   # prepArg/assertBlockingType for the blocking macros, and
                        # the re-exported std/isolation (isolate/extract/Isolated)
 
 export PathParams, ResponseHeaders
@@ -1149,6 +1151,18 @@ proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
   ("Set-Cookie", v)
 
+proc setSignedCookie*(name, value, secret: string, maxAge = -1, path = "/",
+                      domain = "", secure = true, httpOnly = true,
+                      sameSite = "Lax"): (string, string) =
+  ## Like `setCookie`, but the value is HMAC-SHA1 signed with `secret` so the
+  ## client cannot forge or alter it. The stored value is `value.signature`;
+  ## read it back and verify with `req.cookies.signed(name, secret)`. This is
+  ## tamper-proofing, not encryption: the value stays readable, only unforgeable.
+  ## Keep `secret` private and stable (rotating it invalidates live cookies), and
+  ## pass a cookie-safe `value` (no ';', as with `setCookie`).
+  let stored = value & "." & sign(secret, name & "=" & value)
+  setCookie(name, stored, maxAge, path, domain, secure, httpOnly, sameSite)
+
 proc cookies*(req: Request): Cookies {.inline.} =
   ## A view of the request's cookies, matching the `req.headers` shape:
   ## `req.cookies["sid"]`. Reads the incoming Cookie header(s) sent by the
@@ -1188,6 +1202,20 @@ proc `[]`*(c: Cookies, name: string): string =
   ## quotes is stripped (RFC 6265 4.1.1), no other decoding.
   for v in c.all(name):
     return v
+
+proc signed*(c: Cookies, name, secret: string): Option[string] =
+  ## The verified value of a cookie written with `setSignedCookie`, or `none`
+  ## when the cookie is absent, unsigned/malformed, or its HMAC-SHA1 signature
+  ## does not match `secret` (i.e. tampered). The comparison is constant time.
+  ## All `cookie` fields with this name are checked and the first that verifies
+  ## is returned, so a valid cookie is not masked by an injected forgery.
+  for raw in c.all(name):
+    let dot = raw.rfind('.')                    # signature is base64url (no '.')
+    if dot <= 0: continue
+    let value = raw[0 ..< dot]
+    if verify(secret, name & "=" & value, raw[dot + 1 .. ^1]):
+      return some(value)
+  none(string)
 
 # --- streaming request bodies (inbound) -------------------------------------
 
