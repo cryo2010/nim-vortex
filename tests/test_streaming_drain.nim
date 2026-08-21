@@ -33,6 +33,14 @@ proc slowGet(path: string): string =
   ## backlog fills and the producer has to await drained().
   let s = newSocket(buffered = false)
   defer: s.close()
+  # Force TCP backpressure deterministically instead of racing timing: a small
+  # receive buffer keeps the advertised window tiny, so the server cannot offload
+  # the 4 MiB into kernel buffers (regardless of its SO_SNDBUF autotuning or of
+  # ASan slowdown). Its app-level outbox then fills past the high water and the
+  # producer must await drained(). Must be set before connect.
+  var rcvbuf: cint = 16 * 1024
+  discard setsockopt(s.getFd, SOL_SOCKET, SO_RCVBUF, addr rcvbuf,
+                     SockLen(sizeof(rcvbuf)))
   s.connect("127.0.0.1", port)
   s.send("GET " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
   s.setRecvTimeout(5000)
