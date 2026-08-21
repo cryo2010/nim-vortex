@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and HTTP/3 split across several fields are recombined. On a duplicate name,
   `[]` returns the first occurrence (RFC 6265 §5.4 most-specific-path first), the
   safer pick against cookie shadowing; `all` exposes every value for detection.
+  A single matched pair of surrounding double quotes is stripped from a value
+  (RFC 6265 §4.1.1); interior/unbalanced quotes and any other encoding are left
+  as-is.
 
 ## [0.3.0] - 2026-08-20
 

@@ -538,14 +538,13 @@ res.send(Http200, body,
            setCookie("theme", "dark", httpOnly = false, maxAge = 31536000)])
 ```
 
-Reading cookies from the request uses `req.cookies`, a view matching the
-`req.headers[name]` shape:
+Reading cookies from the request uses `req.cookies`.
 
 ```nim
 let sid = req.cookies["sid"]        # "" when absent
 ```
 
-Cookie names are case-sensitive (RFC 6265). All `cookie` header fields are
+**Cookie names are case-sensitive** (RFC 6265). All `cookie` header fields are
 scanned, so cookies that HTTP/2 or HTTP/3 split across several fields are
 recombined transparently. If the same name appears more than once (distinct
 cookies sharing a name, e.g. set at different paths), `[]` returns the **first**
@@ -558,7 +557,9 @@ for v in req.cookies.all("sid"):    # client order, most-specific first
   ...
 ```
 
-Values are returned as-is, with no quote or percent decoding.
+A single matched pair of surrounding double quotes is stripped
+(`sid="abc"` reads as `abc`), per RFC 6265 §4.1.1; interior or unbalanced
+quotes are left untouched. No other decoding is done (no percent-decoding).
 
 ### Middleware
 

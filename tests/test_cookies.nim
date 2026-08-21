@@ -59,6 +59,17 @@ suite "cookies over HTTP/1.1":
     c.headers = newHttpHeaders({"Cookie": "sid=first; sid=second"})
     check c.getContent(base & "/all") == "first,second"
 
+  test "a matched pair of surrounding double quotes is stripped":
+    var c = newHttpClient(); defer: c.close()
+    c.headers = newHttpHeaders({"Cookie": "sid=\"abc\"; theme=dark"})
+    check c.getContent(base & "/echo") == "abc|dark"
+
+  test "interior and unbalanced quotes are left as-is":
+    var c = newHttpClient(); defer: c.close()
+    # sid has an interior quote (no leading quote), theme is unbalanced
+    c.headers = newHttpHeaders({"Cookie": "sid=a\"b; theme=\"dark"})
+    check c.getContent(base & "/echo") == "a\"b|\"dark"
+
   test "server Set-Cookie reaches the client (duplicates preserved)":
     var c = newHttpClient(); defer: c.close()
     let r = c.get(base & "/set")
