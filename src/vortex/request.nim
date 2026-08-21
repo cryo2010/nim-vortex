@@ -58,6 +58,12 @@ type
     ## zero-copy parser slices, so it allocates nothing.
     req: Request
 
+  Cookies* = object
+    ## A read-only view of a request's cookies, mirroring the `req.headers[name]`
+    ## shape: `req.cookies["sid"]`. Just a handle; parses the Cookie header(s) on
+    ## demand.
+    req: Request
+
 proc response*(req: Request): Response =
   ## The Response paired with a Request. Dispatch hands handlers both;
   ## this exists for code that stored only the read half.
@@ -1042,6 +1048,46 @@ proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
   if httpOnly: v.add "; HttpOnly"
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
   ("Set-Cookie", v)
+
+proc cookies*(req: Request): Cookies {.inline.} =
+  ## A view of the request's cookies, matching the `req.headers` shape:
+  ## `req.cookies["sid"]`. Reads the incoming Cookie header(s) sent by the
+  ## client (the request side of `setCookie`).
+  Cookies(req: req)
+
+proc dequoteCookie(v: string): string =
+  ## RFC 6265 4.1.1 allows a cookie value to be wrapped in double quotes; strip a
+  ## single matched surrounding pair (only). Interior quotes and unbalanced ones
+  ## are left as-is, and no unescaping/percent-decoding is done.
+  if v.len >= 2 and v[0] == '"' and v[^1] == '"': v[1 ..< v.high] else: v
+
+iterator all*(c: Cookies, name: string): string =
+  ## Yields the value of every cookie named `name`, in the order the client sent
+  ## them (RFC 6265 5.4: most-specific path first). Use this to detect a
+  ## duplicate/shadowed cookie (e.g. a cookie-tossing attack sets a second,
+  ## broader-scoped cookie of the same name); `[]` returns only the first.
+  ## Cookie names are case-sensitive; all `cookie` header fields are scanned
+  ## (HTTP/2 and /3 may split them). A single matched pair of surrounding double
+  ## quotes is stripped (RFC 6265 4.1.1); no other decoding is done.
+  for (n, v) in c.req.headers:
+    if cmpIgnoreCase(n, "cookie") == 0:
+      for part in v.split(';'):
+        let kv = part.strip()
+        if kv.len == 0: continue
+        let eq = kv.find('=')
+        let key = if eq < 0: kv else: kv[0 ..< eq].strip()
+        if key == name:
+          yield (if eq < 0: "" else: dequoteCookie(kv[eq+1 .. ^1].strip()))
+
+proc `[]`*(c: Cookies, name: string): string =
+  ## Value of the named cookie ("" when absent). If the same name appears more
+  ## than once (distinct cookies sharing a name, e.g. different paths), the FIRST
+  ## occurrence wins: per RFC 6265 5.4 the client sends the most-specific-path
+  ## cookie first, so it is the safer pick against shadowing. Use `all` to see
+  ## every value. Case-sensitive names; a matched pair of surrounding double
+  ## quotes is stripped (RFC 6265 4.1.1), no other decoding.
+  for v in c.all(name):
+    return v
 
 # --- streaming request bodies (inbound) -------------------------------------
 

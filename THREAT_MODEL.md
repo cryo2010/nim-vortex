@@ -51,6 +51,7 @@ names the test/fuzz/conformance coverage (see the Verification section).
 | Request smuggling (CL/TE) | Reject Content-Length together with Transfer-Encoding, duplicate Content-Length, non-chunked TE (501), space in a field name, and bare-LF line endings (CRLF required), before dispatch | `test_security_parsing`, `test_http1_parser` |
 | Response splitting / header injection | Header names and values are rejected if they contain CR or LF, in both the buffered and streaming serializers | `test_security_headers`, `test_http1_server` |
 | On-path modification | TLS integrity (OpenSSL / ngtcp2); see Information disclosure for the policy vortex sets | conformance (`testssl`) |
+| Cookie shadowing / tossing | On a duplicate cookie name (a distinct cookie an attacker set on a broader path or a sibling subdomain), `req.cookies[name]` returns the **first** occurrence, which per RFC 6265 §5.4 is the most-specific-path cookie the client sends first, i.e. the legitimate one rather than the attacker's broader-scoped shadow. `req.cookies.all(name)` exposes every value so a handler can detect the duplicate and reject the request outright | `test_cookies` |
 
 ### Repudiation (attribution)
 
