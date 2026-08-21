@@ -16,7 +16,7 @@ FROM ${BASE}
 
 RUN for i in 1 2 3 4 5; do \
       pacman -Syu --noconfirm --needed --disable-sandbox \
-        nim gcc openssl zlib libngtcp2 libnghttp3 && break; \
+        nim gcc git openssl zlib libngtcp2 libnghttp3 && break; \
       [ "$i" = 5 ] && exit 1; \
       echo "pacman failed (attempt $i/5); retrying in 15s"; sleep 15; \
     done && \

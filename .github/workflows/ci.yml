@@ -210,7 +210,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib libngtcp2 libnghttp3
+          nim gcc git openssl zlib libngtcp2 libnghttp3
           && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test WebSocket permessage-deflate
@@ -233,7 +233,7 @@ jobs:
         # and the CLIs decode the streamed responses.
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli curl libngtcp2 libnghttp3
+          nim gcc git openssl zlib brotli curl libngtcp2 libnghttp3
           && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test streaming response compression (gzip + brotli)
@@ -253,7 +253,7 @@ jobs:
       - name: Install toolchain
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli zstd curl libngtcp2 libnghttp3
+          nim gcc git openssl zlib brotli zstd curl libngtcp2 libnghttp3
           && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test request-body decompression (gzip + brotli + zstd)
@@ -275,7 +275,7 @@ jobs:
         # zstd/brotli provide the encoders + CLIs; curl fetches, the CLIs decode.
         run: >-
           pacman -Syu --noconfirm --needed --disable-sandbox
-          nim gcc openssl zlib brotli zstd curl libngtcp2 libnghttp3
+          nim gcc git openssl zlib brotli zstd curl libngtcp2 libnghttp3
           && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: Test zstd response compression
