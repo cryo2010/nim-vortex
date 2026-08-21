@@ -422,6 +422,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.query` | `Table[string, string]` | decoded query params, last value wins (lazy, cached) |
 | `req.headers[name]` | `string` | one header, case-insensitive; "" if absent. `name in req.headers` tests presence; `for (n, v) in req.headers` iterates (pseudo-headers skipped). Read-only view (no allocation) mirroring `res.headers[name]` |
 | `req.header(name)` | `string` | alias of `req.headers[name]` |
+| `req.cookies[name]` | `string` | one request cookie, first match; "" if absent. `for v in req.cookies.all(name)` yields every value. Case-sensitive; see [Cookies](#cookies) |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
 | `req.json` | `JsonNode` | body parsed as JSON, cached per request; empty body is `{}`; raises `JsonParsingError` on malformed input |
 | `req.contentLength` | `int` | body length in bytes |
@@ -537,8 +538,27 @@ res.send(Http200, body,
            setCookie("theme", "dark", httpOnly = false, maxAge = 31536000)])
 ```
 
-Reading cookies is left to the handler: the raw header is `req.header("cookie")`
-(a `name=value; name2=value2` string), which you parse as your app needs.
+Reading cookies from the request uses `req.cookies`, a view matching the
+`req.headers[name]` shape:
+
+```nim
+let sid = req.cookies["sid"]        # "" when absent
+```
+
+Cookie names are case-sensitive (RFC 6265). All `cookie` header fields are
+scanned, so cookies that HTTP/2 or HTTP/3 split across several fields are
+recombined transparently. If the same name appears more than once (distinct
+cookies sharing a name, e.g. set at different paths), `[]` returns the **first**
+occurrence: per RFC 6265 §5.4 the client sends the most-specific-path cookie
+first, so it is the safer pick against cookie shadowing. To see every value (for
+example to detect and reject a shadowed cookie), iterate `all`:
+
+```nim
+for v in req.cookies.all("sid"):    # client order, most-specific first
+  ...
+```
+
+Values are returned as-is, with no quote or percent decoding.
 
 ### Middleware
 
