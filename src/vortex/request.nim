@@ -58,6 +58,12 @@ type
     ## zero-copy parser slices, so it allocates nothing.
     req: Request
 
+  Cookies* = object
+    ## A read-only view of a request's cookies, mirroring the `req.headers[name]`
+    ## shape: `req.cookies["sid"]`. Just a handle; parses the Cookie header(s) on
+    ## demand.
+    req: Request
+
 proc response*(req: Request): Response =
   ## The Response paired with a Request. Dispatch hands handlers both;
   ## this exists for code that stored only the read half.
@@ -1042,6 +1048,28 @@ proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
   if httpOnly: v.add "; HttpOnly"
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
   ("Set-Cookie", v)
+
+proc cookies*(req: Request): Cookies {.inline.} =
+  ## A view of the request's cookies, matching the `req.headers` shape:
+  ## `req.cookies["sid"]`. Reads the incoming Cookie header(s) sent by the
+  ## client (the request side of `setCookie`).
+  Cookies(req: req)
+
+proc `[]`*(c: Cookies, name: string): string =
+  ## Value of the named cookie ("" when absent). Cookie names are case-sensitive
+  ## (RFC 6265); if the same name appears more than once, the LAST occurrence
+  ## wins. All `cookie` header fields are scanned, since HTTP/2 and /3 may split
+  ## the client's cookies across several of them. Values are returned as-is (no
+  ## quote or percent decoding).
+  for (n, v) in c.req.headers:
+    if cmpIgnoreCase(n, "cookie") == 0:
+      for part in v.split(';'):
+        let kv = part.strip()
+        if kv.len == 0: continue
+        let eq = kv.find('=')
+        let key = if eq < 0: kv else: kv[0 ..< eq].strip()
+        if key == name:
+          result = if eq < 0: "" else: kv[eq+1 .. ^1].strip()  # last wins
 
 # --- streaming request bodies (inbound) -------------------------------------
 
