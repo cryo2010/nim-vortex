@@ -19,6 +19,7 @@ import vortex/settings
 import vortex/request
 import vortex/server
 import vortex/routing
+import vortex/cors
 import vortex/streaming
 import vortex/staticfiles
 import vortex/ratelimit
@@ -31,6 +32,7 @@ export request except dispatchBlockingData, dispatchBlockingResult,
                       BlockingResultBase, BlockingResultBox  # internal; use req.blocking
 export server
 export routing
+export cors
 export streaming
 export staticfiles
 export ratelimit
