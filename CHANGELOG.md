@@ -19,6 +19,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A single matched pair of surrounding double quotes is stripped from a value
   (RFC 6265 §4.1.1); interior/unbalanced quotes and any other encoding are left
   as-is.
+- `req.form` parses an `application/x-www-form-urlencoded` request body into a
+  `Table[string, string]` (percent-decoded, `+` is a space, last value wins);
+  empty for other content types. `req.mediaType` exposes the Content-Type media
+  type without parameters.
+- Content negotiation: `req.accepts`, `req.acceptsLanguage`, and
+  `req.acceptsCharset` choose the best of the server-offered values against the
+  corresponding `Accept*` header, honoring q-values and wildcards (`type/*`,
+  `*/*`, and language prefix ranges). Returns "" if none is acceptable, or the
+  first offer when the client sends no such header.
+- CORS middleware: `cors(initCorsOptions(...))` (register with `app.use`) sets
+  the `Access-Control-*` headers for allowed origins and answers preflight
+  `OPTIONS` requests directly with 204 (403 for a disallowed origin). Supports a
+  wildcard or exact-allowlist of origins, credentials, exposed headers, and
+  Max-Age.
+- Signed (tamper-proof) cookies: `setSignedCookie(name, value, secret, ...)`
+  writes an HMAC-SHA1 signed value and `req.cookies.signed(name, secret)` returns
+  it only if the signature verifies (constant-time), else `none`. Works in every
+  build mode including `-d:plainHttp` (no OpenSSL). This is integrity, not
+  confidentiality. `sign`/`verify`/`hmacSha1` are exported for other uses.
+- Router: an unhandled `OPTIONS` on a known path is now answered automatically
+  with a 204 and an `Allow` header (an explicit `options` handler still wins;
+  `OPTIONS` is also added to the `Allow` header on 405 responses).
+
+### Changed
+
+- Router: registering the same `(method, path)` twice, directly or via a
+  sub-router mount, now raises `RouteConflictError` at registration instead of
+  silently overwriting the earlier handler.
 
 ## [0.3.0] - 2026-08-20
 
