@@ -230,14 +230,24 @@ client (httpx + websockets). Local-only. See `conformance/stress/README.md`.
 | `nimble stressStreamDownload` | stream down; the **client** verifies the SHA-1 |
 | `nimble stress` | short smoke of all five (20 s, 64 MiB); fails on any |
 
-Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`): `VORTEX_PROTO`
-(`h1｜h2｜h3｜all`), `VORTEX_SERVER` (`sync｜async｜async-await｜chronos｜chronos-await｜all`),
-`VORTEX_SECONDS`, `VORTEX_REPORT_SECONDS`, `VORTEX_CONCURRENCY`, `VORTEX_CLIENTS`,
-`VORTEX_REQ_COMPRESSION` / `VORTEX_RESP_COMPRESSION` (`none｜gzip｜br｜zstd`), and
-`VORTEX_STREAM_BYTES`. The `VORTEX_SERVER` axis runs each soak against the sync,
-`vortex/asyncdispatch`, and `vortex/chronos` servers - e.g.
-`VORTEX_SERVER=chronos nimble stressWs` exercises chronos's WebSocket path under
-load. HTTP/3 is a printed skip (httpx has no h3; use `nimble h3load`).
+Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
+`VORTEX_PROTO` × `VORTEX_SERVER`:
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2; h3 is a printed skip, httpx has no h3 - use `nimble h3load`) |
+| `VORTEX_SERVER` | `sync` | Handler runtime: `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` (`async` = `vortex/asyncdispatch`, `chronos` = `vortex/chronos`) |
+| `VORTEX_SECONDS` | `60` | Runtime per cell, in seconds |
+| `VORTEX_REPORT_SECONDS` | `60` | Cadence of the status-code + server-RSS report |
+| `VORTEX_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
+| `VORTEX_CLIENTS` | `3` | Client workers per cell |
+| `VORTEX_REQ_COMPRESSION` | `gzip` | Request-body encoding the client sends (server decompresses): `none` \| `gzip` \| `br` \| `zstd` |
+| `VORTEX_RESP_COMPRESSION` | `gzip` | Response encoding the server applies: `none` \| `gzip` \| `br` \| `zstd` |
+| `VORTEX_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB; lower for a smoke) |
+
+The `VORTEX_SERVER` axis runs each soak against the sync, `vortex/asyncdispatch`,
+and `vortex/chronos` servers - e.g. `VORTEX_SERVER=chronos nimble stressWs`
+exercises chronos's WebSocket path under load.
 
 ---
 
