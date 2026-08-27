@@ -55,9 +55,7 @@ simg=vortex-stress-server-img
 cimg=vortex-stress-client-img
 
 docker network create "$net" >/dev/null 2>&1 || true
-statspid=""
-cleanup() { [ -n "$statspid" ] && kill "$statspid" >/dev/null 2>&1 || true
-            docker rm -f "$srvc" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$srvc" >/dev/null 2>&1 || true; }
 trap cleanup EXIT INT TERM
 
 echo "building client image..."
@@ -86,16 +84,6 @@ codec_flags() {
   done
 }
 
-# Print server CPU/RSS every $report seconds (Docker Desktop-friendly: no cAdvisor).
-sample_server_stats() {
-  cell="$1"
-  while docker inspect -f '{{.State.Running}}' "$srvc" >/dev/null 2>&1; do
-    line=$(docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "$srvc" 2>/dev/null) || break
-    [ -n "$line" ] && echo "  [rss $cell] $line"
-    sleep "$report"
-  done
-}
-
 run_cell() {
   p="$1"; s="$2"
   proto_cfg "$p"; codec_flags
@@ -119,11 +107,11 @@ run_cell() {
     sleep 0.1
   done
 
-  sample_server_stats "$p/$s" & statspid=$!
-
+  # The client reports RSS/heap (from the server's /stats) and prints the
+  # per-cell "== <workload> <server> <proto> passed ==" line on success.
   set +e
   docker run --rm --network "$net" \
-    -e VORTEX_WORKLOAD="$workload" -e VORTEX_PROTO="$p" \
+    -e VORTEX_WORKLOAD="$workload" -e VORTEX_PROTO="$p" -e STRESS_SERVER="$s" \
     -e STRESS_BASE="$scheme://server:$port" \
     -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
     -e VORTEX_CONCURRENCY="$conc" -e VORTEX_CLIENTS="$clients" \
@@ -132,11 +120,8 @@ run_cell() {
   crc=$?
   set -e
 
-  { [ -n "$statspid" ] && kill "$statspid" >/dev/null 2>&1; } || true; statspid=""
   docker rm -f "$srvc" >/dev/null 2>&1 || true
-
-  if [ "$crc" = 0 ]; then echo "=== $workload [proto=$p server=$s]: PASS ==="
-  else echo "=== $workload [proto=$p server=$s]: FAIL (exit $crc) ==="; fi
+  [ "$crc" = 0 ] || echo "== $workload $s $p FAILED (exit $crc) =="
   return "$crc"
 }
 

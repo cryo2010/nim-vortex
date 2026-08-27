@@ -21,7 +21,7 @@
 ## and the handler runtime via one -d:lt* flag (sync / asyncdispatch / chronos),
 ## so VORTEX_SERVER sweeps sync|async|chronos under load.
 
-import std/[os, strutils]
+import std/[os, strutils, posix]
 import vortex
 import nimcrypto/[sha, hash]        # incremental SHA-1 (nimcrypto is a core dep)
 
@@ -46,6 +46,14 @@ proc genChunk(start, n: int): string =
   ## `n` bytes of the deterministic generator starting at global index `start`.
   result = newString(n)
   for j in 0 ..< n: result[j] = char((start + j) and 0xff)
+
+proc rssBytes(): int =
+  ## Current resident set size (bytes), from /proc/self/statm (Linux container).
+  try:
+    let fields = readFile("/proc/self/statm").splitWhitespace()
+    if fields.len >= 2: return parseInt(fields[1]) * int(sysconf(SC_PAGESIZE))
+  except CatchableError: discard
+  0
 
 # --- shared handler bodies (no await needed; identical sync/async) -----------
 
@@ -78,11 +86,17 @@ template sseBody(req, res: untyped) =
     inc i; inc sent
   s.close()
 
+template statsBody(req, res: untyped) =
+  ## "<rssBytes> <heapBytes>" for the client's periodic report. getOccupiedMem is
+  ## the live GC heap of the loop thread that handled this request.
+  vortex.send(res, Http200, $rssBytes() & " " & $getOccupiedMem())
+
 # --- runtime-specific handlers -----------------------------------------------
 
 when asyncMode:
   proc hEcho(req: Request, res: Response) {.async.} = echoBody(req, res)
   proc hSse(req: Request, res: Response) {.async.} = sseBody(req, res)
+  proc hStats(req: Request, res: Response) {.async.} = statsBody(req, res)
 
   proc hWs(req: Request, res: Response) {.async.} =
     let ws = req.acceptWebSocket()
@@ -112,6 +126,7 @@ when asyncMode:
 else:
   proc hEcho(req: Request, res: Response) {.gcsafe.} = echoBody(req, res)
   proc hSse(req: Request, res: Response) {.gcsafe.} = sseBody(req, res)
+  proc hStats(req: Request, res: Response) {.gcsafe.} = statsBody(req, res)
 
   proc hWs(req: Request, res: Response) {.gcsafe.} =
     let ws = req.acceptWebSocket()
@@ -155,6 +170,7 @@ when isMainModule:
   rt.put("/echo", hEcho)
   rt.get("/ws", hWs)
   rt.get("/sse", hSse)
+  rt.get("/stats", hStats)
   rt.post("/upload", hUpload, streaming = true)
   rt.get("/download", hDownload)
 
