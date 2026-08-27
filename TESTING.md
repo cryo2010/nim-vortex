@@ -33,9 +33,13 @@ nimble testchronos     # chronos async adapter (needs chronos)
 nimble h1spec h2spec h3spec h3websocket autobahn redbot \
        zap testssl h2load h3load interop brotli fuzz
 
+# Per-workload stress soaks (pass/fail, checksum-verified; Docker):
+nimble stressRequests stressWs stressSse stressStreamUpload stressStreamDownload
+nimble stress          # short smoke of all five
+
 # Interactive load/stress with live Grafana charts (the stack stays up):
 nimble loadtest        # k6: hold a load, chart latency + server CPU/mem  (localhost:3000)
-nimble stress          # h2load: saturate, chart server CPU/mem + req/s   (localhost:3001)
+nimble saturate        # h2load: saturate, chart server CPU/mem + req/s   (localhost:3001)
 
 nimble bench perf perf2   # benchmarks (not pass/fail)
 ```
@@ -208,6 +212,35 @@ Details for each live in the matching `conformance/<name>/README.md`.
 
 ---
 
+## Stress soaks (per-workload, pass/fail)
+
+Focused soak tests that drive **one workload** at a vortex server, sustained, and
+**verify** it: streaming transfers are checksummed and any mismatch, echo
+mismatch, non-2xx, or missing SSE event **hard-fails**. Responses are discarded
+so memory stays flat; the server's CPU/RSS is printed each interval. Each task
+builds the server (a **protocol × server-runtime** matrix) and a Python load
+client (httpx + websockets). Local-only. See `conformance/stress/README.md`.
+
+| Task | Workload |
+|------|----------|
+| `nimble stressRequests` | buffered GET/POST/PUT at `/echo` with req/resp compression |
+| `nimble stressWs` | persistent WebSocket echo |
+| `nimble stressSse` | SSE subscribe; server drops mid-stream; reconnect + Last-Event-ID |
+| `nimble stressStreamUpload` | stream up; the **server** verifies the SHA-1 |
+| `nimble stressStreamDownload` | stream down; the **client** verifies the SHA-1 |
+| `nimble stress` | short smoke of all five (20 s, 64 MiB); fails on any |
+
+Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`): `VORTEX_PROTO`
+(`h1｜h2｜h3｜all`), `VORTEX_SERVER` (`sync｜async｜async-await｜chronos｜chronos-await｜all`),
+`VORTEX_SECONDS`, `VORTEX_REPORT_SECONDS`, `VORTEX_CONCURRENCY`, `VORTEX_CLIENTS`,
+`VORTEX_REQ_COMPRESSION` / `VORTEX_RESP_COMPRESSION` (`none｜gzip｜br｜zstd`), and
+`VORTEX_STREAM_BYTES`. The `VORTEX_SERVER` axis runs each soak against the sync,
+`vortex/asyncdispatch`, and `vortex/chronos` servers - e.g.
+`VORTEX_SERVER=chronos nimble stressWs` exercises chronos's WebSocket path under
+load. HTTP/3 is a printed skip (httpx has no h3; use `nimble h3load`).
+
+---
+
 ## Interactive load & stress (Grafana)
 
 Two Docker-based tools that drive load at a vortex server and stream metrics to a
@@ -220,7 +253,7 @@ CI. Each brings up its own stack on its own ports; stop it with the runner's
 | Task | CI | Driver | Grafana | For |
 |------|----|--------|---------|-----|
 | `nimble loadtest` | local | k6 | http://localhost:3000 | Hold a chosen load; chart client throughput, latency (p50/p95/p99), errors, plus server CPU/memory |
-| `nimble stress` | local | h2load | http://localhost:3001 | Saturate (max req/s); chart the server's own CPU/memory live, with achieved req/s as a summary |
+| `nimble saturate` | local | h2load | http://localhost:3001 | Saturate (max req/s); chart the server's own CPU/memory live, with achieved req/s as a summary |
 
 Both build the selected backend(s) (`BACKEND=h1|h2|h2-gzip|all`) from the shared
 `conformance/loadtest/loadtest_server.nim` (TechEmpower-style `/plaintext`,
@@ -234,11 +267,12 @@ and the load model (`MODE=throughput|rate`); knobs: `DURATION`, `VUS`, `RATE`,
 h2c, and its memory grows with total requests, so long high-rate runs are
 memory-bound. See `conformance/loadtest/README.md`.
 
-**`nimble stress` (h2load).** Saturates the server so the *client* is not the
+**`nimble saturate` (h2load).** Saturates the server so the *client* is not the
 bottleneck; knobs: `DURATION` (seconds), `CONNS`, `STREAMS` (h2), `ENDPOINT`.
 Achieved req/s is a summary stat, not a live curve (h2load reports only at the
 end); the live signal is the server's CPU/memory. h2load drives h1/h2c/h2-TLS;
-for HTTP/3 saturation use `nimble h3load`. See `conformance/stress/README.md`.
+for HTTP/3 saturation use `nimble h3load`. (Formerly `nimble stress`; that name
+is now the per-workload soaks above.) See `conformance/stress/README.md`.
 
 ---
 
