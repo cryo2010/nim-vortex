@@ -203,13 +203,39 @@ task loadtest, "Configurable k6 load test with live Grafana/Prometheus charts (D
   # ENDPOINT. Interactive, so not a CI gate. See conformance/loadtest/README.md.
   exec "sh conformance/loadtest/run.sh"
 
-task stress, "Saturation stress test via h2load with live Grafana charts (Docker)":
-  # run.sh saturates the selected backend(s) with h2load (max req/s) while
-  # Grafana (http://localhost:3001) shows the server's own CPU/memory live (from
-  # docker stats) and the achieved req/s as a summary. Env knobs: BACKEND,
-  # DURATION, CONNS, STREAMS, ENDPOINT. Interactive, so not a CI gate. See
-  # conformance/stress/README.md.
-  exec "sh conformance/stress/run.sh"
+# Per-workload stress soaks: each drives one workload at the vortex server
+# (protocol x server-runtime matrix) and verifies it -- checksums/echoes
+# hard-fail. Env knobs (mirror nim-navi): VORTEX_PROTO, VORTEX_SERVER (sync|
+# async|chronos|...|all), VORTEX_SECONDS, VORTEX_REPORT_SECONDS, VORTEX_CLIENTS,
+# VORTEX_CONCURRENCY, VORTEX_REQ_COMPRESSION, VORTEX_RESP_COMPRESSION,
+# VORTEX_STREAM_BYTES. Local-only. See conformance/stress/README.md.
+
+task stressRequests, "Stress soak: buffered GET/POST/PUT with compression (Docker)":
+  exec "VORTEX_WORKLOAD=requests sh conformance/stress/run.sh"
+
+task stressWs, "Stress soak: persistent WebSocket echo (Docker)":
+  exec "VORTEX_WORKLOAD=ws sh conformance/stress/run.sh"
+
+task stressSse, "Stress soak: SSE subscribe with reconnect / Last-Event-ID (Docker)":
+  exec "VORTEX_WORKLOAD=sse sh conformance/stress/run.sh"
+
+task stressStreamUpload, "Stress soak: stream up, server verifies SHA-1 (Docker)":
+  exec "VORTEX_WORKLOAD=streamupload sh conformance/stress/run.sh"
+
+task stressStreamDownload, "Stress soak: stream down, client verifies SHA-1 (Docker)":
+  exec "VORTEX_WORKLOAD=streamdownload sh conformance/stress/run.sh"
+
+task stress, "Short smoke of all five stress workloads (Docker)":
+  # Runs every workload short (20s, 64 MiB) and hard-fails on any mismatch.
+  exec "STRESS_SMOKE=1 VORTEX_SECONDS=20 VORTEX_STREAM_BYTES=67108864 " &
+       "sh conformance/stress/run.sh"
+
+task saturate, "Interactive h2load saturation with live Grafana charts (Docker)":
+  # The former `nimble stress`: saturates the selected backend(s) with h2load
+  # (max req/s) while Grafana (http://localhost:3001) shows the server's own
+  # CPU/memory live. Env knobs: BACKEND, DURATION, CONNS, STREAMS, ENDPOINT.
+  # Interactive, not a CI gate. See conformance/stress/README.md.
+  exec "sh conformance/stress/saturate.sh"
 
 task interop, "Cross-client interop test (Node/Python/Go/Rust/Java) (Docker)":
   # run.sh mints a shared CA, builds a vortex TLS server (h1/h2, gzip) image and
