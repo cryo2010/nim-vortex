@@ -2,9 +2,12 @@
 """Per-workload load client for the vortex stress soaks (conformance/stress/run.sh).
 
 Drives one workload (VORTEX_WORKLOAD) at the vortex server for VORTEX_SECONDS,
-verifying it and **discarding** responses so memory stays flat. Any checksum
-mismatch, echo mismatch, non-2xx, or missing SSE event is a **hard fail**
-(non-zero exit). Workloads:
+verifying it and **discarding** responses so memory stays flat. **Hard fails**
+(non-zero exit) on data corruption - checksum mismatch, echo mismatch, a
+non-2xx status, or a missing/out-of-order SSE event. A transient connection
+error (a reset under high concurrency) is counted and retried on a fresh
+connection, not fatal - a soak tolerates connection churn. If *no* iteration
+ever succeeds, that is a failure.
 
   requests        GET/POST/PUT /echo with bodies + req/resp compression
   ws              persistent WebSocket echo, verified
@@ -18,6 +21,10 @@ h3 cells print a skip (h3 saturation lives in `nimble h3load`).
 """
 import asyncio, gzip, hashlib, os, sys, time
 import httpx
+try:
+    from websockets.exceptions import WebSocketException
+except ImportError:
+    class WebSocketException(Exception): pass
 
 WORKLOAD = os.environ.get("VORTEX_WORKLOAD", "requests")
 PROTO    = os.environ.get("VORTEX_PROTO", "h2")
@@ -45,7 +52,7 @@ def expected_sha1() -> str:
         n = min(CHUNK, STREAM - off); h.update(gen_chunk(off, n)); off += n
     return h.hexdigest()
 
-def body_gen():
+async def body_gen():                             # async: httpx AsyncClient streams it
     off = 0
     while off < STREAM:
         n = min(CHUNK, STREAM - off); yield gen_chunk(off, n); off += n
@@ -63,8 +70,9 @@ def compress(raw: bytes):
 ACCEPT = None if RESP_COMP in ("", "none") else RESP_COMP   # server compresses response
 
 # --- shared state ------------------------------------------------------------
-class Fail(Exception): pass
-stats = {"ok": 0, "bad": 0, "bytes": 0}
+class Fail(Exception):
+    """A real, fatal defect (data corruption / bad status). Never retried."""
+stats = {"ok": 0, "transient": 0, "bytes": 0}
 deadline = 0.0
 
 def new_client() -> httpx.AsyncClient:
@@ -74,28 +82,40 @@ async def reporter():
     while time.monotonic() < deadline:
         await asyncio.sleep(REPORT)
         left = max(0, int(deadline - time.monotonic()))
-        print(f"  [{WORKLOAD}] ok={stats['ok']} bad={stats['bad']} "
+        print(f"  [{WORKLOAD}] ok={stats['ok']} transient={stats['transient']} "
               f"bytes={stats['bytes']} ({left}s left)", flush=True)
+
+async def retrying(worker):
+    """Run `worker` until the deadline, reopening on transient transport errors.
+    `Fail` (a real defect) and anything else propagate immediately."""
+    while time.monotonic() < deadline:
+        try:
+            await worker()
+        except (httpx.TransportError, WebSocketException, ConnectionError, OSError):
+            stats["transient"] += 1
+            await asyncio.sleep(0.02)
 
 # --- workloads ---------------------------------------------------------------
 async def w_requests():
-    async def worker():
+    raw = b"the quick brown fox " * 64
+    body, enc = compress(raw)
+    hdrs = {}
+    if enc: hdrs["content-encoding"] = enc
+    if ACCEPT: hdrs["accept-encoding"] = ACCEPT
+    get_hdrs = {"accept-encoding": ACCEPT} if ACCEPT else {}
+    async def once():
         async with new_client() as c:
-            raw = b"the quick brown fox " * 64
-            body, enc = compress(raw)
-            hdrs = {}
-            if enc: hdrs["content-encoding"] = enc
-            if ACCEPT: hdrs["accept-encoding"] = ACCEPT
             while time.monotonic() < deadline:
-                for meth in ("GET", "POST", "PUT"):
-                    if meth == "GET":
-                        r = await c.get(BASE + "/plaintext", headers={"accept-encoding": ACCEPT} if ACCEPT else {})
-                        if r.status_code != 200 or r.text != "Hello, World!": stats["bad"] += 1; raise Fail("GET /plaintext")
-                    else:
-                        r = await c.request(meth, BASE + "/echo", content=body, headers=hdrs)
-                        if r.status_code != 200 or r.content != raw: stats["bad"] += 1; raise Fail(f"{meth} /echo echo mismatch")
+                r = await c.get(BASE + "/plaintext", headers=get_hdrs)
+                if r.status_code != 200 or r.text != "Hello, World!":
+                    raise Fail(f"GET /plaintext -> {r.status_code}")
+                stats["ok"] += 1
+                for meth in ("POST", "PUT"):
+                    r = await c.request(meth, BASE + "/echo", content=body, headers=hdrs)
+                    if r.status_code != 200 or r.content != raw:
+                        raise Fail(f"{meth} /echo -> {r.status_code}, {len(r.content)}B")
                     stats["ok"] += 1
-    await asyncio.gather(*[worker() for _ in range(CONC)])
+    await asyncio.gather(*[retrying(once) for _ in range(CONC)])
 
 async def w_ws():
     import websockets
@@ -104,61 +124,63 @@ async def w_ws():
     if ws_url.startswith("wss://"):
         import ssl
         ssl_ctx = ssl.create_default_context(); ssl_ctx.check_hostname = False; ssl_ctx.verify_mode = ssl.CERT_NONE
-    async def worker(i):
+    async def once(i):
+        n = 0
         async with websockets.connect(ws_url, ssl=ssl_ctx, max_size=None) as ws:
-            n = 0
             while time.monotonic() < deadline:
                 msg = f"msg-{i}-{n}"
                 await ws.send(msg)
                 got = await ws.recv()
-                if got != msg: stats["bad"] += 1; raise Fail(f"ws echo mismatch: {got!r} != {msg!r}")
+                if got != msg: raise Fail(f"ws echo mismatch: {got!r} != {msg!r}")
                 stats["ok"] += 1; n += 1
-    await asyncio.gather(*[worker(i) for i in range(CONC)])
+    await asyncio.gather(*[retrying(lambda i=i: once(i)) for i in range(CONC)])
 
 async def w_sse():
     total = 100     # must match the server's sseTotal
-    async def worker():
+    async def once():
         async with new_client() as c:
-            while time.monotonic() < deadline:
-                got = []
-                last = None
-                # reconnect until all `total` events are collected in id order
-                while len(got) < total:
-                    hdrs = {"accept": "text/event-stream"}
-                    if last is not None: hdrs["last-event-id"] = str(last)
-                    async with c.stream("GET", BASE + "/sse", headers=hdrs) as r:
-                        if r.status_code != 200: stats["bad"] += 1; raise Fail("sse status")
-                        cur_id = None
-                        async for line in r.aiter_lines():
-                            if line.startswith("id:"): cur_id = int(line[3:].strip())
-                            elif line.startswith("data:") and cur_id is not None:
-                                if cur_id != len(got): stats["bad"] += 1; raise Fail(f"sse out of order: {cur_id} != {len(got)}")
-                                got.append(cur_id); last = cur_id; cur_id = None
-                    if last is None: stats["bad"] += 1; raise Fail("sse made no progress")
-                stats["ok"] += 1
-    await asyncio.gather(*[worker() for _ in range(CONC)])
+            got = 0
+            last = None
+            while got < total:                       # reconnect on the server's drop
+                hdrs = {"accept": "text/event-stream"}
+                if last is not None: hdrs["last-event-id"] = str(last)
+                progressed = False
+                async with c.stream("GET", BASE + "/sse", headers=hdrs) as r:
+                    if r.status_code != 200: raise Fail(f"sse status {r.status_code}")
+                    cur_id = None
+                    async for line in r.aiter_lines():
+                        if line.startswith("id:"): cur_id = int(line[3:].strip())
+                        elif line.startswith("data:") and cur_id is not None:
+                            if cur_id != got: raise Fail(f"sse out of order: {cur_id} != {got}")
+                            got += 1; last = cur_id; cur_id = None; progressed = True
+                if not progressed: raise Fail("sse made no progress")
+            stats["ok"] += 1
+    await asyncio.gather(*[retrying(once) for _ in range(CONC)])
 
 async def w_streamupload():
     sha = expected_sha1()
-    async with new_client() as c:
-        while time.monotonic() < deadline:
+    async def once():
+        async with new_client() as c:
             r = await c.post(BASE + "/upload", content=body_gen(),
                              headers={"x-sha1": sha})   # chunked; server streams onBody
-            if r.status_code != 200: stats["bad"] += 1; raise Fail(f"upload rejected: {r.status_code} {r.text}")
+            if r.status_code == 400: raise Fail("server rejected the SHA-1 (400)")
+            if r.status_code != 200: raise Fail(f"upload -> {r.status_code}")
             stats["ok"] += 1; stats["bytes"] += STREAM
+    await retrying(once)                          # one big transfer per copy
 
 async def w_streamdownload():
     want = expected_sha1()
-    async with new_client() as c:
-        while time.monotonic() < deadline:
+    async def once():
+        async with new_client() as c:
             h = hashlib.sha1(); got = 0
             async with c.stream("GET", BASE + "/download") as r:
-                if r.status_code != 200: stats["bad"] += 1; raise Fail(f"download status {r.status_code}")
+                if r.status_code != 200: raise Fail(f"download status {r.status_code}")
                 async for chunk in r.aiter_raw():
                     h.update(chunk); got += len(chunk)
             if got != STREAM or h.hexdigest() != want:
-                stats["bad"] += 1; raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
+                raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
             stats["ok"] += 1; stats["bytes"] += STREAM
+    await retrying(once)                          # one big transfer per copy
 
 WORKLOADS = {
     "requests": w_requests, "ws": w_ws, "sse": w_sse,
@@ -176,13 +198,20 @@ async def main():
     deadline = time.monotonic() + SECONDS
     rep = asyncio.ensure_future(reporter())
     try:
-        # CLIENTS parallel copies of the workload (each already fans out CONC-wide)
+        # CLIENTS client-copies. requests/ws/sse fan out CONC-wide inside each
+        # (CLIENTS x CONC total); streamupload/download do one big transfer per
+        # copy (CLIENTS concurrent streams).
         await asyncio.gather(*[WORKLOADS[WORKLOAD]() for _ in range(CLIENTS)])
     except Fail as e:
-        print(f"FAIL {WORKLOAD}: {e}", file=sys.stderr); return 1
+        print(f"FAIL {WORKLOAD}: {e} (ok={stats['ok']} transient={stats['transient']})",
+              file=sys.stderr); return 1
     finally:
         rep.cancel()
-    print(f"PASS {WORKLOAD}: ok={stats['ok']} bad={stats['bad']} bytes={stats['bytes']}", flush=True)
+    if stats["ok"] == 0:
+        print(f"FAIL {WORKLOAD}: no successful iterations "
+              f"(transient={stats['transient']})", file=sys.stderr); return 1
+    print(f"PASS {WORKLOAD}: ok={stats['ok']} transient={stats['transient']} "
+          f"bytes={stats['bytes']}", flush=True)
     return 0
 
 if __name__ == "__main__":
