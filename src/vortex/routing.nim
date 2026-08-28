@@ -18,13 +18,20 @@ proc decodeSegment(s: string): string =
   except CatchableError: s
 
 type
-  RouteNode = ref object
+  RouteNodeObj = object
     segment: string           ## literal, or param name when isParam
     isParam: bool
     isWild: bool              ## trailing "*": matches the rest
     children: seq[RouteNode]
     handlers: array[HttpMethod, RequestHandler]
     streaming: array[HttpMethod, bool]  ## route registered via `stream`
+  RouteNode = ref RouteNodeObj
+    ## The trie is built once, then shared read-only across loop threads for the
+    ## process lifetime (GC-pinned in toHandler / streamPredicate). Serving-time
+    ## traversal returns `ptr RouteNodeObj` and uses `{.cursor.}` locals so it
+    ## touches no ORC refcount: an owning copy of a shared node/handler would
+    ## incref/decref one non-atomic refcount from several threads at once and
+    ## corrupt the cycle collector (an intermittent SIGSEGV under load).
 
   Middleware* = proc(next: RequestHandler): RequestHandler {.gcsafe.}
     ## Wraps a handler: run code before/after `next(req, res)`, or skip `next`
@@ -134,30 +141,35 @@ proc options*(r: Router, path: string, h: RequestHandler, streaming = false) =
   r.addRoute(HttpOptions, path, h, streaming)
 
 proc match(node: RouteNode, path: string, start: int,
-           params: var PathParams): RouteNode =
+           params: var PathParams): ptr RouteNodeObj =
   ## Recursive segment match: exact children win over params over wildcard.
+  ## Returns a raw `ptr` into the (pinned) trie -- see RouteNode -- so no shared
+  ## ORC refcount is touched during a concurrent lookup.
   var i = start
   while i < path.len and path[i] == '/': inc i
   if i >= path.len:
-    return node
+    return cast[ptr RouteNodeObj](node)
   var j = i
   while j < path.len and path[j] != '/': inc j
   let seg = decodeSegment(path.substr(i, j - 1))
   # Exact matches first.
-  for child in node.children:
+  for k in 0 ..< node.children.len:
+    let child {.cursor.} = node.children[k]
     if not child.isParam and not child.isWild and child.segment == seg:
       let found = match(child, path, j, params)
       if found != nil: return found
-  for child in node.children:
+  for k in 0 ..< node.children.len:
+    let child {.cursor.} = node.children[k]
     if child.isParam:
       params.add (child.segment, seg)
       let found = match(child, path, j, params)
       if found != nil: return found
       params.setLen(params.len - 1)
-  for child in node.children:
+  for k in 0 ..< node.children.len:
+    let child {.cursor.} = node.children[k]
     if child.isWild:
       params.add ("*", path.substr(i))   # raw remainder (see decodeSegment)
-      return child
+      return cast[ptr RouteNodeObj](child)
   nil
 
 proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
@@ -167,11 +179,11 @@ proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
   let q = path.find('?')
   if q >= 0: path.setLen(q)
   var params: PathParams
-  let node = router.root.match(path, 0, params)
+  let node = router.root.match(path, 0, params)   # ptr into the pinned trie
   if node == nil:
     router.notFound(req, res)
     return
-  var h = node.handlers[req.method]
+  var h {.cursor.} = node.handlers[req.method]
   if h == nil and req.method == HttpHead:
     h = node.handlers[HttpGet]   # HEAD falls back to GET; the codec drops the body
   if h == nil:
@@ -241,6 +253,6 @@ proc streamPredicate*(router: Router): StreamRouteCb =
       let q = path.find('?')
       if q >= 0: path.setLen(q)
       var params: PathParams
-      let node = r.root.match(path, 0, params)
+      let node = r.root.match(path, 0, params)   # ptr into the pinned trie
       if node == nil: return false
       node.streaming[req.method]
