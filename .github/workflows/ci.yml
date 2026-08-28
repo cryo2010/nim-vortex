@@ -498,7 +498,7 @@ jobs:
   # Built -d:plainHttp (no OpenSSL) so the tools run cleanly; scenarios are
   # cleartext. See conformance/memcheck/run.sh.
   valgrind:
-    name: valgrind / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    name: valgrind / ${{ matrix.target }} / ${{ matrix.mm }}
     runs-on: ubuntu-latest
     # Debian-based nim image: Arch ships a stripped ld.so that valgrind can't set
     # up its mandatory memcmp redirection against. -d:plainHttp means no OpenSSL,
@@ -507,7 +507,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
         target: [sync, async, chronos]
         mm: [orc]
     steps:
@@ -520,8 +519,7 @@ jobs:
       - name: Install chronos
         if: matrix.target == 'chronos'
         # Retry: nimble fetches chronos's deps from several git remotes, which
-        # occasionally hit a transient TLS/network error across the 30 chronos
-        # cells.
+        # occasionally hit a transient TLS/network error.
         run: |
           ok=
           for i in 1 2 3; do
@@ -529,21 +527,31 @@ jobs:
             echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
           done
           [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
-      - name: memcheck
-        run: >-
-          TOOL=valgrind SCENARIO=${{ matrix.scenario }}
-          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
-          bash conformance/memcheck/run.sh
+      - name: memcheck (all scenarios)
+        # One job per target loops over every scenario (was a scenario x target
+        # matrix). Collapsing the scenario axis turns 30 jobs into 3: far fewer
+        # Docker Hub container-init pulls (a recurring CI flake) and much less
+        # queue time under the runner concurrency cap, while each scenario still
+        # fails the job. Failures are collected so one bad scenario can't hide
+        # the rest, and ::group:: keeps the per-scenario logs foldable.
+        run: |
+          fails=
+          for s in http1 http1c http2 http2c streamup streamdown streamdownc sse ws shutdown; do
+            echo "::group::valgrind $s / ${{ matrix.target }}"
+            if TOOL=valgrind SCENARIO=$s TARGET=${{ matrix.target }} MM=${{ matrix.mm }} \
+                 bash conformance/memcheck/run.sh; then :; else fails="$fails $s"; fi
+            echo "::endgroup::"
+          done
+          [ -z "$fails" ] || { echo "FAILED scenarios:$fails"; exit 1; }
 
   helgrind:
-    name: helgrind / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    name: helgrind / ${{ matrix.target }} / ${{ matrix.mm }}
     runs-on: ubuntu-latest
     # Debian-based (see valgrind job): Arch's stripped ld.so breaks valgrind.
     container: nimlang/nim
     strategy:
       fail-fast: false
       matrix:
-        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
         target: [sync, async, chronos]
         mm: [orc]
     steps:
@@ -556,8 +564,7 @@ jobs:
       - name: Install chronos
         if: matrix.target == 'chronos'
         # Retry: nimble fetches chronos's deps from several git remotes, which
-        # occasionally hit a transient TLS/network error across the 30 chronos
-        # cells.
+        # occasionally hit a transient TLS/network error.
         run: |
           ok=
           for i in 1 2 3; do
@@ -565,14 +572,22 @@ jobs:
             echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
           done
           [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
-      - name: helgrind
-        run: >-
-          TOOL=helgrind SCENARIO=${{ matrix.scenario }}
-          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
-          bash conformance/memcheck/run.sh
+      - name: helgrind (all scenarios)
+        # See the valgrind job: one job per target loops the scenarios (30 -> 3)
+        # to cut Docker Hub container pulls and queue time; each scenario still
+        # fails the job, with failures collected and logs grouped per scenario.
+        run: |
+          fails=
+          for s in http1 http1c http2 http2c streamup streamdown streamdownc sse ws shutdown; do
+            echo "::group::helgrind $s / ${{ matrix.target }}"
+            if TOOL=helgrind SCENARIO=$s TARGET=${{ matrix.target }} MM=${{ matrix.mm }} \
+                 bash conformance/memcheck/run.sh; then :; else fails="$fails $s"; fi
+            echo "::endgroup::"
+          done
+          [ -z "$fails" ] || { echo "FAILED scenarios:$fails"; exit 1; }
 
   tsan:
-    name: tsan / ${{ matrix.scenario }} / ${{ matrix.target }} / ${{ matrix.mm }}
+    name: tsan / ${{ matrix.target }} / ${{ matrix.mm }}
     runs-on: ubuntu-latest
     # Privileged to lower mmap randomization for ThreadSanitizer's shadow
     # mapping (same as the sanitize/testrace jobs).
@@ -582,7 +597,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [http1, http1c, http2, http2c, streamup, streamdown, streamdownc, sse, ws, shutdown]
         target: [sync, async, chronos]
         mm: [orc]
     steps:
@@ -597,8 +611,7 @@ jobs:
       - name: Install chronos
         if: matrix.target == 'chronos'
         # Retry: nimble fetches chronos's deps from several git remotes, which
-        # occasionally hit a transient TLS/network error across the 30 chronos
-        # cells.
+        # occasionally hit a transient TLS/network error.
         run: |
           ok=
           for i in 1 2 3; do
@@ -606,8 +619,16 @@ jobs:
             echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
           done
           [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
-      - name: tsan
-        run: >-
-          TOOL=tsan SCENARIO=${{ matrix.scenario }}
-          TARGET=${{ matrix.target }} MM=${{ matrix.mm }}
-          bash conformance/memcheck/run.sh
+      - name: tsan (all scenarios)
+        # See the valgrind job: one job per target loops the scenarios (30 -> 3)
+        # to cut Docker Hub container pulls and queue time; each scenario still
+        # fails the job, with failures collected and logs grouped per scenario.
+        run: |
+          fails=
+          for s in http1 http1c http2 http2c streamup streamdown streamdownc sse ws shutdown; do
+            echo "::group::tsan $s / ${{ matrix.target }}"
+            if TOOL=tsan SCENARIO=$s TARGET=${{ matrix.target }} MM=${{ matrix.mm }} \
+                 bash conformance/memcheck/run.sh; then :; else fails="$fails $s"; fi
+            echo "::endgroup::"
+          done
+          [ -z "$fails" ] || { echo "FAILED scenarios:$fails"; exit 1; }
