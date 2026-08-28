@@ -1279,10 +1279,6 @@ proc ackBody*(req: Request, n: int) =
 
 # --- streaming responses ----------------------------------------------------
 
-const respHighWater* = 256 * 1024
-  ## write() reports backpressure once the unsent backlog reaches this many
-  ## bytes; the producer should pause and resume from onDrain.
-
 proc flushConn(res: Response) {.raises: [].} =
   ## Call the loop's flush hook, containing its untyped effect so the streaming
   ## API stays callable from a strict-effect async body (chronos infers the
@@ -1293,6 +1289,20 @@ proc flushConn(res: Response) {.raises: [].} =
 proc kickConn(res: Response) {.raises: [].} =
   try: res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
   except Exception: discard
+
+proc h2Writable(res: Response, backlog: int): bool =
+  ## Backpressure verdict for an HTTP/2 streamed write: writable only when both
+  ## the stream send window (empty `backlog`) and the connection write buffer
+  ## (`pendingOut`) have room. Unlike HTTP/1 (which is capped by the socket), a
+  ## large peer window lets sendData move a whole response into c.wbuf, so
+  ## without the pendingOut cap one stream could buffer it all in RAM. When
+  ## backed up, mark the stream so flushOut's drain (h2DrainResume) resumes it.
+  let c = conn(res.core, res.fd, res.gen)     # flush may have closed the conn
+  if c == nil: return false
+  if backlog >= respHighWater or pendingOut(c) >= respHighWater:
+    h2MarkRespBackedUp(c, res.stream)
+    return false
+  true
 
 proc sendHead*(res: Response, code: HttpCode, contentType = "",
                headers: openArray[(string, string)] = [],
@@ -1426,10 +1436,10 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
           if z.len == 0: return true
           let backlog = h2StreamWrite(c, res.stream, z)
           flushConn(res)
-          return backlog < respHighWater
+          return h2Writable(res, backlog)
       let backlog = h2StreamWrite(c, res.stream, data)
       flushConn(res)
-      return backlog < respHighWater
+      return h2Writable(res, backlog)
     if not c.respStreaming: return false
     if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
@@ -1570,7 +1580,11 @@ proc bufferedAmount*(res: Response): int =
   if res.stream != 0:
     let st = h2Stream(c, res.stream)
     if st == nil: return 0
-    return st.pendingBody.len - st.pendingPos
+    # Both limits `write` backpressures on: this stream's send-window backlog
+    # and the shared connection write buffer. Without pendingOut, a stream
+    # parked on the connection cap (backlog 0) would report 0 and `drained()`
+    # would resume the producer at once, defeating the connection-level cap.
+    return max(st.pendingBody.len - st.pendingPos, pendingOut(c))
   pendingOut(c)
 
 proc abort*(res: Response) {.raises: [].} =
