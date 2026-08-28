@@ -95,7 +95,11 @@ class HttpxSession:
     async def stream(self, method, path, headers=None):
         async with self.c.stream(method, BASE + path, headers=headers or {}) as r:
             yield r.status_code
-            async for chunk in r.aiter_raw():
+            # aiter_bytes (content-decoded), not aiter_raw: httpx auto-negotiates
+            # Accept-Encoding, so the server may gzip the stream; the sse/download
+            # workloads verify the logical payload (SSE framing / plaintext SHA),
+            # so decode transparently -- reading raw would feed gzip to the parser.
+            async for chunk in r.aiter_bytes():
                 yield chunk
     async def upload(self, path, headers, agen):
         r = await self.c.post(BASE + path, content=agen, headers=headers or {})
