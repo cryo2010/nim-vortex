@@ -240,22 +240,27 @@ async def read_lines(gen):
 async def w_sse():
     total = 100     # must match the server's sseTotal
     async def once():
+        # One connection per worker for the whole run (like the other soaks),
+        # re-subscribing to the full N-event sequence until the deadline. Do NOT
+        # open a fresh connection per 100 events: that churns TLS+h2 connections
+        # and the transient connect failures it induces are now fatal.
         async with session() as s:
-            got, last = 0, None
-            while got < total:                       # reconnect on the server's drop
-                hdrs = {"accept": "text/event-stream"}
-                if last is not None: hdrs["last-event-id"] = str(last)
-                gen = s.stream("GET", "/sse", hdrs)
-                st = await gen.__anext__()
-                if st != 200: raise Fail(f"sse status {st}")
-                progressed, cur_id = False, None
-                async for line in read_lines(gen):
-                    if line.startswith("id:"): cur_id = int(line[3:].strip())
-                    elif line.startswith("data:") and cur_id is not None:
-                        if cur_id != got: raise Fail(f"sse out of order: {cur_id} != {got}")
-                        got += 1; last = cur_id; cur_id = None; progressed = True
-                        bump(200)
-                if not progressed: raise Fail("sse made no progress")
+            while time.monotonic() < deadline:
+                got, last = 0, None
+                while got < total:                   # reconnect on the server's drop
+                    hdrs = {"accept": "text/event-stream"}
+                    if last is not None: hdrs["last-event-id"] = str(last)
+                    gen = s.stream("GET", "/sse", hdrs)
+                    st = await gen.__anext__()
+                    if st != 200: raise Fail(f"sse status {st}")
+                    progressed, cur_id = False, None
+                    async for line in read_lines(gen):
+                        if line.startswith("id:"): cur_id = int(line[3:].strip())
+                        elif line.startswith("data:") and cur_id is not None:
+                            if cur_id != got: raise Fail(f"sse out of order: {cur_id} != {got}")
+                            got += 1; last = cur_id; cur_id = None; progressed = True
+                            bump(200)
+                    if not progressed: raise Fail("sse made no progress")
     await asyncio.gather(*[drive(once) for _ in range(CONC)])
 
 async def w_streamupload():
