@@ -242,10 +242,20 @@ proc deliverBody(h3c: H3Conn, usid: uint64, last: bool) =
   template st: H3Stream = h3c.streams[usid]
   if st.onBodyCb == nil: return
   if st.body.len > 0 or last:
+    # The callback may res.send (deleting this stream from the table), so move
+    # the buffer out and capture manualAck *before* the call, and touch nothing
+    # on `st` afterwards -- re-check membership before crediting flow control.
     let cb = st.onBodyCb
+    let manualAck = st.bodyManualAck
     var buf: string
     swap(buf, st.body)
     cb(buf.toOpenArray(0, buf.len - 1), last)
+    if not manualAck and buf.len > 0 and h3c.vq != nil and usid in h3c.streams:
+      # nghttp3_conn_read_stream does not credit DATA-frame payload to QUIC
+      # flow control (only framing); replenish the consumed body bytes so the
+      # peer's stream/connection window reopens. manualAck defers this to
+      # req.ackBody so a slow consumer throttles the peer. Mirrors h2DeliverBody.
+      vqStreamConsume(h3c.vq, int64(usid), csize_t(buf.len))
 
 proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -478,9 +488,14 @@ proc h3SetOnBody*(conn: H3Conn, sid: uint64, cb: BodyCb, manualAck = false) =
   deliverBody(conn, sid, conn.streams[sid].finSeen)
 
 proc h3AckBody*(conn: H3Conn, sid: uint64, n: int) =
-  ## Flow control is handled inside the shim/ngtcp2 on receive; nothing to do
-  ## here yet (a future refinement can gate extend_max_stream_offset on acks).
-  discard
+  ## Replenish `n` consumed request-body bytes of a streaming h3 stream by
+  ## extending QUIC stream+connection flow control. nghttp3_conn_read_stream
+  ## does not credit DATA-frame payload (RFC 9000 flow control is the app's to
+  ## drive), so a manualAck consumer must ack what it reads or the peer stalls
+  ## once the initial window fills. Mirrors h2AckBody's WINDOW_UPDATE; the
+  ## auto-ack default replenishes in deliverBody instead.
+  if conn.vq != nil and n > 0 and sid in conn.streams:
+    vqStreamConsume(conn.vq, int64(sid), csize_t(n))
 
 proc h3Goaway*(conn: H3Conn) =
   if conn.vq == nil or conn.goneAway: return

@@ -268,10 +268,6 @@ WORKLOADS = {
 
 async def main():
     global deadline, start
-    if IS_H3 and WORKLOAD == "streamupload":
-        print("SKIP streamupload: vortex does not yet ack HTTP/3 request-body flow "
-              "control (NG2 / h3AckBody), so a large h3 upload stalls.", flush=True)
-        return 0
     if WORKLOAD not in WORKLOADS:
         print(f"unknown VORTEX_WORKLOAD: {WORKLOAD}", file=sys.stderr); return 2
     start = time.monotonic()
