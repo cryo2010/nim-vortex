@@ -323,6 +323,11 @@ proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
   result = addr core.conns[int(fd)]
   if result.gen != gen or result.state == csFree: return nil
 
+const respHighWater* = 256 * 1024
+  ## write() reports backpressure once the unsent backlog reaches this many
+  ## bytes; the producer should pause and resume from onDrain. Lives here (not
+  ## request.nim) so the HTTP/2 codec can apply the same connection-level cap.
+
 proc pendingOut*(c: ptr Connection): int {.inline.} =
   c.wbuf.len - c.wpos
 

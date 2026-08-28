@@ -426,6 +426,10 @@ proc flushOut(loop: Loop, c: ptr Connection) =
     c.respBackedUp = false
     if c.onRespDrain != nil:
       c.onRespDrain(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
+  else:
+    # HTTP/2: resume any streamed response parked on the connection-level cap
+    # now that the socket has drained c.wbuf (no-op for non-h2 connections).
+    h2codec.h2DrainResume(c, addr loop.core)
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code

@@ -247,12 +247,53 @@ proc h2RespPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
   if backlog == 0:
     st.pendingBody.setLen 0
     st.pendingPos = 0
-    if st.respBackedUp:
+    # Resume the producer only when BOTH limits have room: the send window (this
+    # stream's backlog is empty) and the connection write buffer (pendingOut).
+    # A large peer window would otherwise drain pendingBody straight into c.wbuf
+    # and fire onDrain while the connection buffer is still full, letting one
+    # stream buffer a whole response in RAM. If the buffer is full, stay backed
+    # up; flushOut's drain (h2DrainResume) resumes us when the socket catches up.
+    if st.respBackedUp and pendingOut(c) < respHighWater:
       st.respBackedUp = false
-      if st.onRespDrain != nil:
-        st.onRespDrain(h2.core, c.fd, c.gen, sid)
+      let cb = st.onRespDrain
+      st.onRespDrain = nil          # fire once; the producer re-registers if it
+      if cb != nil:                 # backs up again (guards the two resume paths)
+        cb(h2.core, c.fd, c.gen, sid)
   else:
     st.respBackedUp = true
+
+proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
+  ## Mark a streamed response as backed up (write() returned false), so a drain
+  ## path resumes its producer. Used when the connection write buffer is full
+  ## even though this stream's send window still has room.
+  let h2 = h2Conn(c)
+  if h2 != nil and sid in h2.streams:
+    h2.streams[sid].respBackedUp = true
+
+proc h2DrainResume*(c: ptr Connection, core: ptr LoopCore) =
+  ## The connection write buffer fully drained to the socket: resume any
+  ## streamed response parked on the connection-level cap (respHighWater), as
+  ## long as its own send window isn't the limit (empty backlog). Collect the
+  ## stream ids first -- an onRespDrain callback may res.write and mutate the
+  ## stream table -- and stop early if a resumed producer refills the buffer.
+  let h2 = h2Conn(c)
+  if h2 == nil: return
+  var resumable: seq[uint32]
+  for sid in h2.streams.keys:
+    template st: H2Stream = h2.streams[sid]
+    if st.respBackedUp and st.onRespDrain != nil and
+       st.pendingBody.len - st.pendingPos < respHighWater:
+      resumable.add sid
+  for sid in resumable:
+    if pendingOut(c) >= respHighWater: break
+    if sid notin h2.streams: continue
+    template st: H2Stream = h2.streams[sid]
+    if not st.respBackedUp: continue
+    st.respBackedUp = false
+    let cb = st.onRespDrain
+    st.onRespDrain = nil            # fire once (guards against a double resume)
+    if cb != nil:
+      cb(core, c.fd, c.gen, sid)
 
 proc h2ResumeSend(h2: H2Conn, c: ptr Connection, sid: uint32) =
   ## Resume a stream blocked on the send window: WebSocket streams need the
@@ -337,6 +378,7 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32) =
   template st: H2Stream = h2.streams[sid]
   st.streaming = false
   st.onRespDrain = nil
+  st.respBackedUp = false          # finished: never let a drain path resume it
   if st.isHead:
     return                               # HEAD stream already closed at head
   st.pendingIsLast = true
