@@ -30,7 +30,7 @@ try:
     from websockets.exceptions import WebSocketException
 except ImportError:
     class WebSocketException(Exception): pass
-from h3 import connect_h3
+from h3 import connect_h3, OP_TEXT
 
 WORKLOAD = os.environ.get("VORTEX_WORKLOAD", "requests")
 PROTO    = os.environ.get("VORTEX_PROTO", "h2")
@@ -48,6 +48,7 @@ MB = 1024 * 1024
 IS_H3 = PROTO == "h3"
 UNIT = {"requests": "requests", "ws": "messages", "sse": "events",
         "streamupload": "transfers", "streamdownload": "transfers"}.get(WORKLOAD, "ok")
+STREAMING = WORKLOAD in ("streamupload", "streamdownload")
 
 # --- deterministic byte generator: byte i = i mod 256 (matches the server) ---
 _PAT = bytes(range(256))
@@ -67,6 +68,7 @@ async def body_gen():
     off = 0
     while off < STREAM:
         n = min(CHUNK, STREAM - off); yield gen_chunk(off, n); off += n
+        xfer[0] += n            # bytes handed to the transport (upload progress)
 
 # --- request-body compression (server decompresses via decompressRequest) ----
 def compress(raw: bytes):
@@ -114,6 +116,8 @@ class Fail(Exception):
     """A real, fatal defect (data corruption / bad status). Never retried."""
 codes = Counter()
 transient = [0]
+xfer = [0]              # cumulative bytes streamed (upload sent / download received)
+_rate = [0.0, 0]       # [last report monotonic, bytes at last report] for MB/s
 start = 0.0
 deadline = 0.0
 
@@ -124,6 +128,16 @@ def fmt_codes() -> str:
     if transient[0]: parts.append(f"errx{transient[0]}")
     return " ".join(parts) if parts else "0"
 
+def fmt_xfer(now: float) -> str:
+    """A throughput segment for the streaming workloads: cumulative bytes plus
+    the MB/s since the last report, so a slow-but-progressing transfer (a 1 GiB
+    upload takes many report intervals) is visible instead of a bare 0, and a
+    real stall shows 0 MB/s."""
+    dt, db = now - _rate[0], xfer[0] - _rate[1]
+    _rate[0], _rate[1] = now, xfer[0]
+    rate = db / dt / MB if dt > 0 else 0.0
+    return f" | {xfer[0] // MB}MB xfer @ {rate:.0f}MB/s"
+
 async def get_server_stats(s) -> tuple:
     try:
         st, body = await s.get("/stats")
@@ -133,8 +147,10 @@ async def get_server_stats(s) -> tuple:
         return 0, 0
 
 def report_line(prefix, rss, heap):
-    t = int(time.monotonic() - start)
-    print(f"[{WORKLOAD} {PROTO} {SERVER}] {prefix}{fmt_codes()} | "
+    now = time.monotonic()
+    t = int(now - start)
+    seg = fmt_xfer(now) if STREAMING else ""
+    print(f"[{WORKLOAD} {PROTO} {SERVER}] {prefix}{fmt_codes()}{seg} | "
           f"RSS {rss // MB}MB | heap {heap // MB}MB | t={t}s", flush=True)
 
 async def reporter():
@@ -174,7 +190,22 @@ async def w_requests():
                     bump(200)
     await asyncio.gather(*[retrying(once) for _ in range(CONC)])
 
-async def w_ws():   # h1/h2 only; h3 (Extended CONNECT) is skipped in main()
+async def w_ws():
+    if IS_H3:                                   # RFC 9220 Extended CONNECT via aioquic
+        async def once(i):
+            async with session() as s:
+                ws = await s.ws_open("/ws")
+                if ws.status != 200: raise Fail(f"ws-h3 handshake {ws.status}")
+                n = 0
+                while time.monotonic() < deadline:
+                    msg = f"msg-{i}-{n}".encode()
+                    ws.send(OP_TEXT, msg)
+                    op, payload = await ws.recv()
+                    if op != OP_TEXT or payload != msg:
+                        raise Fail(f"ws-h3 echo mismatch: op={op} {payload!r}")
+                    bump(200); n += 1
+        await asyncio.gather(*[retrying(lambda i=i: once(i)) for i in range(CONC)])
+        return
     import websockets
     ws_url = BASE.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
     ssl_ctx = None
@@ -240,7 +271,7 @@ async def w_streamdownload():
             if st != 200: raise Fail(f"download status {st}")
             h = hashlib.sha1(); got = 0
             async for chunk in gen:
-                h.update(chunk); got += len(chunk)
+                h.update(chunk); got += len(chunk); xfer[0] += len(chunk)
             if got != STREAM or h.hexdigest() != want:
                 raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
             bump(200)
@@ -253,17 +284,10 @@ WORKLOADS = {
 
 async def main():
     global deadline, start
-    if IS_H3 and WORKLOAD == "ws":
-        print("SKIP ws: WebSocket-over-HTTP/3 (Extended CONNECT) is not yet wired "
-              "in the stress client.", flush=True)
-        return 0
-    if IS_H3 and WORKLOAD == "streamupload":
-        print("SKIP streamupload: vortex does not yet ack HTTP/3 request-body flow "
-              "control (NG2 / h3AckBody), so a large h3 upload stalls.", flush=True)
-        return 0
     if WORKLOAD not in WORKLOADS:
         print(f"unknown VORTEX_WORKLOAD: {WORKLOAD}", file=sys.stderr); return 2
     start = time.monotonic()
+    _rate[0] = start
     deadline = start + SECONDS
     rep = asyncio.ensure_future(reporter())
     try:
@@ -280,8 +304,15 @@ async def main():
     finally:
         rep.cancel()
     total = sum(n for c, n in codes.items() if 200 <= c < 300)
-    async with session() as s:
-        rss, heap = await get_server_stats(s)
+    # A fresh session just for the closing RSS/heap sample; never let a failed
+    # connect (server already torn down, a transient QUIC/DNS blip) crash the
+    # run with a traceback and mask the real pass/fail verdict below.
+    rss, heap = 0, 0
+    try:
+        async with session() as s:
+            rss, heap = await get_server_stats(s)
+    except Exception:
+        pass
     report_line("final ", rss, heap)
     if total == 0:
         print(f"FAIL {WORKLOAD}: no successful iterations (errx{transient[0]})",

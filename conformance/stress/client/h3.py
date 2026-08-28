@@ -16,6 +16,37 @@ from aioquic.h3.events import HeadersReceived, DataReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated
 
+# --- WebSocket-over-HTTP/3 (RFC 9220 Extended CONNECT) framing ---------------
+OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
+_WS_MASK = b"\x21\x43\x65\x87"
+
+def ws_frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
+    """A client-masked WebSocket frame (7-bit or 16-bit length)."""
+    out = bytearray([(0x80 if fin else 0) | opcode])
+    n = len(payload)
+    if n < 126:
+        out.append(0x80 | n)
+    else:
+        out += bytes([0x80 | 126, (n >> 8) & 0xff, n & 0xff])
+    out += _WS_MASK
+    out += bytes(payload[i] ^ _WS_MASK[i % 4] for i in range(n))
+    return bytes(out)
+
+def parse_ws(buf: bytearray):
+    """Return (frames, consumed): complete server (unmasked) frames as (op, payload)."""
+    frames, pos = [], 0
+    while pos + 2 <= len(buf):
+        b0, b1 = buf[pos], buf[pos + 1]
+        assert (b1 & 0x80) == 0, "server WebSocket frame must be unmasked"
+        ln, hdr = b1 & 0x7f, 2
+        if ln == 126:
+            if pos + 4 > len(buf): break
+            ln = (buf[pos + 2] << 8) | buf[pos + 3]; hdr = 4
+        if pos + hdr + ln > len(buf): break
+        frames.append((b0 & 0x0f, bytes(buf[pos + hdr:pos + hdr + ln])))
+        pos += hdr + ln
+    return frames, pos
+
 
 class H3Client(QuicConnectionProtocol):
     def __init__(self, *a, **kw):
@@ -110,6 +141,50 @@ class H3Session:
             elif kind == "end": break
         self.c._queues.pop(sid, None)
         return status
+
+    async def ws_open(self, path="/ws", subprotocols=None):
+        """Open an RFC 9220 Extended CONNECT WebSocket; returns an H3Ws tunnel."""
+        sid = self.c._quic.get_next_available_stream_id()
+        q = asyncio.Queue()
+        self.c._queues[sid] = q
+        h = [(b":method", b"CONNECT"), (b":scheme", b"https"),
+             (b":authority", self.c.authority.encode()), (b":path", path.encode()),
+             (b":protocol", b"websocket"), (b"sec-websocket-version", b"13")]
+        if subprotocols:
+            h.append((b"sec-websocket-protocol", ", ".join(subprotocols).encode()))
+        self.c._http.send_headers(sid, h, end_stream=False)
+        self.c.transmit()
+        status = None
+        while status is None:
+            kind, val = await q.get()
+            if kind == "h": status = val
+            elif kind == "end": raise ConnectionError("ws CONNECT stream ended")
+        return H3Ws(self.c, sid, q, status)
+
+
+class H3Ws:
+    """A WebSocket tunnel over one Extended CONNECT h3 stream (client-masked)."""
+    def __init__(self, client, sid, q, status):
+        self.c, self.sid, self.q, self.status = client, sid, q, status
+        self._buf = bytearray()
+
+    def send(self, opcode, payload: bytes):
+        self.c._http.send_data(self.sid, ws_frame(opcode, payload), end_stream=False)
+        self.c.transmit()
+
+    async def recv(self):
+        """Return the next (opcode, payload) frame from the server."""
+        while True:
+            frames, consumed = parse_ws(self._buf)
+            if frames:
+                del self._buf[:consumed]
+                return frames[0]
+            kind, val = await self.q.get()
+            if kind == "d": self._buf += val
+            elif kind == "end": raise ConnectionError("ws stream ended")
+
+    def close(self):
+        self.c._queues.pop(self.sid, None)
 
 
 @asynccontextmanager

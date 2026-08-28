@@ -168,7 +168,11 @@ when isMainModule:
   rt.get("/echo", hEcho)
   rt.post("/echo", hEcho)
   rt.put("/echo", hEcho)
-  rt.get("/ws", hWs)
+  rt.get("/ws", hWs)                       # h1/h2 WebSocket (GET Upgrade)
+  when asyncMode:
+    rt.addRoute(HttpConnect, "/ws", toHandler(hWs))   # h2/h3 Extended CONNECT (RFC 9220)
+  else:
+    rt.addRoute(HttpConnect, "/ws", hWs)
   rt.get("/sse", hSse)
   rt.get("/stats", hStats)
   rt.post("/upload", hUpload, streaming = true)
