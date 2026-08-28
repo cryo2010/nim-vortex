@@ -122,7 +122,11 @@ task testrace, "ThreadSanitizer regressions for the cross-thread races":
   #  - test_blocking_args: req.blocking(a, b, ...) box ORC refcount must be
   #    touched on one thread only (loop wasMoves it to the worker) -- guards the
   #    loop-decref vs worker-incref race that surfaced as an ASan use-after-free.
-  for t in ["test_thread_race", "test_blocking_race", "test_blocking_args"]:
+  #  - test_router_race: concurrent requests against a numThreads>1 server --
+  #    guards route()/match() traversing the shared route trie/handlers with
+  #    ptr/{.cursor.} instead of owning copies that race a shared ORC refcount.
+  for t in ["test_thread_race", "test_blocking_race", "test_blocking_args",
+            "test_router_race"]:
     exec "nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc " &
          "--passC:-fsanitize=thread --passL:-fsanitize=thread --debugger:native " &
          "-p:src -o:tests/" & t & " tests/" & t & ".nim"

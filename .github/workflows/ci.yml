@@ -306,17 +306,20 @@ jobs:
           && nimble install -y "nimcrypto@>= 0.6.0"
       - uses: actions/checkout@v7
       - name: ThreadSanitizer handler-race regression
-        # Builds the start()/shutdown and blocking-request stress under TSan;
-        # TSan aborts on any data race, failing the job. Guards the
-        # handler/stream-route closure being stored as a raw (proc, env) pair
-        # instead of a traced ref that would race its ORC refcount across loop
-        # threads. -d:plainHttp keeps OpenSSL out of the report; -d:useMalloc
-        # lets TSan see all allocations. Built/run directly (not
-        # `nimble testrace`) so a failure is not masked by nim-lang/nimble#1802.
+        # Builds the start()/shutdown, blocking-request, and concurrent-router
+        # stress under TSan; TSan aborts on any data race, failing the job.
+        # Guards (a) the handler/stream-route closure stored as a raw (proc,env)
+        # pair, and (b) route()/match() traversing the shared route trie with
+        # ptr/{.cursor.} -- both would otherwise race an ORC refcount across loop
+        # threads. test_router_race needs >1 loop thread AND concurrent requests
+        # (reusePort load-balances across threads on Linux). -d:plainHttp keeps
+        # OpenSSL out of the report; -d:useMalloc lets TSan see all allocations.
+        # Built/run directly (not `nimble testrace`) so a failure is not masked
+        # by nim-lang/nimble#1802.
         env:
           TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
         run: |
-          for t in test_thread_race test_blocking_race test_blocking_args; do
+          for t in test_thread_race test_blocking_race test_blocking_args test_router_race; do
             nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc \
               --passC:-fsanitize=thread --passL:-fsanitize=thread \
               --debugger:native -p:src -o:tests/$t tests/$t.nim
