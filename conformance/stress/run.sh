@@ -61,11 +61,12 @@ trap cleanup EXIT INT TERM
 echo "building client image..."
 docker build -f "$here/client.Dockerfile" -t "$cimg" "$root" >/dev/null
 
-# proto -> build flags / port / scheme (h3 handled by the client's skip)
+# proto -> build flags / port / scheme / QUIC toggle
 proto_cfg() {
   case "$1" in
-    h1) pflags="-d:plainHttp"; tls=0; port=8080; scheme=http ;;
-    h2|h3) pflags="";          tls=1; port=8443; scheme=https ;;
+    h1) pflags="-d:plainHttp"; tls=0; h3=0; port=8080; scheme=http ;;
+    h2) pflags="";             tls=1; h3=0; port=8443; scheme=https ;;
+    h3) pflags="";             tls=1; h3=1; port=8443; scheme=https ;;  # QUIC + aioquic client
     *) echo "unknown VORTEX_PROTO: $1" >&2; exit 2 ;;
   esac
 }
@@ -98,8 +99,8 @@ run_cell() {
 
   docker rm -f "$srvc" >/dev/null 2>&1 || true
   docker run -d --name "$srvc" --network "$net" --network-alias server \
-    -e STRESS_PORT="$port" -e STRESS_TLS="$tls" -e STRESS_COMPRESS="$compress" \
-    -e STREAM_BYTES="$sbytes" "$simg" >/dev/null
+    -e STRESS_PORT="$port" -e STRESS_TLS="$tls" -e STRESS_HTTP3="$h3" \
+    -e STRESS_COMPRESS="$compress" -e STREAM_BYTES="$sbytes" "$simg" >/dev/null
 
   i=0
   until docker logs "$srvc" 2>&1 | grep -q "listening"; do

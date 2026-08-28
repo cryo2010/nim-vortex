@@ -183,7 +183,7 @@ when isMainModule:
     if getEnv("STRESS_TLS") == "1":
       settings.certFile = "/vortex/cert.pem"
       settings.keyFile = "/vortex/key.pem"
-      settings.http3 = false
+      settings.http3 = getEnv("STRESS_HTTP3") == "1"   # QUIC listener for h3 cells
   let srv = newVortex(rt.toHandler, settings, rt.streamPredicate).start()
   echo "listening on ", int(srv.port)
   while true: sleep(3600 * 1000)

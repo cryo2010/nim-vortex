@@ -54,10 +54,20 @@ VORTEX_SERVER=all VORTEX_STREAM_BYTES=8388608 VORTEX_SECONDS=5 nimble stressStre
 VORTEX_PROTO=all VORTEX_RESP_COMPRESSION=br nimble stressRequests
 ```
 
+## HTTP/3
+
+`VORTEX_PROTO=h3` drives the server's QUIC listener with **aioquic** (httpx has
+no h3). `requests`, `sse`, and `streamdownload` run over h3; two cells are a
+printed skip (exit 0) for now:
+
+- **`ws` over h3** - WebSocket-over-HTTP/3 (RFC 9220 Extended CONNECT) is not yet
+  wired into the client.
+- **`streamupload` over h3** - vortex does not yet ack HTTP/3 request-body flow
+  control (the `h3AckBody` / NG2 gap), so a large h3 upload stalls after the
+  initial window. Downloads (server -> client) are unaffected.
+
 ## Gaps
 
-- **HTTP/3** - the httpx client has no h3, so `VORTEX_PROTO=h3` cells print a
-  skip. Use `nimble h3load` for HTTP/3 saturation.
 - On Docker Desktop the `docker stats` RSS reflects the shared Linux VM; read it
   as a trend, not an absolute host number.
 - Not a CI gate (Docker, long runtimes, 1 GiB transfers). Pass/fail makes a short
