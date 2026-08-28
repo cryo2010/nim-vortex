@@ -30,7 +30,7 @@ try:
     from websockets.exceptions import WebSocketException
 except ImportError:
     class WebSocketException(Exception): pass
-from h3 import connect_h3
+from h3 import connect_h3, OP_TEXT
 
 WORKLOAD = os.environ.get("VORTEX_WORKLOAD", "requests")
 PROTO    = os.environ.get("VORTEX_PROTO", "h2")
@@ -174,7 +174,22 @@ async def w_requests():
                     bump(200)
     await asyncio.gather(*[retrying(once) for _ in range(CONC)])
 
-async def w_ws():   # h1/h2 only; h3 (Extended CONNECT) is skipped in main()
+async def w_ws():
+    if IS_H3:                                   # RFC 9220 Extended CONNECT via aioquic
+        async def once(i):
+            async with session() as s:
+                ws = await s.ws_open("/ws")
+                if ws.status != 200: raise Fail(f"ws-h3 handshake {ws.status}")
+                n = 0
+                while time.monotonic() < deadline:
+                    msg = f"msg-{i}-{n}".encode()
+                    ws.send(OP_TEXT, msg)
+                    op, payload = await ws.recv()
+                    if op != OP_TEXT or payload != msg:
+                        raise Fail(f"ws-h3 echo mismatch: op={op} {payload!r}")
+                    bump(200); n += 1
+        await asyncio.gather(*[retrying(lambda i=i: once(i)) for i in range(CONC)])
+        return
     import websockets
     ws_url = BASE.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
     ssl_ctx = None
@@ -253,10 +268,6 @@ WORKLOADS = {
 
 async def main():
     global deadline, start
-    if IS_H3 and WORKLOAD == "ws":
-        print("SKIP ws: WebSocket-over-HTTP/3 (Extended CONNECT) is not yet wired "
-              "in the stress client.", flush=True)
-        return 0
     if IS_H3 and WORKLOAD == "streamupload":
         print("SKIP streamupload: vortex does not yet ack HTTP/3 request-body flow "
               "control (NG2 / h3AckBody), so a large h3 upload stalls.", flush=True)
