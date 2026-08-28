@@ -26,7 +26,14 @@ fi
 echo "building vortex TLS server image..."
 docker build -f "$here/Dockerfile" -t "$img" $basearg "$root"
 echo "pulling testssl.sh image ($timg)..."
-docker pull "$timg"
+# Retry: Docker Hub intermittently resets the manifest fetch (registry TLS/
+# rate limit), which otherwise fails the whole job on a transient network blip.
+i=0
+until docker pull "$timg"; do
+  i=$((i + 1))
+  [ "$i" -ge 5 ] && { echo "docker pull $timg failed after $i attempts" >&2; exit 1; }
+  echo "pull attempt $i failed; retrying in 5s..." >&2; sleep 5
+done
 
 out=$(mktemp -d)
 chmod 777 "$out"
