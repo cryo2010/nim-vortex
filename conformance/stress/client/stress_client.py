@@ -3,11 +3,11 @@
 
 Drives one workload (VORTEX_WORKLOAD) at the vortex server for VORTEX_SECONDS,
 verifying it and **discarding** responses so memory stays flat. **Hard fails**
-(non-zero exit) on data corruption - checksum mismatch, echo mismatch, a
-non-2xx status, or a missing/out-of-order SSE event. A transient connection
-error (a reset under high concurrency) is counted and retried on a fresh
-connection, not fatal - a soak tolerates connection churn. If *no* iteration
-ever succeeds, that is a failure.
+(non-zero exit) at once on the first defect - checksum mismatch, echo mismatch,
+a non-2xx status, a missing/out-of-order SSE event, or any transport/connection
+error (a reset, refused connect, timeout). There is no retry or errx tally: an
+error is surfaced immediately with its cause. If *no* iteration ever succeeds,
+that too is a failure.
 
 Transport is chosen by VORTEX_PROTO: h1/h2 via httpx, **h3 via aioquic** (see
 h3.py; httpx has no HTTP/3). Both expose the same session shape, so the
@@ -113,9 +113,9 @@ async def session():
 
 # --- shared state ------------------------------------------------------------
 class Fail(Exception):
-    """A real, fatal defect (data corruption / bad status). Never retried."""
+    """A fatal defect (corruption, bad status, or a transport error). Ends the
+    run non-zero at once; never retried or tallied."""
 codes = Counter()
-transient = [0]
 xfer = [0]              # cumulative bytes streamed (upload sent / download received)
 _rate = [0.0, 0]       # [last report monotonic, bytes at last report] for MB/s
 start = 0.0
@@ -125,7 +125,6 @@ def bump(status: int, n: int = 1): codes[status] += n
 
 def fmt_codes() -> str:
     parts = [f"{c}x{n}" for c, n in sorted(codes.items())]
-    if transient[0]: parts.append(f"errx{transient[0]}")
     return " ".join(parts) if parts else "0"
 
 def fmt_xfer(now: float) -> str:
@@ -160,13 +159,16 @@ async def reporter():
             rss, heap = await get_server_stats(s)
             report_line("", rss, heap)
 
-async def retrying(worker):
+async def drive(worker):
+    # Call worker repeatedly until the deadline (workers that do one transfer
+    # per call repeat here). A transport/connection error is a hard failure:
+    # raise it as a fatal Fail at once so the run exits non-zero immediately
+    # with the cause, instead of tallying an errx count to sift through later.
     while time.monotonic() < deadline:
         try:
             await worker()
-        except (httpx.TransportError, WebSocketException, ConnectionError, OSError):
-            transient[0] += 1
-            await asyncio.sleep(0.02)
+        except (httpx.TransportError, WebSocketException, ConnectionError, OSError) as e:
+            raise Fail(f"transport error ({type(e).__name__}): {e}") from e
 
 # --- workloads (transport-agnostic via session) ------------------------------
 async def w_requests():
@@ -188,7 +190,7 @@ async def w_requests():
                     if st != 200 or b != raw:
                         raise Fail(f"{meth} /echo -> {st}, {len(b)}B")
                     bump(200)
-    await asyncio.gather(*[retrying(once) for _ in range(CONC)])
+    await asyncio.gather(*[drive(once) for _ in range(CONC)])
 
 async def w_ws():
     if IS_H3:                                   # RFC 9220 Extended CONNECT via aioquic
@@ -204,7 +206,7 @@ async def w_ws():
                     if op != OP_TEXT or payload != msg:
                         raise Fail(f"ws-h3 echo mismatch: op={op} {payload!r}")
                     bump(200); n += 1
-        await asyncio.gather(*[retrying(lambda i=i: once(i)) for i in range(CONC)])
+        await asyncio.gather(*[drive(lambda i=i: once(i)) for i in range(CONC)])
         return
     import websockets
     ws_url = BASE.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
@@ -220,7 +222,7 @@ async def w_ws():
                 await ws.send(msg)
                 if await ws.recv() != msg: raise Fail("ws echo mismatch")
                 bump(200); n += 1
-    await asyncio.gather(*[retrying(lambda i=i: once(i)) for i in range(CONC)])
+    await asyncio.gather(*[drive(lambda i=i: once(i)) for i in range(CONC)])
 
 async def read_lines(gen):
     """Yield decoded lines from a byte-chunk async generator (SSE framing)."""
@@ -250,7 +252,7 @@ async def w_sse():
                         got += 1; last = cur_id; cur_id = None; progressed = True
                         bump(200)
                 if not progressed: raise Fail("sse made no progress")
-    await asyncio.gather(*[retrying(once) for _ in range(CONC)])
+    await asyncio.gather(*[drive(once) for _ in range(CONC)])
 
 async def w_streamupload():
     sha = expected_sha1()
@@ -260,7 +262,7 @@ async def w_streamupload():
             if st == 400: raise Fail("server rejected the SHA-1 (400)")
             if st != 200: raise Fail(f"upload -> {st}")
             bump(200)
-    await retrying(once)
+    await drive(once)
 
 async def w_streamdownload():
     want = expected_sha1()
@@ -275,7 +277,7 @@ async def w_streamdownload():
             if got != STREAM or h.hexdigest() != want:
                 raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
             bump(200)
-    await retrying(once)
+    await drive(once)
 
 WORKLOADS = {
     "requests": w_requests, "ws": w_ws, "sse": w_sse,
@@ -315,8 +317,7 @@ async def main():
         pass
     report_line("final ", rss, heap)
     if total == 0:
-        print(f"FAIL {WORKLOAD}: no successful iterations (errx{transient[0]})",
-              file=sys.stderr); return 1
+        print(f"FAIL {WORKLOAD}: no successful iterations", file=sys.stderr); return 1
     print(f"== {WORKLOAD} {SERVER} {PROTO} passed ({total} {UNIT}) ==", flush=True)
     return 0
 
