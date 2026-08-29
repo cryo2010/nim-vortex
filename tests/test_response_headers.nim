@@ -34,6 +34,12 @@ proc echoReq(req: Request, res: Response) {.gcsafe.} =
   let present = if "x-custom" in req.headers: "yes" else: "no"
   res.send(Http200, req.headers["X-Custom"] & "|" & present)
 
+proc r301(req: Request, res: Response) {.gcsafe.} = res.redirect("/dest", permanent = true)
+proc r302(req: Request, res: Response) {.gcsafe.} = res.redirect("/dest")
+proc r307(req: Request, res: Response) {.gcsafe.} = res.redirect("/dest", preserveMethod = true)
+proc r308(req: Request, res: Response) {.gcsafe.} =
+  res.redirect("/dest", permanent = true, preserveMethod = true)
+
 var rt = newRouter()
 rt.use(poweredBy)
 rt.get("/plain", plain)
@@ -41,6 +47,10 @@ rt.get("/html", html)
 rt.get("/override", override)
 rt.get("/cookies", cookies)
 rt.get("/echo-req", echoReq)
+rt.get("/r301", r301)
+rt.get("/r302", r302)
+rt.get("/r307", r307)
+rt.get("/r308", r308)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
@@ -87,6 +97,26 @@ suite "res.headers":
       "curl -s -D - -o /dev/null --http2-prior-knowledge " & base & "/plain")
     check rc == 0
     check "x-powered-by: vortex" in output.toLowerAscii
+
+suite "redirect status codes":
+  test "302 default (temporary, may downgrade to GET)":
+    var c = newHttpClient(maxRedirects = 0)
+    defer: c.close()
+    let r = c.get(base & "/r302")
+    check r.status.startsWith("302")
+    check r.headers["location"] == "/dest"
+  test "301 with permanent":
+    var c = newHttpClient(maxRedirects = 0)
+    defer: c.close()
+    check c.get(base & "/r301").status.startsWith("301")
+  test "307 with preserveMethod (keeps method + body)":
+    var c = newHttpClient(maxRedirects = 0)
+    defer: c.close()
+    check c.get(base & "/r307").status.startsWith("307")
+  test "308 with permanent + preserveMethod":
+    var c = newHttpClient(maxRedirects = 0)
+    defer: c.close()
+    check c.get(base & "/r308").status.startsWith("308")
 
 srv.close()
 echo "res.headers ok"
