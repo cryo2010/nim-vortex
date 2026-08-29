@@ -9,6 +9,7 @@
 
 import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros, times]
 import ./connection
+import ./proxyprotocol   # isTrustedProxy for forwarded-header resolution
 import ./blockingguard
 import ./conditional
 export blockingguard
@@ -360,14 +361,103 @@ proc forwardedFor*(req: Request): seq[string] =
     let p = part.strip
     if p.len > 0: result.add p
 
+proc fromTrustedProxy*(req: Request): bool =
+  ## True when the direct peer is in `settings.trustedProxies` (which must be
+  ## non-empty). Forwarding headers (X-Forwarded-*, RFC 7239 Forwarded) are
+  ## believed only from such a peer -- a request straight from a client can forge
+  ## them, so with no trustedProxies configured this is always false (fail safe).
+  req.core != nil and req.core.trustedProxies.len > 0 and
+    isTrustedProxy(req.remoteAddress, req.core.trustedProxies)
+
+type ForwardedElem = tuple[forr, proto, host: string]
+
+proc parseForwarded(hdr: string): seq[ForwardedElem] =
+  ## RFC 7239 Forwarded -> its elements (client-most first), each with the for /
+  ## proto / host params (surrounding quotes stripped, keys lowercased).
+  for elem in hdr.split(','):
+    var e: ForwardedElem
+    for param in elem.split(';'):
+      let eq = param.find('=')
+      if eq < 0: continue
+      let k = param[0 ..< eq].strip.toLowerAscii
+      var v = param[eq+1 .. ^1].strip
+      if v.len >= 2 and v[0] == '"' and v[^1] == '"': v = v[1 ..< v.len-1]
+      case k
+      of "for": e.forr = v
+      of "proto": e.proto = v
+      of "host": e.host = v
+      else: discard
+    if e.forr.len > 0 or e.proto.len > 0 or e.host.len > 0: result.add e
+
+proc fwdIp(s: string): string =
+  ## Extract the bare IP from an RFC 7239 for= node (`ip`, `ip:port`,
+  ## `"[v6]:port"`, `_obfuscated`); returns the token unchanged if it isn't one.
+  var v = s.strip(chars = {'"'})
+  if v.startsWith("["):
+    let rb = v.find(']')
+    return (if rb > 1: v[1 ..< rb] else: v)
+  if v.count(':') == 1: return v[0 ..< v.find(':')]   # ipv4:port
+  v
+
+proc forwardedProto*(req: Request): string =
+  ## The client-facing scheme ("https"/"http") the outermost trusted proxy saw,
+  ## from RFC 7239 Forwarded (proto=) or X-Forwarded-Proto; "" when not behind a
+  ## trusted proxy or unset. Prefer `req.scheme` / `req.isSecure`, which fold it
+  ## in.
+  if not req.fromTrustedProxy: return ""
+  let fwd = parseForwarded(req.header("forwarded"))
+  if fwd.len > 0 and fwd[0].proto.len > 0: return fwd[0].proto.toLowerAscii
+  let xfp = req.header("x-forwarded-proto")
+  if xfp.len > 0: return xfp.split(',')[0].strip.toLowerAscii
+
+proc forwardedHost*(req: Request): string =
+  ## The Host the client sent to a trusted proxy, from RFC 7239 Forwarded
+  ## (host=) or X-Forwarded-Host; "" when not behind a trusted proxy or unset.
+  ## Folded into `req.host`.
+  if not req.fromTrustedProxy: return ""
+  let fwd = parseForwarded(req.header("forwarded"))
+  if fwd.len > 0 and fwd[0].host.len > 0: return fwd[0].host
+  let xfh = req.header("x-forwarded-host")
+  if xfh.len > 0: return xfh.split(',')[0].strip
+
+proc clientIp*(req: Request): string =
+  ## The origin client's IP behind a trusted proxy chain. Walks the forwarded
+  ## chain (RFC 7239 for= elements, else X-Forwarded-For) from the nearest proxy
+  ## outward and returns the first address that is NOT itself a trusted proxy --
+  ## what the outermost trusted proxy actually saw. Only trusted hops are peeled,
+  ## so a client-forged prefix can't move the result. Falls back to
+  ## `remoteAddress` when not behind a trusted proxy.
+  if not req.fromTrustedProxy: return req.remoteAddress
+  var chain: seq[string]
+  let fwd = parseForwarded(req.header("forwarded"))
+  if fwd.len > 0:
+    for e in fwd:
+      if e.forr.len > 0: chain.add fwdIp(e.forr)   # left = client-most
+  else:
+    chain = req.forwardedFor
+  for i in countdown(chain.high, 0):
+    if not isTrustedProxy(chain[i], req.core.trustedProxies): return chain[i]
+  if chain.len > 0: return chain[0]
+  req.remoteAddress
+
 proc isSecure*(req: Request): bool =
   ## True if the request arrived over TLS (HTTPS, or HTTP/2 over TLS) or QUIC
   ## (HTTP/3 is always encrypted). Use it to gate Secure cookies, HSTS, and a
-  ## plaintext->HTTPS redirect.
+  ## plaintext->HTTPS redirect. Behind a trusted proxy it reflects the forwarded
+  ## proto (X-Forwarded-Proto / Forwarded), so termination at the proxy is seen
+  ## as secure.
+  let fp = req.forwardedProto
+  if fp.len > 0: return fp == "https"
   if req.snap != nil: return req.snap.secure
   if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
   let c = conn(req.core, req.fd, req.gen)
   c != nil and c.ssl != nil
+
+proc scheme*(req: Request): string =
+  ## "https" or "http" for the original client request -- the trusted proxy's
+  ## forwarded proto if present, else the connection's own scheme. Use it to
+  ## build absolute URLs / redirects correctly behind a TLS terminator.
+  if req.isSecure: "https" else: "http"
 
 proc securityHeaders*(hsts = false, hstsMaxAge = 63072000,
                       hstsIncludeSubdomains = true, hstsPreload = false,
@@ -422,9 +512,12 @@ proc originAllowed*(req: Request, allowed: openArray[string],
   false
 
 proc host*(req: Request): string =
-  ## The request's host: the :authority pseudo-header for HTTP/2 and HTTP/3, the
-  ## Host header for HTTP/1.1 ("" if absent). Use it to build an absolute URL,
-  ## e.g. a plaintext -> HTTPS redirect.
+  ## The request's host: behind a trusted proxy the forwarded host
+  ## (X-Forwarded-Host / RFC 7239 Forwarded host=); otherwise the :authority
+  ## pseudo-header for HTTP/2 and HTTP/3, or the Host header for HTTP/1.1 ("" if
+  ## absent). Use it to build an absolute URL, e.g. a plaintext -> HTTPS redirect.
+  let fwd = req.forwardedHost
+  if fwd.len > 0: return fwd
   result = req.header(":authority")
   if result.len == 0: result = req.header("host")
 

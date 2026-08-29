@@ -194,6 +194,9 @@ type
     compress*: bool           ## gzip/brotli eligible responses (needs the flags)
     decompressRequest*: bool  ## decode gzip/br/zstd request bodies into req.body
     maxDecompressedBody*: int ## cap on a decoded request body (decompression bomb)
+    trustedProxies*: seq[string]  ## CIDR/IP allowlist; forwarded headers
+                                  ## (X-Forwarded-*, RFC 7239) are honored only
+                                  ## from a peer in this list (empty = none)
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox
