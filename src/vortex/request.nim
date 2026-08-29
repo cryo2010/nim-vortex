@@ -9,6 +9,8 @@
 
 import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros]
 import ./connection
+import ./multipart
+export multipart          # MultipartForm/MultipartFile + field/file accessors
 import ./blockingguard
 export blockingguard
 import ./signing
@@ -540,6 +542,20 @@ proc form*(req: Request): Table[string, string] =
   ## thread (it reads req.body), not inside `blocking:`.
   if req.mediaType != "application/x-www-form-urlencoded": return
   for (k, v) in decodeQuery(req.body): result[k] = v
+
+proc multipart*(req: Request): MultipartForm =
+  ## Parse a `multipart/form-data` request body (RFC 7578) into text `fields`
+  ## and uploaded `files`; empty for any other content type. Read a field with
+  ## `req.multipart.field("name")` and a file with
+  ## `req.multipart.file("name")`. Buffered: it reads `req.body` (whole body,
+  ## bounded by `settings.maxBodySize`), so it suits forms and modest uploads;
+  ## for large uploads stream with `req.onBody` / `req.read` and parse the parts
+  ## incrementally instead. Call on the loop thread (it reads req.body), not
+  ## inside `blocking:`.
+  if req.mediaType != "multipart/form-data": return
+  let boundary = multipartBoundary(req.header("content-type"))
+  if boundary.len > 0:
+    result = parseMultipart(req.body, boundary)
 
 # --- content negotiation (Accept / Accept-Language / Accept-Charset) ---------
 
