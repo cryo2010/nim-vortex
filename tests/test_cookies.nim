@@ -5,9 +5,35 @@
 ## (HPACK) and h3 (QPACK) may split a client's cookies across several `cookie`
 ## fields that the server must recombine (RFC 7540 8.1.2.5 / RFC 9114 4.2.1).
 
-import std/[unittest, net, osproc, strutils, os, tables]
+import std/[unittest, net, osproc, strutils, os, tables, times, options]
 import std/httpclient except Response
 import vortex/[settings, request, server, routing]
+
+suite "Set-Cookie attribute building (pure)":
+  test "Expires renders an RFC 7231 IMF-fixdate":
+    let (_, v) = setCookie("a", "b", expires = some(fromUnix(1700000000)))
+    check "Expires=Tue, 14 Nov 2023 22:13:20 GMT" in v
+  test "__Host- prefix forces Secure + Path=/ and drops Domain":
+    let (_, v) = setCookie("sid", "x", path = "/app", domain = "example.com",
+                           secure = false, prefix = cpHost)
+    check v.startsWith("__Host-sid=x")
+    check "; Path=/;" in (v & ";")          # Path is exactly "/"
+    check "Domain=" notin v
+    check "; Secure" in v
+  test "__Secure- prefix forces Secure but keeps Path/Domain":
+    let (_, v) = setCookie("sid", "x", path = "/app", secure = false,
+                           prefix = cpSecure)
+    check v.startsWith("__Secure-sid=x")
+    check "; Path=/app" in v
+    check "; Secure" in v
+  test "Partitioned (CHIPS) attribute is emitted":
+    let (_, v) = setCookie("a", "b", partitioned = true)
+    check "; Partitioned" in v
+  test "signed cookie carries Expires + Partitioned":
+    let (_, v) = setSignedCookie("s", "v", "secret", partitioned = true,
+                                 expires = some(fromUnix(1700000000)))
+    check "; Partitioned" in v
+    check "Expires=Tue, 14 Nov 2023 22:13:20 GMT" in v
 
 proc echoCookies(req: Request, res: Response) {.gcsafe.} =
   # first-match wins on duplicate names; theme absent -> ""

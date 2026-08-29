@@ -7,7 +7,7 @@
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
 ## streams are independent.
 
-import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros]
+import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros, times]
 import ./connection
 import ./blockingguard
 export blockingguard
@@ -1126,43 +1126,80 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     true
 
 proc redirect*(res: Response, location: string, permanent = false,
+               preserveMethod = false,
                extraHeaders: openArray[(string, string)] = []) =
-  ## Send a redirect to `location` (301 permanent / 302 temporary). For a
-  ## plaintext-listener -> HTTPS redirect: `res.redirect("https://" & req.host &
-  ## req.url.path, permanent = true)`. Serve HTTPS with HSTS (securityHeaders)
-  ## so subsequent requests skip the plaintext hop entirely.
+  ## Send a redirect to `location`. By default 302 (temporary) or 301 (with
+  ## `permanent`), which let the client fall back to GET. Set `preserveMethod`
+  ## for 307 (temporary) / 308 (permanent), which keep the original method and
+  ## body (RFC 9110 15.4) -- use these to redirect a POST/PUT/PATCH so it is not
+  ## silently downgraded to GET. For a plaintext-listener -> HTTPS redirect:
+  ## `res.redirect("https://" & req.host & req.url.path, permanent = true)`.
+  ## Serve HTTPS with HSTS (securityHeaders) so subsequent requests skip the
+  ## plaintext hop entirely.
+  let code =
+    if preserveMethod: (if permanent: Http308 else: Http307)
+    else:              (if permanent: Http301 else: Http302)
   var hdrs = @[("Location", location)]
   for h in extraHeaders: hdrs.add h
-  send(res, (if permanent: Http301 else: Http302), "", hdrs)
+  send(res, code, "", hdrs)
+
+type CookiePrefix* = enum
+  ## RFC 6265bis cookie name prefixes. The browser rejects a cookie carrying the
+  ## prefix unless it also carries the attributes the prefix demands, so vortex
+  ## forces them (rather than letting a misconfigured cookie be silently dropped).
+  cpNone       ## no prefix
+  cpSecure     ## `__Secure-`: forces Secure
+  cpHost       ## `__Host-`: forces Secure, Path=/ and no Domain (host-locked)
+
+const cookieDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"  # RFC 7231 IMF-fixdate
 
 proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
-                secure = true, httpOnly = true,
-                sameSite = "Lax"): (string, string) =
+                secure = true, httpOnly = true, sameSite = "Lax",
+                expires = none(Time), partitioned = false,
+                prefix = cpNone): (string, string) =
   ## Build a Set-Cookie header (as a (name, value) pair for res.send's headers)
   ## with secure defaults: Secure, HttpOnly, SameSite=Lax (OWASP Session
-  ## Management). maxAge < 0 omits Max-Age (a session cookie). Set secure=false
-  ## only for local plaintext development. Emit several by passing several pairs.
-  var v = name & "=" & value
-  if path.len > 0: v.add "; Path=" & path
-  if domain.len > 0: v.add "; Domain=" & domain
+  ## Management). maxAge < 0 omits Max-Age (a session cookie); maxAge = 0 (or an
+  ## `expires` in the past) deletes the cookie. `expires` sets an absolute expiry
+  ## (Max-Age takes precedence in modern browsers; send both for old ones).
+  ## `partitioned` adds Partitioned (CHIPS: a separate cookie jar per top-level
+  ## site; requires Secure). `prefix` prepends `__Secure-`/`__Host-` and forces
+  ## the attributes those prefixes require. Set secure=false only for local
+  ## plaintext development. Emit several by passing several pairs.
+  var (nm, p, dom, sec) = (name, path, domain, secure)
+  case prefix
+  of cpSecure: nm = "__Secure-" & name; sec = true
+  of cpHost:   nm = "__Host-" & name; sec = true; p = "/"; dom = ""
+  of cpNone:   discard
+  var v = nm & "=" & value
+  if p.len > 0: v.add "; Path=" & p
+  if dom.len > 0: v.add "; Domain=" & dom
   if maxAge >= 0: v.add "; Max-Age=" & $maxAge
-  if secure: v.add "; Secure"
+  if expires.isSome: v.add "; Expires=" & expires.get.utc.format(cookieDateFmt)
+  if sec: v.add "; Secure"
   if httpOnly: v.add "; HttpOnly"
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
+  if partitioned: v.add "; Partitioned"
   ("Set-Cookie", v)
 
 proc setSignedCookie*(name, value, secret: string, algo = macSha256,
                       maxAge = -1, path = "/", domain = "", secure = true,
-                      httpOnly = true, sameSite = "Lax"): (string, string) =
+                      httpOnly = true, sameSite = "Lax",
+                      expires = none(Time),
+                      partitioned = false): (string, string) =
   ## Like `setCookie`, but the value is HMAC signed with `secret` (HMAC-SHA256 by
   ## default; see `CookieMac`) so the client cannot forge or alter it. The stored
   ## value is `value.signature`; read it back and verify with
   ## `req.cookies.signed(name, secret)` using the same `algo`. This is
   ## tamper-proofing, not encryption: the value stays readable, only unforgeable.
   ## Keep `secret` private and stable (rotating it invalidates live cookies), and
-  ## pass a cookie-safe `value` (no ';', as with `setCookie`).
+  ## pass a cookie-safe `value` (no ';', as with `setCookie`). A name `prefix` is
+  ## intentionally not offered here: it changes the cookie name the client sends
+  ## back, which must match the name signed -- use `setCookie` for prefixed
+  ## signed cookies if you sign the prefixed name yourself.
   let stored = value & "." & sign(secret, name & "=" & value, algo)
-  setCookie(name, stored, maxAge, path, domain, secure, httpOnly, sameSite)
+  setCookie(name, stored, maxAge, path, domain, secure, httpOnly, sameSite,
+            expires = expires, partitioned = partitioned)
 
 proc cookies*(req: Request): Cookies {.inline.} =
   ## A view of the request's cookies, matching the `req.headers` shape:
