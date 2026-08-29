@@ -1219,6 +1219,46 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
           c.bodyDecodedSet = true
     true
 
+proc informational*(res: Response, code: HttpCode,
+                    headers: openArray[(string, string)] = []) =
+  ## Send a 1xx informational response (e.g. 103 Early Hints) NOW, ahead of the
+  ## final response; the handler then continues and later calls `send`. May be
+  ## called several times. Loop-thread only (a sync or async handler, before any
+  ## `blocking:`); a no-op once the final response is sent. Implemented for
+  ## HTTP/1.1 and HTTP/2; over HTTP/3 it is currently a no-op (pending an nghttp3
+  ## submit_info binding), so treat early hints as best-effort.
+  let ci = int(code)
+  if ci < 100 or ci > 199: return
+  if currentThreadId() != res.core.threadId: return   # loop-thread only
+  if res.fd < 0: return                                # h3: not yet supported
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return
+  if res.stream != 0:
+    h2SendInformational(c, ci, res.stream, headers)
+  else:
+    if c.responded: return
+    var s = "HTTP/1.1 " & $code & "\r\n"
+    for (n, v) in headers: s.add n & ": " & v & "\r\n"
+    s.add "\r\n"
+    c.wbuf.add s
+  # Flush now so the hint is on the wire before the handler does its work.
+  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  except Exception: discard
+
+proc earlyHints*(res: Response, links: openArray[string],
+                 headers: openArray[(string, string)] = []) =
+  ## Send a 103 Early Hints response carrying `Link` headers, so the client can
+  ## preload / preconnect the listed resources while your handler prepares the
+  ## final response (RFC 8297). Best-effort (see `informational`):
+  ##   res.earlyHints(["</app.css>; rel=preload; as=style",
+  ##                   "<https://cdn.example>; rel=preconnect"])
+  ##   ... build the page ...
+  ##   res.send(Http200, html)
+  var h: seq[(string, string)]
+  for l in links: h.add ("Link", l)
+  for kv in headers: h.add kv
+  res.informational(Http103, h)
+
 proc redirect*(res: Response, location: string, permanent = false,
                preserveMethod = false,
                extraHeaders: openArray[(string, string)] = []) =

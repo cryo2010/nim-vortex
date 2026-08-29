@@ -561,6 +561,30 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
     st.pendingIsLast = true
     h2.sendData(c, sid)
 
+proc h2SendInformational*(c: ptr Connection, code: int, sid: uint32,
+                          headers: openArray[(string, string)]) =
+  ## Send a 1xx informational HEADERS block (e.g. 103 Early Hints) on `sid`
+  ## WITHOUT ending the stream or marking it responded -- the final response
+  ## still follows via h2Respond, and this may be sent several times. No-op if
+  ## `code` is not 1xx, or the stream is gone / already finally answered.
+  if code < 100 or code > 199: return
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams or h2.streams[sid].responded: return
+  var hb = ""
+  encodeStatus(hb, code)
+  for (name, val) in headers:
+    encodeHeader(hb, name.toLowerAscii, val)
+  var off = 0
+  var first = true
+  while first or off < hb.len:
+    let chunk = min(hb.len - off, h2.peerMaxFrame)
+    let flags = if off + chunk >= hb.len: flagEndHeaders else: 0'u8  # no END_STREAM
+    c.wbuf.addFrameHeader(chunk, (if first: ftHeaders else: ftContinuation),
+                          flags, sid)
+    c.wbuf.add hb[off ..< off + chunk]
+    off += chunk
+    first = false
+
 # --- receive-window replenishment (batched WINDOW_UPDATE) -------------------
 
 proc creditStream(h2: H2Conn, c: ptr Connection, sid: uint32, n: int) =
