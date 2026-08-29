@@ -594,8 +594,14 @@ proc processInput(loop: Loop, c: ptr Connection) =
     case res
     of prNeedMore:
       if c.parser.inBody:
-        if c.dlKind != dkBody:
-          c.setDeadline(loop, dkBody)
+        # bodyTimeout is an *idle* timeout: re-arm on every read that carries
+        # body bytes (processInput runs per readable event), so a large upload
+        # that keeps making progress is never cut off. Arming it once at
+        # headers-complete made it a total-duration cap that rejected any body
+        # taking longer than bodyTimeout even while actively transferring (a
+        # 1 GiB upload on a slow link always failed). Only a genuine stall -- no
+        # bytes for bodyTimeout -- now fires; maxBodySize still bounds the total.
+        c.setDeadline(loop, dkBody)
         # Streaming route: dispatch at headers-complete, then feed the body
         # incrementally to onBody instead of waiting for the whole request.
         # 100 Continue is sent implicitly when the handler first reads
