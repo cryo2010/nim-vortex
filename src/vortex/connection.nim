@@ -204,6 +204,10 @@ type
       ## Pending `res.headers` per in-flight request, merged in at send and
       ## dropped once the response is emitted (loop-thread only). Empty for the
       ## common case, so a non-user pays only one failed lookup per response.
+    respTrailers*: Table[ReqKey, ResponseHeaders]
+      ## Pending `res.trailers` per in-flight streamed response, emitted by
+      ## `res.finish` after the body (loop-thread only). Empty for the common
+      ## case, so a response that sets no trailers pays only one failed lookup.
     # Async-adapter integration (see adapters/). All loop-thread only.
     loopPtr*: pointer         ## the owning Loop, for kick
     pumpHook*: proc (): int {.nimcall, gcsafe.}
@@ -338,11 +342,16 @@ proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
   ## Drop any pending `res.headers` for a connection/slot being torn down (a
   ## request that set headers but never sent). No-op when unused; the table is
   ## normally near-empty, so the scan is cheap.
-  if core.respHeaders.len == 0: return
-  var stale: seq[ReqKey]
-  for k in core.respHeaders.keys:
-    if k[0] == fd and k[1] == gen: stale.add k
-  for k in stale: core.respHeaders.del k
+  if core.respHeaders.len > 0:
+    var stale: seq[ReqKey]
+    for k in core.respHeaders.keys:
+      if k[0] == fd and k[1] == gen: stale.add k
+    for k in stale: core.respHeaders.del k
+  if core.respTrailers.len > 0:
+    var stale: seq[ReqKey]
+    for k in core.respTrailers.keys:
+      if k[0] == fd and k[1] == gen: stale.add k
+    for k in stale: core.respTrailers.del k
 
 proc resetForNextRequest*(c: var Connection) =
   ## Compact consumed bytes and prepare the parser for a pipelined or
