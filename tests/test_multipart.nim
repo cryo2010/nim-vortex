@@ -1,7 +1,7 @@
-## multipart/form-data: the pure parser (RFC 7578) and req.multipart end to end
-## with a real curl -F upload (text field + file part).
+## multipart/form-data: the pure parser (RFC 7578) and the req.form / req.files
+## accessors (req.headers-shaped) end to end with a real curl -F upload.
 
-import std/[unittest, net, strutils, os, osproc, options, httpcore]
+import std/[unittest, net, strutils, os, osproc, httpcore]
 import vortex/[settings, request, server, routing]
 import vortex/multipart
 
@@ -24,48 +24,71 @@ suite "multipart parser (pure)":
     check multipartBoundary("application/json") == ""
 
   test "fields and files are separated with the right metadata":
-    let f = parseMultipart(body, bnd)
-    check f.fields.len == 1
-    check f.field("title") == "Hello World"
-    check f.files.len == 1
-    let doc = f.file("doc")
-    check doc.isSome
-    check doc.get.filename == "a.txt"
-    check doc.get.contentType == "text/plain"
-    check doc.get.content == "file\r\ncontents"    # interior CRLF preserved
-    check f.file("missing").isNone
+    let m = parseMultipart(body, bnd)
+    check m.fields == @[("title", "Hello World")]
+    check m.files.len == 1
+    check m.files[0].name == "doc"
+    check m.files[0].filename == "a.txt"
+    check m.files[0].contentType == "text/plain"
+    check m.files[0].content == "file\r\ncontents"   # interior CRLF preserved
 
   test "empty body / wrong boundary yields nothing":
     check parseMultipart("", bnd).files.len == 0
     check parseMultipart(body, "OTHER").fields.len == 0
 
+suite "FormFields / UploadedFiles accessors (req.headers-shaped)":
+  test "form: [] is first-or-empty, `in`, iterate":
+    let f = FormFields(s: @[("a", "1"), ("a", "2"), ("b", "3")])
+    check f["a"] == "1"                          # first wins
+    check f["missing"] == ""                     # "" when absent (like headers)
+    check "b" in f
+    check "z" notin f
+    check f.len == 3
+    var seen: seq[string]
+    for (k, v) in f: seen.add k & "=" & v
+    check seen == @["a=1", "a=2", "b=3"]
+
+  test "files: [] raises when absent, `in`, iterate":
+    let u = UploadedFiles(s: @[UploadedFile(name: "doc", filename: "a.txt")])
+    check "doc" in u
+    check "nope" notin u
+    check u["doc"].filename == "a.txt"
+    expect KeyError: discard u["nope"]
+
 proc handleUpload(req: Request, res: Response) {.gcsafe.} =
-  let m = req.multipart
-  let doc = m.file("doc")
-  res.send(Http200, m.field("title") & "|" &
-    (if doc.isSome: doc.get.filename & ":" & doc.get.contentType & ":" &
-                    doc.get.content
-     else: "nofile"))
+  let form = req.form
+  let files = req.files
+  let present = "doc" in files
+  let doc = if present: files["doc"] else: UploadedFile()
+  res.send(Http200, form["title"] & "|" & $present & "|" &
+    doc.filename & ":" & doc.contentType & ":" & doc.content)
 
 let rt = newRouter()
 rt.post("/upload", handleUpload)
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 
-suite "req.multipart end to end (curl -F)":
+suite "req.form / req.files end to end (curl -F)":
   let curlBin = findExe("curl")
   let tmp = getTempDir() / ("vortex_mp_" & $getCurrentProcessId() & ".txt")
   writeFile(tmp, "the file body")
 
-  test "text field + file upload reach the handler":
+  test "text field via req.form + file via req.files reach the handler":
     if curlBin.len == 0: skip()
     else:
       let (output, rc) = execCmdEx(curlBin & " -s " &
         "-F title=Greetings " &
         "-F \"doc=@" & tmp & ";type=text/plain\" " & base & "/upload")
       check rc == 0
-      check output.strip == "Greetings|" & tmp.extractFilename &
+      check output.strip == "Greetings|true|" & tmp.extractFilename &
                             ":text/plain:the file body"
+
+  test "a missing file key is absent (checked with `in`, no exception)":
+    if curlBin.len == 0: skip()
+    else:
+      let (output, rc) = execCmdEx(curlBin & " -s -F title=NoFile " & base & "/upload")
+      check rc == 0
+      check output.strip == "NoFile|false|::"     # empty UploadedFile() fields
 
   removeFile(tmp)
 

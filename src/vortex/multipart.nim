@@ -1,20 +1,74 @@
-## multipart/form-data parsing (RFC 7578) for request bodies: text fields and
-## file uploads. Pure and buffered -- it works on a whole body string, so it is
-## unit-testable and suits forms / modest uploads (bounded by maxBodySize). For
-## large uploads, stream with req.onBody / req.read and parse incrementally.
+## multipart/form-data parsing (RFC 7578) plus the shared shape behind req.form /
+## req.files. Pure and buffered (works on a whole body string), so it is
+## unit-testable and suits forms / modest uploads; large uploads should stream
+## via req.onBody / req.read and parse incrementally.
+##
+## req.form and req.files mirror req.headers: `[]` looks a key up, `in` tests
+## presence, and you can iterate. A missing form field is "" (like a header); a
+## missing file raises KeyError (there is no empty file), so check
+## `"x" in req.files` first or handle the exception.
 
-import std/[strutils, options]
+import std/strutils
 
 type
-  MultipartFile* = object
-    name*: string          ## the form field name
+  UploadedFile* = object
+    name*: string          ## the form field name (the <input name>)
     filename*: string      ## the client-supplied filename
     contentType*: string   ## the part's Content-Type
     content*: string       ## the raw file bytes
 
-  MultipartForm* = object
-    fields*: seq[(string, string)]   ## text parts (name, value), in order
-    files*: seq[MultipartFile]       ## file parts (a filename was present)
+  MultipartForm* = object  ## raw parse result behind req.form / req.files
+    fields*: seq[(string, string)]
+    files*: seq[UploadedFile]
+
+  FormFields* = object
+    ## Submitted form fields (application/x-www-form-urlencoded, or the text
+    ## parts of multipart/form-data). Same shape as req.headers:
+    ## `req.form["name"]` is the first value ("" if absent), `"name" in req.form`
+    ## tests presence, `for (k, v) in req.form` iterates all. Field names are
+    ## case-sensitive (unlike headers).
+    s*: seq[(string, string)]
+
+  UploadedFiles* = object
+    ## Uploaded files of a multipart/form-data body, keyed by the form field
+    ## name (the <input name>, not the filename). `req.files["avatar"]` is the
+    ## first file for that field and RAISES KeyError if absent (check
+    ## `"avatar" in req.files` or catch); `for f in req.files` iterates all.
+    s*: seq[UploadedFile]
+
+# --- req.form / req.files accessors (req.headers-shaped) ---------------------
+
+proc `[]`*(f: FormFields, name: string): string =
+  ## First value for `name`, or "" if absent (like req.headers[name]).
+  for (n, v) in f.s:
+    if n == name: return v
+
+proc contains*(f: FormFields, name: string): bool =
+  for (n, _) in f.s:
+    if n == name: return true
+
+iterator items*(f: FormFields): (string, string) =
+  for p in f.s: yield p
+
+proc len*(f: FormFields): int {.inline.} = f.s.len
+
+proc `[]`*(u: UploadedFiles, name: string): UploadedFile =
+  ## First uploaded file for form field `name`. Raises KeyError if there is
+  ## none -- test `name in req.files` first, or handle the exception.
+  for f in u.s:
+    if f.name == name: return f
+  raise newException(KeyError, "no uploaded file for form field: " & name)
+
+proc contains*(u: UploadedFiles, name: string): bool =
+  for f in u.s:
+    if f.name == name: return true
+
+iterator items*(u: UploadedFiles): UploadedFile =
+  for f in u.s: yield f
+
+proc len*(u: UploadedFiles): int {.inline.} = u.s.len
+
+# --- parsing ----------------------------------------------------------------
 
 proc multipartBoundary*(contentType: string): string =
   ## The `boundary` parameter of a multipart Content-Type (quotes stripped);
@@ -58,7 +112,7 @@ proc parsePart(form: var MultipartForm, part: string) =
       ctype = hv
   if name.len == 0 and not hasFilename: return   # not a form-data part
   if hasFilename:
-    form.files.add MultipartFile(name: name, filename: filename,
+    form.files.add UploadedFile(name: name, filename: filename,
       contentType: (if ctype.len > 0: ctype else: "application/octet-stream"),
       content: content)
   else:
@@ -76,8 +130,7 @@ proc parseMultipart*(body, boundary: string): MultipartForm =
   while idx <= body.len:
     if idx + 1 < body.len and body[idx] == '-' and body[idx+1] == '-':
       break                                    # closing delimiter "--boundary--"
-    if idx + 1 <= body.len and idx + 1 < body.len and
-        body[idx] == '\r' and body[idx+1] == '\n':
+    if idx + 1 < body.len and body[idx] == '\r' and body[idx+1] == '\n':
       idx += 2
     elif idx < body.len and body[idx] == '\n':
       idx += 1
@@ -94,13 +147,3 @@ proc parseMultipart*(body, boundary: string): MultipartForm =
     if partEnd > idx:
       result.parsePart(body[idx ..< partEnd])
     idx = afterDelim
-
-proc field*(form: MultipartForm, name: string): string =
-  ## First text field value for `name`, or "" if none.
-  for (n, v) in form.fields:
-    if n == name: return v
-
-proc file*(form: MultipartForm, name: string): Option[MultipartFile] =
-  ## First file part for field `name`, or none.
-  for f in form.files:
-    if f.name == name: return some(f)
