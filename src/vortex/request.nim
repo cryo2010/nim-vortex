@@ -10,6 +10,7 @@
 import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros, times]
 import ./connection
 import ./blockingguard
+import ./conditional
 export blockingguard
 import ./signing
 export signing        # CookieMac + sign/verify for signed cookies (and app use)   # prepArg/assertBlockingType for the blocking macros, and
@@ -1152,6 +1153,72 @@ type CookiePrefix* = enum
   cpHost       ## `__Host-`: forces Secure, Path=/ and no Domain (host-locked)
 
 const cookieDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"  # RFC 7231 IMF-fixdate
+
+var mpBoundaryCtr {.threadvar.}: uint64
+
+proc serveContent*(req: Request, res: Response, body: openArray[char],
+                   contentType = "application/octet-stream", etag = "",
+                   lastModified = none(Time), cacheControl = "") =
+  ## Serve an in-memory `body` with full conditional-request and byte-range
+  ## handling -- the analog of Go's http.ServeContent for a buffered body. Pass
+  ## an `etag` and/or `lastModified` to enable validators; it then honors
+  ## If-Match / If-Unmodified-Since (-> 412 Precondition Failed), If-None-Match /
+  ## If-Modified-Since (-> 304 Not Modified), If-Range, and Range (-> 206 for a
+  ## single range, `multipart/byteranges` for several, 416 if none are
+  ## satisfiable). Emits `Accept-Ranges: bytes` plus the validators and
+  ## Cache-Control you pass. For a large or generated body prefer `res.sendFile`
+  ## / `res.stream` (this holds the whole body, and any multipart parts, in
+  ## memory).
+  let size = body.len.int64
+  let isGetHead = req.method in {HttpGet, HttpHead}
+  var hdrs: seq[(string, string)] = @[("Accept-Ranges", "bytes")]
+  if etag.len > 0: hdrs.add ("ETag", etag)
+  if lastModified.isSome: hdrs.add ("Last-Modified", httpDate(lastModified.get))
+  if cacheControl.len > 0: hdrs.add ("Cache-Control", cacheControl)
+
+  case evalPreconditions(req.header("if-match"), req.header("if-none-match"),
+      req.header("if-modified-since"), req.header("if-unmodified-since"),
+      etag, lastModified, isGetHead)
+  of pcNotModified: send(res, Http304, "", hdrs); return
+  of pcFailed:      send(res, HttpCode(412), "", hdrs); return
+  of pcProceed:     discard
+
+  var ranges: seq[ByteRange]
+  if isGetHead and req.header("range").len > 0 and
+      ifRangeApplies(req.header("if-range"), etag, lastModified):
+    let (ok, rs) = parseRanges(req.header("range"), size)
+    if not ok:
+      hdrs.add ("Content-Range", "bytes */" & $size)
+      send(res, HttpCode(416), "", hdrs); return
+    ranges = rs
+
+  if ranges.len == 0:                        # whole body -> 200
+    hdrs.add ("Content-Type", contentType)
+    send(res, Http200, body, hdrs); return
+
+  if ranges.len == 1:                        # one range -> 206
+    let (s, e) = ranges[0]
+    hdrs.add ("Content-Type", contentType)
+    hdrs.add ("Content-Range", "bytes " & $s & "-" & $e & "/" & $size)
+    send(res, HttpCode(206), body.toOpenArray(int(s), int(e)), hdrs); return
+
+  # Several ranges -> multipart/byteranges (RFC 9110 14.6). The body is
+  # server-supplied (not attacker-controlled), so a counter-based boundary
+  # token that won't occur in it is sufficient.
+  inc mpBoundaryCtr
+  let boundary = "vortex" & toHex(mpBoundaryCtr) & toHex(size)
+  var mp = ""
+  for (s, e) in ranges:
+    mp.add "\r\n--" & boundary & "\r\n"
+    mp.add "Content-Type: " & contentType & "\r\n"
+    mp.add "Content-Range: bytes " & $s & "-" & $e & "/" & $size & "\r\n\r\n"
+    let rlen = int(e - s + 1)
+    let old = mp.len
+    mp.setLen(old + rlen)
+    if rlen > 0: copyMem(addr mp[old], unsafeAddr body[int(s)], rlen)
+  mp.add "\r\n--" & boundary & "--\r\n"
+  hdrs.add ("Content-Type", "multipart/byteranges; boundary=" & boundary)
+  send(res, HttpCode(206), mp, hdrs)
 
 proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
                 secure = true, httpOnly = true, sameSite = "Lax",
