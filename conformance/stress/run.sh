@@ -18,6 +18,8 @@
 #   VORTEX_SECONDS / VORTEX_REPORT_SECONDS / VORTEX_CONCURRENCY / VORTEX_CLIENTS
 #   VORTEX_REQ_COMPRESSION / VORTEX_RESP_COMPRESSION   none | gzip | br | zstd
 #   VORTEX_STREAM_BYTES   streaming transfer size (default 1 GiB)
+#   VORTEX_RUN_ID    isolation id for the docker network/container/image names,
+#                    so runs can go in parallel (default: this run's PID)
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -34,6 +36,17 @@ reqc=${VORTEX_REQ_COMPRESSION:-gzip}
 respc=${VORTEX_RESP_COMPRESSION:-gzip}
 sbytes=${VORTEX_STREAM_BYTES:-1073741824}
 
+# A per-run id isolates concurrent runs: each gets its own docker network,
+# server container, and image tags, so several `run.sh` / `nimble stress`
+# invocations can run in parallel without clobbering one another (fixed names
+# would share a `vortex-stress-server` container / `...-img` tag / `server`
+# alias and sabotage each other). Default to the PID; generated once here --
+# before the STRESS_SMOKE self-re-exec (`sh "$0"` per workload) -- and exported
+# so every workload of one smoke shares the same id. Set VORTEX_RUN_ID yourself
+# to name a run.
+id="${VORTEX_RUN_ID:-$$}"
+export VORTEX_RUN_ID="$id"
+
 # The `stress` smoke runs every workload, short, and fails on any.
 if [ "${STRESS_SMOKE:-0}" = "1" ]; then
   rc=0
@@ -49,13 +62,22 @@ fi
 
 if [ "$(uname -m)" = "x86_64" ]; then basearg="--build-arg BASE=archlinux:latest"; else basearg=""; fi
 
-net=vortex-stress
-srvc=vortex-stress-server
-simg=vortex-stress-server-img
-cimg=vortex-stress-client-img
+net=vortex-stress-$id
+srvc=vortex-stress-server-$id
+simg=vortex-stress-server-img-$id
+cimg=vortex-stress-client-img-$id
 
 docker network create "$net" >/dev/null 2>&1 || true
-cleanup() { docker rm -f "$srvc" >/dev/null 2>&1 || true; }
+# Tear down everything this run created -- the network and the per-run image
+# tags, not just the server container -- so a per-run id can't leak resources.
+# The shared build-cache layers survive (only the tags are removed), so
+# rebuilds stay fast. The `server` alias is per-network, so the client is
+# unchanged.
+cleanup() {
+  docker rm -f "$srvc" >/dev/null 2>&1 || true
+  docker network rm "$net" >/dev/null 2>&1 || true
+  docker rmi -f "$simg" "$cimg" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT INT TERM
 
 echo "building client image..."

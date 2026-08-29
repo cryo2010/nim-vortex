@@ -34,9 +34,22 @@ A green run ends with `== <workload>: all cells passed ==`.
 | `VORTEX_REQ_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - client encodes the request body; the server decompresses |
 | `VORTEX_RESP_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - the server compresses the response |
 | `VORTEX_STREAM_BYTES` | `1073741824` | streaming transfer size (1 GiB; lower for a smoke) |
+| `VORTEX_RUN_ID` | this run's PID | isolation id for the docker network / container / image names, so runs can go **in parallel** |
 
 The matrix is `VORTEX_PROTO` × `VORTEX_SERVER`; each cell builds its own server
 image and prints `== <workload> [proto=<p> server=<s>]: PASS/FAIL ==`.
+
+Runs are isolated by `VORTEX_RUN_ID` (defaults to the PID), so several can run
+concurrently without clobbering each other's containers/images, e.g.
+
+```sh
+VORTEX_RUN_ID=a VORTEX_PROTO=h1 nimble stress &
+VORTEX_RUN_ID=b VORTEX_PROTO=h2 nimble stress &
+```
+
+Each run tears down its own network + image tags on exit (shared build-cache
+layers survive). Note: many concurrent runs contend for the host, so the
+throughput-sensitive streaming/h2 cells may slow down or time out.
 
 ## Examples
 
