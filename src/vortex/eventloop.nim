@@ -488,7 +488,9 @@ proc initH2(loop: Loop, c: ptr Connection) =
                    loop.settings.maxBodySize, loop.settings.maxHeaderSize,
                    loop.settings.maxConcurrentStreams,
                    loop.settings.maxResetStreams,
-                   loop.settings.maxControlFrames)
+                   loop.settings.maxControlFrames,
+                   loop.settings.h2StreamWindow,
+                   loop.settings.h2ConnWindow)
 
 proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
   ## Deliver newly-arrived request-body bytes to a streaming handler's onBody.
