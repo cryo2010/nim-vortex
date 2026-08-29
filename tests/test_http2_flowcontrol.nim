@@ -2,13 +2,16 @@
 ## a stream exists must resize that stream's send window and flush any DATA
 ## the larger window unblocks (RFC 7540 6.9.2).
 
-import std/[unittest, net, httpcore]
+import std/[unittest, net, httpcore, strutils]
 import vortex/[settings, request, server]
 import vortex/http2/frames
 import ./h2client
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "hello h2")     # 8-byte body
+
+proc bodyLenHandler(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, $req.body.len)  # echo how many body bytes arrived
 
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1)).start(0)
 
@@ -82,6 +85,34 @@ suite "HTTP/2 flow control":
     check connWindowGrow(fr) == 768 * 1024 - 65535
     c2.close()
     s2.close()
+
+  test "WINDOW_UPDATE is batched, not one per DATA frame":
+    # A 200 KiB upload split into twenty 10 KiB DATA frames, with a 256 KiB
+    # window (so it fits -- no flow-control violation) and a 128 KiB batch
+    # threshold. Un-batched this would emit ~20 stream + ~20 connection
+    # WINDOW_UPDATEs; batched it crosses the half-window threshold only ~once
+    # each, so the count stays tiny.
+    var s3 = newVortex(RequestHandler(bodyLenHandler),
+      initVortexConfig(numThreads = 1, h2StreamWindow = 256 * 1024,
+                       h2ConnWindow = 256 * 1024)).start(0)
+    var c3 = newH2TestConn(s3.port)
+    discard c3.readFrames(300)                    # drain the server's hello
+    var f = ""
+    f.addRequest(1, {":method": "POST", ":scheme": "http", ":path": "/",
+                     ":authority": "x"}, endStream = false)
+    let chunk = 'x'.repeat(10 * 1024)
+    for i in 0 ..< 19: f.addData(1, chunk, endStream = false)
+    f.addData(1, chunk, endStream = true)         # 20th frame ends the stream
+    c3.sendAndDrain(f)                            # interleave to avoid deadlock
+    let fr = c3.readFrames(2000,
+      until = proc(frs: seq[Frame]): bool = frs.count(ftHeaders) >= 1)
+    var body = ""
+    for fx in fr:
+      if fx.typ == uint8(ftData): body.add fx.payload
+    check body == $(200 * 1024)                   # whole body received intact
+    check fr.count(ftWindowUpdate) <= 6           # batched (would be ~40 per-frame)
+    c3.close()
+    s3.close()
 
 srv.close()
 echo "server shut down cleanly"

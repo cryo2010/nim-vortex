@@ -46,6 +46,8 @@ type
     bodyManualAck*: bool             ## defer stream WINDOW_UPDATE to req.ackBody
     isWsConnect*: bool               ## RFC 8441 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
+    pendingWindow*: int              ## consumed bytes not yet returned as a
+                                     ## stream WINDOW_UPDATE (batched at half-window)
 
   H2Conn* = ref object of RootObj
     core*: ptr LoopCore              ## owning loop core (for WS callbacks)
@@ -74,6 +76,8 @@ type
     controlFrameCount*: int
     streamRecvWindow*: int    ## per-stream receive window we advertise
     connRecvWindow*: int      ## per-connection receive window (streaming cap)
+    pendingConnWindow*: int   ## consumed bytes not yet returned as a connection
+                              ## WINDOW_UPDATE (batched at half-window)
 
 const
   ourMaxFrameSize = defaultMaxFrameSize
@@ -557,6 +561,29 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
     st.pendingIsLast = true
     h2.sendData(c, sid)
 
+# --- receive-window replenishment (batched WINDOW_UPDATE) -------------------
+
+proc creditStream(h2: H2Conn, c: ptr Connection, sid: uint32, n: int) =
+  ## Return `n` consumed bytes to a stream's receive window, batched: accumulate
+  ## and emit a WINDOW_UPDATE only once the un-returned credit reaches half the
+  ## window. The peer keeps >= half the window to send into, so it never stalls,
+  ## while a large upload emits far fewer control frames (as nghttp2 / Go do).
+  if n <= 0 or sid notin h2.streams: return
+  template st: H2Stream = h2.streams[sid]
+  st.pendingWindow += n
+  if st.pendingWindow * 2 >= h2.streamRecvWindow:
+    c.wbuf.addWindowUpdate(sid, st.pendingWindow)
+    st.pendingWindow = 0
+
+proc creditConn(h2: H2Conn, c: ptr Connection, n: int) =
+  ## Connection-level counterpart, batched at half the connection window;
+  ## accumulates across all streams on the connection.
+  if n <= 0: return
+  h2.pendingConnWindow += n
+  if h2.pendingConnWindow * 2 >= h2.connRecvWindow:
+    c.wbuf.addWindowUpdate(0, h2.pendingConnWindow)
+    h2.pendingConnWindow = 0
+
 # --- inbound streaming (req.onBody) -----------------------------------------
 
 proc h2DeliverBody(h2: H2Conn, c: ptr Connection, sid: uint32, last: bool) =
@@ -581,8 +608,8 @@ proc h2DeliverBody(h2: H2Conn, c: ptr Connection, sid: uint32, last: bool) =
       # Auto-ack: consumed on delivery. Replenish both the stream and the
       # connection window (the connection window is credited on consume for
       # streaming bodies, so it bounds total un-consumed upload buffer).
-      c.wbuf.addWindowUpdate(sid, buf.len)
-      c.wbuf.addWindowUpdate(0, buf.len)
+      h2.creditStream(c, sid, buf.len)
+      h2.creditConn(c, buf.len)
 
 proc h2AckBody*(c: ptr Connection, sid: uint32, n: int) =
   ## Replenish `n` consumed body bytes of a streaming stream's flow-control
@@ -592,8 +619,8 @@ proc h2AckBody*(c: ptr Connection, sid: uint32, n: int) =
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or not h2.streams[sid].streamingReq:
     return
-  c.wbuf.addWindowUpdate(sid, n)
-  c.wbuf.addWindowUpdate(0, n)
+  h2.creditStream(c, sid, n)
+  h2.creditConn(c, n)
 
 proc h2SetOnBody*(c: ptr Connection, sid: uint32, cb: BodyCb,
                   manualAck = false) =
@@ -821,7 +848,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         # peer and the connection window caps total un-consumed buffer; padding
         # is discarded now, so credit its flow-control bytes now.
         if fh.length > dataLen:
-          c.wbuf.addWindowUpdate(sid, fh.length - dataLen)
+          h2.creditStream(c, sid, fh.length - dataLen)
         streamingConnDefer = dataLen    # connection credit deferred to consume
         if dataLen > 0:
           let old = st.body.len
@@ -851,11 +878,11 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.length > 0:
       let connNow = fh.length - streamingConnDefer
       if connNow > 0:
-        c.wbuf.addWindowUpdate(0, connNow)
+        h2.creditConn(c, connNow)
       if fh.streamId in h2.streams and
           not h2.streams[fh.streamId].endStreamSeen and
           not h2.streams[fh.streamId].streamingReq:
-        c.wbuf.addWindowUpdate(fh.streamId, fh.length)
+        h2.creditStream(c, fh.streamId, fh.length)
 
   of ftHeaders:
     let sid = fh.streamId
