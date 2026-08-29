@@ -341,6 +341,10 @@ rejection when exceeded, and the handler never runs for a rejected request:
 | `maxConcurrentStreams` | 256 | open HTTP/2 or HTTP/3 streams per connection |
 | `maxResetStreams` | 512 | HTTP/2 peer resets before `GOAWAY` (rapid-reset defense) |
 | `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/etc. between stream progress (flood defense) |
+| `h2StreamWindow` | 1 MiB | HTTP/2 per-stream receive window (`SETTINGS_INITIAL_WINDOW_SIZE`) — upload flow control; larger raises upload throughput on higher-latency links |
+| `h2ConnWindow` | 1 MiB | HTTP/2 per-connection receive window — caps total un-consumed upload buffer across all streams (≥ `h2StreamWindow`) |
+| `h3StreamWindow` | 1 MiB | HTTP/3 (QUIC) per-stream receive window for request bodies (the h3 analog of `h2StreamWindow`) |
+| `h3ConnWindow` | 4 MiB | HTTP/3 (QUIC) per-connection receive window — aggregate flow-control limit across streams (≥ `h3StreamWindow`) |
 
 ```nim
 app.serve(8080, config = initVortexConfig(
@@ -425,17 +429,22 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.cookies[name]` | `string` | one request cookie, first match; "" if absent. `for v in req.cookies.all(name)` yields every value. Case-sensitive; see [Cookies](#cookies) |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
 | `req.json` | `JsonNode` | body parsed as JSON, cached per request; empty body is `{}`; raises `JsonParsingError` on malformed input |
-| `req.form` | `Table[string, string]` | `application/x-www-form-urlencoded` body fields (decoded, `+` is a space, last value wins); empty for other content types |
+| `req.form` | `FormFields` | form fields from an `application/x-www-form-urlencoded` body *or* the text parts of `multipart/form-data` (decoded, `+` is a space); indexed like `req.headers` — `[]` is the first value ("" if absent), `in` tests presence, iterate for all (first wins on a repeat). Empty for other content types; uploaded files are on `req.files` |
+| `req.files` | `UploadedFiles` | uploaded files of a `multipart/form-data` body, keyed by form field name; `req.files["avatar"]` is the first `UploadedFile` (`.filename` / `.contentType` / `.content`) and raises `KeyError` if absent (check `"avatar" in req.files` first), with `in` and iteration |
 | `req.mediaType` | `string` | Content-Type media type without parameters (`"application/json"`); "" if absent |
 | `req.contentLength` | `int` | body length in bytes |
 | `req.accepts(offered…)` | `string` | best of `offered` per `Accept` (q-values, `type/*`, `*/*`); "" if none, first offer if no header. Also `req.acceptsLanguage` / `req.acceptsCharset` |
-| `req.host` | `string` | `:authority` (h2/h3) or `Host` (h1) |
+| `req.host` | `string` | forwarded host behind a trusted proxy (`X-Forwarded-Host` / RFC 7239 `Forwarded`), else `:authority` (h2/h3) or `Host` (h1) |
+| `req.scheme` | `string` | `"https"` / `"http"` for the original request — the trusted proxy's forwarded proto if any, else the connection's own scheme (for absolute URLs / redirects behind a TLS terminator) |
 | `req.origin` | `string` | `Origin` header |
 | `req.originAllowed(allowed, allowMissing = false)` | `bool` | Origin allowlist check (CSWSH defense) |
 | `req.remoteAddress` | `string` | direct peer IP (real client IP under PROXY protocol) |
 | `req.forwardedFor` | `seq[string]` | parsed `X-Forwarded-For` chain, client → nearest proxy |
+| `req.clientIp` | `string` | origin client IP behind a trusted proxy chain — peels only trusted hops (spoof-resistant); falls back to `req.remoteAddress`. Requires `trustedProxies` |
+| `req.forwardedProto` / `req.forwardedHost` | `string` | client-facing proto / host from `Forwarded` or `X-Forwarded-*`, only from a trusted proxy; "" otherwise (folded into `req.scheme` / `req.host`) |
+| `req.fromTrustedProxy` | `bool` | is the direct peer in `trustedProxies`? (forwarded headers are believed only then) |
 | `req.clientCertSubject` | `string` | mTLS client-cert subject DN; "" if none |
-| `req.isSecure` | `bool` | arrived over TLS/HTTPS or QUIC |
+| `req.isSecure` | `bool` | arrived over TLS/HTTPS or QUIC — behind a trusted proxy, reflects the forwarded proto (so Secure cookies / HSTS gate correctly after termination) |
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
 | `req.params` | `PathParams` | all router path parameters |
 | `req.param(name)` | `string` | one router path parameter; "" if absent |
@@ -475,7 +484,10 @@ through a dead connection is a safe no-op.
 | `res.send(code, json: JsonNode, headers = [])` | `void` | send `json` stringified; `Content-Type` defaults to `application/json` |
 | `res.send(code, body: T, headers = [])` | `void` | send any `%`-able value as JSON (object, `ref object`, string-keyed `Table`, `seq`, `enum`, `Option`, or a named tuple): `res.send(Http200, user)`, `res.send(Http200, (ok: true, n: 3))`. `Content-Type` defaults to `application/json` |
 | `res.headers` | `var ResponseHeaders` | response headers to send with the eventual `send`: `res.headers["X-Request-Id"] = id`, `res.headers.add("Set-Cookie", c)`. `[]=` overwrites by name, `add` keeps duplicates. The `send` call's own `headers` win per name. Set it from middleware or a handler; loop-thread only (see below) |
-| `res.redirect(location, permanent = false, extraHeaders = [])` | `void` | 301 (permanent) / 302 redirect |
+| `res.redirect(location, permanent = false, preserveMethod = false, extraHeaders = [])` | `void` | 302 (default) / 301 (`permanent`), or 307 / 308 (`preserveMethod`, keeping the method + body — use for a redirected POST/PUT/PATCH) |
+| `res.informational(code, headers = [])` | `void` | send a 1xx response ahead of the final one (repeatable; loop-thread only). h1 + h2; a no-op over h3 |
+| `res.earlyHints(links, headers = [])` | `void` | 103 Early Hints with `Link` headers (RFC 8297) so the client can preload/preconnect while the handler works |
+| `res.serveContent(body, contentType = "application/octet-stream", etag = "", lastModified = none(Time), cacheControl = "")` | `void` | serve an in-memory body with conditional requests (If-Match / If-Unmodified-Since → 412, If-None-Match / If-Modified-Since → 304, If-Range) and byte ranges (206, `multipart/byteranges`, 416); the `http.ServeContent` analog |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
 | `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
@@ -530,9 +542,13 @@ proc login(req: Request, res: Response) =
 
 The full signature is
 `setCookie(name, value, maxAge = -1, path = "/", domain = "", secure = true,
-httpOnly = true, sameSite = "Lax")`. `maxAge < 0` omits `Max-Age` (a browser
-session cookie); set `secure = false` only for local plaintext development. Emit
-several cookies by passing several pairs:
+httpOnly = true, sameSite = "Lax", expires = none(Time), partitioned = false,
+prefix = cpNone)`. `maxAge < 0` omits `Max-Age` (a browser session cookie); set
+`secure = false` only for local plaintext development. `expires` sets an absolute
+expiry (`Max-Age` still takes precedence in modern browsers); `partitioned` adds
+`Partitioned` (CHIPS); `prefix` prepends `__Secure-` (`cpSecure`) or `__Host-`
+(`cpHost`) and forces the attributes the browser requires for them (`__Host-`:
+`Secure`, `Path=/`, no `Domain`). Emit several cookies by passing several pairs:
 
 ```nim
 res.send(Http200, body,
@@ -720,10 +736,14 @@ HTTP/1.1, /2 and /3, plaintext or TLS. Each response includes:
 - **Content-Type** from a built-in extension → MIME table (text types carry
   `charset=utf-8`); unknown extensions get `application/octet-stream`.
 - **Conditional requests**: `ETag` + `Last-Modified`, answering `304 Not
-  Modified` to `If-None-Match` / `If-Modified-Since` without resending the body.
+  Modified` to `If-None-Match` / `If-Modified-Since` without resending the body,
+  and `412 Precondition Failed` to a non-matching `If-Match` / `If-Unmodified-
+  Since` (RFC 9110 13.2.2). (For a dynamic in-memory body, `res.serveContent`
+  applies the same rules.)
 - **Byte ranges**: `Range` yields `206 Partial Content` with `Content-Range`
   (single range; `If-Range` honored), `416` when unsatisfiable, and
-  `Accept-Ranges: bytes` is always advertised.
+  `Accept-Ranges: bytes` is always advertised. (Multiple ranges on a streamed
+  file serve the full `200`; `res.serveContent` emits `multipart/byteranges`.)
 - **Traversal safety**: the request path is percent-decoded and normalized, any
   `..` escape or NUL is refused, and the resolved path (symlinks included) must
   stay within `rootDir`.

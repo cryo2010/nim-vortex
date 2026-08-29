@@ -19,9 +19,12 @@ a safe default, configurable in `initVortexConfig`.
   attacker-controlled until parsed and validated. This is the primary boundary
   and where most defenses live.
 - **Fronting proxy or CDN (optional, semi-trusted).** When present, vortex can
-  recover the real client IP from a HAProxy PROXY header, gated on a
-  `trustedProxies` allowlist. `X-Forwarded-For` is available but not trusted by
-  default.
+  recover the real client IP and the client-facing scheme/host from a HAProxy
+  PROXY header or the `X-Forwarded-*` / RFC 7239 `Forwarded` headers — but only
+  from a peer in the `trustedProxies` allowlist. With no trusted proxies
+  configured, forwarded headers are ignored entirely (fail-safe), and
+  `req.clientIp` peels only trusted hops, so a client cannot forge its apparent
+  address.
 - **Loop thread and worker pool (internal).** Blocking work runs on a worker
   pool. A `req.blocking:` worker reads a value-only snapshot of the request
   captured on the loop thread, never live loop-owned memory, so a handler on a
@@ -39,7 +42,8 @@ names the test/fuzz/conformance coverage (see the Verification section).
 
 | Threat | Defense | Verified by |
 |--------|---------|-------------|
-| Forged client IP behind a proxy | Real client IP recovered from a PROXY header only from a `trustedProxies` peer (`proxyProtocol`); `X-Forwarded-For` parsed but untrusted by default | `test_proxy_protocol` |
+| Forged client IP behind a proxy | Real client IP recovered from a PROXY header only from a `trustedProxies` peer (`proxyProtocol`) | `test_proxy_protocol` |
+| Spoofed `X-Forwarded-*` / RFC 7239 `Forwarded` headers | Believed only from a peer in `trustedProxies`; ignored entirely when none is configured (fail-safe). `req.clientIp` walks the chain and returns the first non-trusted hop, peeling only trusted proxies, so a forged prefix can't move the result | `test_forwarded` |
 | Cross-site WebSocket hijacking (CSWSH) | `req.originAllowed(allowed)` gates the upgrade on an Origin allowlist; a cross-site page sends its own Origin, which is not in the list | `test_ws_origin` |
 | Host-header confusion (HTTP/1.1) | A request with no `Host`, or more than one, is rejected with 400 (RFC 9112 3.2) | `test_http1_parser` |
 | Unauthenticated client (when auth is required) | Optional mutual TLS: `verifyClient = Optional/Require` makes OpenSSL validate the client cert during the handshake; `req.clientCertSubject()` exposes the verified subject | `test_tls_advanced`, `test_tls_key_options` |
@@ -84,10 +88,11 @@ resource is bounded.
 | HTTP/2 framing floods (PING/SETTINGS/PRIORITY) | Per-connection control-frame budget (`maxControlFrames`) that resets on real request progress, GOAWAY when exceeded; WINDOW_UPDATE floods self-limit via the flow-control overflow check | `test_security_dos` |
 | HPACK decompression bomb | The decoder tracks accumulated decoded size and raises during decode once it exceeds `maxHeaderSize`, not after fully expanding | `test_security_parsing`, `test_hpack` |
 | QPACK abuse (HTTP/3) | QPACK is handled by nghttp3; vortex advertises a bounded dynamic-table capacity (4096 bytes) as its decoder limit, and a field section is further bounded by its HEADERS frame length (capped by `maxBodySize`), so the peer's request-header table cannot grow unbounded | conformance (`h3spec`) |
-| Slowloris / slow body | Coarse header/body/idle timeout wheel (`headerTimeout`, `bodyTimeout`, `keepAliveTimeout`); optional `responseTimeout` | `test_security_dos` |
+| Slowloris / slow body | Coarse timeout wheel: `headerTimeout` (first byte → headers), `bodyTimeout` (*idle* during the body, re-armed on each read — a stalled upload fires, an actively-transferring one on a slow link does not), `keepAliveTimeout` (idle between requests); optional `responseTimeout` | `test_security_dos` |
 | Oversized header / body | 431 / 413 with reliable delivery via lingering close (see Elevation of privilege) | `test_http1_parser`, `test_http1_server`, `test_security_dos` |
 | Integer overflow | Overflow guards on Content-Length and chunk-size parsing (413 rather than wrapping); fixed-width and bounded varints elsewhere | `test_security_parsing` |
 | Connection / stream exhaustion | `maxConnections` (accept-and-drop past the cap, keeping the accept queue clear); `maxConcurrentStreams` advertised and enforced (excess refused with RST_STREAM); the HTTP/2 receive buffer is compacted as frames are consumed and bounded while a `blocking:` worker holds a connection | `test_security_dos` |
+| Streaming-upload memory exhaustion | A streaming request body (`req.onBody` / `req.read`) is compacted out of the receive buffer as it is consumed, so it stays O(read-burst): an HTTP/1.1 `Transfer-Encoding: chunked` upload no longer retains the whole raw body (a fast chunked upload could otherwise drive RSS to gigabytes and OOM the server). On HTTP/2 and HTTP/3 the per-connection receive window (`h2ConnWindow` / `h3ConnWindow`) additionally caps total un-consumed upload buffer across all streams, regardless of stream count (the analog of Go's `MaxUploadBufferPerConnection`) | `test_http2_flowcontrol`, `test_streaming_request` |
 | Decompression bomb (request body) | `decompressRequest` (opt-in) decodes gzip/br/zstd bounded by `maxBodySize`; a bomb hits 413, a corrupt body 400, before the handler runs | `test_request_decompression` |
 | Per-client request flooding | Token-bucket rate limiting, `rateLimit(key, ratePerSec, burst)`, keyed on the client IP; returns 429 over budget (per-loop-thread, see Residual risk / [HARDENING.md](HARDENING.md)) | `test_ratelimit` |
 | Keep-alive amortization abuse | `maxRequestsPerSocket` (opt-in) answers the last allowed request with `Connection: close` | `test_http1_server` |

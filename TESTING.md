@@ -228,15 +228,15 @@ client (httpx + websockets). Local-only. See `conformance/stress/README.md`.
 | `nimble stressSse` | SSE subscribe; server drops mid-stream; reconnect + Last-Event-ID |
 | `nimble stressStreamUpload` | stream up; the **server** verifies the SHA-1 |
 | `nimble stressStreamDownload` | stream down; the **client** verifies the SHA-1 |
-| `nimble stress` | short smoke of all five (20 s, 64 MiB); fails on any |
+| `nimble stress` | short smoke of all five (default 20 s, 64 MiB; honors an explicit `VORTEX_SECONDS` / `VORTEX_STREAM_BYTES`); fails on any |
 
 Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 `VORTEX_PROTO` × `VORTEX_SERVER`:
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2; h3 drives QUIC via aioquic - `requests`/`sse`/`streamdownload` run, `ws` and `streamupload` skip, see the stress README) |
-| `VORTEX_SERVER` | `sync` | Handler runtime: `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` (`async` = `vortex/asyncdispatch`, `chronos` = `vortex/chronos`) |
+| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = **h1 + h2 only**; h3 is opt-in and drives QUIC via aioquic - `requests`/`sse`/`streamdownload` run, `ws` and `streamupload` skip, see the stress README) |
+| `VORTEX_SERVER` | `sync` | Handler runtime: `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` (`async`/`chronos` = `vortex/asyncdispatch` / `vortex/chronos` without an in-handler `await`; the `-await` variants exercise the `await` path) |
 | `VORTEX_SECONDS` | `60` | Runtime per cell, in seconds |
 | `VORTEX_REPORT_SECONDS` | `60` | Cadence of the status-code + server-RSS report |
 | `VORTEX_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
@@ -244,6 +244,7 @@ Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 | `VORTEX_REQ_COMPRESSION` | `gzip` | Request-body encoding the client sends (server decompresses): `none` \| `gzip` \| `br` \| `zstd` |
 | `VORTEX_RESP_COMPRESSION` | `gzip` | Response encoding the server applies: `none` \| `gzip` \| `br` \| `zstd` |
 | `VORTEX_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB; lower for a smoke) |
+| `VORTEX_RUN_ID` | this run's PID | Isolation id for the docker network / container / image names, so several runs can go in parallel without clobbering one another |
 
 The `VORTEX_SERVER` axis runs each soak against the sync, `vortex/asyncdispatch`,
 and `vortex/chronos` servers - e.g. `VORTEX_SERVER=chronos nimble stressWs`

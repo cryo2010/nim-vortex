@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
 ### Added
 
 - Request-side cookie parsing: `req.cookies[name]` reads an incoming cookie
@@ -19,10 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A single matched pair of surrounding double quotes is stripped from a value
   (RFC 6265 §4.1.1); interior/unbalanced quotes and any other encoding are left
   as-is.
-- `req.form` parses an `application/x-www-form-urlencoded` request body into a
-  `Table[string, string]` (percent-decoded, `+` is a space, last value wins);
-  empty for other content types. `req.mediaType` exposes the Content-Type media
-  type without parameters.
+- Forms and file uploads. `req.form` returns the submitted form fields from an
+  `application/x-www-form-urlencoded` body OR the text parts of a
+  `multipart/form-data` body (RFC 7578), and `req.files` returns the uploaded
+  files. Both are shaped like `req.headers`: `req.form["email"]` is the first
+  value ("" if absent), `req.files["avatar"]` is the first `UploadedFile`
+  (`.filename`/`.contentType`/`.content`; raises `KeyError` if absent, so check
+  `"avatar" in req.files` first), each with `in` and iteration. `req.mediaType`
+  exposes the Content-Type media type without parameters.
 - Content negotiation: `req.accepts`, `req.acceptsLanguage`, and
   `req.acceptsCharset` choose the best of the server-offered values against the
   corresponding `Accept*` header, honoring q-values and wildcards (`type/*`,
@@ -43,12 +49,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Router: an unhandled `OPTIONS` on a known path is now answered automatically
   with a 204 and an `Allow` header (an explicit `options` handler still wins;
   `OPTIONS` is also added to the `Allow` header on 405 responses).
+- Cookie attributes: `setCookie` gains `expires` (an absolute IMF-fixdate,
+  alongside Max-Age), `partitioned` (CHIPS), and a name `prefix`
+  (`cpSecure`/`cpHost`) that prepends `__Secure-`/`__Host-` and forces the
+  attributes the browser requires (`__Host-`: Secure, Path=/, no Domain).
+- Redirects: `res.redirect(location, preserveMethod = true)` sends 307/308
+  (method and body preserved), in addition to the default method-droppable
+  301/302.
+- `req.serveContent(res, body, contentType, etag, lastModified, cacheControl)`
+  serves an in-memory body with full conditional-request handling (If-Match /
+  If-Unmodified-Since → 412, If-None-Match / If-Modified-Since → 304, If-Range)
+  and byte ranges (206 for one range, `multipart/byteranges` for several, 416),
+  the analog of Go's `http.ServeContent`. The static-file handler also honors
+  If-Match / If-Unmodified-Since.
+- Trusted forwarded-header resolution. Behind a reverse proxy, `req.scheme`,
+  `req.host`, `req.isSecure`, and `req.clientIp` reflect `X-Forwarded-Proto` /
+  `-Host` / `-For` and RFC 7239 `Forwarded` — but only from a peer in the new
+  `trustedProxies` setting (ignored entirely otherwise, so a direct client can't
+  forge them). `req.clientIp` peels only trusted hops. Also
+  `req.forwardedProto` / `req.forwardedHost` / `req.fromTrustedProxy`.
+- 103 Early Hints: `res.earlyHints(links)` (RFC 8297, `Link` preload/preconnect)
+  and the general `res.informational(code, headers)` send a 1xx response ahead
+  of the final one (HTTP/1.1 and HTTP/2; a best-effort no-op over HTTP/3 for now).
+- Configurable HTTP/2 and HTTP/3 receive (upload) flow-control windows:
+  `h2StreamWindow` / `h2ConnWindow` (default 1 MiB each) and
+  `h3StreamWindow` / `h3ConnWindow` (1 MiB / 4 MiB). Larger windows raise upload
+  throughput on higher-latency links; the connection window bounds total
+  un-consumed upload buffer per connection (like Go's
+  `MaxUploadBufferPerConnection`).
 
 ### Changed
 
+- **`req.form` now returns a `FormFields` view instead of
+  `Table[string, string]` (breaking).** It also covers `multipart/form-data`
+  text parts, not just urlencoded; `req.form["x"]` returns "" for a missing key
+  (was a `Table` `KeyError`) and the first value wins on a duplicate key (was the
+  last). Uploaded files moved to the new `req.files`.
+- `bodyTimeout` is now an *idle* timeout — re-armed on every read that carries
+  body bytes — rather than a total deadline, so a large upload on a slow link is
+  no longer cut off while it is actively transferring. A genuine stall (no bytes
+  for `bodyTimeout`) still fires, and `maxBodySize` still bounds the total.
+- TLS: a session-id context is set on the server `SSL_CTX`, so connections using
+  client certificates (mTLS) can now resume instead of paying a full handshake
+  each time. (Non-mTLS resumption already worked via OpenSSL defaults.)
+- HTTP/2: outbound `WINDOW_UPDATE` frames are batched — emitted once the returned
+  credit reaches half the window — instead of one per consumed DATA frame,
+  cutting control-frame overhead on large uploads (matching nghttp2 and Go).
 - Router: registering the same `(method, path)` twice, directly or via a
   sub-router mount, now raises `RouteConflictError` at registration instead of
   silently overwriting the earlier handler.
+
+### Fixed
+
+- HTTP/1.1: a fast `Transfer-Encoding: chunked` streaming upload (`req.onBody` /
+  `req.read`) no longer retains the whole raw body in the connection receive
+  buffer — it is compacted as it is consumed — so a large chunked upload can no
+  longer drive the server to gigabytes of RSS and OOM (a denial of service).
+- HTTP/2: a streamed response is bounded by the connection receive buffer, not
+  just the per-stream flow-control window, so a slow client can't drive
+  unbounded server memory during a large streamed download.
+- Routing: the router trie is traversed with non-owning pointers/cursors,
+  fixing a cross-thread ORC refcount race (a SIGSEGV under concurrent requests
+  on a multi-threaded server).
 
 ## [0.3.0] - 2026-08-20
 

@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.3.0"
+version       = "0.4.0"
 author        = "Craig Younker"
 description   = "A fast HTTP/1.1-3 server with TLS, streaming, SSE and WebSockets"
 license       = "MIT"

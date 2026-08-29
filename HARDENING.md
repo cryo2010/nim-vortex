@@ -39,13 +39,17 @@ reference below.
 | `maxHeaderCount` | 100 | Header fields per request (400) |
 | `maxBodySize` | 8 MiB | Request body (413); per stream on HTTP/2 and HTTP/3; also caps a decompressed body |
 | `maxWsMessageSize` | 1 MiB | Largest inbound WebSocket message (close 1009) |
+| `h2StreamWindow` | 1 MiB | HTTP/2 per-stream receive window (upload flow control) |
+| `h2ConnWindow` | 1 MiB | HTTP/2 per-connection cap on total un-consumed upload buffer across streams (bounds memory regardless of stream count, like Go's `MaxUploadBufferPerConnection`) |
+| `h3StreamWindow` | 1 MiB | HTTP/3 per-stream receive window (upload flow control) |
+| `h3ConnWindow` | 4 MiB | HTTP/3 per-connection receive window (aggregate cap on buffered uploads) |
 
 ### Timeouts
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `headerTimeout` | 10 s | First byte to end of headers (slowloris); 0 disables |
-| `bodyTimeout` | 30 s | End of headers to end of body (slow body); 0 disables |
+| `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. 0 disables |
 | `keepAliveTimeout` | 60 s | Idle time between requests; 0 disables |
 | `responseTimeout` | 0 (off) | End of request to first response byte (stuck handler) |
 | `shutdownGrace` | 10 s | Drain window on graceful shutdown |
@@ -74,7 +78,7 @@ reference below.
 | `securityHeaders` | `false` | Auto-inject the OWASP baseline (nosniff, DENY, no-referrer, + HSTS on TLS) on every response |
 | `serverHeader` | "vortex" | `Server` header value; set "" to omit |
 | `proxyProtocol` | `Disabled` | HAProxy PROXY header: `Disabled` / `Optional` / `Require` |
-| `trustedProxies` | `@[]` | IPs/CIDRs allowed to send a PROXY header; empty trusts any direct peer (safe only if the listener is not public) |
+| `trustedProxies` | `@[]` | IPs/CIDRs allowed to supply a PROXY header, and whose `X-Forwarded-*` / RFC 7239 `Forwarded` headers `req.scheme` / `req.host` / `req.clientIp` will believe. Empty = a PROXY header is trusted from any direct peer (safe only if the listener isn't public), but forwarded **headers** are ignored entirely (fail-safe), so `req.clientIp` can't be spoofed without a configured proxy |
 | `decompressRequest` | `false` | Decode gzip/br/zstd request bodies, bounded by `maxBodySize` |
 | `compress` | `false` | gzip/brotli-compress eligible responses |
 
