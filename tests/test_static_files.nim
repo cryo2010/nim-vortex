@@ -116,6 +116,20 @@ suite "static file serving":
     check "304" in resp.status
     check resp.bodyOf.len == 0
 
+  test "If-Match with a non-matching tag returns 412":
+    let resp = raw("/assets/hello.txt", "If-Match: \"nope\"\r\n")
+    check "412" in resp.status
+
+  test "If-Match with the current tag proceeds (200)":
+    let etag = raw("/assets/hello.txt").headerVal("ETag")
+    let resp = raw("/assets/hello.txt", "If-Match: " & etag & "\r\n")
+    check "200" in resp.status
+
+  test "If-Unmodified-Since in the past returns 412":
+    let resp = raw("/assets/hello.txt",
+                   "If-Unmodified-Since: Mon, 01 Jan 1990 00:00:00 GMT\r\n")
+    check "412" in resp.status
+
   test "byte range returns 206 with the slice":
     let resp = raw("/assets/data.bin", "Range: bytes=2-5\r\n")
     check "206" in resp.status
