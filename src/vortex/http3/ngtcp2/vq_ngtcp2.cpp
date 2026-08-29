@@ -479,9 +479,19 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   ngtcp2_transport_params tp;
   ngtcp2_transport_params_default(&tp);
   tp.max_idle_timeout = 30ULL * NGTCP2_SECONDS;
-  tp.initial_max_data = 4 * 1024 * 1024;
-  tp.initial_max_stream_data_bidi_remote = 1024 * 1024;
-  tp.initial_max_stream_data_bidi_local = 1024 * 1024;
+  // Receive flow-control windows (configurable via VortexConfig; 0 = default).
+  // bidi_remote is the request-body upload window (client-opened streams) and
+  // initial_max_data is the connection aggregate -- both extended on consumption
+  // (vq_stream_consume) so they cap un-consumed upload buffer, the h3 analog of
+  // h2's stream/connection receive windows. uni streams carry only the HTTP/3
+  // control and QPACK encoder/decoder streams, so they keep a fixed window
+  // independent of the upload knob (a tiny knob must not starve QPACK).
+  uint64_t stream_win = e->cfg.stream_recv_window
+                            ? e->cfg.stream_recv_window : 1024 * 1024;
+  tp.initial_max_data = e->cfg.conn_recv_window
+                            ? e->cfg.conn_recv_window : 4 * 1024 * 1024;
+  tp.initial_max_stream_data_bidi_remote = stream_win;
+  tp.initial_max_stream_data_bidi_local = stream_win;
   tp.initial_max_stream_data_uni = 1024 * 1024;
   tp.initial_max_streams_bidi = e->cfg.max_concurrent_streams
                                     ? e->cfg.max_concurrent_streams : 100;

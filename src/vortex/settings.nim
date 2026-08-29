@@ -72,12 +72,19 @@ type
                                   ## Larger = higher upload throughput on
                                   ## higher-latency links (bandwidth-delay
                                   ## product); the 64 KiB HTTP/2 default throttles
-                                  ## it. (h3 uses QUIC transport-parameter flow
-                                  ## control, set separately by the ngtcp2 shim.)
+                                  ## it. See h3StreamWindow for the HTTP/3 analog.
     h2ConnWindow*: int            ## h2 per-connection receive window: the cap on
                                   ## total un-consumed streaming-body buffer
                                   ## across all streams (bounds memory regardless
                                   ## of stream count). Should be >= h2StreamWindow.
+    h3StreamWindow*: int          ## h3 (QUIC) per-stream receive window for
+                                  ## request bodies: initial_max_stream_data on
+                                  ## client-opened bidi streams. The h3 analog of
+                                  ## h2StreamWindow (upload flow control).
+    h3ConnWindow*: int            ## h3 (QUIC) per-connection receive window:
+                                  ## initial_max_data, the aggregate flow-control
+                                  ## limit across all of a connection's streams.
+                                  ## Should be >= h3StreamWindow.
 
     # Timeouts (seconds, coarse; 0 disables)
     headerTimeout*: int       ## from first byte of a request to end of headers
@@ -137,6 +144,8 @@ proc initVortexConfig*(
     maxRequestsPerSocket = 0,
     h2StreamWindow = 1024 * 1024,
     h2ConnWindow = 1024 * 1024,
+    h3StreamWindow = 1024 * 1024,
+    h3ConnWindow = 4 * 1024 * 1024,
     headerTimeout = 10,
     bodyTimeout = 30,
     keepAliveTimeout = 60,
@@ -179,6 +188,7 @@ proc initVortexConfig*(
     maxResetStreams: maxResetStreams, maxControlFrames: maxControlFrames,
     maxRequestsPerSocket: maxRequestsPerSocket,
     h2StreamWindow: h2StreamWindow, h2ConnWindow: h2ConnWindow,
+    h3StreamWindow: h3StreamWindow, h3ConnWindow: h3ConnWindow,
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
     responseTimeout: responseTimeout,

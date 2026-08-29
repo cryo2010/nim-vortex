@@ -103,6 +103,11 @@ typedef struct {
   uint64_t max_body;
   uint64_t max_concurrent_streams;
   int max_field_section_size;
+  /* QUIC receive flow-control windows (0 = shim default). stream_recv_window is
+   * initial_max_stream_data for client-opened bidi streams (request-body upload
+   * window); conn_recv_window is initial_max_data (connection aggregate). */
+  uint64_t stream_recv_window;
+  uint64_t conn_recv_window;
 } VqConfig;
 
 /* Create/destroy the per-loop engine. Returns NULL on failure (bad cert etc.).*/
