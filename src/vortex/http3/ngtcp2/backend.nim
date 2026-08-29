@@ -56,6 +56,8 @@ type
     max_body: uint64
     max_concurrent_streams: uint64
     max_field_section_size: cint
+    stream_recv_window: uint64
+    conn_recv_window: uint64
 
 {.push header: "vq_ngtcp2.h", cdecl.}
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
@@ -347,7 +349,8 @@ proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
 # --- transport drive (called by eventloop's ngtcp2 h3Drive branch) ----------
 proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxBody, maxStreams, maxFieldSection: int,
-              certPem = "", keyPem = "", keyPassword = ""): bool =
+              certPem = "", keyPem = "", keyPassword = "",
+              streamRecvWindow = 0, connRecvWindow = 0): bool =
   gCore = core
   gUdpFd = udpFd
   var cfg: VqConfig
@@ -366,6 +369,8 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.max_body = uint64(maxBody)
   cfg.max_concurrent_streams = uint64(maxStreams)
   cfg.max_field_section_size = cint(maxFieldSection)
+  cfg.stream_recv_window = uint64(streamRecvWindow)
+  cfg.conn_recv_window = uint64(connRecvWindow)
   gEngine = vqEngineNew(addr cfg)
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))

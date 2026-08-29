@@ -258,7 +258,9 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  settings.keyFile, settings.maxBodySize,
                  settings.maxConcurrentStreams, settings.maxHeaderSize,
                  certPem = settings.certPem, keyPem = settings.keyPem,
-                 keyPassword = settings.keyPassword):
+                 keyPassword = settings.keyPassword,
+                 streamRecvWindow = settings.h3StreamWindow,
+                 connRecvWindow = settings.h3ConnWindow):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
