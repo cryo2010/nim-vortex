@@ -19,8 +19,10 @@
 ## small files, ranges, and HEAD are read in one shot. sendfile(2) is
 ## intentionally not used -- it does not compose with TLS or the readiness loop.
 
-import std/[os, times, strutils, uri, httpcore]
+import std/[os, times, strutils, uri, httpcore, options]
 import ./request
+from ./conditional import evalPreconditions, ifRangeApplies,
+                          pcProceed, pcNotModified, pcFailed
 
 type
   StaticOptions* = object
@@ -82,22 +84,12 @@ const httpDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"
 proc httpDate(t: Time): string =
   t.utc.format(httpDateFmt)
 
-proc parseHttpDate(s: string): (bool, Time) =
-  try: (true, s.parse(httpDateFmt, utc()).toTime)
-  except CatchableError: (false, Time())
-
 proc makeEtag(size: int64, mtime: Time): string =
   ## Strong validator from size + mtime; opaque to the client.
   "\"" & $size & "-" & $mtime.toUnix & "\""
 
-proc etagMatches(headerVal, etag: string): bool =
-  ## If-None-Match: "*", or a comma list containing our tag (weak-compared).
-  for raw in headerVal.split(','):
-    var t = raw.strip()
-    if t == "*": return true
-    if t.startsWith("W/"): t = t[2..^1].strip()
-    if t == etag: return true
-  false
+# Conditional-request evaluation (If-Match / If-None-Match / If-(Un)Modified-
+# Since / If-Range) is shared with request.serveContent -- see conditional.nim.
 
 # --- path safety -----------------------------------------------------------
 
@@ -234,32 +226,26 @@ proc serveResolved(req: Request, res: Response, data: string)
   if useLastMod: hdrs.add ("Last-Modified", lastMod)
   if cacheControl.len > 0: hdrs.add ("Cache-Control", cacheControl)
 
-  # Conditional GET: If-None-Match wins over If-Modified-Since (RFC 9110).
-  if useEtag:
-    let inm = req.header("if-none-match")
-    if inm.len > 0 and etagMatches(inm, etag):
-      res.send(Http304, "", hdrs); return
-  elif useLastMod:
-    let ims = req.header("if-modified-since")
-    if ims.len > 0:
-      let (ok, imsT) = parseHttpDate(ims)
-      if ok and mtime.toUnix <= imsT.toUnix:
-        res.send(Http304, "", hdrs); return
+  # Preconditions (RFC 9110 13.2.2): If-Match / If-Unmodified-Since -> 412, then
+  # If-None-Match / If-Modified-Since -> 304. Shared with request.serveContent.
+  let condEtag = if useEtag: etag else: ""
+  let condLastMod = if useLastMod: some(mtime) else: none(Time)
+  case evalPreconditions(req.header("if-match"), req.header("if-none-match"),
+      req.header("if-modified-since"), req.header("if-unmodified-since"),
+      condEtag, condLastMod, req.method in {HttpGet, HttpHead})
+  of pcNotModified: res.send(Http304, "", hdrs); return
+  of pcFailed:      res.send(HttpCode(412), "", hdrs); return
+  of pcProceed:     discard
 
   # Range (single). If-Range gates it: only apply when the validator still
-  # matches, else serve the full 200.
+  # matches, else serve the full 200. (Multiple ranges are served as full 200
+  # here; request.serveContent emits multipart/byteranges for in-memory bodies.)
   var s = 0'i64
   var e = size - 1
   var partial = false
   let rangeHdr = req.header("range")
   if rangeHdr.len > 0 and size > 0:
-    var applyRange = true
-    let ifr = req.header("if-range")
-    if ifr.len > 0:
-      applyRange =
-        if ifr.len > 0 and ifr[0] == '"': ifr == etag        # strong etag
-        else: (let (ok, t) = parseHttpDate(ifr); ok and t.toUnix == mtime.toUnix)
-    if applyRange:
+    if ifRangeApplies(req.header("if-range"), condEtag, condLastMod):
       let (satisfiable, rs, re) = parseRange(rangeHdr, size)
       if not satisfiable:
         hdrs.add ("Content-Range", "bytes */" & $size)

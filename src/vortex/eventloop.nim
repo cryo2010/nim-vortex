@@ -234,6 +234,7 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
   result.core.wsCompression = settings.wsCompression
   result.core.compress = settings.compress
   result.core.decompressRequest = settings.decompressRequest
+  result.core.trustedProxies = settings.trustedProxies
   result.core.maxDecompressedBody = settings.maxBodySize
   result.core.nowSec = monoSec()
   result.core.pool = pool

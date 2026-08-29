@@ -7,11 +7,13 @@
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
 ## streams are independent.
 
-import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros]
+import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros, times]
 import ./connection
+import ./proxyprotocol   # isTrustedProxy for forwarded-header resolution
 import ./multipart
 export multipart          # MultipartForm/MultipartFile + field/file accessors
 import ./blockingguard
+import ./conditional
 export blockingguard
 import ./signing
 export signing        # CookieMac + sign/verify for signed cookies (and app use)   # prepArg/assertBlockingType for the blocking macros, and
@@ -361,14 +363,103 @@ proc forwardedFor*(req: Request): seq[string] =
     let p = part.strip
     if p.len > 0: result.add p
 
+proc fromTrustedProxy*(req: Request): bool =
+  ## True when the direct peer is in `settings.trustedProxies` (which must be
+  ## non-empty). Forwarding headers (X-Forwarded-*, RFC 7239 Forwarded) are
+  ## believed only from such a peer -- a request straight from a client can forge
+  ## them, so with no trustedProxies configured this is always false (fail safe).
+  req.core != nil and req.core.trustedProxies.len > 0 and
+    isTrustedProxy(req.remoteAddress, req.core.trustedProxies)
+
+type ForwardedElem = tuple[forr, proto, host: string]
+
+proc parseForwarded(hdr: string): seq[ForwardedElem] =
+  ## RFC 7239 Forwarded -> its elements (client-most first), each with the for /
+  ## proto / host params (surrounding quotes stripped, keys lowercased).
+  for elem in hdr.split(','):
+    var e: ForwardedElem
+    for param in elem.split(';'):
+      let eq = param.find('=')
+      if eq < 0: continue
+      let k = param[0 ..< eq].strip.toLowerAscii
+      var v = param[eq+1 .. ^1].strip
+      if v.len >= 2 and v[0] == '"' and v[^1] == '"': v = v[1 ..< v.len-1]
+      case k
+      of "for": e.forr = v
+      of "proto": e.proto = v
+      of "host": e.host = v
+      else: discard
+    if e.forr.len > 0 or e.proto.len > 0 or e.host.len > 0: result.add e
+
+proc fwdIp(s: string): string =
+  ## Extract the bare IP from an RFC 7239 for= node (`ip`, `ip:port`,
+  ## `"[v6]:port"`, `_obfuscated`); returns the token unchanged if it isn't one.
+  var v = s.strip(chars = {'"'})
+  if v.startsWith("["):
+    let rb = v.find(']')
+    return (if rb > 1: v[1 ..< rb] else: v)
+  if v.count(':') == 1: return v[0 ..< v.find(':')]   # ipv4:port
+  v
+
+proc forwardedProto*(req: Request): string =
+  ## The client-facing scheme ("https"/"http") the outermost trusted proxy saw,
+  ## from RFC 7239 Forwarded (proto=) or X-Forwarded-Proto; "" when not behind a
+  ## trusted proxy or unset. Prefer `req.scheme` / `req.isSecure`, which fold it
+  ## in.
+  if not req.fromTrustedProxy: return ""
+  let fwd = parseForwarded(req.header("forwarded"))
+  if fwd.len > 0 and fwd[0].proto.len > 0: return fwd[0].proto.toLowerAscii
+  let xfp = req.header("x-forwarded-proto")
+  if xfp.len > 0: return xfp.split(',')[0].strip.toLowerAscii
+
+proc forwardedHost*(req: Request): string =
+  ## The Host the client sent to a trusted proxy, from RFC 7239 Forwarded
+  ## (host=) or X-Forwarded-Host; "" when not behind a trusted proxy or unset.
+  ## Folded into `req.host`.
+  if not req.fromTrustedProxy: return ""
+  let fwd = parseForwarded(req.header("forwarded"))
+  if fwd.len > 0 and fwd[0].host.len > 0: return fwd[0].host
+  let xfh = req.header("x-forwarded-host")
+  if xfh.len > 0: return xfh.split(',')[0].strip
+
+proc clientIp*(req: Request): string =
+  ## The origin client's IP behind a trusted proxy chain. Walks the forwarded
+  ## chain (RFC 7239 for= elements, else X-Forwarded-For) from the nearest proxy
+  ## outward and returns the first address that is NOT itself a trusted proxy --
+  ## what the outermost trusted proxy actually saw. Only trusted hops are peeled,
+  ## so a client-forged prefix can't move the result. Falls back to
+  ## `remoteAddress` when not behind a trusted proxy.
+  if not req.fromTrustedProxy: return req.remoteAddress
+  var chain: seq[string]
+  let fwd = parseForwarded(req.header("forwarded"))
+  if fwd.len > 0:
+    for e in fwd:
+      if e.forr.len > 0: chain.add fwdIp(e.forr)   # left = client-most
+  else:
+    chain = req.forwardedFor
+  for i in countdown(chain.high, 0):
+    if not isTrustedProxy(chain[i], req.core.trustedProxies): return chain[i]
+  if chain.len > 0: return chain[0]
+  req.remoteAddress
+
 proc isSecure*(req: Request): bool =
   ## True if the request arrived over TLS (HTTPS, or HTTP/2 over TLS) or QUIC
   ## (HTTP/3 is always encrypted). Use it to gate Secure cookies, HSTS, and a
-  ## plaintext->HTTPS redirect.
+  ## plaintext->HTTPS redirect. Behind a trusted proxy it reflects the forwarded
+  ## proto (X-Forwarded-Proto / Forwarded), so termination at the proxy is seen
+  ## as secure.
+  let fp = req.forwardedProto
+  if fp.len > 0: return fp == "https"
   if req.snap != nil: return req.snap.secure
   if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
   let c = conn(req.core, req.fd, req.gen)
   c != nil and c.ssl != nil
+
+proc scheme*(req: Request): string =
+  ## "https" or "http" for the original client request -- the trusted proxy's
+  ## forwarded proto if present, else the connection's own scheme. Use it to
+  ## build absolute URLs / redirects correctly behind a TLS terminator.
+  if req.isSecure: "https" else: "http"
 
 proc securityHeaders*(hsts = false, hstsMaxAge = 63072000,
                       hstsIncludeSubdomains = true, hstsPreload = false,
@@ -423,9 +514,12 @@ proc originAllowed*(req: Request, allowed: openArray[string],
   false
 
 proc host*(req: Request): string =
-  ## The request's host: the :authority pseudo-header for HTTP/2 and HTTP/3, the
-  ## Host header for HTTP/1.1 ("" if absent). Use it to build an absolute URL,
-  ## e.g. a plaintext -> HTTPS redirect.
+  ## The request's host: behind a trusted proxy the forwarded host
+  ## (X-Forwarded-Host / RFC 7239 Forwarded host=); otherwise the :authority
+  ## pseudo-header for HTTP/2 and HTTP/3, or the Host header for HTTP/1.1 ("" if
+  ## absent). Use it to build an absolute URL, e.g. a plaintext -> HTTPS redirect.
+  let fwd = req.forwardedHost
+  if fwd.len > 0: return fwd
   result = req.header(":authority")
   if result.len == 0: result = req.header("host")
 
@@ -1141,44 +1235,187 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
           c.bodyDecodedSet = true
     true
 
+proc informational*(res: Response, code: HttpCode,
+                    headers: openArray[(string, string)] = []) =
+  ## Send a 1xx informational response (e.g. 103 Early Hints) NOW, ahead of the
+  ## final response; the handler then continues and later calls `send`. May be
+  ## called several times. Loop-thread only (a sync or async handler, before any
+  ## `blocking:`); a no-op once the final response is sent. Implemented for
+  ## HTTP/1.1 and HTTP/2; over HTTP/3 it is currently a no-op (pending an nghttp3
+  ## submit_info binding), so treat early hints as best-effort.
+  let ci = int(code)
+  if ci < 100 or ci > 199: return
+  if currentThreadId() != res.core.threadId: return   # loop-thread only
+  if res.fd < 0: return                                # h3: not yet supported
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil: return
+  if res.stream != 0:
+    h2SendInformational(c, ci, res.stream, headers)
+  else:
+    if c.responded: return
+    var s = "HTTP/1.1 " & $code & "\r\n"
+    for (n, v) in headers: s.add n & ": " & v & "\r\n"
+    s.add "\r\n"
+    c.wbuf.add s
+  # Flush now so the hint is on the wire before the handler does its work.
+  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  except Exception: discard
+
+proc earlyHints*(res: Response, links: openArray[string],
+                 headers: openArray[(string, string)] = []) =
+  ## Send a 103 Early Hints response carrying `Link` headers, so the client can
+  ## preload / preconnect the listed resources while your handler prepares the
+  ## final response (RFC 8297). Best-effort (see `informational`):
+  ##   res.earlyHints(["</app.css>; rel=preload; as=style",
+  ##                   "<https://cdn.example>; rel=preconnect"])
+  ##   ... build the page ...
+  ##   res.send(Http200, html)
+  var h: seq[(string, string)]
+  for l in links: h.add ("Link", l)
+  for kv in headers: h.add kv
+  res.informational(Http103, h)
+
 proc redirect*(res: Response, location: string, permanent = false,
+               preserveMethod = false,
                extraHeaders: openArray[(string, string)] = []) =
-  ## Send a redirect to `location` (301 permanent / 302 temporary). For a
-  ## plaintext-listener -> HTTPS redirect: `res.redirect("https://" & req.host &
-  ## req.url.path, permanent = true)`. Serve HTTPS with HSTS (securityHeaders)
-  ## so subsequent requests skip the plaintext hop entirely.
+  ## Send a redirect to `location`. By default 302 (temporary) or 301 (with
+  ## `permanent`), which let the client fall back to GET. Set `preserveMethod`
+  ## for 307 (temporary) / 308 (permanent), which keep the original method and
+  ## body (RFC 9110 15.4) -- use these to redirect a POST/PUT/PATCH so it is not
+  ## silently downgraded to GET. For a plaintext-listener -> HTTPS redirect:
+  ## `res.redirect("https://" & req.host & req.url.path, permanent = true)`.
+  ## Serve HTTPS with HSTS (securityHeaders) so subsequent requests skip the
+  ## plaintext hop entirely.
+  let code =
+    if preserveMethod: (if permanent: Http308 else: Http307)
+    else:              (if permanent: Http301 else: Http302)
   var hdrs = @[("Location", location)]
   for h in extraHeaders: hdrs.add h
-  send(res, (if permanent: Http301 else: Http302), "", hdrs)
+  send(res, code, "", hdrs)
+
+type CookiePrefix* = enum
+  ## RFC 6265bis cookie name prefixes. The browser rejects a cookie carrying the
+  ## prefix unless it also carries the attributes the prefix demands, so vortex
+  ## forces them (rather than letting a misconfigured cookie be silently dropped).
+  cpNone       ## no prefix
+  cpSecure     ## `__Secure-`: forces Secure
+  cpHost       ## `__Host-`: forces Secure, Path=/ and no Domain (host-locked)
+
+const cookieDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"  # RFC 7231 IMF-fixdate
+
+var mpBoundaryCtr {.threadvar.}: uint64
+
+proc serveContent*(req: Request, res: Response, body: openArray[char],
+                   contentType = "application/octet-stream", etag = "",
+                   lastModified = none(Time), cacheControl = "") =
+  ## Serve an in-memory `body` with full conditional-request and byte-range
+  ## handling -- the analog of Go's http.ServeContent for a buffered body. Pass
+  ## an `etag` and/or `lastModified` to enable validators; it then honors
+  ## If-Match / If-Unmodified-Since (-> 412 Precondition Failed), If-None-Match /
+  ## If-Modified-Since (-> 304 Not Modified), If-Range, and Range (-> 206 for a
+  ## single range, `multipart/byteranges` for several, 416 if none are
+  ## satisfiable). Emits `Accept-Ranges: bytes` plus the validators and
+  ## Cache-Control you pass. For a large or generated body prefer `res.sendFile`
+  ## / `res.stream` (this holds the whole body, and any multipart parts, in
+  ## memory).
+  let size = body.len.int64
+  let isGetHead = req.method in {HttpGet, HttpHead}
+  var hdrs: seq[(string, string)] = @[("Accept-Ranges", "bytes")]
+  if etag.len > 0: hdrs.add ("ETag", etag)
+  if lastModified.isSome: hdrs.add ("Last-Modified", httpDate(lastModified.get))
+  if cacheControl.len > 0: hdrs.add ("Cache-Control", cacheControl)
+
+  case evalPreconditions(req.header("if-match"), req.header("if-none-match"),
+      req.header("if-modified-since"), req.header("if-unmodified-since"),
+      etag, lastModified, isGetHead)
+  of pcNotModified: send(res, Http304, "", hdrs); return
+  of pcFailed:      send(res, HttpCode(412), "", hdrs); return
+  of pcProceed:     discard
+
+  var ranges: seq[ByteRange]
+  if isGetHead and req.header("range").len > 0 and
+      ifRangeApplies(req.header("if-range"), etag, lastModified):
+    let (ok, rs) = parseRanges(req.header("range"), size)
+    if not ok:
+      hdrs.add ("Content-Range", "bytes */" & $size)
+      send(res, HttpCode(416), "", hdrs); return
+    ranges = rs
+
+  if ranges.len == 0:                        # whole body -> 200
+    hdrs.add ("Content-Type", contentType)
+    send(res, Http200, body, hdrs); return
+
+  if ranges.len == 1:                        # one range -> 206
+    let (s, e) = ranges[0]
+    hdrs.add ("Content-Type", contentType)
+    hdrs.add ("Content-Range", "bytes " & $s & "-" & $e & "/" & $size)
+    send(res, HttpCode(206), body.toOpenArray(int(s), int(e)), hdrs); return
+
+  # Several ranges -> multipart/byteranges (RFC 9110 14.6). The body is
+  # server-supplied (not attacker-controlled), so a counter-based boundary
+  # token that won't occur in it is sufficient.
+  inc mpBoundaryCtr
+  let boundary = "vortex" & toHex(mpBoundaryCtr) & toHex(size)
+  var mp = ""
+  for (s, e) in ranges:
+    mp.add "\r\n--" & boundary & "\r\n"
+    mp.add "Content-Type: " & contentType & "\r\n"
+    mp.add "Content-Range: bytes " & $s & "-" & $e & "/" & $size & "\r\n\r\n"
+    let rlen = int(e - s + 1)
+    let old = mp.len
+    mp.setLen(old + rlen)
+    if rlen > 0: copyMem(addr mp[old], unsafeAddr body[int(s)], rlen)
+  mp.add "\r\n--" & boundary & "--\r\n"
+  hdrs.add ("Content-Type", "multipart/byteranges; boundary=" & boundary)
+  send(res, HttpCode(206), mp, hdrs)
 
 proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
-                secure = true, httpOnly = true,
-                sameSite = "Lax"): (string, string) =
+                secure = true, httpOnly = true, sameSite = "Lax",
+                expires = none(Time), partitioned = false,
+                prefix = cpNone): (string, string) =
   ## Build a Set-Cookie header (as a (name, value) pair for res.send's headers)
   ## with secure defaults: Secure, HttpOnly, SameSite=Lax (OWASP Session
-  ## Management). maxAge < 0 omits Max-Age (a session cookie). Set secure=false
-  ## only for local plaintext development. Emit several by passing several pairs.
-  var v = name & "=" & value
-  if path.len > 0: v.add "; Path=" & path
-  if domain.len > 0: v.add "; Domain=" & domain
+  ## Management). maxAge < 0 omits Max-Age (a session cookie); maxAge = 0 (or an
+  ## `expires` in the past) deletes the cookie. `expires` sets an absolute expiry
+  ## (Max-Age takes precedence in modern browsers; send both for old ones).
+  ## `partitioned` adds Partitioned (CHIPS: a separate cookie jar per top-level
+  ## site; requires Secure). `prefix` prepends `__Secure-`/`__Host-` and forces
+  ## the attributes those prefixes require. Set secure=false only for local
+  ## plaintext development. Emit several by passing several pairs.
+  var (nm, p, dom, sec) = (name, path, domain, secure)
+  case prefix
+  of cpSecure: nm = "__Secure-" & name; sec = true
+  of cpHost:   nm = "__Host-" & name; sec = true; p = "/"; dom = ""
+  of cpNone:   discard
+  var v = nm & "=" & value
+  if p.len > 0: v.add "; Path=" & p
+  if dom.len > 0: v.add "; Domain=" & dom
   if maxAge >= 0: v.add "; Max-Age=" & $maxAge
-  if secure: v.add "; Secure"
+  if expires.isSome: v.add "; Expires=" & expires.get.utc.format(cookieDateFmt)
+  if sec: v.add "; Secure"
   if httpOnly: v.add "; HttpOnly"
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
+  if partitioned: v.add "; Partitioned"
   ("Set-Cookie", v)
 
 proc setSignedCookie*(name, value, secret: string, algo = macSha256,
                       maxAge = -1, path = "/", domain = "", secure = true,
-                      httpOnly = true, sameSite = "Lax"): (string, string) =
+                      httpOnly = true, sameSite = "Lax",
+                      expires = none(Time),
+                      partitioned = false): (string, string) =
   ## Like `setCookie`, but the value is HMAC signed with `secret` (HMAC-SHA256 by
   ## default; see `CookieMac`) so the client cannot forge or alter it. The stored
   ## value is `value.signature`; read it back and verify with
   ## `req.cookies.signed(name, secret)` using the same `algo`. This is
   ## tamper-proofing, not encryption: the value stays readable, only unforgeable.
   ## Keep `secret` private and stable (rotating it invalidates live cookies), and
-  ## pass a cookie-safe `value` (no ';', as with `setCookie`).
+  ## pass a cookie-safe `value` (no ';', as with `setCookie`). A name `prefix` is
+  ## intentionally not offered here: it changes the cookie name the client sends
+  ## back, which must match the name signed -- use `setCookie` for prefixed
+  ## signed cookies if you sign the prefixed name yourself.
   let stored = value & "." & sign(secret, name & "=" & value, algo)
-  setCookie(name, stored, maxAge, path, domain, secure, httpOnly, sameSite)
+  setCookie(name, stored, maxAge, path, domain, secure, httpOnly, sameSite,
+            expires = expires, partitioned = partitioned)
 
 proc cookies*(req: Request): Cookies {.inline.} =
   ## A view of the request's cookies, matching the `req.headers` shape:
