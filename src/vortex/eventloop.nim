@@ -500,7 +500,6 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
     # Decoded chunk bytes accumulate in c.chunkBody; end-of-body (the 0-chunk)
     # is only known when the parser reaches prComplete, i.e. `last`.
     let avail = c.chunkBody.len - c.bodyFed
-    if avail <= 0 and not last: return
     if avail > 0:
       cb(toOpenArray(c.chunkBody, c.bodyFed, c.chunkBody.len - 1), last)
       # Drop the delivered bytes so a streaming chunked upload stays O(read
@@ -514,6 +513,22 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
       c.bodyFed = 0
     elif last:
       cb(toOpenArray(c.chunkBody, 0, -1), true)   # empty final chunk
+    if not last and c.parser.pos > c.parser.bodyStart:
+      # Compact the *raw* receive buffer. The parser copied the consumed chunk
+      # data into c.chunkBody (delivered above), but the raw chunk framing still
+      # occupies rbuf up to parser.pos. Drop it -- keep the request head
+      # [reqStart, bodyStart) (req.header still reads it during onBody) and the
+      # unparsed tail [pos, rlen) -- so a streaming chunked upload stays O(read
+      # burst) in rbuf instead of retaining every raw body byte. Without this
+      # rbuf grows to the whole body on each connection; across many concurrent
+      # uploads that is gigabytes (OOM). The Content-Length branch below already
+      # compacts this way; here bodyStart marks the head end (see parser).
+      let headEnd = c.parser.bodyStart
+      let tailLen = c.rlen - c.parser.pos
+      if tailLen > 0:
+        moveMem(addr c.rbuf[headEnd], addr c.rbuf[c.parser.pos], tailLen)
+      c.rlen = headEnd + tailLen
+      c.parser.pos = headEnd
   else:
     # Content-Length. Deliver the buffered body bytes, then drop them from rbuf
     # so an arbitrarily large upload streams in O(read-burst) memory instead of
@@ -747,6 +762,15 @@ const h2RecvBufferCap = 1024 * 1024
   ## frame is <= max frame size); it only bounds backpressure while a
   ## `blocking:` worker has the connection pinned.
 
+const streamRecvBufferCap = 1024 * 1024
+  ## Ceiling on an HTTP/1 connection's receive buffer while it streams a request
+  ## body to a `req.onBody` handler. Past this, compact (feed onBody + drop the
+  ## delivered bytes) instead of doubling toward maxHeaderSize+maxBodySize, so a
+  ## fast upload can't pin ~maxBodySize of receive buffer per connection --
+  ## across many concurrent uploads that is gigabytes (OOM). A buffered (non
+  ## streaming) request still grows to the body cap, as it must hold the whole
+  ## body to dispatch.
+
 proc handleRead(loop: Loop, c: ptr Connection) =
   while true:
     if c.rlen == c.rbuf.len:
@@ -776,6 +800,16 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           # (backpressure) and are consumed once the worker unpins. The current
           # request is already fully buffered; only the next pipelined one waits.
           break
+        if c.reqStreaming and c.onBodyCb != nil and
+            c.rbuf.len >= streamRecvBufferCap:
+          # Streaming request body at the ceiling: feed the buffered bytes to
+          # onBody and drop them (feedBody compacts rbuf) instead of doubling
+          # toward the whole-body cap. A fast h1 upload would otherwise pin
+          # ~maxBodySize per connection; across many concurrent uploads that is
+          # gigabytes -> OOM. Mirrors the h2 process-and-compact path above.
+          loop.processInput(c)
+          if c.state != csActive: return
+          if c.rlen < c.rbuf.len: continue   # compacted: read into the freed room
         let cap =
           if c.ws != nil: loop.settings.maxWsMessageSize + 1024
           else: loop.settings.maxHeaderSize + loop.settings.maxBodySize

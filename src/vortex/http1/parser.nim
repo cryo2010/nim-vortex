@@ -304,6 +304,11 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
             return p.fail(Http400)
           p.pos = nl + 1
           if p.chunked:
+            # Record where the head ends (the first chunk-size begins) so a
+            # streaming chunked body can drop consumed raw framing from the
+            # receive buffer while keeping the head intact (see eventloop
+            # feedBody). Unused by chunked parsing otherwise.
+            p.bodyStart = p.pos
             p.phase = ppChunkSize
           elif p.contentLength > 0:
             if p.contentLength > int64(limits.maxBodySize):
