@@ -231,8 +231,14 @@ task stressStreamDownload, "Stress soak: stream down, client verifies SHA-1 (Doc
 
 task stress, "Short smoke of all five stress workloads (Docker)":
   # Runs every workload short (20s, 64 MiB) and hard-fails on any mismatch.
-  exec "STRESS_SMOKE=1 VORTEX_SECONDS=20 VORTEX_STREAM_BYTES=67108864 " &
-       "sh conformance/stress/run.sh"
+  # Default to 20s / 64 MiB but honor an explicit VORTEX_SECONDS /
+  # VORTEX_STREAM_BYTES from the caller -- an inline `VORTEX_SECONDS=20 sh ...`
+  # would otherwise shadow the inherited env (VORTEX_REPORT_SECONDS already
+  # passes through, so the two were inconsistent: `VORTEX_SECONDS=10` ran 20s).
+  let secs = getEnv("VORTEX_SECONDS", "20")
+  let sbytes = getEnv("VORTEX_STREAM_BYTES", "67108864")
+  exec "STRESS_SMOKE=1 VORTEX_SECONDS=" & secs & " VORTEX_STREAM_BYTES=" &
+       sbytes & " sh conformance/stress/run.sh"
 
 task saturate, "Interactive h2load saturation with live Grafana charts (Docker)":
   # The former `nimble stress`: saturates the selected backend(s) with h2load
