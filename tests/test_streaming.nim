@@ -25,7 +25,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/trailer":
     res.sendHead(Http200, "text/plain")
     res.write("body")
-    res.finish({"X-Checksum": "abc123"})
+    res.trailers["X-Checksum"] = "abc123"
+    res.finish()
   of "/tmpl":
     res.stream(Http200, "text/plain"):
       res.write("template ")
@@ -201,6 +202,12 @@ suite "HTTP/2 streaming responses":
     # RST_STREAM after HEADERS+DATA: curl fails rather than reporting success.
     let (_, rc) = h2curl("-o /dev/null " & base & "/boom")
     check rc != 0
+
+  test "response trailers are emitted over h2 (trailing HEADERS)":
+    # curl surfaces h2 trailers by dumping them with the response headers (-D).
+    let (output, rc) = h2curl("-D - -o /dev/null -sS " & base & "/trailer")
+    check rc == 0
+    check "x-checksum: abc123" in output.toLowerAscii
 
 srv.close()
 echo "server shut down cleanly"

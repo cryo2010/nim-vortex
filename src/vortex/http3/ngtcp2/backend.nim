@@ -85,6 +85,7 @@ type
   H3Stream* = object
     id*: uint64
     headers*: seq[(string, string)]
+    trailers*: seq[(string, string)]  ## request trailer fields (after the body)
     body*: string
     headersDone*: bool
     responded*: bool
@@ -215,6 +216,16 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   if usid notin h3c.streams:
     h3c.streams[usid] = H3Stream(id: usid)
   template st: H3Stream = h3c.streams[usid]
+  if st.headersDone:
+    # A header block after the request head is the trailer section (RFC 9114
+    # 4.1). Capture it for req.trailers, dropping pseudo-headers (not allowed
+    # in trailers) rather than re-classifying it as a malformed request head.
+    let tarr = cast[ptr UncheckedArray[VqHeader]](hdrs)
+    for i in 0 ..< int(n):
+      let name = toStr(tarr[i].name, tarr[i].name_len)
+      if name.len > 0 and name[0] != ':':
+        st.trailers.add (name, toStr(tarr[i].value, tarr[i].value_len))
+    return
   let arr = cast[ptr UncheckedArray[VqHeader]](hdrs)
   for i in 0 ..< int(n):
     st.headers.add (toStr(arr[i].name, arr[i].name_len),

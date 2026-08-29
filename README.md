@@ -426,6 +426,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.query` | `Table[string, string]` | decoded query params, last value wins (lazy, cached) |
 | `req.headers[name]` | `string` | one header, case-insensitive; "" if absent. `name in req.headers` tests presence; `for (n, v) in req.headers` iterates (pseudo-headers skipped). Read-only view (no allocation) mirroring `res.headers[name]` |
 | `req.header(name)` | `string` | alias of `req.headers[name]` |
+| `req.trailers[name]` | `string` | one request *trailer* (a field sent after a chunked/streamed body), case-insensitive; "" if absent. `name in req.trailers` and iteration too. Same view shape as `req.headers`; empty until the body has fully arrived. h1/h2/h3 |
 | `req.cookies[name]` | `string` | one request cookie, first match; "" if absent. `for v in req.cookies.all(name)` yields every value. Case-sensitive; see [Cookies](#cookies) |
 | `req.body` | `string` | request body (decompressed if `decompressRequest`) |
 | `req.json` | `JsonNode` | body parsed as JSON, cached per request; empty body is `{}`; raises `JsonParsingError` on malformed input |
@@ -491,7 +492,8 @@ through a dead connection is a safe no-op.
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
 | `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
-| `res.finish(trailers = [])` | `void` | end a streamed response cleanly |
+| `res.finish()` | `void` | end a streamed response cleanly (emits `res.trailers`, if any) |
+| `res.trailers[name] = v` | `void` | set a response *trailer* emitted after the streamed body: the chunked trailer section on h1, a trailing `HEADERS` frame on h2. Same shape as `res.headers`; set before `res.finish`. Not emitted over h3 yet |
 | `res.abort()` | `void` | truncate a streamed response (error mid-body) |
 | `res.stream(code = Http200, contentType, headers = []): body` | `template` | block form of a streamed response |
 | `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |

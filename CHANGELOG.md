@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Trailers, both directions, shaped like `req.headers` / `res.headers`.
+  `req.trailers` is a read-only view of the header fields a client sent after a
+  chunked (HTTP/1.1) or streamed (HTTP/2, HTTP/3) request body:
+  `req.trailers["checksum"]` ("" if absent), `"x" in req.trailers`, and
+  iteration, populated once the body has fully arrived. `res.trailers` sets the
+  trailers emitted after a streamed response body (`res.trailers["X-Checksum"]
+  = digest`); `res.finish` sends them as the chunked trailer section on
+  HTTP/1.1 or a trailing `HEADERS`+`END_STREAM` frame on HTTP/2. Previously
+  received request trailers were discarded and there was no typed response-side
+  API.
+
+### Changed
+
+- `res.finish` no longer takes a `trailers` argument; set response trailers via
+  `res.trailers` before calling `res.finish()` instead. (Migration:
+  `res.finish({"X-Checksum": v})` becomes `res.trailers["X-Checksum"] = v;
+  res.finish()`.)
+
+### Known limitations
+
+- HTTP/3 does not emit response trailers yet (a request's trailers are still
+  read via `req.trailers`): `res.trailers` set on an h3 response are dropped by
+  `res.finish`. Emitting them needs an nghttp3 `submit_trailers` path in the
+  QUIC C++ shim.
+
 ## [0.4.0] - 2026-08-29
 
 ### Added

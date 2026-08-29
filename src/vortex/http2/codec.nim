@@ -17,6 +17,8 @@ const h2FieldNameDelims = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
 type
   H2Stream* = object
     headers*: seq[(string, string)]  ## request fields incl. pseudo-headers
+    trailers*: seq[(string, string)] ## request trailer fields (after the body)
+    respTrailers*: seq[(string, string)] ## response trailers to emit at END_STREAM
     body*: string
     sendWindow*: int32
     endStreamSeen*: bool             ## client half-closed
@@ -167,24 +169,55 @@ proc noteControlFrame(h2: H2Conn, c: ptr Connection) =
 
 # --- response serialization ------------------------------------------------
 
+proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
+  ## Emit a streamed response's trailer section as a trailing HEADERS frame
+  ## carrying END_STREAM, then drop the stream. Called once the response body
+  ## has fully drained; HEADERS are not flow-controlled, so this always fits.
+  if sid notin h2.streams: return
+  template st: H2Stream = h2.streams[sid]
+  var hb = ""
+  for (name, val) in st.respTrailers:
+    encodeHeader(hb, name.toLowerAscii, val)
+  var off = 0
+  var first = true
+  while first or off < hb.len:
+    let chunk = min(hb.len - off, h2.peerMaxFrame)
+    let lastFrag = off + chunk >= hb.len
+    var flags = if lastFrag: flagEndHeaders else: 0'u8
+    if first: flags = flags or flagEndStream   # END_STREAM rides the HEADERS
+    c.wbuf.addFrameHeader(chunk,
+      (if first: ftHeaders else: ftContinuation), flags, sid)
+    c.wbuf.add hb[off ..< off + chunk]
+    off += chunk
+    first = false
+  h2.streams.del(sid)
+  dec h2.activeStreams
+
 proc sendData(h2: H2Conn, c: ptr Connection, sid: uint32) =
   ## Push as much of the stream's pending response body as flow control
-  ## allows; delete the stream once fully sent.
+  ## allows; delete the stream once fully sent (emitting trailers first when
+  ## res.trailers were set).
   if sid notin h2.streams: return
   template st: H2Stream = h2.streams[sid]
   while true:
     let remaining = st.pendingBody.len - st.pendingPos
     if remaining == 0:
       if st.pendingIsLast:
-        h2.streams.del(sid)
-        dec h2.activeStreams
+        if st.respTrailers.len > 0:
+          h2.emitTrailers(c, sid)          # trailing HEADERS(END_STREAM) + drop
+        else:
+          h2.streams.del(sid)
+          dec h2.activeStreams
       return
     var chunk = min(remaining, h2.peerMaxFrame)
     chunk = min(chunk, int(st.sendWindow))
     chunk = min(chunk, int(h2.connSendWindow))
     if chunk <= 0:
       return                        # blocked on window; resume on UPDATE
-    let last = st.pendingIsLast and (st.pendingPos + chunk == st.pendingBody.len)
+    # With trailers pending the last DATA must NOT carry END_STREAM; the
+    # trailing HEADERS frame closes the stream instead.
+    let last = st.pendingIsLast and st.respTrailers.len == 0 and
+               (st.pendingPos + chunk == st.pendingBody.len)
     c.wbuf.addFrameHeader(chunk, ftData,
                           (if last: flagEndStream else: 0'u8), sid)
     let oldLen = c.wbuf.len
@@ -393,9 +426,11 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   if sid notin h2.streams: return 0
   h2.streams[sid].pendingBody.len - h2.streams[sid].pendingPos
 
-proc h2StreamFinish*(c: ptr Connection, sid: uint32) =
+proc h2StreamFinish*(c: ptr Connection, sid: uint32,
+                     trailers: openArray[(string, string)] = []) =
   ## Terminate a streamed response: mark the pending body final so the last
-  ## DATA frame carries END_STREAM, then push.
+  ## DATA frame carries END_STREAM (or, when `trailers` are given, a trailing
+  ## HEADERS frame does), then push.
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
     return
@@ -406,10 +441,15 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32) =
   if st.isHead:
     return                               # HEAD stream already closed at head
   st.pendingIsLast = true
+  if trailers.len > 0: st.respTrailers = @trailers
   if st.pendingBody.len - st.pendingPos > 0:
-    # A final real DATA chunk remains; sendData tags it END_STREAM (and, if the
-    # window is closed, h2ResumeSend does so when it reopens).
+    # A final real DATA chunk remains; sendData tags it END_STREAM -- or, with
+    # trailers pending, emits the trailing HEADERS once the body drains (and, if
+    # the window is closed, h2ResumeSend does so when it reopens).
     h2.sendData(c, sid)
+  elif st.respTrailers.len > 0:
+    # The body already drained; close with the trailer section.
+    h2.emitTrailers(c, sid)
   else:
     # The body already fully drained before finish: the prior DATA frames went
     # out without END_STREAM, so emit a bare END_STREAM DATA frame to close it.
@@ -672,10 +712,17 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
   if sid notin h2.streams: return    # e.g. trailers for a reset stream
   template st: H2Stream = h2.streams[sid]
   if st.headersDone:
-    # Trailers: allowed only with END_STREAM; fields are discarded.
+    # Trailers: allowed only with END_STREAM. Capture the fields for
+    # req.trailers; a pseudo-header in the trailer section is malformed
+    # (RFC 9113 8.1), so reject it rather than expose it.
     if not endStream:
       h2.connError(c, errProtocol)
       return
+    for (name, val) in fields:
+      if name.len == 0 or name[0] == ':':
+        h2.streamError(c, sid, errProtocol)
+        return
+      st.trailers.add (name, val)
     st.endStreamSeen = true
     if st.streamingReq and st.dispatched:
       # A streaming route consumed the DATA via onBody as it arrived; the

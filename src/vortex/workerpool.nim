@@ -23,6 +23,7 @@ type
     httpMethod*: HttpMethod
     target*: string                    ## raw request-target (path + query)
     headers*: seq[(string, string)]    ## all request headers, pseudo-headers kept
+    trailers*: seq[(string, string)]   ## request trailers (fields after the body)
     body*: string
     params*: seq[(string, string)]     ## route params captured by the router
     remoteAddr*: string

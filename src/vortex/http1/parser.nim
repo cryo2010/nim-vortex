@@ -44,6 +44,7 @@ type
     pathStart*, pathLen*: int32
     minor*: int8              ## HTTP/1.<minor>
     headers*: seq[HeaderSlice]
+    trailers*: seq[HeaderSlice] ## chunked trailer fields (req.trailers)
     contentLength*: int64     ## -1 when absent
     chunked*: bool
     keepAlive*: bool
@@ -105,6 +106,7 @@ proc reset*(p: var RequestParser, reqStart: int) =
   p.pathLen = 0
   p.minor = 1
   p.headers.setLen(0)
+  p.trailers.setLen(0)
   p.contentLength = -1
   p.chunked = false
   p.keepAlive = true
@@ -391,15 +393,36 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
         if dataEnd - p.pos > limits.maxHeaderSize: return p.fail(Http431)
         return prNeedMore
       if nl == p.pos or buf[nl-1] != '\r': return p.fail(Http400)
-      let empty = nl - 1 == p.pos
-      p.pos = nl + 1
-      if empty:
+      let lineEnd = nl - 1        # exclusive end, before CR
+      if lineEnd == p.pos:
+        # Blank line: the trailer section (and the request) is finished.
+        p.pos = nl + 1
         p.phase = ppComplete
         return prComplete
-      # Trailer fields are discarded, but still bounded: cap their number like
-      # header fields so a peer can't stream unbounded trailer lines.
+      # A trailer field: bound the count like headers so a peer can't stream
+      # unbounded trailer lines, then capture the name/value slice for
+      # req.trailers. Validated exactly like a header line (token name, no
+      # control chars in the value) so a trailer can't smuggle a bad field.
       inc p.trailerCount
       if p.trailerCount > limits.maxHeaderCount: return p.fail(Http431)
+      let colon = findByte(buf, p.pos, lineEnd, ':')
+      if colon < 0 or colon == p.pos: return p.fail(Http400)
+      for i in p.pos ..< colon:
+        let b = uint8(buf[i])
+        if b <= 0x20'u8 or b >= 0x7f'u8 or char(b) in tokenDelims:
+          return p.fail(Http400)
+      var vs = colon + 1
+      while vs < lineEnd and buf[vs] in {' ', '\t'}: inc vs
+      var ve = lineEnd
+      while ve > vs and buf[ve-1] in {' ', '\t'}: dec ve
+      for i in vs ..< ve:
+        let b = uint8(buf[i])
+        if (b < 0x20'u8 and b != 0x09'u8) or b == 0x7f'u8:
+          return p.fail(Http400)
+      p.trailers.add HeaderSlice(
+        nameStart: int32(p.pos), nameLen: int32(colon - p.pos),
+        valStart: int32(vs), valLen: int32(ve - vs))
+      p.pos = nl + 1
 
     of ppComplete:
       return prComplete

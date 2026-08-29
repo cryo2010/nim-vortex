@@ -64,6 +64,13 @@ type
     ## zero-copy parser slices, so it allocates nothing.
     req: Request
 
+  RequestTrailers* = object
+    ## A read-only, case-insensitive view of a request's *trailers* (the header
+    ## fields a chunked/streamed request may send after its body), mirroring the
+    ## `req.headers[name]` shape. Empty until the request body has fully arrived;
+    ## read it from a buffered handler or the last `req.onBody(last=true)` call.
+    req: Request
+
   Cookies* = object
     ## A read-only view of a request's cookies, mirroring the `req.headers[name]`
     ## shape: `req.cookies["sid"]`. Just a handle; parses the Cookie header(s) on
@@ -148,6 +155,18 @@ proc headers*(res: Response): var ResponseHeaders =
     "res.headers is loop-thread only; set headers before req.blocking, or " &
     "pass them to send() from the worker"
   res.core.respHeaders.mgetOrPut((res.fd, res.gen, res.stream), ResponseHeaders())
+
+proc trailers*(res: Response): var ResponseHeaders =
+  ## Response trailers to emit after a streamed body: the chunked trailer
+  ## section on HTTP/1.1, a trailing HEADERS frame on HTTP/2. Same shape as
+  ## `res.headers`, e.g. `res.trailers["X-Checksum"] = digest` or
+  ## `res.trailers.add("Server-Timing", t)`. Set them any time before
+  ## `res.finish`, which emits them. Streamed responses only
+  ## (`res.sendHead`/`write`/`finish`); loop-thread only, like `res.headers`.
+  ## NOTE: HTTP/3 does not emit response trailers yet (they are dropped there).
+  assert currentThreadId() == res.core.threadId,
+    "res.trailers is loop-thread only; set it before res.finish on the loop"
+  res.core.respTrailers.mgetOrPut((res.fd, res.gen, res.stream), ResponseHeaders())
 
 # --- accessors --------------------------------------------------------------
 
@@ -299,6 +318,58 @@ proc contains*(h: RequestHeaders, name: string): bool =
           match = false; break
       if match: return true
   false
+
+# --- request trailers -------------------------------------------------------
+
+iterator items*(h: RequestTrailers): (string, string) =
+  ## Yields (name, value) trailer pairs (`for (n, v) in req.trailers`). Names are
+  ## lowercase on h2/h3; empty until the request body has fully arrived.
+  let req = h.req
+  if req.snap != nil:
+    for (n, v) in req.snap.trailers: yield (n, v)
+  elif req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        let st = h3StreamPtr(h3c, uint64(req.stream))
+        if st != nil:
+          for (n, v) in st.trailers: yield (n, v)
+  else:
+    let c = conn(req.core, req.fd, req.gen)
+    if c != nil:
+      if req.stream != 0:
+        let st = h2Stream(c, req.stream)
+        if st != nil:
+          for (n, v) in st.trailers: yield (n, v)
+      else:
+        for hs in c.parser.trailers:
+          yield (c.rbuf.substr(int(hs.nameStart),
+                               int(hs.nameStart + hs.nameLen) - 1),
+                 c.rbuf.substr(int(hs.valStart),
+                               int(hs.valStart + hs.valLen) - 1))
+
+proc trailers*(req: Request): RequestTrailers {.inline.} =
+  ## A read-only, case-insensitive view of the request *trailers* (the header
+  ## fields a chunked/streamed request may send after its body), matching the
+  ## `req.headers[name]` shape: `req.trailers["checksum"]`,
+  ## `"x" in req.trailers`, `for (n, v) in req.trailers`. Empty until the body
+  ## is fully received (read it from a buffered handler or the last
+  ## `req.onBody(last=true)` call).
+  RequestTrailers(req: req)
+
+proc `[]`*(h: RequestTrailers, name: string): string =
+  ## First value for `name` (case-insensitive); "" when absent.
+  for (n, v) in h:
+    if cmpIgnoreCase(n, name) == 0: return v
+
+proc contains*(h: RequestTrailers, name: string): bool =
+  ## True if the trailer is present (case-insensitive), even with an empty value.
+  for (n, _) in h:
+    if cmpIgnoreCase(n, name) == 0: return true
+
+proc len*(h: RequestTrailers): int =
+  ## Number of trailer fields received.
+  for _ in h: inc result
 
 proc body*(req: Request): string =
   if req.snap != nil: return req.snap.body
@@ -1735,13 +1806,20 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
   except Exception:
     return false
 
-proc finish*(res: Response, trailers: openArray[(string, string)] = [])
-             {.raises: [].} =
-  ## Terminate a streaming response (the chunked 0-chunk plus optional
-  ## trailers, or a connection close for HTTP/1.0), flush, and resume the
-  ## connection for the next request. `{.raises: [].}` (contained) for async.
+proc finish*(res: Response) {.raises: [].} =
+  ## Terminate a streaming response: the chunked 0-chunk plus any `res.trailers`
+  ## on HTTP/1.1, a final DATA / trailing HEADERS(END_STREAM) on HTTP/2, or a
+  ## connection close for HTTP/1.0; then flush and resume the connection for the
+  ## next request. Set trailers with `res.trailers` before calling.
+  ## `{.raises: [].}` (contained) for async.
   try:
     if currentThreadId() != res.core.threadId: return
+    # Pull any pending res.trailers (loop-thread only, so no lock needed).
+    var trailers: seq[(string, string)]
+    let tkey = (res.fd, res.gen, res.stream)
+    if res.core.respTrailers.len > 0 and res.core.respTrailers.hasKey(tkey):
+      for pair in res.core.respTrailers[tkey].pairs: trailers.add pair
+      res.core.respTrailers.del tkey
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
@@ -1752,6 +1830,8 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
               let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)), "", true)
               if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
+          # NOTE: HTTP/3 response trailers are not emitted yet (needs an
+          # nghttp3 submit_trailers path in the C++ shim); `trailers` is dropped.
           h3StreamFinish(h3c, uint64(res.stream))
       return
     let c = conn(res.core, res.fd, res.gen)
@@ -1764,7 +1844,7 @@ proc finish*(res: Response, trailers: openArray[(string, string)] = [])
           if z.len > 0: discard h2StreamWrite(c, res.stream, z)
           st.respComp = nil
           st.respEnc = ""
-      h2StreamFinish(c, res.stream)
+      h2StreamFinish(c, res.stream, trailers)
       flushConn(res)
       return
     if not c.respStreaming: return
@@ -2073,6 +2153,8 @@ proc snapshotRequest(req: Request): ReqSnapshot =
           for (n, v) in st.headers: result.headers.add (n, v)
       else:
         for (n, v) in req.headers: result.headers.add (n, v)  # h1: no pseudo
+  # Trailers, if any arrived before dispatch (buffered requests have them all).
+  for (n, v) in req.trailers: result.trailers.add (n, v)
 
 proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32): Request =
   ## Build the worker's Request, pointing it at the task snapshot when present
