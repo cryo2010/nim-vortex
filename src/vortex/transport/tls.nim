@@ -57,6 +57,8 @@ const
   X509_V_OK = clong(0)
   SSL_MODE_ENABLE_PARTIAL_WRITE = clong(1)
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
+  SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
+  SSL_SESS_CACHE_SERVER = clong(0x0002)
 
 const
   # OpenSSL protocol version numbers (for set_min_proto_version).
@@ -80,6 +82,8 @@ proc SSL_CTX_use_certificate_chain_file(ctx: SslCtxPtr, file: cstring): cint
 proc SSL_CTX_use_certificate(ctx: SslCtxPtr, x: pointer): cint   # up-refs x
 proc SSL_CTX_use_PrivateKey(ctx: SslCtxPtr, pkey: pointer): cint # up-refs pkey
 proc SSL_CTX_check_private_key(ctx: SslCtxPtr): cint
+proc SSL_CTX_set_session_id_context(ctx: SslCtxPtr, sid: cstring,
+                                    len: cuint): cint
 proc SSL_CTX_ctrl(ctx: SslCtxPtr, cmd: cint, larg: clong,
                   parg: pointer): clong
 proc SSL_CTX_set_cipher_list(ctx: SslCtxPtr, str: cstring): cint
@@ -434,6 +438,20 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   discard SSL_CTX_ctrl(ctx, SSL_CTRL_MODE,
       SSL_MODE_ENABLE_PARTIAL_WRITE or SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
       nil)
+  # Session resumption. OpenSSL already resumes by default -- server session
+  # cache (SSL_SESS_CACHE_SERVER) for TLS 1.2 and stateless tickets for TLS 1.3
+  # (we never set SSL_OP_NO_TICKET) -- and the SSL_CTX is shared across all loop
+  # threads, so its ticket key and session cache are shared: a resumed
+  # connection succeeds whichever thread accepts it. The one gap this closes:
+  # under client-cert auth (mTLS) OpenSSL refuses to resume a stored session
+  # unless a session-id context is set (RFC-mandated, to bind the resumed
+  # session to this verification context). Set one so verifyClient deployments
+  # can resume too; make the server cache mode explicit rather than relying on
+  # the default.
+  const sidCtx = "vortex/1"
+  discard SSL_CTX_set_session_id_context(ctx, sidCtx.cstring, cuint(sidCtx.len))
+  discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE,
+                       SSL_SESS_CACHE_SERVER, nil)
   ctx
 
 proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
