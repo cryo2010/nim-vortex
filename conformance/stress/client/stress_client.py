@@ -68,7 +68,12 @@ async def body_gen():
     off = 0
     while off < STREAM:
         n = min(CHUNK, STREAM - off); yield gen_chunk(off, n); off += n
-        xfer[0] += n            # bytes handed to the transport (upload progress)
+        # h1/h2 (httpx) stream the body -- httpx pulls the next chunk only when
+        # it can send the current one (bounded by the socket / h2 window) -- so
+        # bytes yielded ~= bytes sent, an accurate live upload rate. h3 (aioquic)
+        # buffers the whole body up front, so there yielded != sent; count h3
+        # upload progress on completion instead (see w_streamupload).
+        if not IS_H3: xfer[0] += n
 
 # --- request-body compression (server decompresses via decompressRequest) ----
 def compress(raw: bytes):
@@ -133,9 +138,13 @@ def fmt_codes() -> str:
 
 def fmt_xfer(now: float) -> str:
     """A throughput segment for the streaming workloads: cumulative bytes plus
-    the MB/s since the last report, so a slow-but-progressing transfer (a 1 GiB
-    upload takes many report intervals) is visible instead of a bare 0, and a
-    real stall shows 0 MB/s."""
+    the MB/s since the last report. `xfer` tracks what actually moved on the
+    wire, not what was queued: download counts bytes received; h1/h2 upload
+    counts bytes yielded (httpx streams, so yielded ~= sent); h3 upload counts
+    STREAM per completed transfer (aioquic buffers the whole body up front, so a
+    queued-bytes rate would spike then read 0 while the wire drains). 0 MB/s
+    means nothing moved in the interval -- a stall, or (h3 upload) a large
+    transfer still in flight with no completion yet."""
     dt, db = now - _rate[0], xfer[0] - _rate[1]
     _rate[0], _rate[1] = now, xfer[0]
     rate = db / dt / MB if dt > 0 else 0.0
@@ -277,6 +286,12 @@ async def w_streamupload():
             if st == 400: raise Fail("server rejected the SHA-1 (400)")
             if st != 200: raise Fail(f"upload -> {st}")
             bump(200)
+            if IS_H3: xfer[0] += STREAM   # h3 only: aioquic buffers the whole
+                                          # body up front, so a queued-bytes rate
+                                          # spikes then reads 0 while the wire
+                                          # drains. Count delivered on completion.
+                                          # h1/h2 already count sent bytes in
+                                          # body_gen (httpx streams).
     await drive(once)
 
 async def w_streamdownload():
