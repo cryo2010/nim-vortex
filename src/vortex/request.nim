@@ -10,6 +10,8 @@
 import std/[httpcore, strutils, uri, tables, json, options, typetraits, macros, times]
 import ./connection
 import ./proxyprotocol   # isTrustedProxy for forwarded-header resolution
+import ./multipart
+export multipart          # MultipartForm/MultipartFile + field/file accessors
 import ./blockingguard
 import ./conditional
 export blockingguard
@@ -626,14 +628,36 @@ proc mediaType*(req: Request): string =
   let semi = ct.find(';')
   result = (if semi >= 0: ct[0 ..< semi] else: ct).strip.toLowerAscii
 
-proc form*(req: Request): Table[string, string] =
-  ## Parse an `application/x-www-form-urlencoded` request body into fields:
-  ## percent-decoded, `+` is a space (form encoding), last value wins on a
-  ## duplicate key. Empty for any other content type; use `decodeQuery(req.body)`
-  ## directly if you need every occurrence of a repeated key. Call on the loop
-  ## thread (it reads req.body), not inside `blocking:`.
-  if req.mediaType != "application/x-www-form-urlencoded": return
-  for (k, v) in decodeQuery(req.body): result[k] = v
+proc form*(req: Request): FormFields =
+  ## The submitted form fields, from an `application/x-www-form-urlencoded` body
+  ## OR the text parts of a `multipart/form-data` body (percent-decoded, `+` is a
+  ## space for urlencoded). Indexed like `req.headers`: `req.form["email"]` is
+  ## the first value ("" if absent), `"email" in req.form` tests presence,
+  ## `for (k, v) in req.form` iterates all (a repeated field keeps every value;
+  ## `[]` returns the first). Empty for any other content type. Uploaded files
+  ## are on `req.files`. Reads `req.body` (bounded by `maxBodySize`) and parses on
+  ## each call, so bind it once (`let f = req.form`) rather than indexing
+  ## repeatedly; loop thread only (not inside `blocking:`).
+  case req.mediaType
+  of "application/x-www-form-urlencoded":
+    for (k, v) in decodeQuery(req.body): result.s.add (k, v)
+  of "multipart/form-data":
+    let boundary = multipartBoundary(req.header("content-type"))
+    if boundary.len > 0: result.s = parseMultipart(req.body, boundary).fields
+  else: discard
+
+proc files*(req: Request): UploadedFiles =
+  ## The uploaded files of a `multipart/form-data` body, keyed by the form field
+  ## name (the `<input name>`). Indexed like `req.headers`, except a missing key
+  ## raises (there is no empty file): `req.files["avatar"]` is the first file for
+  ## that field, `"avatar" in req.files` tests presence, `for f in req.files`
+  ## iterates all. Each is an `UploadedFile` (`.filename`, `.contentType`,
+  ## `.content`). Empty for any other content type. Buffered -- reads `req.body`
+  ## (bounded by `maxBodySize`); for large uploads stream via `req.onBody` /
+  ## `req.read` and parse incrementally instead. Loop thread only.
+  if req.mediaType == "multipart/form-data":
+    let boundary = multipartBoundary(req.header("content-type"))
+    if boundary.len > 0: result.s = parseMultipart(req.body, boundary).files
 
 # --- content negotiation (Accept / Accept-Language / Accept-Charset) ---------
 

@@ -1,13 +1,13 @@
 ## Request-side helpers: req.form (application/x-www-form-urlencoded parsing) and
 ## content negotiation (req.accepts / acceptsLanguage over Accept headers).
 
-import std/[unittest, net, tables]
+import std/[unittest, net]
 import std/httpclient except Response
 import vortex/[settings, request, server, routing]
 
 proc hForm(req: Request, res: Response) {.gcsafe.} =
-  let f = req.form
-  res.send(Http200, f.getOrDefault("name") & "|" & f.getOrDefault("q"))
+  let f = req.form                 # req.headers-shaped: [] is "" when absent
+  res.send(Http200, f["name"] & "|" & f["q"])
 
 proc hAccept(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, req.accepts("application/json", "text/html"))
