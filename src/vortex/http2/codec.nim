@@ -72,6 +72,8 @@ type
     maxControlFrames*: int
     rstStreamCount*: int
     controlFrameCount*: int
+    streamRecvWindow*: int    ## per-stream receive window we advertise
+    connRecvWindow*: int      ## per-connection receive window (streaming cap)
 
 const
   ourMaxFrameSize = defaultMaxFrameSize
@@ -81,7 +83,9 @@ proc h2Conn*(c: ptr Connection): H2Conn {.inline.} =
 
 proc newH2Conn*(core: ptr LoopCore, maxBody, maxHeaderList,
                 maxConcurrentStreams, maxResetStreams,
-                maxControlFrames: int): H2Conn =
+                maxControlFrames: int,
+                streamRecvWindow = 1024 * 1024,
+                connRecvWindow = 1024 * 1024): H2Conn =
   H2Conn(
     core: core,
     decoder: initHpackDecoder(4096, maxDecoded = maxHeaderList),
@@ -92,7 +96,9 @@ proc newH2Conn*(core: ptr LoopCore, maxBody, maxHeaderList,
     maxHeaderList: maxHeaderList,
     maxConcurrentStreams: maxConcurrentStreams,
     maxResetStreams: maxResetStreams,
-    maxControlFrames: maxControlFrames)
+    maxControlFrames: maxControlFrames,
+    streamRecvWindow: max(streamRecvWindow, int(defaultInitialWindow)),
+    connRecvWindow: max(connRecvWindow, int(defaultInitialWindow)))
 
 proc sendOurSettings(c: ptr Connection) =
   var payload = ""
@@ -101,9 +107,23 @@ proc sendOurSettings(c: ptr Connection) =
   payload.addSetting(setMaxConcurrentStreams,
                      uint32(h2Conn(c).maxConcurrentStreams))
   payload.addSetting(setMaxFrameSize, uint32(ourMaxFrameSize))
+  # Advertise our per-stream receive window. The HTTP/2 default is only 64 KiB,
+  # which throttles uploads to (window / round-trip): a large streaming upload,
+  # especially on an async/manualAck handler that replenishes the window on
+  # consumption, drains it and stalls each cycle. A larger window keeps the pipe
+  # full (bandwidth-delay product). Bounded per stream by this value and per
+  # connection by connRecvWindow (see the DATA flow-control handling).
+  payload.addSetting(setInitialWindowSize, uint32(h2Conn(c).streamRecvWindow))
   payload.addSetting(setEnableConnectProtocol, 1)   # RFC 8441 WebSockets
   c.wbuf.addFrameHeader(payload.len, ftSettings, 0, 0)
   c.wbuf.add payload
+  # Grow the connection-level receive window from the fixed 64 KiB default to
+  # connRecvWindow, so the whole connection (not just one stream) can keep a
+  # large upload in flight. Streaming-body bytes are credited back on
+  # consumption, so this doubles as the cap on total un-consumed upload buffer.
+  let connGrow = h2Conn(c).connRecvWindow - int(defaultInitialWindow)
+  if connGrow > 0:
+    c.wbuf.addWindowUpdate(0, connGrow)
 
 proc connError(h2: H2Conn, c: ptr Connection, err: uint32) =
   c.wbuf.addGoaway(h2.lastStreamId, err)
@@ -558,15 +578,22 @@ proc h2DeliverBody(h2: H2Conn, c: ptr Connection, sid: uint32, last: bool) =
     swap(buf, st.body)
     cb(buf.toOpenArray(0, buf.len - 1), last)
     if not manualAck and buf.len > 0:
+      # Auto-ack: consumed on delivery. Replenish both the stream and the
+      # connection window (the connection window is credited on consume for
+      # streaming bodies, so it bounds total un-consumed upload buffer).
       c.wbuf.addWindowUpdate(sid, buf.len)
+      c.wbuf.addWindowUpdate(0, buf.len)
 
 proc h2AckBody*(c: ptr Connection, sid: uint32, n: int) =
   ## Replenish `n` consumed body bytes of a streaming stream's flow-control
-  ## window (req.ackBody). The connection window was replenished on receipt.
+  ## window (req.ackBody). Credits both the stream and the connection window:
+  ## for a streaming body the connection window is credited on consumption (not
+  ## receipt), so it caps total un-consumed upload buffer across all streams.
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or not h2.streams[sid].streamingReq:
     return
   c.wbuf.addWindowUpdate(sid, n)
+  c.wbuf.addWindowUpdate(0, n)
 
 proc h2SetOnBody*(c: ptr Connection, sid: uint32, cb: BodyCb,
                   manualAck = false) =
@@ -750,6 +777,9 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.connError(c, errProtocol)   # DATA on an idle stream
       return
     # Flow control applies to the whole payload regardless of validity.
+    # A streaming body's DATA payload has its connection-window credit deferred
+    # to consumption (set below); 0 means credit the whole frame eagerly.
+    var streamingConnDefer = 0
     if sid notin h2.streams or h2.streams[sid].endStreamSeen or
         not h2.streams[sid].headersDone:
       h2.streamError(c, sid, errStreamClosed)
@@ -786,11 +816,13 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       elif st.streamingReq:
         # Inbound streaming: hand DATA to onBody and clear (bounded memory);
         # no content-length reconciliation since the body is not retained. The
-        # stream flow-control window is replenished on consume (h2DeliverBody /
-        # ackBody), not here, so a slow consumer throttles the peer; padding is
-        # discarded now, so credit its flow-control bytes now.
+        # stream AND connection flow-control windows are replenished on consume
+        # (h2DeliverBody / ackBody), not here, so a slow consumer throttles the
+        # peer and the connection window caps total un-consumed buffer; padding
+        # is discarded now, so credit its flow-control bytes now.
         if fh.length > dataLen:
           c.wbuf.addWindowUpdate(sid, fh.length - dataLen)
+        streamingConnDefer = dataLen    # connection credit deferred to consume
         if dataLen > 0:
           let old = st.body.len
           st.body.setLen(old + dataLen)
@@ -812,10 +844,14 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
             st.dispatched = true
             ready.add sid
     # Replenish the connection window eagerly (so a slow stream can't starve
-    # the others); the stream window is eager too, except a streaming request
-    # defers it to consumption (handled above / via ackBody).
+    # the others), EXCEPT a streaming body's DATA payload, which is credited on
+    # consumption (h2DeliverBody / ackBody) so the connection window bounds the
+    # total un-consumed upload buffer across all streams. The stream window is
+    # eager too, except a streaming request defers it to consumption likewise.
     if fh.length > 0:
-      c.wbuf.addWindowUpdate(0, fh.length)
+      let connNow = fh.length - streamingConnDefer
+      if connNow > 0:
+        c.wbuf.addWindowUpdate(0, connNow)
       if fh.streamId in h2.streams and
           not h2.streams[fh.streamId].endStreamSeen and
           not h2.streams[fh.streamId].streamingReq:

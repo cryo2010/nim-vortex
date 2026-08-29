@@ -18,6 +18,23 @@ proc addInitialWindow(buf: var string, value: uint32) =
   buf.addFrameHeader(payload.len, ftSettings, 0, 0)
   buf.add payload
 
+proc settingValue(frames: seq[Frame], id: uint16): int =
+  ## Value of setting `id` in the server's own (non-ACK) SETTINGS frame, or -1.
+  for f in frames:
+    if f.typ == uint8(ftSettings) and (f.flags and flagAck) == 0:
+      var i = 0
+      while i + 6 <= f.payload.len:
+        if get16(f.payload, i) == id: return int(get32(f.payload, i + 2))
+        i += 6
+  -1
+
+proc connWindowGrow(frames: seq[Frame]): int =
+  ## Increment of the server's connection-level (stream 0) WINDOW_UPDATE, or -1.
+  for f in frames:
+    if f.typ == uint8(ftWindowUpdate) and f.streamId == 0 and f.payload.len >= 4:
+      return int(get32(f.payload, 0))
+  -1
+
 suite "HTTP/2 flow control":
   test "raising INITIAL_WINDOW_SIZE flushes DATA blocked on a zero window":
     var c = newH2TestConn(srv.port)
@@ -50,6 +67,21 @@ suite "HTTP/2 flow control":
     check payload == "hello h2"
     check endStream                                # stream completes
     c.close()
+
+  test "server advertises the configured receive windows (upload throughput)":
+    # The HTTP/2 default receive window is only 64 KiB, which throttles uploads
+    # to window/round-trip. The server must advertise the configured per-stream
+    # window (SETTINGS_INITIAL_WINDOW_SIZE) and grow the connection window, so a
+    # large streaming upload keeps the pipe full instead of stalling each cycle.
+    var s2 = newVortex(RequestHandler(handler),
+      initVortexConfig(numThreads = 1, h2StreamWindow = 512 * 1024,
+                       h2ConnWindow = 768 * 1024)).start(0)
+    var c2 = newH2TestConn(s2.port)
+    let fr = c2.readFrames(500)
+    check settingValue(fr, setInitialWindowSize) == 512 * 1024
+    check connWindowGrow(fr) == 768 * 1024 - 65535
+    c2.close()
+    s2.close()
 
 srv.close()
 echo "server shut down cleanly"

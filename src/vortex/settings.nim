@@ -65,6 +65,19 @@ type
     maxResetStreams*: int         ## h2 peer resets before GOAWAY (rapid reset)
     maxControlFrames*: int        ## h2 PING/SETTINGS/etc. between stream progress
     maxRequestsPerSocket*: int    ## HTTP/1 keep-alive requests before close
+    h2StreamWindow*: int          ## h2 receive window advertised per stream
+                                  ## (SETTINGS_INITIAL_WINDOW_SIZE): the upload
+                                  ## flow-control window and the cap on one
+                                  ## stream's un-consumed streaming-body buffer.
+                                  ## Larger = higher upload throughput on
+                                  ## higher-latency links (bandwidth-delay
+                                  ## product); the 64 KiB HTTP/2 default throttles
+                                  ## it. (h3 uses QUIC transport-parameter flow
+                                  ## control, set separately by the ngtcp2 shim.)
+    h2ConnWindow*: int            ## h2 per-connection receive window: the cap on
+                                  ## total un-consumed streaming-body buffer
+                                  ## across all streams (bounds memory regardless
+                                  ## of stream count). Should be >= h2StreamWindow.
 
     # Timeouts (seconds, coarse; 0 disables)
     headerTimeout*: int       ## from first byte of a request to end of headers
@@ -122,6 +135,8 @@ proc initVortexConfig*(
     maxResetStreams = 512,
     maxControlFrames = 1000,
     maxRequestsPerSocket = 0,
+    h2StreamWindow = 1024 * 1024,
+    h2ConnWindow = 1024 * 1024,
     headerTimeout = 10,
     bodyTimeout = 30,
     keepAliveTimeout = 60,
@@ -163,6 +178,7 @@ proc initVortexConfig*(
     maxConcurrentStreams: maxConcurrentStreams,
     maxResetStreams: maxResetStreams, maxControlFrames: maxControlFrames,
     maxRequestsPerSocket: maxRequestsPerSocket,
+    h2StreamWindow: h2StreamWindow, h2ConnWindow: h2ConnWindow,
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
     responseTimeout: responseTimeout,
