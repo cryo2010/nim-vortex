@@ -3,7 +3,7 @@
 ## One H2Conn per connection, touched only by the owning loop thread
 ## (workers respond through the protocol-neutral outbox).
 
-import std/[tables, strutils, uri, json]
+import std/[tables, strutils, uri, json, deques]
 import ./frames, ./hpack
 import ../connection
 import ../websocket/codec as wscodec
@@ -50,6 +50,7 @@ type
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
     pendingWindow*: int              ## consumed bytes not yet returned as a
                                      ## stream WINDOW_UPDATE (batched at half-window)
+    inSendQ*: bool                   ## currently queued in H2Conn.sendQ (dedupe)
 
   H2Conn* = ref object of RootObj
     core*: ptr LoopCore              ## owning loop core (for WS callbacks)
@@ -80,6 +81,12 @@ type
     connRecvWindow*: int      ## per-connection receive window (streaming cap)
     pendingConnWindow*: int   ## consumed bytes not yet returned as a connection
                               ## WINDOW_UPDATE (batched at half-window)
+    # Per-connection write scheduler: sendQ is a round-robin ready-queue of
+    # streams that can emit a frame now (h2Sendable); the scheduler pops one,
+    # emits a single frame, and re-enqueues at the back so no stream is starved.
+    sendQ*: Deque[uint32]
+    scheduling*: bool         ## reentrancy guard for h2Schedule
+    resuming*: bool           ## reentrancy guard for h2ResumeProducers
 
 const
   ourMaxFrameSize = defaultMaxFrameSize
@@ -193,39 +200,65 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   h2.streams.del(sid)
   dec h2.activeStreams
 
-proc sendData(h2: H2Conn, c: ptr Connection, sid: uint32) =
-  ## Push as much of the stream's pending response body as flow control
-  ## allows; delete the stream once fully sent (emitting trailers first when
-  ## res.trailers were set).
+proc h2Sendable(h2: H2Conn, st: H2Stream): bool =
+  ## Can this stream emit a frame right now, ignoring the connection window
+  ## (which gates the whole pass, not queue membership)? A backlog needs its
+  ## own send window; an empty backlog is sendable only when it still owes a
+  ## terminal frame -- END_STREAM for a response, the close for a WebSocket.
+  let backlog = st.pendingBody.len - st.pendingPos
+  if backlog > 0: return st.sendWindow > 0
+  if st.ws != nil: return WsConn(st.ws).wantClose
+  st.pendingIsLast
+
+proc h2Enqueue(h2: H2Conn, sid: uint32) =
+  ## Add a stream to the round-robin ready-queue if it can send now and is not
+  ## already queued (O(1) dedupe via inSendQ).
   if sid notin h2.streams: return
   template st: H2Stream = h2.streams[sid]
-  while true:
-    let remaining = st.pendingBody.len - st.pendingPos
-    if remaining == 0:
-      if st.pendingIsLast:
-        if st.respTrailers.len > 0:
-          h2.emitTrailers(c, sid)          # trailing HEADERS(END_STREAM) + drop
-        else:
-          h2.streams.del(sid)
-          dec h2.activeStreams
-      return
-    var chunk = min(remaining, h2.peerMaxFrame)
-    chunk = min(chunk, int(st.sendWindow))
-    chunk = min(chunk, int(h2.connSendWindow))
-    if chunk <= 0:
-      return                        # blocked on window; resume on UPDATE
-    # With trailers pending the last DATA must NOT carry END_STREAM; the
-    # trailing HEADERS frame closes the stream instead.
-    let last = st.pendingIsLast and st.respTrailers.len == 0 and
-               (st.pendingPos + chunk == st.pendingBody.len)
-    c.wbuf.addFrameHeader(chunk, ftData,
-                          (if last: flagEndStream else: 0'u8), sid)
-    let oldLen = c.wbuf.len
-    c.wbuf.setLen(oldLen + chunk)
-    copyMem(addr c.wbuf[oldLen], addr st.pendingBody[st.pendingPos], chunk)
-    st.pendingPos += chunk
-    st.sendWindow -= int32(chunk)
-    h2.connSendWindow -= int32(chunk)
+  if not st.inSendQ and h2.h2Sendable(st):
+    st.inSendQ = true
+    h2.sendQ.addLast(sid)
+
+proc emitOneFrame(h2: H2Conn, c: ptr Connection, sid: uint32): bool =
+  ## Emit exactly one DATA frame for a stream, bounded by the peer max frame
+  ## size and both flow-control windows. Returns true if a body frame went out.
+  ## Terminal handling for an empty backlog that owes END_STREAM: emit trailers
+  ## (trailing HEADERS) or a bare END_STREAM DATA, then drop the stream.
+  if sid notin h2.streams: return false
+  template st: H2Stream = h2.streams[sid]
+  let remaining = st.pendingBody.len - st.pendingPos
+  if remaining == 0:
+    if st.ws == nil and st.pendingIsLast:
+      if st.respTrailers.len > 0:
+        h2.emitTrailers(c, sid)              # trailing HEADERS(END_STREAM) + drop
+      else:
+        c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
+        h2.streams.del(sid)
+        dec h2.activeStreams
+    return false
+  var chunk = min(remaining, h2.peerMaxFrame)
+  chunk = min(chunk, int(st.sendWindow))
+  chunk = min(chunk, int(h2.connSendWindow))
+  if chunk <= 0: return false                # blocked on a window; re-enter on UPDATE
+  # With trailers pending the last DATA must NOT carry END_STREAM; the trailing
+  # HEADERS frame closes the stream instead. WebSocket DATA never ends the stream.
+  let last = st.ws == nil and st.pendingIsLast and st.respTrailers.len == 0 and
+             (st.pendingPos + chunk == st.pendingBody.len)
+  c.wbuf.addFrameHeader(chunk, ftData,
+                        (if last: flagEndStream else: 0'u8), sid)
+  let oldLen = c.wbuf.len
+  c.wbuf.setLen(oldLen + chunk)
+  copyMem(addr c.wbuf[oldLen], addr st.pendingBody[st.pendingPos], chunk)
+  st.pendingPos += chunk
+  st.sendWindow -= int32(chunk)
+  h2.connSendWindow -= int32(chunk)
+  if st.pendingPos == st.pendingBody.len:
+    st.pendingBody.setLen 0                  # compact a fully-drained buffer
+    st.pendingPos = 0
+  if last:
+    h2.streams.del(sid)
+    dec h2.activeStreams
+  true
 
 # --- RFC 8441 WebSockets over HTTP/2 ----------------------------------------
 
@@ -239,20 +272,16 @@ proc h2WsFinalize(h2: H2Conn, c: ptr Connection, sid: uint32, w: WsConn) =
     h2.streams.del(sid)
     dec h2.activeStreams
 
-proc h2WsPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
-  ## Flush a WebSocket stream's queued outbound frames as DATA (bounded by
-  ## flow control), finalize on close, and track backpressure for onDrain /
-  ## bufferedAmount. `pendingIsLast` stays false so sendData never emits
-  ## END_STREAM or deletes the stream on its own.
+proc h2WsAfterEmit(h2: H2Conn, c: ptr Connection, sid: uint32) =
+  ## WebSocket post-emit bookkeeping after the scheduler pushed a frame for this
+  ## stream: finalize on close, clear/fire onDrain backpressure, or RST a close
+  ## that can never drain (window exhausted).
   if sid notin h2.streams or h2.streams[sid].ws == nil: return
   let w = WsConn(h2.streams[sid].ws)
-  h2.sendData(c, sid)
   template st: H2Stream = h2.streams[sid]
   let backlog = st.pendingBody.len - st.pendingPos
   w.h2Pending = backlog
   if backlog == 0:
-    st.pendingBody.setLen 0
-    st.pendingPos = 0
     if w.wantClose:
       h2WsFinalize(h2, c, sid, w)
     elif w.backedUp:
@@ -272,10 +301,61 @@ proc h2WsPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
       h2.streams.del(sid)
       dec h2.activeStreams
 
+proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
+  ## Resume streamed-response producers parked on the connection write-buffer
+  ## cap (respHighWater), now that a scheduler pass or a socket drain left room.
+  ## A parked producer's frames have already been emitted, so its backlog is
+  ## empty and it is NOT in the ready-queue -- only this scan finds it. Collect
+  ## ids first (an onRespDrain callback may res.write and mutate the table) and
+  ## stop early if a resumed producer refills the buffer.
+  if h2.resuming: return
+  if pendingOut(c) >= respHighWater: return
+  h2.resuming = true
+  var resumable: seq[uint32]
+  for sid in h2.streams.keys:
+    template st: H2Stream = h2.streams[sid]
+    if st.respBackedUp and st.onRespDrain != nil and
+       st.pendingBody.len - st.pendingPos < respHighWater:
+      resumable.add sid
+  for sid in resumable:
+    if pendingOut(c) >= respHighWater: break
+    if sid notin h2.streams: continue
+    template st: H2Stream = h2.streams[sid]
+    if not st.respBackedUp or st.onRespDrain == nil: continue
+    st.respBackedUp = false
+    let cb = st.onRespDrain
+    st.onRespDrain = nil            # fire once; the producer re-registers if it
+    cb(h2.core, c.fd, c.gen, sid)   # backs up again (res.write -> enqueue+schedule)
+  h2.resuming = false
+
+proc h2Schedule(h2: H2Conn, c: ptr Connection) =
+  ## Round-robin write pass: pop the next ready stream, emit ONE frame, and
+  ## re-enqueue it at the back if it can still send. Bounded by the connection
+  ## send window and the write-buffer cap (respHighWater) so no single stream
+  ## monopolises the wire or buffers a whole response in RAM. When the pass
+  ## ends with room, resume any producer parked on the buffer cap.
+  if h2.scheduling: return
+  h2.scheduling = true
+  while h2.sendQ.len > 0 and h2.connSendWindow > 0 and pendingOut(c) < respHighWater:
+    let sid = h2.sendQ.popFirst()
+    if sid notin h2.streams: continue
+    template st: H2Stream = h2.streams[sid]
+    st.inSendQ = false
+    let isWs = st.ws != nil
+    discard emitOneFrame(h2, c, sid)
+    if sid notin h2.streams: continue        # emitted a terminal frame and dropped
+    if isWs:
+      h2.h2WsAfterEmit(c, sid)
+      if sid in h2.streams and h2.h2Sendable(h2.streams[sid]): h2.h2Enqueue(sid)
+    elif h2.h2Sendable(st):
+      h2.h2Enqueue(sid)                       # more to send: back of the line
+  h2.scheduling = false
+  h2.h2ResumeProducers(c)
+
 proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
                w: WsConn) {.nimcall, gcsafe.} =
   ## `WsConn.flush` for HTTP/2: append produced frames to the stream's
-  ## pending outbound and push them as DATA.
+  ## pending outbound and schedule them as DATA.
   let h2 = h2Conn(c)
   let sid = w.stream
   if h2 == nil or sid notin h2.streams:
@@ -289,35 +369,8 @@ proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
     st.pendingBody.add w.outBuf
     w.outBuf.setLen 0
     st.pendingIsLast = false
-  h2WsPush(h2, c, sid)
-
-proc h2RespPush(h2: H2Conn, c: ptr Connection, sid: uint32) =
-  ## Flush a streamed response's pending body bounded by flow control and,
-  ## when the backlog empties after backpressure, fire onDrain. Mirrors
-  ## h2WsPush; `pendingIsLast` is set by h2StreamFinish so the last DATA
-  ## carries END_STREAM and sendData deletes the stream on completion.
-  if sid notin h2.streams: return
-  h2.sendData(c, sid)
-  if sid notin h2.streams: return           # finished and fully drained
-  template st: H2Stream = h2.streams[sid]
-  let backlog = st.pendingBody.len - st.pendingPos
-  if backlog == 0:
-    st.pendingBody.setLen 0
-    st.pendingPos = 0
-    # Resume the producer only when BOTH limits have room: the send window (this
-    # stream's backlog is empty) and the connection write buffer (pendingOut).
-    # A large peer window would otherwise drain pendingBody straight into c.wbuf
-    # and fire onDrain while the connection buffer is still full, letting one
-    # stream buffer a whole response in RAM. If the buffer is full, stay backed
-    # up; flushOut's drain (h2DrainResume) resumes us when the socket catches up.
-    if st.respBackedUp and pendingOut(c) < respHighWater:
-      st.respBackedUp = false
-      let cb = st.onRespDrain
-      st.onRespDrain = nil          # fire once; the producer re-registers if it
-      if cb != nil:                 # backs up again (guards the two resume paths)
-        cb(h2.core, c.fd, c.gen, sid)
-  else:
-    st.respBackedUp = true
+  h2.h2Enqueue(sid)
+  h2.h2Schedule(c)
 
 proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
   ## Mark a streamed response as backed up (write() returned false), so a drain
@@ -328,42 +381,11 @@ proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
     h2.streams[sid].respBackedUp = true
 
 proc h2DrainResume*(c: ptr Connection, core: ptr LoopCore) =
-  ## The connection write buffer fully drained to the socket: resume any
-  ## streamed response parked on the connection-level cap (respHighWater), as
-  ## long as its own send window isn't the limit (empty backlog). Collect the
-  ## stream ids first -- an onRespDrain callback may res.write and mutate the
-  ## stream table -- and stop early if a resumed producer refills the buffer.
+  ## The connection write buffer drained to the socket: run a scheduler pass to
+  ## refill it from the ready-queue and resume any producer parked on the cap.
   let h2 = h2Conn(c)
   if h2 == nil: return
-  var resumable: seq[uint32]
-  for sid in h2.streams.keys:
-    template st: H2Stream = h2.streams[sid]
-    if st.respBackedUp and st.onRespDrain != nil and
-       st.pendingBody.len - st.pendingPos < respHighWater:
-      resumable.add sid
-  for sid in resumable:
-    if pendingOut(c) >= respHighWater: break
-    if sid notin h2.streams: continue
-    template st: H2Stream = h2.streams[sid]
-    if not st.respBackedUp: continue
-    st.respBackedUp = false
-    let cb = st.onRespDrain
-    st.onRespDrain = nil            # fire once (guards against a double resume)
-    if cb != nil:
-      cb(core, c.fd, c.gen, sid)
-
-proc h2ResumeSend(h2: H2Conn, c: ptr Connection, sid: uint32) =
-  ## Resume a stream blocked on the send window: WebSocket streams need the
-  ## WS finalize/backpressure bookkeeping, streamed responses need the
-  ## response drain bookkeeping, ordinary responses just sendData.
-  if sid notin h2.streams:
-    return
-  elif h2.streams[sid].ws != nil:
-    h2WsPush(h2, c, sid)
-  elif h2.streams[sid].streaming:
-    h2RespPush(h2, c, sid)
-  else:
-    h2.sendData(c, sid)
+  h2.h2Schedule(c)
 
 # --- streaming responses (res.sendHead / write / finish over HTTP/2) --------
 
@@ -422,7 +444,8 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
     let oldLen = st.pendingBody.len
     st.pendingBody.setLen(oldLen + data.len)
     copyMem(addr st.pendingBody[oldLen], unsafeAddr data[0], data.len)
-  h2RespPush(h2, c, sid)
+  h2.h2Enqueue(sid)
+  h2.h2Schedule(c)
   if sid notin h2.streams: return 0
   h2.streams[sid].pendingBody.len - h2.streams[sid].pendingPos
 
@@ -443,10 +466,11 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   st.pendingIsLast = true
   if trailers.len > 0: st.respTrailers = @trailers
   if st.pendingBody.len - st.pendingPos > 0:
-    # A final real DATA chunk remains; sendData tags it END_STREAM -- or, with
-    # trailers pending, emits the trailing HEADERS once the body drains (and, if
-    # the window is closed, h2ResumeSend does so when it reopens).
-    h2.sendData(c, sid)
+    # A final real DATA chunk remains; the scheduler tags it END_STREAM (or, with
+    # trailers pending, emits the trailing HEADERS once the body drains; a closed
+    # window re-enters via the stream WINDOW_UPDATE path).
+    h2.h2Enqueue(sid)
+    h2.h2Schedule(c)
   elif st.respTrailers.len > 0:
     # The body already drained; close with the trailer section.
     h2.emitTrailers(c, sid)
@@ -599,7 +623,8 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
     copyMem(addr st.pendingBody[0], unsafeAddr body[0], body.len)
     st.pendingPos = 0
     st.pendingIsLast = true
-    h2.sendData(c, sid)
+    h2.h2Enqueue(sid)
+    h2.h2Schedule(c)
 
 proc h2SendInformational*(c: ptr Connection, code: int, sid: uint32,
                           headers: openArray[(string, string)]) =
@@ -1060,13 +1085,11 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       i += 6
     c.wbuf.addFrameHeader(0, ftSettings, flagAck, 0)
     if initialWindowChanged:
-      # Raising SETTINGS_INITIAL_WINDOW_SIZE grows every stream's send
-      # window (RFC 7540 6.9.2): flush DATA it may have unblocked, the same
-      # retry the connection-level WINDOW_UPDATE path does.
-      var retry: seq[uint32]
+      # Raising SETTINGS_INITIAL_WINDOW_SIZE grows every stream's send window
+      # (RFC 7540 6.9.2): re-enqueue any stream with a backlog and run a pass.
       for sid, st in h2.streams:
-        if st.pendingBody.len - st.pendingPos > 0: retry.add sid
-      for sid in retry: h2ResumeSend(h2, c, sid)
+        if st.pendingBody.len - st.pendingPos > 0: h2.h2Enqueue(sid)
+      h2.h2Schedule(c)
 
   of ftPing:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
@@ -1088,13 +1111,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.connError(c, errFlowControl); return
       let wasBlocked = h2.connSendWindow <= 0
       h2.connSendWindow += int32(inc32)
-      if wasBlocked and h2.connSendWindow > 0:
-        # The connection window just went positive: retry stalled streams. Only
-        # scan on this transition, not on every WINDOW_UPDATE.
-        var retry: seq[uint32]
-        for sid, st in h2.streams:
-          if st.pendingBody.len - st.pendingPos > 0: retry.add sid
-        for sid in retry: h2ResumeSend(h2, c, sid)
+      if h2.sendQ.len > 0 or (wasBlocked and h2.connSendWindow > 0):
+        # The connection window moved: run a scheduler pass. The ready-queue
+        # already holds the stream-sendable streams, so no scan is needed.
+        h2.h2Schedule(c)
       else:
         # A WINDOW_UPDATE that unblocked nothing is pure overhead; budget it so a
         # flood trips ENHANCE_YOUR_CALM (the counter resets on real progress).
@@ -1105,7 +1125,8 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       if int64(st.sendWindow) + int64(inc32) > 0x7fffffff'i64:
         h2.streamError(c, fh.streamId, errFlowControl); return
       st.sendWindow += int32(inc32)
-      h2ResumeSend(h2, c, fh.streamId)
+      h2.h2Enqueue(fh.streamId)
+      h2.h2Schedule(c)
     elif fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
 
