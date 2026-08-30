@@ -2440,10 +2440,18 @@ proc emitFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
 
 proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
   ## Loop-side: pin + enqueue the next chunk read; the worker calls
-  ## emitFileChunk when it lands.
+  ## emitFileChunk when it lands. The chunk-read worker only reads a file (never
+  ## the h2 stream table), so mark the pin as a file pin (c.filePinned): h2Input
+  ## may then keep processing flow-control frames while the read is in flight, so
+  ## a streamed sendFile response never starves its own WINDOW_UPDATEs. The
+  ## INITIAL read (sendFile -> serveResolved) is dispatched separately and reads
+  ## req headers, so it is NOT a file pin and correctly pauses input.
   dispatchBlockingData(
     Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
     cast[BlockingDataProc](reader), nextRead)
+  if res.fd >= 0:
+    let c = conn(res.core, res.fd, res.gen)
+    if c != nil: inc c.filePinned
 
 proc applyFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
                      reader: pointer, last: bool) =

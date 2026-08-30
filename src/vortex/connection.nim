@@ -129,6 +129,14 @@ type
     writeArmed*: bool         ## selector currently watching writability
     registered*: bool         ## fd registered with the selector
     pinned*: int32            ## outstanding worker tasks; slot can't recycle
+    filePinned*: int32        ## subset of `pinned` that are sendFile chunk reads
+                              ## (dispatchNextRead). Such a worker only reads a
+                              ## file -- it never touches the HTTP/2 stream table --
+                              ## so h2 input (flow-control frames, other streams'
+                              ## data) is safe to process while ONLY file pins are
+                              ## held. That keeps a streamed response's own
+                              ## WINDOW_UPDATEs flowing while it is mid-stream,
+                              ## instead of starving them until the read unpins.
     closeRequested*: bool     ## close deferred until unpinned
     responded*: bool          ## current request has been answered
     sent100*: bool            ## 100 Continue already sent for this request
