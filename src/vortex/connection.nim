@@ -49,6 +49,7 @@ type
     # stays stateless between chunks.
     aux*: string              ## next read request ("path\0off\0len\0remaining")
     user*: pointer            ## the chunk-reader proc (a BlockingDataProc)
+    buf*: pointer             ## omFileChunk: the pooled read buffer (code = bytes read)
     n64*: int64               ## total Content-Length (omFileStart)
     last*: bool               ## this chunk completes the file
 
@@ -180,6 +181,16 @@ type
     pinned*: int32            ## outstanding worker tasks
     closeReq*: bool           ## free deferred until unpinned
 
+  ChunkPool* = object
+    ## Loop-owned free-list of raw `fileChunkCap` buffers for streamed file
+    ## reads (res.sendFile). A worker fills a borrowed buffer (it never
+    ## allocates); the loop copies it into the response and returns it here.
+    ## alloc/free stay on the loop thread and buffers are recycled, so a
+    ## slow-drained download no longer churns a fresh chunk per read hop through
+    ## the per-thread allocator (which is what ballooned RSS under load).
+    free*: seq[pointer]       ## available buffers (loop thread only)
+    all*: seq[pointer]        ## every buffer created, for teardown
+
   LoopCore* = object
     ## The part of an event loop's state that `Request` handles must reach:
     ## connection slots plus per-loop cached strings. Lives inside the Loop
@@ -208,6 +219,7 @@ type
     threadId*: int            ## owning thread; respond() routes on this
     pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
     outbox*: ptr Outbox
+    chunkPool*: ChunkPool     ## recycled sendFile read buffers (loop-owned)
     respHeaders*: Table[ReqKey, ResponseHeaders]
       ## Pending `res.headers` per in-flight request, merged in at send and
       ## dropped once the response is emitted (loop-thread only). Empty for the
@@ -337,6 +349,25 @@ proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
   if fd < 0 or int(fd) >= core.conns.len: return nil
   result = addr core.conns[int(fd)]
   if result.gen != gen or result.state == csFree: return nil
+
+const fileChunkCap* = 128 * 1024
+  ## Size of a pooled sendFile read buffer (one worker read hop).
+
+proc chunkTake*(p: var ChunkPool): pointer =
+  ## Borrow a buffer for a file-read worker to fill (loop thread only).
+  if p.free.len > 0: return p.free.pop()
+  result = alloc(fileChunkCap)
+  p.all.add result
+
+proc chunkReturn*(p: var ChunkPool, buf: pointer) =
+  ## Return a buffer after the loop copied it into the response (loop thread).
+  if buf != nil: p.free.add buf
+
+proc chunkPoolFree*(p: var ChunkPool) =
+  ## Free every pooled buffer at loop teardown (workers already joined).
+  for b in p.all: dealloc(b)
+  p.free.setLen 0
+  p.all.setLen 0
 
 const respHighWater* = 256 * 1024
   ## write() reports backpressure once the unsent backlog reaches this many
