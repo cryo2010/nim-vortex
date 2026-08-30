@@ -48,6 +48,11 @@ const
   setMaxFrameSize* = 5'u16
   setMaxHeaderListSize* = 6'u16
   setEnableConnectProtocol* = 8'u16   # RFC 8441: Extended CONNECT (WebSockets)
+  setNoRfc7540Priorities* = 9'u16     # RFC 9218: deprecate the 7540 priority tree
+
+  # RFC 9218 extensible prioritization. The PRIORITY_UPDATE frame type is outside
+  # the RFC 9113 0..9 range, so it is matched by raw value in the codec dispatch.
+  ftPriorityUpdate* = 0x10'u8
 
   connectionPreface* = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
   defaultMaxFrameSize* = 16384

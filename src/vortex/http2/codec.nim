@@ -51,6 +51,9 @@ type
     pendingWindow*: int              ## consumed bytes not yet returned as a
                                      ## stream WINDOW_UPDATE (batched at half-window)
     inSendQ*: bool                   ## currently queued in H2Conn.sendQ (dedupe)
+    urgency*: uint8                  ## RFC 9218 priority: 0 (highest) .. 7, default 3
+    incremental*: bool               ## RFC 9218: true = interleave (round-robin),
+                                     ## false (default) = deliver sequentially
 
   H2Conn* = ref object of RootObj
     core*: ptr LoopCore              ## owning loop core (for WS callbacks)
@@ -81,15 +84,46 @@ type
     connRecvWindow*: int      ## per-connection receive window (streaming cap)
     pendingConnWindow*: int   ## consumed bytes not yet returned as a connection
                               ## WINDOW_UPDATE (batched at half-window)
-    # Per-connection write scheduler: sendQ is a round-robin ready-queue of
-    # streams that can emit a frame now (h2Sendable); the scheduler pops one,
-    # emits a single frame, and re-enqueues at the back so no stream is starved.
-    sendQ*: Deque[uint32]
+    # Per-connection write scheduler (RFC 9218): one round-robin ready-queue per
+    # urgency level (0 highest .. 7). The scheduler serves the lowest non-empty
+    # urgency, popping a stream and emitting one frame; incremental streams
+    # re-enqueue at the back (interleave), non-incremental at the front (deliver
+    # sequentially, one stream at a time within its level).
+    sendQ*: array[8, Deque[uint32]]
     scheduling*: bool         ## reentrancy guard for h2Schedule
     resuming*: bool           ## reentrancy guard for h2ResumeProducers
+    # RFC 9218 PRIORITY_UPDATE that arrived before a stream's HEADERS: the raw
+    # Priority field value, applied when the stream opens. Capped to bound a flood.
+    pendingPriority*: Table[uint32, string]
 
 const
   ourMaxFrameSize = defaultMaxFrameSize
+  defaultUrgency* = 3'u8          ## RFC 9218 default urgency when none is signalled
+  maxPendingPriority = 128        ## cap on buffered pre-HEADERS PRIORITY_UPDATEs
+
+proc parsePriorityField(v: string, urgency: var uint8, incremental: var bool) =
+  ## Parse an RFC 9218 Priority field value (an RFC 8941 Structured Field
+  ## dictionary), updating `urgency`/`incremental` in place. Recognises `u`
+  ## (integer 0..7) and `i` (boolean: bare or `?1` = true, `?0` = false);
+  ## unknown members and malformed values are ignored (leave the current value).
+  for part in v.split(','):
+    let kv = part.strip()
+    if kv.len == 0: continue
+    let eq = kv.find('=')
+    if eq < 0:
+      if kv == "i": incremental = true          # bare boolean member = true
+    else:
+      let key = kv[0 ..< eq].strip()
+      let val = kv[eq + 1 .. ^1].strip()
+      case key
+      of "u":
+        try:
+          let n = parseInt(val)
+          if n in 0 .. 7: urgency = uint8(n)
+        except ValueError: discard
+      of "i":
+        incremental = val != "?0"               # ?1 / anything but ?0 = true
+      else: discard
 
 proc h2Conn*(c: ptr Connection): H2Conn {.inline.} =
   H2Conn(c.h2)
@@ -128,6 +162,7 @@ proc sendOurSettings(c: ptr Connection) =
   # connection by connRecvWindow (see the DATA flow-control handling).
   payload.addSetting(setInitialWindowSize, uint32(h2Conn(c).streamRecvWindow))
   payload.addSetting(setEnableConnectProtocol, 1)   # RFC 8441 WebSockets
+  payload.addSetting(setNoRfc7540Priorities, 1)     # RFC 9218 prioritization
   c.wbuf.addFrameHeader(payload.len, ftSettings, 0, 0)
   c.wbuf.add payload
   # Grow the connection-level receive window from the fixed 64 KiB default to
@@ -217,7 +252,7 @@ proc h2Enqueue(h2: H2Conn, sid: uint32) =
   template st: H2Stream = h2.streams[sid]
   if not st.inSendQ and h2.h2Sendable(st):
     st.inSendQ = true
-    h2.sendQ.addLast(sid)
+    h2.sendQ[st.urgency].addLast(sid)
 
 proc emitOneFrame(h2: H2Conn, c: ptr Connection, sid: uint32): bool =
   ## Emit exactly one DATA frame for a stream, bounded by the peer max frame
@@ -337,16 +372,27 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
     except Exception: discard
   h2.resuming = false
 
+proc h2NextUrgency(h2: H2Conn): int =
+  ## Lowest non-empty urgency level (the highest-priority ready streams), or -1
+  ## when nothing is queued. RFC 9218: urgency is the primary ordering key.
+  for u in 0 .. 7:
+    if h2.sendQ[u].len > 0: return u
+  -1
+
 proc h2Schedule(h2: H2Conn, c: ptr Connection) =
-  ## Round-robin write pass: pop the next ready stream, emit ONE frame, and
-  ## re-enqueue it at the back if it can still send. Bounded by the connection
-  ## send window and the write-buffer cap (respHighWater) so no single stream
-  ## monopolises the wire or buffers a whole response in RAM. When the pass
+  ## RFC 9218 write pass: serve the lowest non-empty urgency level, pop a stream,
+  ## emit ONE frame, and requeue it. Incremental streams go to the BACK of their
+  ## level (interleave/round-robin); non-incremental go to the FRONT so a single
+  ## stream is delivered sequentially within its level before the next. Bounded
+  ## by the connection send window and the write-buffer cap (respHighWater) so no
+  ## level monopolises the wire or buffers a whole response in RAM. When the pass
   ## ends with room, resume any producer parked on the buffer cap.
   if h2.scheduling: return
   h2.scheduling = true
-  while h2.sendQ.len > 0 and h2.connSendWindow > 0 and pendingOut(c) < respHighWater:
-    let sid = h2.sendQ.popFirst()
+  while h2.connSendWindow > 0 and pendingOut(c) < respHighWater:
+    let u = h2.h2NextUrgency()
+    if u < 0: break
+    let sid = h2.sendQ[u].popFirst()
     if sid notin h2.streams: continue
     template st: H2Stream = h2.streams[sid]
     st.inSendQ = false
@@ -354,12 +400,42 @@ proc h2Schedule(h2: H2Conn, c: ptr Connection) =
     discard emitOneFrame(h2, c, sid)
     if sid notin h2.streams: continue        # emitted a terminal frame and dropped
     if isWs:
-      h2.h2WsAfterEmit(c, sid)
+      h2.h2WsAfterEmit(c, sid)               # WebSockets interleave (incremental)
       if sid in h2.streams and h2.h2Sendable(h2.streams[sid]): h2.h2Enqueue(sid)
     elif h2.h2Sendable(st):
-      h2.h2Enqueue(sid)                       # more to send: back of the line
+      st.inSendQ = true
+      if st.incremental: h2.sendQ[st.urgency].addLast(sid)   # round-robin
+      else: h2.sendQ[st.urgency].addFirst(sid)               # keep this stream's turn
   h2.scheduling = false
   h2.h2ResumeProducers(c)
+
+proc h2Reprioritize(h2: H2Conn, sid: uint32, fieldVal: string) =
+  ## Apply an RFC 9218 Priority field value to an open stream (Priority request
+  ## header or PRIORITY_UPDATE frame). If the stream is already queued it stays
+  ## in its old level until the next pop, then migrates to the new urgency via
+  ## h2Enqueue -- no need to hunt it out of the deque.
+  if sid notin h2.streams: return
+  template st: H2Stream = h2.streams[sid]
+  parsePriorityField(fieldVal, st.urgency, st.incremental)
+
+proc handlePriorityUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                          payloadPos: int) =
+  ## RFC 9218 7.1 PRIORITY_UPDATE (frame type 0x10): a connection-level frame
+  ## carrying a Prioritized Stream ID plus a Priority field value. Apply it to
+  ## the open stream, or buffer it (capped) when it arrives ahead of HEADERS.
+  if fh.streamId != 0: h2.connError(c, errProtocol); return
+  if fh.length < 4: h2.connError(c, errFrameSize); return
+  h2.noteControlFrame(c)
+  if c.state == csClosing: return
+  let psid = get32(c.rbuf, payloadPos) and 0x7fffffff'u32
+  if psid == 0 or (psid and 1'u32) == 0:
+    h2.connError(c, errProtocol); return       # must name a client-initiated stream
+  var field = newString(fh.length - 4)
+  for i in 0 ..< field.len: field[i] = c.rbuf[payloadPos + 4 + i]
+  if psid in h2.streams:
+    h2.h2Reprioritize(psid, field)
+  elif psid > h2.lastStreamId and h2.pendingPriority.len < maxPendingPriority:
+    h2.pendingPriority[psid] = field            # ahead of HEADERS: apply on open
 
 proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
                w: WsConn) {.nimcall, gcsafe.} =
@@ -380,6 +456,16 @@ proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
     st.pendingIsLast = false
   h2.h2Enqueue(sid)
   h2.h2Schedule(c)
+
+proc h2SetPriority*(c: ptr Connection, sid: uint32, urgency: uint8,
+                    incremental: bool) {.raises: [].} =
+  ## RFC 9218 server-side override of a stream's scheduling priority (res.setPriority).
+  ## Effect-clean (`withValue`, no KeyError) so it composes in strict-effect async.
+  let h2 = h2Conn(c)
+  if h2 == nil: return
+  h2.streams.withValue(sid, st):
+    st.urgency = min(urgency, 7'u8)
+    st.incremental = incremental
 
 proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
   ## Mark a streamed response as backed up (write() returned false), so a drain
@@ -828,6 +914,8 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
           if val != "trailers":
             h2.streamError(c, sid, errProtocol)
             return
+        of "priority":
+          parsePriorityField(val, st.urgency, st.incremental)  # RFC 9218 request signal
         of "content-length":
           var n: BiggestInt
           try:
@@ -896,6 +984,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
   if h2.contStream != 0 and
       (fh.typ != uint8(ftContinuation) or fh.streamId != h2.contStream):
     h2.connError(c, errProtocol)
+    return
+
+  if fh.typ == ftPriorityUpdate:
+    h2.handlePriorityUpdate(c, fh, payloadPos)
     return
 
   if fh.typ > uint8(high(FrameType)):
@@ -1023,8 +1115,12 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.streamError(c, sid, errRefusedStream); return
       h2.lastStreamId = sid
       h2.streams[sid] = H2Stream(
-        sendWindow: h2.peerInitialWindow, contentLength: -1)
+        sendWindow: h2.peerInitialWindow, contentLength: -1,
+        urgency: defaultUrgency)
       inc h2.activeStreams
+      if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
+        h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
+        h2.pendingPriority.del(sid)
       h2.controlFrameCount = 0       # a real request: reset the flood budget
     h2.headerBlock.setLen(0)
     for i in 0 ..< fragLen:
@@ -1120,7 +1216,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.connError(c, errFlowControl); return
       let wasBlocked = h2.connSendWindow <= 0
       h2.connSendWindow += int32(inc32)
-      if h2.sendQ.len > 0 or (wasBlocked and h2.connSendWindow > 0):
+      if h2.h2NextUrgency() >= 0 or (wasBlocked and h2.connSendWindow > 0):
         # The connection window moved: run a scheduler pass. The ready-queue
         # already holds the stream-sendable streams, so no scan is needed.
         h2.h2Schedule(c)
