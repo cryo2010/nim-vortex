@@ -2442,39 +2442,34 @@ proc emitFileStart*(res: Response, status: int, contentType: string,
     aux: nextRead, user: reader, n64: totalLen, last: last))
   workerResponded = true
 
-proc emitFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
+proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
                     reader: pointer, last: bool) =
-  ## Worker-side: hand one more chunk back to the loop.
-  var d = newString(bytes.len)
-  if bytes.len > 0: copyMem(addr d[0], unsafeAddr bytes[0], bytes.len)
+  ## Worker-side: hand back a filled pool buffer (no data copy). `n` = bytes
+  ## read; the loop copies `buf[0..<n]` into the response and recycles `buf`.
   push(res.core.outbox, OutMsg(
     kind: omFileChunk, fd: res.fd, gen: res.gen, stream: res.stream,
-    data: d, aux: nextRead, user: reader, last: last))
+    buf: buf, code: int32(n), aux: nextRead, user: reader, last: last))
   workerResponded = true
 
 proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
-  ## Loop-side: pin + enqueue the next chunk read; the worker calls
-  ## emitFileChunk when it lands. The chunk-read worker only reads a file (never
-  ## the h2 stream table), so mark the pin as a file pin (c.filePinned): h2Input
-  ## may then keep processing flow-control frames while the read is in flight, so
-  ## a streamed sendFile response never starves its own WINDOW_UPDATEs. The
-  ## INITIAL read (sendFile -> serveResolved) is dispatched separately and reads
-  ## req headers, so it is NOT a file pin and correctly pauses input.
+  ## Loop-side: borrow a pool buffer and enqueue the next chunk read INTO it
+  ## (the pointer rides in the read request; the worker fills it, never
+  ## allocates). The chunk-read worker only reads a file (never the h2 stream
+  ## table), so mark the pin as a file pin (c.filePinned): h2Input may keep
+  ## processing flow-control frames while the read is in flight, so a streamed
+  ## sendFile response never starves its own WINDOW_UPDATEs. The INITIAL read
+  ## (sendFile -> serveResolved) is dispatched separately and reads req headers,
+  ## so it is NOT a file pin and correctly pauses input.
+  let buf = res.core.chunkPool.chunkTake()
   dispatchBlockingData(
     Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
-    cast[BlockingDataProc](reader), nextRead)
+    cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf))
   if res.fd >= 0:
     let c = conn(res.core, res.fd, res.gen)
     if c != nil: inc c.filePinned
 
-proc applyFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
-                     reader: pointer, last: bool) =
-  ## Loop-side: write one chunk; finish on the last, else pull the next read now
-  ## (or after the write backlog drains).
-  let room = res.write(bytes)
-  if last:
-    res.finish()
-    return
+proc pullNext(res: Response, room: bool, nextRead: string, reader: pointer) =
+  ## Pull the next chunk now if the write backlog has room, else after it drains.
   if room:
     dispatchNextRead(res, nextRead, reader)
   else:
@@ -2483,14 +2478,33 @@ proc applyFileChunk*(res: Response, bytes: openArray[char], nextRead: string,
     res.onDrain(proc(res2: Response) {.gcsafe.} =
       dispatchNextRead(res2, held, r))
 
+proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
+                     reader: pointer, last: bool) =
+  ## Loop-side: copy a filled pool buffer into the response; finish on the last,
+  ## else pull the next read. `buf` is returned to the pool by processOutbox
+  ## after the batch (whether or not the connection is still alive).
+  var room = true
+  if buf != nil and n > 0:
+    room = res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
+  if last:
+    res.finish()
+    return
+  pullNext(res, room, nextRead, reader)
+
 proc applyFileStart*(res: Response, status: int, contentType: string,
                      headers: openArray[(string, string)], totalLen: int64,
                      firstChunk: openArray[char], nextRead: string,
                      reader: pointer, last: bool) =
-  ## Loop-side: send the head (Content-Length = totalLen), then the first chunk.
+  ## Loop-side: send the head (Content-Length = totalLen), write the first chunk
+  ## (a plain string from the worker's initial read), then pull the rest through
+  ## the buffer pool.
   res.sendHead(HttpCode(status), contentType, headers,
                contentLength = int(totalLen))
-  applyFileChunk(res, firstChunk, nextRead, reader, last)
+  let room = res.write(firstChunk)
+  if last:
+    res.finish()
+    return
+  pullNext(res, room, nextRead, reader)
 
 macro blocking*(request: Request, args: varargs[untyped]): untyped =
   ## Run a block on the worker pool, where blocking calls (sync DB drivers, file

@@ -1156,7 +1156,7 @@ proc processOutbox(loop: Loop) =
                            m.data.toOpenArray(bodyStart, m.data.len - 1),
                            m.aux, m.user, m.last)
           else:
-            applyFileChunk(res, m.data, m.aux, m.user, m.last)
+            applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
           h3Touched = true
           continue
         if slot.pinned > 0: dec slot.pinned
@@ -1224,7 +1224,7 @@ proc processOutbox(loop: Loop) =
                        m.data.toOpenArray(bodyStart, m.data.len - 1),
                        m.aux, m.user, m.last)
       else:
-        applyFileChunk(res, m.data, m.aux, m.user, m.last)
+        applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
       # The final chunk finished the response: reset and resume the pipeline
       # (the blocking-dispatch path doesn't set awaitingResponse, so finish()'s
       # kick is a no-op here -- mirror the buffered omHttp path explicitly).
@@ -1244,6 +1244,12 @@ proc processOutbox(loop: Loop) =
     applyResponse(addr loop.core, c, m.stream, int(m.code), contentType,
                   headers, m.data.toOpenArray(bodyStart, m.data.len - 1))
     loop.resumeAfterRespond(c, m.stream)
+  # Recycle every sendFile read buffer from this batch back to the pool -- once,
+  # here, so a buffer is returned exactly once whether its stream was alive (the
+  # data was copied above) or the connection had died (the data is discarded).
+  for m in loop.outboxScratch:
+    if m.kind == omFileChunk and m.buf != nil:
+      loop.core.chunkPool.chunkReturn(m.buf)
   when not defined(plainHttp):
     if h3Touched and loop.udpFd >= 0:
       loop.h3Drive()             # flush unpinned conns, dispatch new work
@@ -1559,6 +1565,7 @@ proc run*(loop: Loop) =
       ngEngineFree()              # frees the shim engine (all conns + TLS ctx)
       discard posix.close(cint(loop.udpFd))
   loop.selector.close()
+  loop.core.chunkPool.chunkPoolFree()    # free pooled sendFile buffers (workers joined)
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
     discard posix.close(cint(loop.listenFd))
   if loop.core.teardownHook != nil:      # release the async adapter's dispatcher

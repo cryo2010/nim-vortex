@@ -155,25 +155,38 @@ const
   fileStreamChunk = 128 * 1024      ## bytes per worker read hop
   fileStreamThreshold = 512 * 1024  ## stream full-file GETs larger than this
 
+proc readInto(path: string, start: int, buf: pointer, length: int): int =
+  ## Read up to `length` bytes at `start` directly into `buf` (a loop-owned pool
+  ## buffer); returns bytes read. No allocation -- the read buffer IS the message.
+  if buf == nil or length <= 0: return 0
+  var f = open(path, fmRead)
+  defer: f.close()
+  if start > 0: f.setFilePos(start)
+  result = f.readBuffer(buf, length)
+
 proc readChunkTramp(req: Request, res: Response, data: string)
                    {.nimcall, gcsafe.} =
-  ## Worker: read the next chunk (data = "path\0offset\0remaining") and hand it
-  ## to the loop, which pulls the following one once this flushes.
+  ## Worker: read the next chunk into the pool buffer whose pointer rides in
+  ## `data` ("path\0offset\0remaining\0bufptr"), then hand the buffer back. The
+  ## worker never allocates the payload -- it fills a buffer the loop owns.
   let f = data.split('\0')
-  if f.len != 3:
-    emitFileChunk(res, "", "", cast[pointer](readChunkTramp), true); return
+  var buf: pointer = nil
+  if f.len >= 4:
+    buf = cast[pointer](try: parseUInt(f[3]) except CatchableError: 0'u)
+  if f.len < 4:
+    emitFileChunk(res, buf, 0, "", cast[pointer](readChunkTramp), true); return
   let path = f[0]
   let off = try: parseBiggestInt(f[1]) except CatchableError: 0'i64
   let remaining = try: parseBiggestInt(f[2]) except CatchableError: 0'i64
   let want = int(min(int64(fileStreamChunk), remaining))
-  var bytes: string
-  try: bytes = readSlice(path, int(off), want)
-  except CatchableError: bytes = ""
-  let got = int64(bytes.len)
-  let nextRemaining = remaining - got
+  var got = 0
+  try: got = readInto(path, int(off), buf, want)
+  except CatchableError: got = 0
+  let nextRemaining = remaining - int64(got)
   let last = got == 0 or nextRemaining <= 0
-  let nextRead = if last: "" else: path & '\0' & $(off + got) & '\0' & $nextRemaining
-  emitFileChunk(res, bytes, nextRead, cast[pointer](readChunkTramp), last)
+  let nextRead = if last: ""
+                 else: path & '\0' & $(off + int64(got)) & '\0' & $nextRemaining
+  emitFileChunk(res, buf, got, nextRead, cast[pointer](readChunkTramp), last)
 
 proc serveResolved(req: Request, res: Response, data: string)
                   {.nimcall, gcsafe.} =
