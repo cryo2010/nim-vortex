@@ -1928,6 +1928,20 @@ proc bufferedAmount*(res: Response): int =
     return max(st.pendingBody.len - st.pendingPos, pendingOut(c))
   pendingOut(c)
 
+proc setPriority*(res: Response, urgency: range[0..7], incremental = false)
+    {.raises: [].} =
+  ## RFC 9218: override this response's scheduling priority (HTTP/2), taking
+  ## precedence over the client's Priority signal. Lower `urgency` is served
+  ## first; `incremental = true` interleaves this stream round-robin with peers
+  ## at the same urgency, false (default) delivers it sequentially. No-op over
+  ## HTTP/1.1 (single stream) and HTTP/3 (nghttp3 owns its own scheduling).
+  ## Loop-thread only; call before or while streaming the response.
+  if currentThreadId() != res.core.threadId: return
+  if res.fd < 0: return                       # h3: handled by the ngtcp2 backend
+  let c = conn(res.core, res.fd, res.gen)
+  if c != nil and res.stream != 0:
+    h2SetPriority(c, res.stream, uint8(urgency), incremental)
+
 proc abort*(res: Response) {.raises: [].} =
   ## Abort a streamed response mid-body *without* a clean terminator, so the
   ## client can tell the transfer was cut short rather than completed: HTTP/1.1
