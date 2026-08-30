@@ -396,6 +396,8 @@ proc flushOut(loop: Loop, c: ptr Connection) =
         of tlsWantWrite:
           if c.ws != nil: wsBackpressure(c)
           loop.armWrite(c)
+          if c.h2 != nil and c.pendingOut < respHighWater:
+            h2codec.h2DrainResume(c, addr loop.core)
           return
         of tlsWantRead:
           return               # retried after the next read event
@@ -412,6 +414,8 @@ proc flushOut(loop: Loop, c: ptr Connection) =
       if err == EAGAIN or err == EWOULDBLOCK:
         if c.ws != nil: wsBackpressure(c)
         loop.armWrite(c)
+        if c.h2 != nil and c.pendingOut < respHighWater:
+          h2codec.h2DrainResume(c, addr loop.core)
         return
       loop.closeConn(c)
       return
@@ -430,9 +434,12 @@ proc flushOut(loop: Loop, c: ptr Connection) =
     if c.onRespDrain != nil:
       c.onRespDrain(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
   else:
-    # HTTP/2: resume any streamed response parked on the connection-level cap
-    # now that the socket has drained c.wbuf (no-op for non-h2 connections).
+    # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it and
+    # resume producers parked on the cap (no-op for non-h2 connections). It may
+    # buffer fresh frames, so re-arm write to flush them on the next writable.
     h2codec.h2DrainResume(c, addr loop.core)
+    if c.pendingOut > 0:
+      loop.armWrite(c)
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code
@@ -1223,6 +1230,11 @@ proc processOutbox(loop: Loop) =
       # kick is a no-op here -- mirror the buffered omHttp path explicitly).
       if m.last and c.gen == m.gen and c.state != csFree:
         loop.resumeAfterRespond(c, m.stream)
+      elif c.gen == m.gen and c.state != csFree and c.pendingOut > 0:
+        # The write scheduler fills c.wbuf up to respHighWater and stops; push it
+        # to the socket now. On a fast socket flushOut never hits EAGAIN, so write
+        # interest is never armed and no later Write event would drain it.
+        loop.flushOut(c)
       continue
     if c.pinned > 0: dec c.pinned
     if c.closeRequested:
