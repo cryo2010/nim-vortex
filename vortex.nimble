@@ -247,6 +247,14 @@ task saturate, "Interactive h2load saturation with live Grafana charts (Docker)"
   # Interactive, not a CI gate. See conformance/stress/README.md.
   exec "sh conformance/stress/saturate.sh"
 
+task fairness, "HTTP/2 write-scheduler fairness / tail-latency micro-benchmark (local)":
+  # Builds a cleartext h2c stress server and drives it with h2load over one
+  # connection carrying many concurrent streams, reporting the spread of
+  # per-request completion times (a fair write scheduler tightens it). Local,
+  # no Docker. Env knobs: FAIRNESS_STREAMS, FAIRNESS_REQUESTS, FAIRNESS_BYTES,
+  # FAIRNESS_RUNTIME, FAIRNESS_WINDOWS. See conformance/fairness/run.sh.
+  exec "bash conformance/fairness/run.sh"
+
 task interop, "Cross-client interop test (Node/Python/Go/Rust/Java) (Docker)":
   # run.sh mints a shared CA, builds a vortex TLS server (h1/h2, gzip) image and
   # five language-client images, then drives every HTTP method from each client
