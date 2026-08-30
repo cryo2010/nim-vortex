@@ -283,11 +283,15 @@ proc h2WsAfterEmit(h2: H2Conn, c: ptr Connection, sid: uint32) =
   w.h2Pending = backlog
   if backlog == 0:
     if w.wantClose:
-      h2WsFinalize(h2, c, sid, w)
+      # A user onClose fires inside; contain it so the effect stays `raises: []`
+      # (the scheduler is reachable from strict-effect async handlers via send).
+      try: h2WsFinalize(h2, c, sid, w)
+      except Exception: discard
     elif w.backedUp:
       w.backedUp = false
       if w.onDrain != nil:
-        w.onDrain(WebSocket(core: h2.core, fd: c.fd, gen: c.gen, stream: sid))
+        try: w.onDrain(WebSocket(core: h2.core, fd: c.fd, gen: c.gen, stream: sid))
+        except Exception: discard
   else:
     w.backedUp = true
     if w.wantClose and (st.sendWindow <= 0 or h2.connSendWindow <= 0):
@@ -296,7 +300,8 @@ proc h2WsAfterEmit(h2: H2Conn, c: ptr Connection, sid: uint32) =
       # slot (and, being active, stripping the connection's read deadline),
       # RST_STREAM and tear it down.
       c.wbuf.addRstStream(sid, errCancel)
-      wsStreamClosed(h2.core, c, w)
+      try: wsStreamClosed(h2.core, c, w)
+      except Exception: discard
       st.ws = nil
       h2.streams.del(sid)
       dec h2.activeStreams
@@ -325,7 +330,11 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
     st.respBackedUp = false
     let cb = st.onRespDrain
     st.onRespDrain = nil            # fire once; the producer re-registers if it
-    cb(h2.core, c.fd, c.gen, sid)   # backs up again (res.write -> enqueue+schedule)
+    # backs up again (res.write -> enqueue+schedule). Contain a raising producer
+    # so the effect stays `raises: []`: the scheduler is reachable from a
+    # strict-effect async handler (res.send -> h2Respond -> h2Schedule).
+    try: cb(h2.core, c.fd, c.gen, sid)
+    except Exception: discard
   h2.resuming = false
 
 proc h2Schedule(h2: H2Conn, c: ptr Connection) =
