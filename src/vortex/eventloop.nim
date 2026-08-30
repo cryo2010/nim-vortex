@@ -1192,6 +1192,17 @@ proc processOutbox(loop: Loop) =
       if c.closeRequested:
         loop.closeConn(c)
         continue
+      # Drain HTTP/2 frames that piled up in the receive buffer while the
+      # file-read worker held the pin (h2Input is paused while pinned). A
+      # streamed sendFile response depends on the peer's WINDOW_UPDATEs to keep
+      # sending; without draining them here the produce cycle re-pins every
+      # chunk, so a small peer flow-control window deadlocks -- the server
+      # exhausts the send window and never reads the update that reopens it.
+      # Safe now: pinned is 0 (no worker holds a Request), and the file-read
+      # worker never touches the stream table.
+      if c.h2 != nil and c.pinned == 0 and c.rlen > 0:
+        loop.processInput(c)
+        if c.state != csActive: continue
       let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
                          stream: m.stream)
       if m.kind == omFileStart:
