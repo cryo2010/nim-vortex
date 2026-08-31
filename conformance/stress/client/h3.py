@@ -16,6 +16,12 @@ from aioquic.h3.events import HeadersReceived, DataReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated
 
+# Per-stream cap on the client's unacked upload buffer (aioquic
+# stream.sender._buffer). Bounds client RAM to ~this x concurrent streams so a
+# large STREAM_BYTES x high concurrency upload does not OOM the client; 256 KiB
+# still keeps the localhost pipe full (well above the bandwidth-delay product).
+_UPLOAD_BUF_CAP = 256 * 1024
+
 # --- WebSocket-over-HTTP/3 (RFC 9220 Extended CONNECT) framing ---------------
 OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
 _WS_MASK = b"\x21\x43\x65\x87"
@@ -131,7 +137,19 @@ class H3Session:
         async for chunk in body_agen:
             self.c._http.send_data(sid, chunk, end_stream=False)
             self.c.transmit()
-            await asyncio.sleep(0)             # let QUIC flush under flow control
+            # Backpressure. aioquic keeps written-but-unacked bytes in
+            # stream.sender._buffer (acked data is dropped from the front). A bare
+            # `sleep(0)` yields once but never waits, so the loop would pump the
+            # whole body in and buffer up to STREAM_BYTES per stream -- which OOMs
+            # the client at high concurrency (many x 1 GiB). Wait until this
+            # stream's unacked buffer drains below the cap so only a bounded window
+            # is held (like httpx pulling body chunks lazily on h1/h2); the event
+            # loop processes incoming ACKs while we wait, shrinking the buffer.
+            st = self.c._quic._streams.get(sid)
+            while st is not None and len(st.sender._buffer) >= _UPLOAD_BUF_CAP:
+                await asyncio.sleep(0.0005)
+                self.c.transmit()
+                st = self.c._quic._streams.get(sid)
         self.c._http.send_data(sid, b"", end_stream=True)
         self.c.transmit()
         status = 0
