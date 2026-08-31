@@ -492,8 +492,17 @@ proc h2Input(loop: Loop, c: ptr Connection) =
         loop.flushOut(c)
   if c.state == csActive:
     if h2ActiveStreams(c) == 0:
-      if c.dlKind != dkIdle:
-        c.setDeadline(loop, dkIdle)
+      # Idle: (re)arm the keep-alive deadline. This must refresh on every pass
+      # that leaves the connection with no active streams, not just the first
+      # (the h1 path re-arms unconditionally after each request too). A fully
+      # synchronous h2 request opens and closes its stream within a single
+      # processInput, so activeStreams is 0 at both ends and the `else` branch
+      # never runs -- guarding this with `dlKind != dkIdle` would freeze the
+      # deadline at the first request's arming time, so sweepTimeouts would
+      # close a busy connection keepAliveTimeout seconds after it opened
+      # regardless of ongoing traffic (e.g. a client streaming SSE batches, one
+      # stream at a time).
+      c.setDeadline(loop, dkIdle)
     else:
       c.deadline = 0
       c.dlKind = dkNone

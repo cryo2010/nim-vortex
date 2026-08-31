@@ -185,8 +185,8 @@ when isMainModule:
       maxBodySize = streamBytes + 1024 * 1024)    # allow the upload workload
   when not defined(plainHttp):
     if getEnv("STRESS_TLS") == "1":
-      settings.certFile = "/vortex/cert.pem"
-      settings.keyFile = "/vortex/key.pem"
+      settings.certFile = getEnv("STRESS_CERT", "/vortex/cert.pem")
+      settings.keyFile = getEnv("STRESS_KEY", "/vortex/key.pem")
       settings.http3 = getEnv("STRESS_HTTP3") == "1"   # QUIC listener for h3 cells
   let srv = newVortex(rt.toHandler, settings, rt.streamPredicate).start()
   echo "listening on ", int(srv.port)
