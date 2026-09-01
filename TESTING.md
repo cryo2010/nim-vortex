@@ -300,11 +300,24 @@ is now the per-workload soaks above.) See `conformance/stress/README.md`.
 
 Performance measurement, not pass/fail (CI does not gate on throughput numbers).
 
+Dockerized per-workload perf suite (same `VORTEX_*` knobs as the stress soaks;
+see `conformance/bench/README.md`):
+
 | Task | Measures |
 |------|----------|
-| `nimble bench` | Dockerized per-workload perf suite (req/s \| msg/s \| evt/s \| MB/s + p50/p90/p99 latency); also `benchRequests` / `benchWs` / `benchSse` / `benchStreamUpload` / `benchStreamDownload`. Same `VORTEX_*` knobs as the stress soaks. See `conformance/bench/README.md` |
-| `nimble perf` | HTTP/1.1 throughput vs httpbeast / chronos / mummy (local, not pass/fail) |
-| `nimble perf2` | HTTP/2 throughput (local) |
+| `nimble benchRequests` | Buffered GET/POST/PUT throughput (req/s) + latency |
+| `nimble benchWs` | WebSocket echo (msg/s) + round-trip latency |
+| `nimble benchSse` | SSE (evt/s) + inter-event latency |
+| `nimble benchStreamUpload` | Stream upload throughput (MB/s) |
+| `nimble benchStreamDownload` | Stream download throughput (MB/s) |
+| `nimble bench` | Short smoke of all five above (20 s, 64 MiB) |
+
+Local (non-Docker) throughput tools:
+
+| Task | Measures |
+|------|----------|
+| `nimble perf` | HTTP/1.1 throughput vs httpbeast / chronos / mummy |
+| `nimble perf2` | HTTP/2 throughput |
 | `nimble benchServer` | Builds the release TechEmpower server (`bench/handlers`) for `bench/run.sh` (wrk/oha/ab/h2load) |
 
 The Dockerized `bench` suite runs anywhere (builds happen in Linux containers);
