@@ -7,6 +7,7 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir "httpx[http2]" websockets brotli zstandard "aioquic>=1.0.0"
 
 WORKDIR /client
+COPY conformance/stress/client/transport.py ./transport.py
 COPY conformance/stress/client/stress_client.py ./stress_client.py
 COPY conformance/stress/client/h3.py ./h3.py
 

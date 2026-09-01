@@ -1,5 +1,5 @@
 ## Benchmark server: TechEmpower-style /plaintext and /json handlers.
-## Build: nimble bench   (or: nim c --mm:orc --threads:on -d:danger bench/handlers.nim)
+## Build: nimble benchServer   (or: nim c --mm:orc --threads:on -d:danger bench/handlers.nim)
 ## Pass cert/key paths as arguments to also serve TLS/h2/h3:
 ##   ./bench/handlers [port] [certFile keyFile]
 

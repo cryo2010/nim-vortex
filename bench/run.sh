@@ -1,5 +1,5 @@
 #!/bin/sh
-# Benchmark driver. Requires the server built via `nimble bench` and one of
+# Benchmark driver. Requires the server built via `nimble benchServer` and one of
 # wrk / oha / ab on PATH. h2load (nghttp2) covers HTTP/2.
 set -e
 PORT="${PORT:-8080}"

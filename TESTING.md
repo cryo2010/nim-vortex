@@ -41,7 +41,8 @@ nimble stress          # short smoke of all five
 nimble loadtest        # k6: hold a load, chart latency + server CPU/mem  (localhost:3000)
 nimble saturate        # h2load: saturate, chart server CPU/mem + req/s   (localhost:3001)
 
-nimble bench perf perf2   # benchmarks (not pass/fail)
+nimble perf perf2   # local throughput comparison vs other servers (not pass/fail)
+nimble bench        # Dockerized per-workload perf suite: req/s | MB/s + latency
 ```
 
 ---
@@ -299,11 +300,14 @@ is now the per-workload soaks above.) See `conformance/stress/README.md`.
 
 Performance measurement, not pass/fail (CI does not gate on throughput numbers).
 
-| Task | Verifies |
+| Task | Measures |
 |------|----------|
-| `nimble bench` | Builds the release benchmark server (`bench/handlers`) for `bench/run.sh` (wrk/oha/ab/h2load) |
-| `nimble perf` | HTTP/1.1 throughput vs httpbeast / chronos / mummy |
-| `nimble perf2` | HTTP/2 throughput |
+| `nimble bench` | Dockerized per-workload perf suite (req/s \| msg/s \| evt/s \| MB/s + p50/p90/p99 latency); also `benchRequests` / `benchWs` / `benchSse` / `benchStreamUpload` / `benchStreamDownload`. Same `VORTEX_*` knobs as the stress soaks. See `conformance/bench/README.md` |
+| `nimble perf` | HTTP/1.1 throughput vs httpbeast / chronos / mummy (local, not pass/fail) |
+| `nimble perf2` | HTTP/2 throughput (local) |
+| `nimble benchServer` | Builds the release TechEmpower server (`bench/handlers`) for `bench/run.sh` (wrk/oha/ab/h2load) |
 
-HTTP/3 throughput is measured via `nimble h3load` (a real QUIC client), not a
-local `perf` task.
+The Dockerized `bench` suite runs anywhere (builds happen in Linux containers);
+its numbers are for relative/regression tracking, not absolute peak (the
+Python client caps cheap-endpoint throughput). Use `nimble saturate` (h2load)
+for absolute peak req/s and `nimble h3load` for HTTP/3 throughput.

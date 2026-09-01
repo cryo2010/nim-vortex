@@ -14,7 +14,7 @@ import std/strutils
 requires "nim >= 2.2.10"
 requires "nimcrypto >= 0.6.0"   # HMAC for signed cookies (pure Nim; plainHttp-safe)
 
-task bench, "Build benchmark server with release flags":
+task benchServer, "Build the TechEmpower bench server binary (bench/handlers)":
   exec "nim c --mm:orc --threads:on -d:danger --passC:-flto -o:bench/handlers bench/handlers.nim"
 
 task docs, "Generate the public API documentation into htmldocs/":
@@ -239,6 +239,34 @@ task stress, "Short smoke of all five stress workloads (Docker)":
   let sbytes = getEnv("VORTEX_STREAM_BYTES", "67108864")
   exec "STRESS_SMOKE=1 VORTEX_SECONDS=" & secs & " VORTEX_STREAM_BYTES=" &
        sbytes & " sh conformance/stress/run.sh"
+
+# Per-workload performance benches: same shape and VORTEX_* knobs as the stress
+# soaks, but measure throughput + latency instead of verifying (Docker; the bench
+# server IS the stress server). Numbers are for relative/regression tracking, not
+# absolute peak -- use `nimble saturate` / `h3load` for that. See
+# conformance/bench/README.md.
+task benchRequests, "Perf bench: buffered GET/POST/PUT throughput + latency (Docker)":
+  exec "VORTEX_WORKLOAD=requests sh conformance/bench/run.sh"
+
+task benchWs, "Perf bench: WebSocket echo msgs/s + round-trip latency (Docker)":
+  exec "VORTEX_WORKLOAD=ws sh conformance/bench/run.sh"
+
+task benchSse, "Perf bench: SSE events/s + inter-event latency (Docker)":
+  exec "VORTEX_WORKLOAD=sse sh conformance/bench/run.sh"
+
+task benchStreamUpload, "Perf bench: stream upload MB/s (Docker)":
+  exec "VORTEX_WORKLOAD=streamupload sh conformance/bench/run.sh"
+
+task benchStreamDownload, "Perf bench: stream download MB/s (Docker)":
+  exec "VORTEX_WORKLOAD=streamdownload sh conformance/bench/run.sh"
+
+task bench, "Short perf smoke over all five bench workloads (Docker)":
+  # Runs every workload short (20s, 64 MiB); honors an explicit VORTEX_SECONDS /
+  # VORTEX_STREAM_BYTES from the caller (mirrors the `stress` smoke).
+  let secs = getEnv("VORTEX_SECONDS", "20")
+  let sbytes = getEnv("VORTEX_STREAM_BYTES", "67108864")
+  exec "BENCH_SMOKE=1 VORTEX_SECONDS=" & secs & " VORTEX_STREAM_BYTES=" &
+       sbytes & " sh conformance/bench/run.sh"
 
 task saturate, "Interactive h2load saturation with live Grafana charts (Docker)":
   # The former `nimble stress`: saturates the selected backend(s) with h2load
