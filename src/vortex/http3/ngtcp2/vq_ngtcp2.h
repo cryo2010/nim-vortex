@@ -93,12 +93,16 @@ typedef struct {
 typedef struct {
   void *user;                 /* engine context (loop core) passed to callbacks */
   VqCallbacks cb;
-  /* TLS material for the ossl SSL_CTX. Either file paths or PEM blobs. */
+  /* TLS material for the ossl SSL_CTX. A PKCS#12 bundle (file path or DER
+   * bytes) takes precedence; otherwise in-memory PEM, otherwise PEM files. */
   const char *cert_file;
   const char *key_file;
   const char *cert_pem;       /* used when *_file are NULL/empty */
   const char *key_pem;
-  const char *key_password;   /* may be NULL */
+  const char *key_password;   /* may be NULL; also the PKCS#12 passphrase */
+  const char *pkcs12_file;    /* PKCS#12 (.pfx/.p12) path; used if non-empty */
+  const uint8_t *pkcs12;      /* PKCS#12 DER bytes; used if pkcs12_len > 0 */
+  size_t pkcs12_len;
   /* Limits mirrored from VortexConfig. */
   uint64_t max_body;
   uint64_t max_concurrent_streams;
@@ -147,6 +151,10 @@ void vq_submit_head(VqConn *conn, int64_t stream_id, int status,
  * (for backpressure). Buffered in the shim, drained via nghttp3 read_data. */
 size_t vq_stream_write(VqConn *conn, int64_t stream_id,
                        const uint8_t *data, size_t len);
+/* Submit a trailer field section, emitted after the body (RFC 9114 4.1). Call
+ * before vq_stream_finish so the stream stays open for the trailing HEADERS. */
+void   vq_submit_trailers(VqConn *conn, int64_t stream_id,
+                          const VqHeader *hdrs, size_t n);
 void   vq_stream_finish(VqConn *conn, int64_t stream_id);       /* FIN */
 size_t vq_stream_backlog(VqConn *conn, int64_t stream_id);
 
@@ -157,8 +165,12 @@ void vq_stream_reset(VqConn *conn, int64_t stream_id, uint64_t app_error);
  * (mirrors req.ackBody backpressure). */
 void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n);
 
-/* Connection-level: GOAWAY (graceful drain) and CONNECTION_CLOSE. */
+/* Connection-level graceful shutdown (RFC 9114 5.2, two-step GOAWAY):
+ *   vq_conn_goaway   -- initial GOAWAY notice (max stream id: "shutting down").
+ *   vq_conn_shutdown -- final GOAWAY (last-accepted stream id: the boundary).
+ * and CONNECTION_CLOSE. */
 void vq_conn_goaway(VqConn *conn);
+void vq_conn_shutdown(VqConn *conn);
 void vq_conn_close(VqConn *conn, uint64_t app_error);
 
 /* Peer IP (numeric, no port) of a connection; empty string if unavailable.

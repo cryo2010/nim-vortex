@@ -39,14 +39,18 @@ createDir(dir)
 let certPath = dir / "cert.pem"
 let keyPath = dir / "key.pem"          # unencrypted
 let encKeyPath = dir / "enc.pem"       # same key, AES-256 encrypted
+let p12Path = dir / "bundle.p12"       # cert + key as a PKCS#12 bundle
 check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
   keyPath & " -out " & certPath & " -days 2 -subj /CN=localhost")[1] == 0
 check execCmdEx("openssl rsa -in " & keyPath & " -aes256 -out " & encKeyPath &
   " -passout pass:" & pass)[1] == 0
+check execCmdEx("openssl pkcs12 -export -inkey " & keyPath & " -in " & certPath &
+  " -out " & p12Path & " -passout pass:" & pass)[1] == 0
 
 let certData = readFile(certPath)
 let keyData = readFile(keyPath)
 let encKeyData = readFile(encKeyPath)
+let p12Data = readFile(p12Path)
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "hello tls")
@@ -89,5 +93,16 @@ suite "TLS material over HTTP/1.1 + HTTP/3":
   test "encrypted key from in-memory PEM + keyPassword":
     checkServes(initVortexConfig(numThreads = 1, certPem = certData,
       keyPem = encKeyData, keyPassword = pass))
+
+  # A PKCS#12-only config used to reach the QUIC engine with empty PEM fields, so
+  # h3 was advertised via Alt-Svc yet every handshake failed (the p12 bundle was
+  # never forwarded to the ossl SSL_CTX). Assert h3 actually serves from a .p12.
+  test "PKCS#12 bundle from a file + keyPassword":
+    checkServes(initVortexConfig(numThreads = 1, pkcs12File = p12Path,
+      keyPassword = pass))
+
+  test "PKCS#12 bundle from in-memory bytes + keyPassword":
+    checkServes(initVortexConfig(numThreads = 1, pkcs12 = p12Data,
+      keyPassword = pass))
 
 echo "tls h3 material ok"

@@ -59,6 +59,11 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     for i in 0 ..< 64:
       discard res.write(chunk)
     res.finish()
+  of "/trailer":
+    res.sendHead(Http200, "text/plain")
+    res.write("body")
+    res.trailers["X-Checksum"] = "abc123"
+    res.finish()
   of "/boom":
     res.stream(Http200, "text/plain"):
       res.write("partial")
@@ -132,6 +137,13 @@ suite "HTTP/3 (QUIC, via curl)":
       "-o /dev/null -w '%{size_download}' " & base & "/streambig")
     check rc == 0
     check output == $(64 * 4096)
+
+  test "response trailers are emitted over h3 (trailing HEADERS)":
+    # curl surfaces h3 trailers by dumping them with the response headers (-D).
+    # Before the fix the h3 finish path dropped res.trailers entirely.
+    let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailer")
+    check rc == 0
+    check "x-checksum: abc123" in output.toLowerAscii
 
   test "a mid-stream exception resets the h3 stream (client sees an error)":
     let (_, rc) = h3curl("-o /dev/null " & base & "/boom")

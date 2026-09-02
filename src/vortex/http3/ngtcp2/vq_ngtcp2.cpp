@@ -12,6 +12,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/pkcs12.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -88,6 +89,7 @@ struct Stream {
   Body body;
   uint64_t acked = 0;         // cumulative acked body bytes (for Body::ack)
   bool headSubmitted = false; // submit_response/submit_head issued
+  bool hasTrailers = false;   // trailers submitted: keep the stream open past body EOF
   bool everBlocked = false;   // nghttp3 stream currently blocked in ngtcp2
   // request header accumulation (owned copies; borrowed to on_headers)
   std::vector<std::string> hdrStore;
@@ -294,13 +296,18 @@ nghttp3_ssize h3ReadData(nghttp3_conn *, int64_t stream_id, nghttp3_vec *vec,
                          size_t, uint32_t *pflags, void *cud, void *) {
   auto *c = static_cast<Conn *>(cud);
   Stream *s = c->stream(stream_id);
+  // At body EOF, NO_END_STREAM keeps the stream open so the already-submitted
+  // trailer HEADERS can follow (RFC 9114 4.1); otherwise EOF ends the stream.
+  const uint32_t eof = s && s->hasTrailers
+      ? (NGHTTP3_DATA_FLAG_EOF | NGHTTP3_DATA_FLAG_NO_END_STREAM)
+      : NGHTTP3_DATA_FLAG_EOF;
   if (!s) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
   if (s->body.next(vec)) {
     if (s->body.fin && s->body.handed >= s->body.end)
-      *pflags |= NGHTTP3_DATA_FLAG_EOF;
+      *pflags |= eof;
     return 1;
   }
-  if (s->body.fin) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  if (s->body.fin) { *pflags |= eof; return 0; }
   return NGHTTP3_ERR_WOULDBLOCK;  // streaming: resumed by vq_stream_write/finish
 }
 
@@ -663,6 +670,40 @@ static bool loadCertChain(SSL_CTX *ctx, const char *pem) {
   return ok;
 }
 
+// Load cert + key (+ any bundled CA chain) into `ctx` from a PKCS#12 bundle:
+// DER bytes (`data`/`len`) or, if empty, a .pfx/.p12 file (`file`). `pw` is the
+// bundle passphrase (may be empty). Mirrors the TCP path's loadPkcs12.
+static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
+                       const char *file, const char *pw) {
+  BioPtr b(len ? BIO_new_mem_buf(data, static_cast<int>(len))
+           : (file && file[0]) ? BIO_new_file(file, "rb")
+                               : nullptr);
+  if (!b) return false;
+  PKCS12 *p12 = d2i_PKCS12_bio(b.get(), nullptr);
+  if (!p12) { ERR_clear_error(); return false; }
+  EVP_PKEY *pkey = nullptr;
+  X509 *cert = nullptr;
+  STACK_OF(X509) *ca = nullptr;
+  bool ok = PKCS12_parse(p12, pw ? pw : "", &pkey, &cert, &ca) == 1;
+  PKCS12_free(p12);
+  if (ok) {
+    // use_certificate / use_PrivateKey up-ref; add1_chain_cert up-refs each CA,
+    // so our references below are freed uniformly regardless of success.
+    ok = cert && pkey && SSL_CTX_use_certificate(ctx, cert) == 1 &&
+         SSL_CTX_use_PrivateKey(ctx, pkey) == 1;
+    if (ok && ca)
+      for (int i = 0; i < sk_X509_num(ca); i++)
+        if (SSL_CTX_add1_chain_cert(ctx, sk_X509_value(ca, i)) != 1) {
+          ok = false;
+          break;
+        }
+  }
+  if (cert) X509_free(cert);
+  if (pkey) EVP_PKEY_free(pkey);
+  if (ca) sk_X509_pop_free(ca, X509_free);
+  return ok;
+}
+
 static SslCtxPtr makeCtx(const VqConfig *cfg) {
   SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
   if (!ctx) return nullptr;
@@ -671,17 +712,31 @@ static SslCtxPtr makeCtx(const VqConfig *cfg) {
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);
-  bool ok = true;
-  // Cert: in-memory PEM takes precedence over the file (matches the TCP path).
-  if (cfg->cert_pem && cfg->cert_pem[0])
-    ok = ok && loadCertChain(ctx.get(), cfg->cert_pem);
-  else if (cfg->cert_file && cfg->cert_file[0])
-    ok = ok && SSL_CTX_use_certificate_chain_file(ctx.get(), cfg->cert_file) == 1;
-  // Key: PEM blob or file, decrypted with key_password, never prompting.
-  if (ok && ((cfg->key_pem && cfg->key_pem[0]) ||
-             (cfg->key_file && cfg->key_file[0])))
-    ok = ok && loadKey(ctx.get(), cfg->key_pem, cfg->key_file, cfg->key_password);
-  if (!ok) return nullptr;   // unique_ptr frees the half-built ctx
+  bool ok;
+  if ((cfg->pkcs12 && cfg->pkcs12_len) ||
+      (cfg->pkcs12_file && cfg->pkcs12_file[0])) {
+    // PKCS#12 bundle carries both cert and key (matches the TCP path's order).
+    ok = loadPkcs12(ctx.get(), cfg->pkcs12, cfg->pkcs12_len, cfg->pkcs12_file,
+                    cfg->key_password);
+  } else {
+    // Cert: in-memory PEM takes precedence over the file (matches the TCP path).
+    ok = true;
+    if (cfg->cert_pem && cfg->cert_pem[0])
+      ok = loadCertChain(ctx.get(), cfg->cert_pem);
+    else if (cfg->cert_file && cfg->cert_file[0])
+      ok = SSL_CTX_use_certificate_chain_file(ctx.get(), cfg->cert_file) == 1;
+    // Key: PEM blob or file, decrypted with key_password, never prompting.
+    if (ok && ((cfg->key_pem && cfg->key_pem[0]) ||
+               (cfg->key_file && cfg->key_file[0])))
+      ok = loadKey(ctx.get(), cfg->key_pem, cfg->key_file, cfg->key_password);
+  }
+  // Fail closed: require a certificate AND a matching private key. Without this
+  // a config that loaded neither (e.g. PKCS#12-only before this was wired, or an
+  // empty/half TLS config) would yield a keyless SSL_CTX that vq_engine_new
+  // accepts, so h3 would be advertised via Alt-Svc yet every handshake would
+  // fail. check_private_key returns 1 only when both are set and they match.
+  if (ok) ok = SSL_CTX_check_private_key(ctx.get()) == 1;
+  if (!ok) { ERR_clear_error(); return nullptr; }  // unique_ptr frees the ctx
   return ctx;
 }
 
@@ -693,6 +748,9 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   // Don't retain the caller's (possibly transient) TLS-material pointers.
   e->cfg.cert_pem = e->cfg.key_pem = e->cfg.key_password = nullptr;
   e->cfg.cert_file = e->cfg.key_file = nullptr;
+  e->cfg.pkcs12_file = nullptr;
+  e->cfg.pkcs12 = nullptr;
+  e->cfg.pkcs12_len = 0;
   e->ssl_ctx = makeCtx(cfg);
   if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
   return reinterpret_cast<VqEngine *>(e.release());
@@ -858,6 +916,19 @@ size_t vq_stream_write(VqConn *conn, int64_t stream_id, const uint8_t *data,
   return s->body.backlog();
 }
 
+void vq_submit_trailers(VqConn *conn, int64_t stream_id, const VqHeader *hdrs,
+                        size_t n) {
+  auto *c = reinterpret_cast<Conn *>(conn);
+  Stream *s = c->stream(stream_id);
+  if (!s || !c->h3 || !s->headSubmitted || n == 0) return;
+  // nghttp3 copies the field data during submit (like submit_response), so the
+  // borrowed VqHeader buffers need only outlive this call. Setting hasTrailers
+  // makes h3ReadData flag NO_END_STREAM at body EOF so these HEADERS can follow.
+  auto nva = toNv(hdrs, n);
+  if (nghttp3_conn_submit_trailers(c->h3, stream_id, nva.data(), nva.size()) == 0)
+    s->hasTrailers = true;
+}
+
 void vq_stream_finish(VqConn *conn, int64_t stream_id) {
   auto *c = reinterpret_cast<Conn *>(conn);
   Stream *s = c->stream(stream_id);
@@ -888,6 +959,15 @@ void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n) {
 void vq_conn_goaway(VqConn *conn) {
   auto *c = reinterpret_cast<Conn *>(conn);
   if (c->h3) { nghttp3_conn_submit_shutdown_notice(c->h3); }
+}
+
+void vq_conn_shutdown(VqConn *conn) {
+  // Final GOAWAY: narrows the range to the last stream the server will process
+  // (nghttp3 uses the highest processed client-initiated bidi id). Sent after
+  // vq_conn_goaway's notice to complete the RFC 9114 5.2 two-step drain, so a
+  // draining client learns which in-flight requests were accepted vs refused.
+  auto *c = reinterpret_cast<Conn *>(conn);
+  if (c->h3) { nghttp3_conn_shutdown(c->h3); }
 }
 
 void vq_conn_close(VqConn *conn, uint64_t app_error) {
