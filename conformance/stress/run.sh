@@ -26,8 +26,11 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 
 workload=${VORTEX_WORKLOAD:-requests}
-proto=${VORTEX_PROTO:-h2}
-server=${VORTEX_SERVER:-sync}
+# Case-insensitive: accept ALL/All/all etc. so a stray capital doesn't trip the
+# `all` expansion (and proto/server matching) below and hard-exit with an
+# "unknown VORTEX_PROTO" before anything runs.
+proto=$(printf '%s' "${VORTEX_PROTO:-h2}" | tr 'A-Z' 'a-z')
+server=$(printf '%s' "${VORTEX_SERVER:-sync}" | tr 'A-Z' 'a-z')
 seconds=${VORTEX_SECONDS:-60}
 report=${VORTEX_REPORT_SECONDS:-60}
 conc=${VORTEX_CONCURRENCY:-32}

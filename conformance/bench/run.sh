@@ -22,8 +22,10 @@ root=$(CDPATH= cd -- "$here/../.." && pwd)
 stressdir=$(CDPATH= cd -- "$here/../stress" && pwd)
 
 workload=${VORTEX_WORKLOAD:-requests}
-proto=${VORTEX_PROTO:-h2}
-frameworks=${BENCH_FRAMEWORKS:-all}
+# Case-insensitive (accept ALL/All/all etc.): a stray capital would otherwise
+# miss the `all` expansion below and be treated as a literal proto/framework.
+proto=$(printf '%s' "${VORTEX_PROTO:-h2}" | tr 'A-Z' 'a-z')
+frameworks=$(printf '%s' "${BENCH_FRAMEWORKS:-all}" | tr 'A-Z' 'a-z')
 seconds=${VORTEX_SECONDS:-15}
 report=${VORTEX_REPORT_SECONDS:-15}
 conc=${VORTEX_CONCURRENCY:-32}
