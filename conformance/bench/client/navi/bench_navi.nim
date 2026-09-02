@@ -7,7 +7,7 @@
 ## build). Emits a machine-readable RESULT line the harness parses, plus a human
 ## line each VORTEX_REPORT_SECONDS. Never verifies payloads; exits non-zero only
 ## if it could not measure at all (status=nomeasure).
-import std/[os, strutils, times, monotimes, asyncdispatch, algorithm, options]
+import std/[os, strutils, times, monotimes, asyncdispatch, algorithm, options, sha1]
 import navi/asyncdispatch
 
 let
@@ -145,6 +145,14 @@ proc wStreamUpload() {.async.} =
     stderr.writeLine "[" & workload & " " & proto & " " & framework &
       "] SKIP: streamupload over h3"
     return
+  # the server SHA-1s the body and 400s a mismatch, so send the real digest of the
+  # deterministic stream (fair 200, and the server does identical work each way).
+  var st = newSha1State()
+  block:
+    var o = 0
+    while o < streamBytes:
+      let n = min(CHUNK, streamBytes - o); st.update(genChunk(o, n)); o += n
+  let sha = ($SecureHash(st.finalize())).toLowerAscii
   let api = newNavi(mkCfg())
   while getMonoTime() < deadline:
     try:
@@ -154,7 +162,7 @@ proc wStreamUpload() {.async.} =
         let n = min(CHUNK, streamBytes - off)
         result = genChunk(off, n); off += n; xfer += n
       var hdrs = initHeaders()
-      hdrs.add("x-sha1", "skip")          # server validates if it wants; bench skips
+      hdrs.add("x-sha1", sha)
       let t0 = getMonoTime()
       let r = await api.request(POST, "/upload", headers = hdrs, bodyStream = producer)
       record(inNanoseconds(getMonoTime() - t0).float / 1e9, r.status)
@@ -167,7 +175,11 @@ proc wSse() {.async.} =
   let api = newNavi(mkCfg())
   while getMonoTime() < deadline:
     try:
-      let s = await api.sse("/sse")           # navi handles reconnect + Last-Event-ID
+      # The server closes after each 20-event batch (SSE reconnect pattern), so
+      # navi's reconnect backoff (default) adds a constant per-batch offset -- the
+      # same for every framework, so the comparison stays fair. evt/s and latency
+      # here are reconnect-dominated by design; documented in the README.
+      let s = await api.sse("/sse")
       var prev = getMonoTime()
       while getMonoTime() < deadline:
         let ev = await s.next()
