@@ -59,6 +59,7 @@ proc genChunk(start, n: int): string =
 
 proc mkCfg(): NaviConfig =
   result = initNaviConfig()
+  result.prefixUrl = base               # relative targets (/plaintext, ...) resolve against this
   result.tls.verify = false
   result.throwHttpErrors = false        # tally non-2xx, never raise
   result.http =
@@ -115,11 +116,11 @@ proc wRequests() {.async.} =
     try:
       var t0 = getMonoTime()
       let r1 = await api.get("/plaintext")
-      record(inMilliseconds(getMonoTime() - t0).float / 1000.0, r1.status)
+      record(inNanoseconds(getMonoTime() - t0).float / 1e9, r1.status)
       for _ in 0 .. 1:
         t0 = getMonoTime()
         let r2 = await api.post("/echo", body = body)
-        record(inMilliseconds(getMonoTime() - t0).float / 1000.0, r2.status)
+        record(inNanoseconds(getMonoTime() - t0).float / 1e9, r2.status)
     except CatchableError:
       inc errs
       await sleepAsync(50)
@@ -132,7 +133,7 @@ proc wStreamDownload() {.async.} =
       let t0 = getMonoTime()
       let sr = await api.stream(GET, "/download")
       await sr.drain(proc(data: string) {.async.} = xfer += data.len)
-      record(inMilliseconds(getMonoTime() - t0).float / 1000.0, sr.status)
+      record(inNanoseconds(getMonoTime() - t0).float / 1e9, sr.status)
     except CatchableError:
       inc errs
       await sleepAsync(50)
@@ -156,7 +157,7 @@ proc wStreamUpload() {.async.} =
       hdrs.add("x-sha1", "skip")          # server validates if it wants; bench skips
       let t0 = getMonoTime()
       let r = await api.request(POST, "/upload", headers = hdrs, bodyStream = producer)
-      record(inMilliseconds(getMonoTime() - t0).float / 1000.0, r.status)
+      record(inNanoseconds(getMonoTime() - t0).float / 1e9, r.status)
     except CatchableError:
       inc errs
       await sleepAsync(50)
@@ -172,7 +173,7 @@ proc wSse() {.async.} =
         let ev = await s.next()
         if ev.isNone: break
         let now = getMonoTime()
-        record(inMilliseconds(now - prev).float / 1000.0); prev = now
+        record(inNanoseconds(now - prev).float / 1e9); prev = now
       await s.close()
     except CatchableError:
       inc errs
@@ -195,7 +196,7 @@ proc wWs() {.async.} =
       let t0 = getMonoTime()
       await ws.send(msg)
       discard await ws.receive()
-      record(inMilliseconds(getMonoTime() - t0).float / 1000.0); inc n
+      record(inNanoseconds(getMonoTime() - t0).float / 1e9); inc n
     await ws.close()
   except CatchableError:
     inc errs

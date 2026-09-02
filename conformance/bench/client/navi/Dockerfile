@@ -3,7 +3,8 @@
 # (github.com/cryo2010/nim-navi), so it runs anywhere. h3 needs -d:naviHttp3,
 # which links ngtcp2 + nghttp3 + OpenSSL >=3.5 -- all available from Arch's repos
 # (same base as the vortex stress/bench server image), so no from-source toolchain.
-ARG BASE=menci/archlinuxarm:latest        # x86_64 override: --build-arg BASE=archlinux:latest
+# x86_64 override: --build-arg BASE=archlinux:latest
+ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
 
 RUN for i in 1 2 3 4 5; do \
