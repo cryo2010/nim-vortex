@@ -53,6 +53,9 @@ type
     cert_pem: cstring
     key_pem: cstring
     key_password: cstring
+    pkcs12_file: cstring
+    pkcs12: ptr uint8
+    pkcs12_len: csize_t
     max_body: uint64
     max_concurrent_streams: uint64
     max_field_section_size: cint
@@ -72,11 +75,13 @@ proc vqSubmitResponse(conn: ptr VqConn, sid: int64, status: cint, hdrs: ptr VqHe
   n: csize_t, body: ptr uint8, bodyLen: csize_t, fin: cint) {.importc: "vq_submit_response".}
 proc vqSubmitHead(conn: ptr VqConn, sid: int64, status: cint, hdrs: ptr VqHeader, n: csize_t) {.importc: "vq_submit_head".}
 proc vqStreamWrite(conn: ptr VqConn, sid: int64, data: ptr uint8, len: csize_t): csize_t {.importc: "vq_stream_write".}
+proc vqSubmitTrailers(conn: ptr VqConn, sid: int64, hdrs: ptr VqHeader, n: csize_t) {.importc: "vq_submit_trailers".}
 proc vqStreamFinish(conn: ptr VqConn, sid: int64) {.importc: "vq_stream_finish".}
 proc vqStreamBacklog(conn: ptr VqConn, sid: int64): csize_t {.importc: "vq_stream_backlog".}
 proc vqStreamReset(conn: ptr VqConn, sid: int64, appErr: uint64) {.importc: "vq_stream_reset".}
 proc vqStreamConsume(conn: ptr VqConn, sid: int64, n: csize_t) {.importc: "vq_stream_consume".}
 proc vqConnGoaway(conn: ptr VqConn) {.importc: "vq_conn_goaway".}
+proc vqConnShutdown(conn: ptr VqConn) {.importc: "vq_conn_shutdown".}
 proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
 {.pop.}
 
@@ -119,7 +124,8 @@ type
     streams*: Table[uint64, H3Stream]
     closing: bool
     lastStreamId: uint64
-    goneAway: bool
+    goneAway: bool          ## initial GOAWAY notice sent
+    finalGoaway: bool       ## final GOAWAY (nghttp3_conn_shutdown) sent
 
 # One engine + core + UDP fd per loop thread.
 var
@@ -361,6 +367,7 @@ proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
 proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxBody, maxStreams, maxFieldSection: int,
               certPem = "", keyPem = "", keyPassword = "",
+              pkcs12File = "", pkcs12 = "",
               streamRecvWindow = 0, connRecvWindow = 0): bool =
   gCore = core
   gUdpFd = udpFd
@@ -370,13 +377,17 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
     on_stream_end: cbStreamEnd, on_stream_close: cbStreamClose,
     on_stream_writable: cbStreamWritable, on_conn_close: cbConnClose, on_send: cbSend)
   # The shim reads these only during vqEngineNew below (synchronous), so the
-  # cstring views into these parameters stay valid for the call. In-memory PEM
-  # takes precedence over the file paths; key_password decrypts an encrypted key.
+  # views into these parameters stay valid for the call. A PKCS#12 bundle takes
+  # precedence, then in-memory PEM, then the file paths; key_password decrypts an
+  # encrypted PEM key or the PKCS#12 bundle.
   cfg.cert_file = certFile.cstring
   cfg.key_file = keyFile.cstring
   cfg.cert_pem = certPem.cstring
   cfg.key_pem = keyPem.cstring
   cfg.key_password = keyPassword.cstring
+  cfg.pkcs12_file = pkcs12File.cstring
+  cfg.pkcs12 = (if pkcs12.len > 0: cast[ptr uint8](unsafeAddr pkcs12[0]) else: nil)
+  cfg.pkcs12_len = csize_t(pkcs12.len)
   cfg.max_body = uint64(maxBody)
   cfg.max_concurrent_streams = uint64(maxStreams)
   cfg.max_field_section_size = cint(maxFieldSection)
@@ -472,10 +483,21 @@ proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
                              cast[ptr uint8](unsafeAddr data[0]), csize_t(data.len)))
   int(vqStreamBacklog(conn.vq, int64(sid)))
 
-proc h3StreamFinish*(conn: H3Conn, sid: uint64) =
+proc h3StreamFinish*(conn: H3Conn, sid: uint64,
+                     trailers: openArray[(string, string)] = []) =
   if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return
   conn.streams[sid].streaming = false
   conn.streams[sid].onRespDrain = nil
+  # Submit any trailer fields before the FIN so nghttp3 keeps the stream open for
+  # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
+  if trailers.len > 0:
+    var tv = newSeq[VqHeader](trailers.len)
+    var lower = newSeq[(string, string)](trailers.len)
+    for i, (name, val) in trailers:
+      lower[i] = (name.toLowerAscii, val)
+      tv[i] = VqHeader(name: lower[i][0].cstring, name_len: csize_t(lower[i][0].len),
+                       value: lower[i][1].cstring, value_len: csize_t(lower[i][1].len))
+    vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
   vqStreamFinish(conn.vq, int64(sid))
 
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
@@ -514,9 +536,18 @@ proc h3AckBody*(conn: H3Conn, sid: uint64, n: int) =
     vqStreamConsume(conn.vq, int64(sid), csize_t(n))
 
 proc h3Goaway*(conn: H3Conn) =
+  ## Initial GOAWAY notice (RFC 9114 5.2): "shutting down", max stream id.
   if conn.vq == nil or conn.goneAway: return
   conn.goneAway = true
   vqConnGoaway(conn.vq)
+
+proc h3Shutdown*(conn: H3Conn) =
+  ## Final GOAWAY (RFC 9114 5.2): the definitive last-accepted stream id. Sent
+  ## after h3Goaway's notice, once the drain has given in-flight requests a
+  ## chance to finish, so the peer learns the request boundary.
+  if conn.vq == nil or conn.finalGoaway: return
+  conn.finalGoaway = true
+  vqConnShutdown(conn.vq)
 
 proc h3Free*(conn: H3Conn) =
   var empty: string

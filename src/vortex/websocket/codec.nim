@@ -10,7 +10,12 @@
 import std/[base64, strutils]
 import ../connection
 import ./frames
-import ./sha1
+# Sec-WebSocket-Accept SHA-1: OpenSSL EVP (hardware SHA where available) in the
+# TLS build; the bundled pure-Nim SHA-1 only when OpenSSL is absent (plainHttp).
+when defined(plainHttp):
+  import ./sha1
+else:
+  import ../hwcrypto
 when defined(wsDeflate):
   import ./deflate
 

@@ -1830,9 +1830,7 @@ proc finish*(res: Response) {.raises: [].} =
               let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)), "", true)
               if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
-          # NOTE: HTTP/3 response trailers are not emitted yet (needs an
-          # nghttp3 submit_trailers path in the C++ shim); `trailers` is dropped.
-          h3StreamFinish(h3c, uint64(res.stream))
+          h3StreamFinish(h3c, uint64(res.stream), trailers)
       return
     let c = conn(res.core, res.fd, res.gen)
     if c == nil: return

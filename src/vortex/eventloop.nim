@@ -260,11 +260,23 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  settings.maxConcurrentStreams, settings.maxHeaderSize,
                  certPem = settings.certPem, keyPem = settings.keyPem,
                  keyPassword = settings.keyPassword,
+                 pkcs12File = settings.pkcs12File, pkcs12 = settings.pkcs12,
                  streamRecvWindow = settings.h3StreamWindow,
                  connRecvWindow = settings.h3ConnWindow):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
+      else:
+        # http3 was requested (a udpFd was bound) but the QUIC engine could not
+        # start -- most often TLS material the ngtcp2 ossl backend can't load
+        # (e.g. a cert/key that failed makeCtx's check). Surface it instead of
+        # silently serving h1/h2 with a bound-but-unused UDP socket and no
+        # Alt-Svc. h1/h2 keep working; only h3 is unavailable on this loop.
+        try:
+          stderr.writeLine("vortex: HTTP/3 engine setup failed; serving " &
+                           "HTTP/1.1 and HTTP/2 only on this loop " &
+                           "(check the TLS certificate/key for QUIC)")
+        except IOError, OSError: discard
 
 const drainTimeoutSec = 5    # bound on how long a lingering close waits
 
@@ -1423,8 +1435,14 @@ proc drainSweep(loop: Loop) =
       # anyway, and this avoids materializing H3Conn(slot.conn) here while the
       # worker holds the same ref (non-atomic ORC refcount race).
       if slot.pinned > 0: continue
-      if slot.conn != nil and H3Conn(slot.conn).h3StreamCount == 0:
-        loop.h3FreeSlot(i)                # no in-flight request streams left
+      if slot.conn != nil:
+        let h3c = H3Conn(slot.conn)
+        # Final GOAWAY (once), after beginDrain's notice went out on a prior
+        # iteration: completes the RFC 9114 5.2 two-step drain so the peer learns
+        # the last-accepted stream id before the connection closes.
+        h3Shutdown(h3c)
+        if h3c.h3StreamCount == 0:
+          loop.h3FreeSlot(i)             # no in-flight request streams left
 
 proc forceCloseAll(loop: Loop) =
   ## Grace expired: drop whatever is still open. A connection still pinned by a
