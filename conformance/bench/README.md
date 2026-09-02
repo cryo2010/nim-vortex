@@ -85,9 +85,11 @@ VORTEX_STREAM_BYTES=268435456 nimble benchStreamDownload         # 256 MiB trans
   20-event batch, so the client's reconnect backoff (a client-side constant,
   equal for all frameworks) dominates. The comparison stays fair; the absolute
   evt/s is low by construction.
-- **rust h2** currently shows a ~40ms per-request stall consistent with
-  delayed-ACK/Nagle (salvo TCP config, not its ceiling) — treat rust h2 with
-  suspicion until a `TCP_NODELAY` tweak lands; rust h1/h3 are representative.
+- **rust h2 / TCP_NODELAY**: salvo 0.77 doesn't set `TCP_NODELAY` and seals its
+  `Acceptor` trait, so it can't be set in-code; without it h2 stalled ~40ms/req
+  (Nagle + delayed-ACK). Fixed by an `LD_PRELOAD` shim (`servers/rust/
+  nodelay_preload.c`) that sets nodelay on every accepted fd — rust h2 is now
+  ~45k req/s, in line with vortex/go.
 - **rust upload buffers** the request body (`payload_with_max_size`), so its
   upload RSS is not comparable to the streaming servers.
 - Not a CI gate (Docker, big transfers). Adding a framework = drop a dir under

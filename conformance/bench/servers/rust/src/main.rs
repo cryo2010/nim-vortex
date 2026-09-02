@@ -2,6 +2,13 @@
 // over HTTP/1.1, HTTP/2 (rustls ALPN), and HTTP/3 (quinn). Semantics match
 // stress_server.nim byte-for-byte: deterministic download (byte i = i mod 256),
 // SHA-1-validated upload, id-ordered SSE (sseTotal=100/sseBatch=20, Last-Event-ID).
+// NOTE on TCP_NODELAY: salvo 0.77 does not set it on accepted sockets, and its
+// Acceptor trait is sealed (the accept() fuse-factory param is a pub(crate) type)
+// so a custom nodelay Acceptor wrapper can't be written, and its Conn
+// (StraightStream) hides the fd. Without nodelay, an HTTP/2 response's HEADERS +
+// DATA frames (two small writes) get held ~40ms by Nagle + delayed-ACK. The fix
+// is applied out-of-band by an LD_PRELOAD shim (see nodelay_preload.c + the
+// Dockerfile) that sets TCP_NODELAY on every accepted fd, before rustls wraps it.
 use salvo::conn::rustls::{Keycert, RustlsConfig};
 use salvo::prelude::*;
 use salvo::sse::{self, SseEvent};
