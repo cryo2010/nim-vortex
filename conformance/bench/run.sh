@@ -78,6 +78,7 @@ supported() {  # $1=fw $2=workload $3=proto
   case "$2" in
     ws) [ "$3" = h1 ] ;;                                  # ws: h1 only (no Go/navi Extended CONNECT)
     streamupload) ! { [ "$1" = vortex ] && [ "$3" = h3 ]; } ;;  # vortex h3 upload gap
+    streamdownload) ! { [ "$1" = rust ] && [ "$3" = h3 ]; } ;;  # ngtcp2<->quinn h3 tail-stall
     *) true ;;
   esac
 }

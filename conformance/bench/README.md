@@ -73,6 +73,15 @@ VORTEX_STREAM_BYTES=268435456 nimble benchStreamDownload         # 256 MiB trans
   over h2/h3 Extended CONNECT (RFC 8441/9220 unimplemented), so ws × {h2,h3} = n/a.
 - **vortex streamupload over h3** = n/a (vortex doesn't yet ack h3 request-body
   flow control; Go/Rust h3 upload is measured).
+- **rust streamdownload over h3** = n/a. The navi (ngtcp2) client ↔ salvo (quinn)
+  server pair has an h3 flow-control **tail-stall**: individual downloads work at
+  low concurrency (~150-200 MB/s) but a fraction stall 10-35s, and at bench
+  concurrency (~96 streams) they compound and throughput collapses to ~0. It is
+  specific to ngtcp2↔quinn (the same navi client hits 538-854 MB/s against Go's
+  quic-go and vortex's ngtcp2 h3), so it's a QUIC-stack interop issue, not
+  fixable from the salvo server config (raising quinn's send/receive windows did
+  not help and a huge advertised `receive_window` destabilized the client).
+  Excluded pending an upstream navi/ngtcp2 or quinn fix.
 
 ## Caveats
 
