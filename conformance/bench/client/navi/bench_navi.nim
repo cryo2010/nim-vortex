@@ -15,6 +15,14 @@ let
   workload   = getEnv("VORTEX_WORKLOAD", "requests")
   proto      = getEnv("VORTEX_PROTO", "h2")
   framework  = getEnv("BENCH_FRAMEWORK", "vortex")
+  # `<language>/<package>` for the human-readable progress lines; the RESULT line
+  # keeps the short `framework` id as its stable machine key (report.nim maps it
+  # for the final table the same way).
+  fwLabel    = (case framework
+                of "vortex": "nim/vortex"
+                of "go": "go/net-http"
+                of "rust": "rust/salvo"
+                else: framework)
   serverLbl  = getEnv("STRESS_SERVER", "sync")
   seconds    = parseInt(getEnv("VORTEX_SECONDS", "10"))
   reportSecs = max(1, parseInt(getEnv("VORTEX_REPORT_SECONDS", "10")))
@@ -96,7 +104,7 @@ proc report(prefix: string) =
   s.sort()
   let scale = if streaming(): 1.0 else: 1000.0      # streaming latency in s, else ms
   let u = if streaming(): "s" else: "ms"
-  stderr.writeLine "[" & workload & " " & proto & " " & framework & "] " & prefix &
+  stderr.writeLine "[" & workload & " " & proto & " " & fwLabel & "] " & prefix &
     formatFloat(thru, ffDecimal, 0) & " " & unitFor() &
     " | p50 " & formatFloat(pct(s, 50) * scale, ffDecimal, 2) & u &
     " p90 " & formatFloat(pct(s, 90) * scale, ffDecimal, 2) & u &
@@ -142,7 +150,7 @@ proc wStreamDownload() {.async.} =
 proc wStreamUpload() {.async.} =
   if isH3:                       # vortex doesn't ack h3 request-body flow control
     skipped = true
-    stderr.writeLine "[" & workload & " " & proto & " " & framework &
+    stderr.writeLine "[" & workload & " " & proto & " " & fwLabel &
       "] SKIP: streamupload over h3"
     return
   # the server SHA-1s the body and 400s a mismatch, so send the real digest of the
@@ -195,7 +203,7 @@ proc wSse() {.async.} =
 proc wWs() {.async.} =
   if proto != "h1":               # navi ws is HTTP/1.1 Upgrade only
     skipped = true
-    stderr.writeLine "[" & workload & " " & proto & " " & framework &
+    stderr.writeLine "[" & workload & " " & proto & " " & fwLabel &
       "] SKIP: websocket only over h1"
     return
   let api = newNavi(mkCfg())

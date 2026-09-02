@@ -2,9 +2,13 @@
 ## ($1 = results dir) and prints ONE table per workload:
 ##
 ##   workload=requests (unit req/s)
-##     framework proto  req/s     p50ms  p90ms  p99ms  err%  RSS
-##     vortex    h1     512300    0.42   0.80   2.10   0.00  28MB
-##     go        h3     n/a
+##     framework    proto  req/s     p50ms  p90ms  p99ms  err%  RSS
+##     nim/vortex   h1     512300    0.42   0.80   2.10   0.00  28MB
+##     go/net-http  h3     n/a
+##
+## The RESULT files carry the short framework id (vortex|go|rust) as the stable
+## machine key (image tags, server dirs, filenames); the table displays it as
+## `<language>/<package>` so every row compares like with like.
 import std/[os, strutils, tables, algorithm]
 
 if paramCount() < 1: quit("usage: report <results-dir>", 1)
@@ -44,6 +48,16 @@ proc rank(c: Cell): int =
   var pi = protoOrder.find(c.proto); if pi < 0: pi = 9
   fi * 10 + pi
 
+const fwW = 13   # widest label (`go/net-http`) + padding
+proc label(fw: string): string =
+  ## Short framework id -> `<language>/<package>` display label, so the table
+  ## compares stacks consistently instead of mixing package and language names.
+  case fw
+  of "vortex": "nim/vortex"
+  of "go": "go/net-http"       # Go stdlib net/http (+ quic-go for h3)
+  of "rust": "rust/salvo"
+  else: fw
+
 proc pad(s: string, w: int): string = s & " ".repeat(max(0, w - s.len))
 proc num(x: float, d: int): string = formatFloat(x, ffDecimal, d)
 
@@ -58,14 +72,14 @@ for wl, cs0 in byWorkload:
   let unit = (if cs.len > 0 and cs[0].unit != "-": cs[0].unit else: "op/s")
   echo ""
   echo "workload=", wl, "  (", unit, ")"
-  echo "  ", pad("framework", 10), pad("proto", 6), pad(unit, 12),
+  echo "  ", pad("framework", fwW), pad("proto", 6), pad(unit, 12),
        pad("p50ms", 9), pad("p90ms", 9), pad("p99ms", 9), pad("err%", 7), "RSS"
   for c in cs:
     if c.status in ["skip", "nomeasure"]:
-      echo "  ", pad(c.fw, 10), pad(c.proto, 6),
+      echo "  ", pad(label(c.fw), fwW), pad(c.proto, 6),
            pad((if c.status == "skip": "n/a" else: "FAIL"), 12)
     else:
-      echo "  ", pad(c.fw, 10), pad(c.proto, 6), pad(num(c.thru, 0), 12),
+      echo "  ", pad(label(c.fw), fwW), pad(c.proto, 6), pad(num(c.thru, 0), 12),
            pad(num(c.p50, 2), 9), pad(num(c.p90, 2), 9), pad(num(c.p99, 2), 9),
            pad(num(c.errpct, 2), 7), $(c.rss div (1024 * 1024)) & "MB"
 echo ""
