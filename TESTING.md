@@ -41,7 +41,8 @@ nimble stress          # short smoke of all five
 nimble loadtest        # k6: hold a load, chart latency + server CPU/mem  (localhost:3000)
 nimble saturate        # h2load: saturate, chart server CPU/mem + req/s   (localhost:3001)
 
-nimble bench perf perf2   # benchmarks (not pass/fail)
+nimble perf perf2   # local throughput comparison vs other servers (not pass/fail)
+nimble bench        # Dockerized per-workload perf suite: req/s | MB/s + latency
 ```
 
 ---
@@ -299,11 +300,27 @@ is now the per-workload soaks above.) See `conformance/stress/README.md`.
 
 Performance measurement, not pass/fail (CI does not gate on throughput numbers).
 
-| Task | Verifies |
+Dockerized per-workload perf suite (same `VORTEX_*` knobs as the stress soaks;
+see `conformance/bench/README.md`):
+
+| Task | Measures |
 |------|----------|
-| `nimble bench` | Builds the release benchmark server (`bench/handlers`) for `bench/run.sh` (wrk/oha/ab/h2load) |
+| `nimble benchRequests` | Buffered GET/POST/PUT throughput (req/s) + latency |
+| `nimble benchWs` | WebSocket echo (msg/s) + round-trip latency |
+| `nimble benchSse` | SSE (evt/s) + inter-event latency |
+| `nimble benchStreamUpload` | Stream upload throughput (MB/s) |
+| `nimble benchStreamDownload` | Stream download throughput (MB/s) |
+| `nimble bench` | Short smoke of all five above (20 s, 64 MiB) |
+
+Local (non-Docker) throughput tools:
+
+| Task | Measures |
+|------|----------|
 | `nimble perf` | HTTP/1.1 throughput vs httpbeast / chronos / mummy |
 | `nimble perf2` | HTTP/2 throughput |
+| `nimble benchServer` | Builds the release TechEmpower server (`bench/handlers`) for `bench/run.sh` (wrk/oha/ab/h2load) |
 
-HTTP/3 throughput is measured via `nimble h3load` (a real QUIC client), not a
-local `perf` task.
+The Dockerized `bench` suite runs anywhere (builds happen in Linux containers);
+its numbers are for relative/regression tracking, not absolute peak (the
+Python client caps cheap-endpoint throughput). Use `nimble saturate` (h2load)
+for absolute peak req/s and `nimble h3load` for HTTP/3 throughput.

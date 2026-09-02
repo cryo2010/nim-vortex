@@ -120,7 +120,7 @@ show up there. `bench/Dockerfile` provides a ready Arch environment.
 Build and drive the benchmark server directly:
 
 ```sh
-nimble bench            # builds bench/handlers (TechEmpower-style /plaintext, /json)
+nimble benchServer      # builds bench/handlers (TechEmpower-style /plaintext, /json)
 ./bench/handlers 8080   # serve on a port
 sh bench/run.sh         # drive load: wrk / oha / ab, plus h2load for HTTP/2
 ```
