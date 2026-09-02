@@ -1,96 +1,94 @@
-# Perf benches (per-workload, throughput + latency)
+# Cross-language perf bench (vortex vs Go vs Rust)
 
-Focused benchmarks that drive **one workload** at a vortex server at max rate and
-**measure** it: throughput (req/s | msg/s | evt/s | MB/s) plus latency
-percentiles (p50/p90/p99/max) and the server's RSS/heap, printed each report
-interval. Unlike the [stress soaks](../stress/README.md) these do **not** verify
-payloads and never fail on data -- a non-2xx is tallied and a transport error is
-counted while the loop keeps measuring.
-
-The **server is identical to the stress server**, so these reuse
-`../stress/Dockerfile` + `../stress/stress_server.nim` and the shared client
-transport (`../stress/client/transport.py`, `../stress/client/h3.py`) directly.
-Only the client's workload/reporting differ (`client/bench_client.py`).
+Compares vortex against other languages' HTTP servers on the same workloads,
+driven by one compiled client so the comparison is uniform. Each server
+implements the identical endpoint contract (`/plaintext`, `/json`, `/echo`,
+`/sse`, `/upload`, `/download`, `/ws`) with **byte-for-byte** semantics
+(deterministic download `byte i = i mod 256`, SHA-1-validated upload, id-ordered
+SSE) so the numbers are apples-to-apples.
 
 ```sh
-nimble benchRequests        # GET /plaintext + POST/PUT /echo, with compression
-nimble benchWs              # persistent WebSocket echo (round-trip latency)
-nimble benchSse             # SSE subscribe (event rate + inter-event latency)
-nimble benchStreamUpload    # stream up (MB/s); server still validates the SHA-1
-nimble benchStreamDownload  # stream down (MB/s)
-nimble bench                # short smoke of all five (20 s, 64 MiB)
+nimble benchRequests        # GET/POST/PUT req/s + latency
+nimble benchWs              # WebSocket echo msg/s (h1)
+nimble benchSse             # SSE evt/s
+nimble benchStreamUpload    # stream upload MB/s
+nimble benchStreamDownload  # stream download MB/s
+nimble bench                # all five, one big table (20s, 64 MiB)
 ```
 
-A run ends with `== <workload> <server> <proto> bench: <N> <unit>, <rate> avg, ... ==`.
+Each prints ONE table per workload:
 
-## Numbers are relative, not absolute peak
+```
+workload=requests  (req/s)
+  framework proto req/s       p50ms    p90ms    p99ms    err%   RSS
+  vortex    h1    65056       1.51     1.69     1.97     0.00   44MB
+  vortex    h2    61473       1.59     1.84     2.15     0.00   86MB
+  vortex    h3    49136       2.02     2.61     3.23     0.00   83MB
+  go        h1    46123       1.70     3.77     6.11     0.00   16MB
+  ...
+  rust      h1    67154       1.39     2.05     3.08     0.00   9MB
+```
 
-The pure-Python client (httpx / aioquic) is itself the bottleneck on cheap
-endpoints (aioquic h3 ~50 MB/s; httpx h2 throttles well below the server's
-ceiling). Read these numbers for **relative / regression tracking** (did this
-change move the needle?) and **cross-runtime comparison** (sync vs async vs
-chronos), not as vortex's absolute maximum. For absolute peak use the C load
-generators: `nimble saturate` (h2load + Grafana, requests) and `nimble h3load`.
+## The players
 
-## Configuration (same knobs as the stress soaks)
+| framework | h1 | h2 | h3 | stack |
+|-----------|----|----|----|-------|
+| **vortex** (Nim) | ✓ | ✓ | ✓ | this repo (`conformance/stress/stress_server.nim`) |
+| **go** | ✓ | ✓ | ✓ | net/http + quic-go (h3) + coder/websocket |
+| **rust** | ✓ | ✓ | ✓ | salvo (rustls h1/h2, quinn h3) |
+
+**Load client:** a compiled Nim client on [navi](https://github.com/cryo2010/nim-navi)
+(`client/navi/bench_navi.nim`, built `-d:naviHttp3`) — one client that speaks
+h1/h2/h3 + ws + sse + streaming, so every cell is measured the same way. Metrics:
+throughput, p50/p90/p99/max latency, error/non-2xx tallies; server memory is peak
+**container RSS via `docker stats`** (uniform across languages — Nim `heap` would
+not be comparable, so it is omitted).
+
+## Configuration
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `VORTEX_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2; h3 opt-in) |
-| `VORTEX_SERVER` | `sync` | `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` - the handler runtime |
-| `VORTEX_SECONDS` | `60` | runtime per cell |
-| `VORTEX_REPORT_SECONDS` | `60` | throughput/latency + server RSS report cadence |
-| `VORTEX_CONCURRENCY` | `32` | in-flight operations per client (async fan-out) |
-| `VORTEX_CLIENTS` | `3` | client workers per cell |
-| `VORTEX_REQ_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - client encodes the request body |
-| `VORTEX_RESP_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - the server compresses the response |
-| `VORTEX_STREAM_BYTES` | `1073741824` | streaming transfer size (1 GiB; lower for a smoke) |
-| `VORTEX_RUN_ID` | this run's PID | isolation id for the docker network / container / image names, so runs can go **in parallel** |
-| `BENCH_SMOKE` | `0` | `1` runs every workload short (set by `nimble bench`) |
+| `VORTEX_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (all = h1 h2 h3) |
+| `BENCH_FRAMEWORKS` | `all` | `vortex` \| `go` \| `rust` \| `all` (or a subset, space-free e.g. `vortex go`) |
+| `VORTEX_SECONDS` | `15` | runtime per cell |
+| `VORTEX_CONCURRENCY` | `32` | in-flight ops per client |
+| `VORTEX_CLIENTS` | `3` | client fan-out |
+| `VORTEX_STREAM_BYTES` | `1 GiB` | streaming transfer size |
+| `VORTEX_RUN_ID` | PID | isolates parallel runs (docker net/img/results) |
 
-The matrix is `VORTEX_PROTO` × `VORTEX_SERVER`; each cell builds its own server
-image and prints per-interval lines like:
+The harness runs in three phases so the report is clean: **build** all images
+(output to stderr), **run** each supported cell (server + `docker stats` RSS
+sampler + client), then **report** one table (stdout).
 
-```
-[requests h2 chronos] 48210 req/s | p50 0.62ms p90 1.10ms p99 3.4ms max 41ms | 200x2894301 err0 | RSS 31MB heap 7MB | t=10s
-[sse h3 chronos]      9820 evt/s  | p50 0.9ms p90 2.1ms p99 6.0ms max 22ms | 200x589200 err0 | RSS 29MB heap 7MB | t=10s
-[streamdownload h2 async] 512MB xfer @ 340MB/s | p50 3.0s p90 3.4s p99 4.0s max 4.1s | 200x14 err0 | RSS 33MB heap 8MB | t=10s
-```
-
-Runs are isolated by `VORTEX_RUN_ID`, so several can run concurrently (but they
-contend for the host, so throughput-sensitive cells slow down).
-
-## Examples
-
+Examples:
 ```sh
-# Quick h2 requests check (10 s)
-VORTEX_PROTO=h2 VORTEX_SECONDS=10 nimble benchRequests
-
-# Compare all five handler runtimes for requests over h2
-VORTEX_SERVER=all VORTEX_SECONDS=15 nimble benchRequests
-
-# Download throughput at 256 MiB transfers
-VORTEX_STREAM_BYTES=268435456 nimble benchStreamDownload
-
-# SSE event rate over both protocols
-VORTEX_PROTO=all VORTEX_SECONDS=15 nimble benchSse
+VORTEX_PROTO=h3 VORTEX_SECONDS=20 nimble benchRequests            # h3 only, all frameworks
+BENCH_FRAMEWORKS="vortex rust" VORTEX_PROTO=all nimble benchSse   # vortex vs rust, all protos
+VORTEX_STREAM_BYTES=268435456 nimble benchStreamDownload         # 256 MiB transfers
 ```
 
-## HTTP/3
+## Sparse matrix (unsupported cells show `n/a`)
 
-`VORTEX_PROTO=h3` drives the server's QUIC listener with **aioquic**. `requests`,
-`sse`, `streamdownload`, and `ws` (RFC 9220 Extended CONNECT) all run over h3.
-One cell is a printed skip (exit 0):
+- **WebSocket is h1-only** for every framework: no client (navi or Go) dials ws
+  over h2/h3 Extended CONNECT (RFC 8441/9220 unimplemented), so ws × {h2,h3} = n/a.
+- **vortex streamupload over h3** = n/a (vortex doesn't yet ack h3 request-body
+  flow control; Go/Rust h3 upload is measured).
 
-- **`streamupload` over h3** - vortex does not yet ack HTTP/3 request-body flow
-  control (the `h3AckBody` / NG2 gap), so a large h3 upload stalls after the
-  initial window. Downloads (server -> client) are unaffected.
+## Caveats
 
-## Gaps
-
-- On Docker Desktop the server RSS (from `/stats`) reflects the shared Linux VM;
-  read it as a trend, not an absolute host number.
-- Latency percentiles for the streaming workloads are coarse (few whole-transfer
-  samples at large `VORTEX_STREAM_BYTES`); MB/s is the primary metric there and
-  the latency is per full transfer.
-- Not a CI gate (Docker, long runtimes, large transfers).
+- **Numbers are relative / cross-language, not absolute peak.** The navi client,
+  though compiled, can still be the ceiling on trivial endpoints. For vortex's
+  absolute peak use `nimble saturate` (h2load) / `nimble h3load`.
+- **`docker stats` RSS** is cgroup memory in Docker Desktop's VM (includes page
+  cache); read it as a consistent *relative* figure, not an absolute host number.
+- **SSE evt/s + latency are reconnect-dominated**: the server closes after each
+  20-event batch, so the client's reconnect backoff (a client-side constant,
+  equal for all frameworks) dominates. The comparison stays fair; the absolute
+  evt/s is low by construction.
+- **rust h2** currently shows a ~40ms per-request stall consistent with
+  delayed-ACK/Nagle (salvo TCP config, not its ceiling) — treat rust h2 with
+  suspicion until a `TCP_NODELAY` tweak lands; rust h1/h3 are representative.
+- **rust upload buffers** the request body (`payload_with_max_size`), so its
+  upload RSS is not comparable to the streaming servers.
+- Not a CI gate (Docker, big transfers). Adding a framework = drop a dir under
+  `servers/<name>/` and extend the capability table in `run.sh`.
