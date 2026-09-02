@@ -240,29 +240,31 @@ task stress, "Short smoke of all five stress workloads (Docker)":
   exec "STRESS_SMOKE=1 VORTEX_SECONDS=" & secs & " VORTEX_STREAM_BYTES=" &
        sbytes & " sh conformance/stress/run.sh"
 
-# Per-workload performance benches: same shape and VORTEX_* knobs as the stress
-# soaks, but measure throughput + latency instead of verifying (Docker; the bench
-# server IS the stress server). Numbers are for relative/regression tracking, not
-# absolute peak -- use `nimble saturate` / `h3load` for that. See
-# conformance/bench/README.md.
-task benchRequests, "Perf bench: buffered GET/POST/PUT throughput + latency (Docker)":
+# Cross-language performance benches: drive vortex vs Go vs Rust servers with the
+# compiled navi client over h1/h2/h3 and print ONE comparison table per workload
+# (throughput + p50/p90/p99 + err% + container RSS). Knobs: VORTEX_PROTO
+# (h1|h2|h3|all), BENCH_FRAMEWORKS (vortex|go|rust|all), VORTEX_{SECONDS,
+# CONCURRENCY,CLIENTS,STREAM_BYTES,RUN_ID}. Numbers are for relative/cross-language
+# comparison, not absolute peak. See conformance/bench/README.md.
+task benchRequests, "Bench: GET/POST/PUT req/s + latency, vortex vs go vs rust (Docker)":
   exec "VORTEX_WORKLOAD=requests sh conformance/bench/run.sh"
 
-task benchWs, "Perf bench: WebSocket echo msgs/s + round-trip latency (Docker)":
+task benchWs, "Bench: WebSocket echo msg/s (h1), vortex vs go vs rust (Docker)":
   exec "VORTEX_WORKLOAD=ws sh conformance/bench/run.sh"
 
-task benchSse, "Perf bench: SSE events/s + inter-event latency (Docker)":
+task benchSse, "Bench: SSE evt/s, vortex vs go vs rust (Docker)":
   exec "VORTEX_WORKLOAD=sse sh conformance/bench/run.sh"
 
-task benchStreamUpload, "Perf bench: stream upload MB/s (Docker)":
+task benchStreamUpload, "Bench: stream upload MB/s, vortex vs go vs rust (Docker)":
   exec "VORTEX_WORKLOAD=streamupload sh conformance/bench/run.sh"
 
-task benchStreamDownload, "Perf bench: stream download MB/s (Docker)":
+task benchStreamDownload, "Bench: stream download MB/s, vortex vs go vs rust (Docker)":
   exec "VORTEX_WORKLOAD=streamdownload sh conformance/bench/run.sh"
 
-task bench, "Short perf smoke over all five bench workloads (Docker)":
-  # Runs every workload short (20s, 64 MiB); honors an explicit VORTEX_SECONDS /
-  # VORTEX_STREAM_BYTES from the caller (mirrors the `stress` smoke).
+task bench, "Bench: all workloads x frameworks, one big comparison table (Docker)":
+  # Runs every workload short (20s, 64 MiB) across the selected frameworks/protos
+  # and prints one consolidated table; honors an explicit VORTEX_SECONDS /
+  # VORTEX_STREAM_BYTES / VORTEX_PROTO / BENCH_FRAMEWORKS from the caller.
   let secs = getEnv("VORTEX_SECONDS", "20")
   let sbytes = getEnv("VORTEX_STREAM_BYTES", "67108864")
   exec "BENCH_SMOKE=1 VORTEX_SECONDS=" & secs & " VORTEX_STREAM_BYTES=" &
