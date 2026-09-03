@@ -1,5 +1,7 @@
 ## Signed (tamper-proof) cookies: setSignedCookie writes an HMAC signed value
-## (HMAC-SHA256 by default; SHA-1/SHA-512 selectable via nimcrypto).
+## (HMAC-SHA256 by default; SHA-1/SHA-512 selectable). The HMAC runs through
+## OpenSSL in the default build and nimcrypto under -d:plainHttp; both produce
+## identical tags, so a signed cookie round-trips across build modes.
 ## req.cookies.signed(name, secret, algo) returns the value only if the
 ## signature verifies under that algo. Tampering, a wrong secret, or a
 ## mismatched algo yield none.
@@ -45,7 +47,7 @@ proc readWith(cookie: string, algo = ""): string =
   let q = if algo.len > 0: "?algo=" & algo else: ""
   c.getContent(base & "/read" & q)
 
-suite "signed cookies (nimcrypto)":
+suite "signed cookies (HMAC)":
   test "default HMAC-SHA256 round-trips":
     check readWith(setCookiePair()) == "val=user-42"
 

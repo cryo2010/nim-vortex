@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   iteration, populated once the body has fully arrived. `res.trailers` sets the
   trailers emitted after a streamed response body (`res.trailers["X-Checksum"]
   = digest`); `res.finish` sends them as the chunked trailer section on
-  HTTP/1.1 or a trailing `HEADERS`+`END_STREAM` frame on HTTP/2. Previously
+  HTTP/1.1 or a trailing `HEADERS` section on HTTP/2 and HTTP/3. Previously
   received request trailers were discarded and there was no typed response-side
   API.
 
@@ -26,13 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `res.trailers` before calling `res.finish()` instead. (Migration:
   `res.finish({"X-Checksum": v})` becomes `res.trailers["X-Checksum"] = v;
   res.finish()`.)
-
-### Known limitations
-
-- HTTP/3 does not emit response trailers yet (a request's trailers are still
-  read via `req.trailers`): `res.trailers` set on an h3 response are dropped by
-  `res.finish`. Emitting them needs an nghttp3 `submit_trailers` path in the
-  QUIC C++ shim.
 
 ## [0.4.0] - 2026-08-29
 
