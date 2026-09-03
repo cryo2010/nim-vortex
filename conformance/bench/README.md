@@ -20,22 +20,27 @@ Each prints ONE table per workload:
 
 ```
 workload=requests  (req/s)
-  framework proto req/s       p50ms    p90ms    p99ms    err%   RSS
-  vortex    h1    65056       1.51     1.69     1.97     0.00   44MB
-  vortex    h2    61473       1.59     1.84     2.15     0.00   86MB
-  vortex    h3    49136       2.02     2.61     3.23     0.00   83MB
-  go        h1    46123       1.70     3.77     6.11     0.00   16MB
+  framework    proto req/s       p50ms    p90ms    p99ms    err%   RSS
+  nim/vortex   h1    65056       1.51     1.69     1.97     0.00   44MB
+  nim/vortex   h2    61473       1.59     1.84     2.15     0.00   86MB
+  nim/vortex   h3    49136       2.02     2.61     3.23     0.00   83MB
+  go/net-http  h1    46123       1.70     3.77     6.11     0.00   16MB
   ...
-  rust      h1    67154       1.39     2.05     3.08     0.00   9MB
+  rust/salvo   h1    67154       1.39     2.05     3.08     0.00   9MB
 ```
+
+The table shows each server as `<language>/<package>` (`nim/vortex`,
+`go/net-http`, `rust/salvo`) so every row compares like with like. The short id
+(`vortex`/`go`/`rust`) is still the machine key for `BENCH_FRAMEWORKS`, image
+tags, and the `servers/<name>/` dirs.
 
 ## The players
 
-| framework | h1 | h2 | h3 | stack |
-|-----------|----|----|----|-------|
-| **vortex** (Nim) | ✓ | ✓ | ✓ | this repo (`conformance/stress/stress_server.nim`) |
-| **go** | ✓ | ✓ | ✓ | net/http + quic-go (h3) + coder/websocket |
-| **rust** | ✓ | ✓ | ✓ | salvo (rustls h1/h2, quinn h3) |
+| framework | id | h1 | h2 | h3 | stack |
+|-----------|----|----|----|----|-------|
+| **nim/vortex** | `vortex` | ✓ | ✓ | ✓ | this repo (`conformance/stress/stress_server.nim`) |
+| **go/net-http** | `go` | ✓ | ✓ | ✓ | net/http + quic-go (h3) + coder/websocket |
+| **rust/salvo** | `rust` | ✓ | ✓ | ✓ | salvo (rustls h1/h2, quinn h3) |
 
 **Load client:** a compiled Nim client on [navi](https://github.com/cryo2010/nim-navi)
 (`client/navi/bench_navi.nim`, built `-d:naviHttp3`) — one client that speaks
