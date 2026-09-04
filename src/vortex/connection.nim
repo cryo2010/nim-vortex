@@ -263,6 +263,14 @@ type
       ## threads. `prc == nil` unless the server was started with streaming
       ## routes; the loop only consults it when set, so the buffered path pays
       ## nothing.
+    pendingBlockingResults*: int
+      ## Async `req.blocking` tasks dispatched but whose `omBlockingDone` the loop
+      ## has not processed yet (loop-thread only). The graceful drain waits for
+      ## this to reach 0 so a worker's completion always runs `onDone` (completing
+      ## the awaiting future) before the loop exits -- otherwise a shutdown that
+      ## races the worker would orphan the future + its suspended continuation
+      ## (the response releases the connection pin one message before
+      ## `omBlockingDone`, so the connection count alone can hit 0 too early).
 
 proc hasStreamRoute*(core: ptr LoopCore): bool {.inline.} =
   ## True when a streaming predicate is configured (see streamRouteRaw).

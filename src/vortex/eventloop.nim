@@ -1126,6 +1126,8 @@ proc processOutbox(loop: Loop) =
       let base = cast[BlockingResultBase](m.user)
       if base.onDone != nil: base.onDone(base)   # complete/fail the future (loop)
       GC_unref(base)                             # release the box
+      if loop.core.pendingBlockingResults > 0:   # this task is no longer outstanding
+        dec loop.core.pendingBlockingResults
       if m.fd < 0:
         when not defined(plainHttp):
           let idx = int(-m.fd) - 2
@@ -1473,8 +1475,15 @@ proc drainComplete(loop: Loop): bool =
   ## orphaned at teardown instead of released -- a shutdown-time leak. So keep
   ## pumping until the adapter drains (pumpCap < 0), bounded by a short deadline
   ## so a never-completing future can't wedge shutdown.
+  ##
+  ## `pendingBlockingResults` covers the earlier window too: a void async
+  ## `req.blocking` body's `res.send` releases the connection pin one outbox
+  ## message before its `omBlockingDone`, so `drainDone` (connection count) can
+  ## reach 0 while the completion is still in flight. Waiting for it guarantees
+  ## the worker's `onDone` runs -- completing the awaiting future -- before exit,
+  ## instead of orphaning the future and its suspended continuation.
   if not loop.drainDone(): return false
-  if loop.pumpCap < 0: return true
+  if loop.pumpCap < 0 and loop.core.pendingBlockingResults == 0: return true
   if loop.asyncDrainDeadline == 0:
     loop.asyncDrainDeadline = loop.core.nowSec + 3
     return false
