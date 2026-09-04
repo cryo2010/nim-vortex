@@ -2,7 +2,7 @@
 ## listener; the kernel load-balances connections) plus a shared worker
 ## pool for `blocking:` code.
 
-import std/[atomics, cpuinfo]
+import std/[atomics, cpuinfo, os]
 when defined(nimdoc):
   # See eventloop.nim: `nim doc` (-d:nimdoc) flips net/nativesockets to winlean
   # types, colliding with std/posix. Resolve the two clashing names from posix
@@ -61,6 +61,11 @@ type
     outboxes: seq[ptr Outbox]
     pool: ptr WorkerPool
     stopFlag: ptr Atomic[bool]  ## this server's own stop signal (shared memory)
+    alive: ptr Atomic[int]      ## live loop + worker threads (shared memory); each
+                                ## decrements on exit so waitFor can bound its wait
+                                ## and detach a thread stuck in a never-returning
+                                ## `blocking:` body instead of hanging
+    hardShutdownSec: int        ## waitFor's cap before detaching stuck threads
     tls: pointer               ## ptr TlsConfig or nil
     quicReload: pointer        ## ptr CertReload: signals loops to reload h3 certs
     port*: Port                ## actual bound port (settings may say 0)
@@ -109,8 +114,18 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
     if settings.workerThreads > 0: settings.workerThreads
     else: numLoops * 2
 
+  # Live-thread counter (loops + workers): each thread decrements it on exit, so
+  # waitFor can wait a bounded time and then detach a thread stuck in a never-
+  # returning `blocking:` body instead of joining it forever.
+  result.alive = createShared(Atomic[int])
+  result.alive[].store(numLoops + numWorkers)
+  result.hardShutdownSec =
+    if settings.shutdownHardTimeout > 0: settings.shutdownHardTimeout
+    else: max(1, settings.shutdownGrace) + 5    # loop grace + margin
+
   result.pool = createShared(WorkerPool)
-  result.pool.start(numWorkers)
+  result.pool.start(numWorkers, maxQueue = settings.maxBlockingQueue,
+                    alive = result.alive)
 
   when not defined(plainHttp):
     if settings.hasTls:
@@ -174,7 +189,8 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
                     pool: cast[pointer](result.pool),
                     outbox: result.outboxes[i], tls: result.tls,
                     udpFd: udpFds[i],
-                    streamRoute: streamRoute, quicReload: result.quicReload))
+                    streamRoute: streamRoute, quicReload: result.quicReload,
+                    alive: result.alive))
       inc madeThreads
   except CatchableError:
     # Stop and join any loops already started (they own their listen/udp fds and
@@ -190,6 +206,7 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
     result.threads.setLen(0)
     result.pool.shutdown()
     deallocShared result.pool
+    if result.alive != nil: deallocShared result.alive
     when not defined(plainHttp):
       if result.tls != nil: freeTlsConfig(cast[ptr TlsConfig](result.tls))
       if result.quicReload != nil:
@@ -200,14 +217,50 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
     raise
 
 proc waitFor*(server: var Server) =
-  ## Block until the loops exit (stop signal), then tear down workers.
+  ## Block until the loops and workers exit, then tear down. Bounded: Nim cannot
+  ## cancel a running thread, so a `blocking:` handler that never returns would
+  ## otherwise hang joinThread forever. After `hardShutdownSec` we stop waiting,
+  ## DETACH the stuck loop/worker threads, and intentionally leak the resources
+  ## they still reference rather than freeing them under a live thread. This
+  ## mirrors Go's `Server.Shutdown(ctx)` returning on the ctx deadline and tokio's
+  ## `Runtime::shutdown_timeout` abandoning blocking threads: the leaked threads
+  ## keep running against still-valid shared state until the process exits.
+  if server.pool != nil: server.pool.signalStop()   # wake idle workers to exit
+  # Poll the live-thread counter (10ms granularity) up to the hard timeout.
+  var live = if server.alive != nil: server.alive[].load(moAcquire) else: 0
+  var waited = 0
+  let maxWait = max(1, server.hardShutdownSec) * 100        # * 10ms
+  while live > 0 and waited < maxWait:
+    sleep(10)
+    inc waited
+    live = server.alive[].load(moAcquire)
+  if live > 0:
+    # Stuck thread(s) inside a never-returning body: detach and leak. Do NOT join
+    # (it would hang) and do NOT free anything they still reference (pool,
+    # outboxes, stopFlag, tls, quicReload, alive). Drop our handles so a second
+    # close/waitFor is a no-op.
+    try: stderr.writeLine("vortex: " & $live & " thread(s) still in a blocking: " &
+      "handler after " & $server.hardShutdownSec & "s; detaching and leaking " &
+      "their resources so shutdown returns (the handler never returned)")
+    except IOError, OSError: discard
+    server.threads.setLen(0)
+    server.outboxes.setLen(0)
+    server.pool = nil
+    server.stopFlag = nil
+    server.alive = nil
+    server.tls = nil
+    server.quicReload = nil
+    return
+  # Clean path: every thread exited, so the joins below return immediately.
   for t in server.threads.mitems:
     joinThread t
   server.threads.setLen(0)
-  server.pool.shutdown()       # workers may still push; loops are gone but
-                               # outbox events stay valid until freed below
+  server.pool.shutdown()       # workers already exited; this joins + frees
   deallocShared server.pool
   server.pool = nil
+  if server.alive != nil:
+    deallocShared server.alive
+    server.alive = nil
   for ob in server.outboxes:
     freeOutbox ob
   server.outboxes.setLen(0)

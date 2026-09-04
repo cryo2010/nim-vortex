@@ -8,7 +8,7 @@
 ## here: ORC's cycle-collector registry is thread-local, so destroying a
 ## closure on a foreign thread corrupts it.
 
-import std/[locks, deques, httpcore]
+import std/[locks, deques, httpcore, atomics]
 
 type
   ReqSnapshot* = object
@@ -52,6 +52,11 @@ type
     cond: Cond
     tasks: Deque[WorkerTask]
     stopping: bool
+    maxQueue: int                 ## reject enqueue past this many waiting tasks
+                                  ## (0 = unbounded); the load-shedding cap
+    alive: ptr Atomic[int]        ## shared live-thread counter (loops + workers);
+                                  ## each worker decrements it on exit so a timed
+                                  ## shutdown can detect stuck workers (nil = off)
     threads: seq[Thread[ptr WorkerPool]]
 
 var workerSnapshot* {.threadvar.}: ptr ReqSnapshot
@@ -64,7 +69,7 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
       wait(pool.cond, pool.lock)
     if pool.tasks.len == 0:
       release pool.lock
-      return                       # stopping and drained
+      break                        # stopping and drained
     var task = pool.tasks.popFirst()
     release pool.lock
     workerSnapshot = addr task.snap   # the trampoline reads this (nil off-pool)
@@ -78,12 +83,19 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
         # server. The trampoline already responded and released the pin.
         discard
     workerSnapshot = nil            # don't dangle at a freed task between runs
+  # Exited cleanly: mark this worker no longer alive so a timed shutdown knows.
+  # A worker still running a never-returning body never reaches here -- which is
+  # exactly what lets the timed shutdown detect it and detach instead of hang.
+  if pool.alive != nil: discard pool.alive[].fetchSub(1, moAcquireRelease)
 
-proc start*(pool: ptr WorkerPool, n: int) =
+proc start*(pool: ptr WorkerPool, n: int, maxQueue = 0,
+            alive: ptr Atomic[int] = nil) =
   initLock pool.lock
   initCond pool.cond
   pool.tasks = initDeque[WorkerTask]()
   pool.stopping = false
+  pool.maxQueue = maxQueue
+  pool.alive = alive
   pool.threads = newSeq[Thread[ptr WorkerPool]](n)
   for i in 0 ..< n:
     createThread(pool.threads[i], workerLoop, pool)
@@ -96,12 +108,35 @@ proc enqueue*(pool: ptr WorkerPool, task: WorkerTask) =
   signal pool.cond
   release pool.lock
 
-proc shutdown*(pool: ptr WorkerPool) =
-  ## Finish queued tasks, then stop the workers.
+proc tryEnqueue*(pool: ptr WorkerPool, task: sink WorkerTask): bool =
+  ## Enqueue unless the pool is closing or its backlog of not-yet-started tasks
+  ## is at the configured cap (load shedding): when every worker is busy and the
+  ## queue has backed up to maxQueue, reject so the caller can fail fast (503)
+  ## instead of queuing unboundedly behind slow/stuck work. Returns false when
+  ## rejected. maxQueue = 0 never rejects (unbounded, the default).
+  acquire pool.lock
+  if pool.stopping or (pool.maxQueue > 0 and pool.tasks.len >= pool.maxQueue):
+    release pool.lock
+    return false
+  pool.tasks.addLast task
+  signal pool.cond
+  release pool.lock
+  true
+
+proc signalStop*(pool: ptr WorkerPool) =
+  ## Ask workers to finish the queue and exit, WITHOUT joining. Idle workers wake
+  ## and drain; a worker inside a never-returning body stays running. Lets a
+  ## timed shutdown wake the pool, then decide (join vs detach) via `alive`.
   acquire pool.lock
   pool.stopping = true
   broadcast pool.cond          # under the lock (see enqueue)
   release pool.lock
+
+proc shutdown*(pool: ptr WorkerPool) =
+  ## Finish queued tasks, then stop and join the workers. Only safe to call once
+  ## every worker has actually exited (see server.waitFor's timed wait); a worker
+  ## stuck in a never-returning body would make joinThread block forever.
+  pool.signalStop()
   for t in pool.threads.mitems:
     joinThread t
   # The pool is a manually-managed `ptr WorkerPool` (createShared), so
