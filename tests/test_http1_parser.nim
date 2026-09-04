@@ -218,11 +218,22 @@ suite "bodies":
     check res == prError
     check p.errorStatus == Http400
 
-  test "chunked as the final coding among others is unsupported (501)":
+  test "chunked as the final coding among others frames as chunked (RFC 9112 6.1)":
+    # `gzip, chunked` is well-framed (chunked is final); the message is chunked
+    # and the inner coding is simply not decoded -- matches Go net/http / llhttp.
     let (res, p, _) = parseAll(
-      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
+    check res == prComplete
+    check p.chunked
+
+  test "duplicate Transfer-Encoding header lines rejected (400)":
+    # Two TE field lines combine into one coding list, leaving chunked non-final
+    # (Go net/http rejects "too many transfer encodings"); a TE-desync guard.
+    let (res, p, _) = parseAll(
+      "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n" &
+      "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
     check res == prError
-    check p.errorStatus == Http501
+    check p.errorStatus == Http400
 
   test "a lone chunked coding is accepted":
     let (res, p, _) = parseAll(
@@ -258,6 +269,22 @@ suite "chunked":
     let (res, p, _) = parseAll(data, limits(maxBodySize = 1024))
     check res == prError
     check p.errorStatus == Http413
+
+  test "chunk extension with control bytes rejected (400)":
+    # A benign chunk-ext is ignored, but C0 control bytes in it are rejected
+    # (llhttp does the same) so they can't hide desync content between parsers.
+    let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
+               "3;a\x00b\r\nabc\r\n0\r\n\r\n"
+    let (res, p, _) = parseAll(data)
+    check res == prError
+    check p.errorStatus == Http400
+
+  test "benign chunk extension is ignored":
+    let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" &
+               "3;name=value\r\nabc\r\n0\r\n\r\n"
+    let (res, _, body) = parseAll(data)
+    check res == prComplete
+    check body == "abc"
 
   test "bad chunk size":
     let data = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
