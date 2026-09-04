@@ -72,7 +72,10 @@ type
     contEndStream*: bool
     headerBlock*: string
     lastStreamId*: uint32
-    goingAway*: bool          ## our own drain: refuse new streams
+    goingAway*: bool          ## our own drain: final GOAWAY sent, refuse new streams
+    drainNoticeSent*: bool    ## initial GOAWAY(2^31-1) sent (graceful drain notice);
+                              ## new/racing streams are still processed until the
+                              ## final GOAWAY(lastStreamId) sets goingAway
     peerGoneAway*: bool       ## peer sent GOAWAY (informational; no push)
     maxBody*: int
     maxHeaderList*: int
@@ -185,8 +188,23 @@ proc connError(h2: H2Conn, c: ptr Connection, err: uint32) =
   c.closeAfterFlush = true
   c.state = csClosing
 
+const goawayMaxStreamId = 0x7fffffff'u32
+  ## RFC 9113 6.8: the initial graceful-shutdown GOAWAY uses the maximum stream
+  ## id so the peer keeps processing in-flight/racing streams until the final
+  ## GOAWAY carries the real last-accepted id.
+
+proc h2GoawayNotice*(c: ptr Connection) =
+  ## Step 1 of the RFC 9113 6.8 two-step graceful drain (as Go/Node do): send
+  ## GOAWAY(2^31-1, NO_ERROR) as a shutdown *notice*. It does NOT set goingAway,
+  ## so streams already on the wire (and new ones during the grace window) are
+  ## still accepted and completed; h2Goaway later sends the real cutoff.
+  let h2 = h2Conn(c)
+  if h2 == nil or h2.goingAway or h2.drainNoticeSent: return
+  h2.drainNoticeSent = true
+  c.wbuf.addGoaway(goawayMaxStreamId, 0'u32)
+
 proc h2Goaway*(c: ptr Connection) =
-  ## Graceful shutdown: refuse new streams (RFC 9113 6.8) and send
+  ## Step 2 (or the immediate cutoff): refuse new streams (RFC 9113 6.8) and send
   ## GOAWAY(NO_ERROR) up to the last accepted stream. Existing streams finish.
   let h2 = h2Conn(c)
   if h2 == nil or h2.goingAway: return
@@ -1346,6 +1364,19 @@ proc h2Feed*(c: ptr Connection, ready: var seq[uint32]) =
 
 proc h2ActiveStreams*(c: ptr Connection): int =
   if c.h2 == nil: 0 else: h2Conn(c).activeStreams
+
+proc h2AwaitingClient*(c: ptr Connection): bool =
+  ## True if any open stream is still expecting bytes from the client (its
+  ## request head/body is not finished: no END_STREAM seen). Such a stream is a
+  ## slowloris vector, so the loop arms a read-idle deadline while it is true.
+  ## A stream the client has finished (endStreamSeen) while the server streams a
+  ## long response back is NOT counted -- read-timing it would kill a legitimate
+  ## SSE/download where the client is silent by design.
+  if c.h2 == nil: return false
+  let h2 = h2Conn(c)
+  for sid, st in h2.streams.mpairs:   # mpairs: no per-stream value copy
+    if not st.endStreamSeen: return true
+  false
 
 proc h2StreamAlive*(c: ptr Connection, sid: uint32): bool =
   c.h2 != nil and sid in h2Conn(c).streams

@@ -1007,6 +1007,15 @@ var workerResponded* {.threadvar.}: bool
   ## worker) must still get a default response emitted, otherwise the outbox push
   ## that releases the connection's pin never happens and it hangs forever.
 
+var blockingPinHeld* {.threadvar.}: bool
+  ## Set only while an *awaitable* req.blocking body runs on a worker
+  ## (blockingResultTrampoline). Such a task releases its connection/slot pin via
+  ## the omBlockingDone message that follows the body, so any response the body
+  ## emits (omHttp / omFile*) must be stamped keepPin=true and must NOT release
+  ## the pin when applied -- otherwise the pin is decremented twice (once by the
+  ## response, once by omBlockingDone), which can free/reuse the slot under the
+  ## still-running worker (use-after-free). See eventloop.processOutbox.
+
 proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
              contentType: string, headers: openArray[(string, string)]) =
   if currentThreadId() != res.core.threadId:
@@ -1019,7 +1028,7 @@ proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
     if workerResponded: return
     push(res.core.outbox, OutMsg(
       fd: res.fd, gen: res.gen, stream: res.stream, code: int32(code),
-      data: packResponse(contentType, headers, body)))
+      data: packResponse(contentType, headers, body), keepPin: blockingPinHeld))
     workerResponded = true
     return
   if res.fd < 0:
@@ -2382,6 +2391,11 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = response(req)
+  # This task owns the connection/slot pin and releases it via the omBlockingDone
+  # pushed below. Flag any response the body emits so its apply path leaves the
+  # pin alone -- otherwise the pin is decremented twice (see blockingPinHeld).
+  let prevPinHeld = blockingPinHeld
+  blockingPinHeld = true
   try:
     when R is void:
       box.body(req, res, box.args)
@@ -2389,6 +2403,8 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
       box.value = box.body(req, res, box.args)
   except CatchableError as e:
     box.err = e
+  finally:
+    blockingPinHeld = prevPinHeld
   push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
                          stream: stream, user: user))
 
@@ -2440,7 +2456,8 @@ proc emitFileStart*(res: Response, status: int, contentType: string,
   push(res.core.outbox, OutMsg(
     kind: omFileStart, fd: res.fd, gen: res.gen, stream: res.stream,
     code: int32(status), data: packResponse(contentType, headers, firstChunk),
-    aux: nextRead, user: reader, n64: totalLen, last: last))
+    aux: nextRead, user: reader, n64: totalLen, last: last,
+    keepPin: blockingPinHeld))
   workerResponded = true
 
 proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
@@ -2449,7 +2466,8 @@ proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## read; the loop copies `buf[0..<n]` into the response and recycles `buf`.
   push(res.core.outbox, OutMsg(
     kind: omFileChunk, fd: res.fd, gen: res.gen, stream: res.stream,
-    buf: buf, code: int32(n), aux: nextRead, user: reader, last: last))
+    buf: buf, code: int32(n), aux: nextRead, user: reader, last: last,
+    keepPin: blockingPinHeld))
   workerResponded = true
 
 proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =

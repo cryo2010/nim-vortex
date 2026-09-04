@@ -91,6 +91,10 @@ type
     bodyTimeout*: int         ## from end of headers to end of body
     keepAliveTimeout*: int    ## idle time between requests
     responseTimeout*: int     ## end of request to first response byte (0 disables)
+    writeTimeout*: int        ## max time the socket may stay unwritable (no send
+                              ## progress) while output is pending; bounds a slow-
+                              ## reading client that never drains the response
+                              ## (idle, re-armed on progress). 0 disables.
     securityHeaders*: bool    ## auto-add the OWASP baseline headers to responses
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
     wsPongTimeout*: int       ## close a WebSocket if no frame arrives this long after a ping
@@ -150,6 +154,7 @@ proc initVortexConfig*(
     bodyTimeout = 30,
     keepAliveTimeout = 60,
     responseTimeout = 0,
+    writeTimeout = 0,
     securityHeaders = false,
     wsPingInterval = 30,
     wsPongTimeout = 10,
@@ -191,7 +196,7 @@ proc initVortexConfig*(
     h3StreamWindow: h3StreamWindow, h3ConnWindow: h3ConnWindow,
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
-    responseTimeout: responseTimeout,
+    responseTimeout: responseTimeout, writeTimeout: writeTimeout,
     securityHeaders: securityHeaders,
     wsPingInterval: wsPingInterval, wsPongTimeout: wsPongTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,

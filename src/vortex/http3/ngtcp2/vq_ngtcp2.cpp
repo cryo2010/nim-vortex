@@ -114,6 +114,8 @@ struct Conn {
   bool closed = false;                // scheduled for reaping
   bool draining = false;
   bool wantClose = false;             // emit CONNECTION_CLOSE(ccerr) then close
+  bool wantGracefulClose = false;     // flush pending h3 frames (final GOAWAY)
+                                      // first, THEN emit CONNECTION_CLOSE(ccerr)
   ngtcp2_ccerr ccerr{};               // application error for the close
 
   Stream *stream(int64_t id) {
@@ -445,6 +447,13 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   ngtcp2_pkt_hd hd;
   if (ngtcp2_accept(&hd, pkt, pktlen) != 0) return nullptr;
 
+  // Bound concurrent QUIC connections so a flood of Initial packets can't grow
+  // unbounded per-connection state (each Conn is an ngtcp2_conn + SSL + h3 slot).
+  // 0 = unlimited. A spoofed-address flood is still cheap here because we do not
+  // yet issue a Retry token (address validation) before committing state.
+  if (e->cfg.max_connections != 0 && e->conns.size() >= e->cfg.max_connections)
+    return nullptr;
+
   auto owned = std::make_unique<Conn>();
   Conn *c = owned.get();
   c->engine = e;
@@ -606,7 +615,23 @@ void writeConn(Conn *c, uint64_t now_ns) {
     }
     if (ndatalen >= 0 && c->h3 && sid >= 0)
       nghttp3_conn_add_write_offset(c->h3, sid, static_cast<size_t>(ndatalen));
-    if (nw == 0) return;   // congestion-limited or nothing left to send
+    if (nw == 0) {
+      // Nothing left to send. For a graceful close (vq_conn_close): the queued
+      // h3 control frames -- notably the final GOAWAY submitted by
+      // vq_conn_shutdown -- have now been serialized, so emit the
+      // CONNECTION_CLOSE(ccerr) that completes the clean shutdown instead of
+      // going silent and forcing the peer to wait out its idle timeout (R15).
+      if (c->wantGracefulClose && !c->closed) {
+        ngtcp2_ssize cw = ngtcp2_conn_write_connection_close(
+            c->conn, &ps.path, &pi, buf, sizeof buf, &c->ccerr, now_ns);
+        if (cw > 0 && send)
+          send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
+               static_cast<size_t>(cw), ps.path.remote.addr,
+               ps.path.remote.addrlen);
+        c->closed = true;
+      }
+      return;   // congestion-limited or nothing left to send
+    }
     if (send && send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
                      static_cast<size_t>(nw), ps.path.remote.addr,
                      ps.path.remote.addrlen) < 0)
@@ -790,6 +815,23 @@ void vq_engine_recv(VqEngine *eng, const uint8_t *pkt, size_t len,
 
   ngtcp2_version_cid vc;
   int rv = ngtcp2_pkt_decode_version_cid(&vc, pkt, len, kScidLen);
+  if (rv == NGTCP2_ERR_VERSION_NEGOTIATION) {
+    // The client offered a QUIC version we don't support: reply with a Version
+    // Negotiation packet listing our supported versions (RFC 9000 6.1) so it can
+    // retry immediately, instead of dropping the datagram and forcing a timeout.
+    // The VN packet echoes the CIDs swapped (its DCID = the client's SCID).
+    uint8_t vnbuf[kMaxUdpPayload];
+    uint8_t rnd = 0;
+    RAND_bytes(&rnd, 1);
+    const uint32_t sv[] = {NGTCP2_PROTO_VER_V1};
+    ngtcp2_ssize nw = ngtcp2_pkt_write_version_negotiation(
+        vnbuf, sizeof vnbuf, rnd, vc.scid, vc.scidlen, vc.dcid, vc.dcidlen,
+        sv, sizeof(sv) / sizeof(sv[0]));
+    if (nw > 0 && e->cfg.cb.on_send)
+      e->cfg.cb.on_send(e->cfg.user, nullptr, vnbuf, static_cast<size_t>(nw),
+                        const_cast<void *>(peer), peer_len);
+    return;
+  }
   if (rv < 0) return;
 
   Conn *c = nullptr;
@@ -977,13 +1019,31 @@ void vq_conn_shutdown(VqConn *conn) {
 
 void vq_conn_close(VqConn *conn, uint64_t app_error) {
   auto *c = reinterpret_cast<Conn *>(conn);
-  (void)app_error;
-  // Called by h3Free as the Nim H3Conn (our conn_ud) is being torn down, e.g.
-  // from drainSweep at shutdown -- before the engine has reaped this conn. Drop
-  // conn_ud so the later pump reap does NOT fire on_conn_close on the now-freed
-  // H3Conn (heap-use-after-free otherwise).
+  // Abrupt teardown: the Nim H3Conn (our conn_ud) is being freed right now
+  // (h3Free), so drop conn_ud first -- the reap must NOT fire on_conn_close on
+  // the freed H3Conn (heap-use-after-free). Then schedule a CONNECTION_CLOSE so
+  // the peer learns the connection is gone instead of idle-timing-out (R15);
+  // the next pump's writeConn emits it and reaps. (Best-effort: if the loop
+  // tears the engine down before the next pump, no packet is sent, which is
+  // acceptable on this hard-close path.)
   c->conn_ud = nullptr;
-  c->closed = true;
+  if (!c->wantClose && !c->closed) {
+    ngtcp2_ccerr_set_application_error(&c->ccerr, app_error, nullptr, 0);
+    c->wantClose = true;
+  }
+}
+
+void vq_conn_close_graceful(VqConn *conn, uint64_t app_error) {
+  auto *c = reinterpret_cast<Conn *>(conn);
+  // Clean shutdown: keep conn_ud valid and the Conn alive so writeConn first
+  // flushes the queued final GOAWAY (vq_conn_shutdown) and only then emits a
+  // CONNECTION_CLOSE(app_error) (see writeConn's nw==0 branch). When the Conn is
+  // reaped afterward it fires on_conn_close -> the Nim slot is released. This is
+  // the RFC 9114 5.2 two-step drain completed with a real close, the h3 analog
+  // of the h2 graceful GOAWAY+close.
+  if (c->wantClose || c->wantGracefulClose || c->closed) return;
+  ngtcp2_ccerr_set_application_error(&c->ccerr, app_error, nullptr, 0);
+  c->wantGracefulClose = true;
 }
 
 const char *vq_conn_peer_ip(VqConn *conn) {

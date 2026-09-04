@@ -52,6 +52,12 @@ type
     buf*: pointer             ## omFileChunk: the pooled read buffer (code = bytes read)
     n64*: int64               ## total Content-Length (omFileStart)
     last*: bool               ## this chunk completes the file
+    keepPin*: bool            ## this response was produced by an awaitable
+                              ## req.blocking body: its connection/slot pin is
+                              ## released by the task's later omBlockingDone, not
+                              ## by applying this message, so the apply path must
+                              ## NOT decrement the pin (double-dec -> UAF). See
+                              ## request.blockingResultTrampoline / eventloop.
 
   Outbox* = object
     ## MPSC channel into an event loop: workers push, the loop drains on
@@ -127,6 +133,11 @@ type
     ws*: RootRef              ## websocket.codec.WsConn; nil = not upgraded
     deadline*: int64          ## coarse monotonic seconds; 0 = no timeout
     dlKind*: DeadlineKind
+    writeDeadline*: int64     ## coarse monotonic seconds; 0 = none. Independent
+                              ## of `deadline`: set when output is pending but the
+                              ## socket is unwritable, so a slow-reading client
+                              ## that stalls the write is closed (writeTimeout)
+                              ## without clobbering the request/idle deadline.
     writeArmed*: bool         ## selector currently watching writability
     registered*: bool         ## fd registered with the selector
     pinned*: int32            ## outstanding worker tasks; slot can't recycle
