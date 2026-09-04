@@ -62,14 +62,18 @@ proc parseFrame*(buf: string, avail: int, pos: var int,
     header = 4
   elif len7 == 127:
     if avail - start < 10: return wpNeedMore
-    payloadLen = 0
+    # Accumulate the 64-bit length into a uint64 so it can never truncate before
+    # the cap check (a native int is only 32 bits on a 32-bit target, where the
+    # shift would wrap a huge advertised length down to a small accepted value).
+    var ext: uint64 = 0
     for i in 0 ..< 8:
-      let bv = int(uint8(buf[start + 2 + i]))
-      # High bit must be 0 (RFC 6455); and reject anything past our cap so
-      # a huge advertised length can never drive an allocation.
-      if (i == 0 and bv >= 0x80) or payloadLen > maxPayload:
-        return wpError
-      payloadLen = (payloadLen shl 8) or bv
+      let bv = uint8(buf[start + 2 + i])
+      if i == 0 and bv >= 0x80'u8: return wpError   # high bit must be 0 (RFC 6455)
+      ext = (ext shl 8) or uint64(bv)
+    # Reject anything past our cap (which also bounds it below high(int)) before
+    # narrowing, so a huge advertised length can never drive an allocation.
+    if ext > uint64(maxPayload): return wpError
+    payloadLen = int(ext)
     header = 10
   if payloadLen > maxPayload: return wpError
 
