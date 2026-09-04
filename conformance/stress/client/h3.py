@@ -14,7 +14,7 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import HeadersReceived, DataReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import ProtocolNegotiated
+from aioquic.quic.events import ProtocolNegotiated, StreamReset, ConnectionTerminated
 
 # Per-stream cap on the client's unacked upload buffer (aioquic
 # stream.sender._buffer). Bounds client RAM to ~this x concurrent streams so a
@@ -27,13 +27,15 @@ OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
 _WS_MASK = b"\x21\x43\x65\x87"
 
 def ws_frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
-    """A client-masked WebSocket frame (7-bit or 16-bit length)."""
+    """A client-masked WebSocket frame (7-bit, 16-bit, or 64-bit length)."""
     out = bytearray([(0x80 if fin else 0) | opcode])
     n = len(payload)
     if n < 126:
         out.append(0x80 | n)
-    else:
+    elif n < 65536:
         out += bytes([0x80 | 126, (n >> 8) & 0xff, n & 0xff])
+    else:
+        out += bytes([0x80 | 127]) + n.to_bytes(8, "big")
     out += _WS_MASK
     out += bytes(payload[i] ^ _WS_MASK[i % 4] for i in range(n))
     return bytes(out)
@@ -48,6 +50,9 @@ def parse_ws(buf: bytearray):
         if ln == 126:
             if pos + 4 > len(buf): break
             ln = (buf[pos + 2] << 8) | buf[pos + 3]; hdr = 4
+        elif ln == 127:
+            if pos + 10 > len(buf): break
+            ln = int.from_bytes(bytes(buf[pos + 2:pos + 10]), "big"); hdr = 10
         if pos + hdr + ln > len(buf): break
         frames.append((b0 & 0x0f, bytes(buf[pos + hdr:pos + hdr + ln])))
         pos += hdr + ln
@@ -64,6 +69,19 @@ class H3Client(QuicConnectionProtocol):
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated) and event.alpn_protocol.startswith("h3"):
             self._http = H3Connection(self._quic)
+        # A stream reset / connection close yields no H3 terminal event, so a
+        # consumer blocked on `q.get()` would hang forever (and the harness would
+        # then wrongly downgrade the hang to a timeout). Enqueue an explicit error
+        # terminal so the workload fails loud with the cause.
+        if isinstance(event, StreamReset):
+            q = self._queues.get(event.stream_id)
+            if q is not None:
+                q.put_nowait(("err", f"stream reset (code {event.error_code})"))
+            return
+        if isinstance(event, ConnectionTerminated):
+            for q in self._queues.values():
+                q.put_nowait(("err", f"connection closed (code {event.error_code})"))
+            return
         if self._http is not None:
             for e in self._http.handle_event(event):
                 self._on_h3(e)
@@ -113,6 +131,8 @@ class H3Session:
             kind, val = await q.get()
             if kind == "h": status = val
             elif kind == "d": body += val
+            elif kind == "err":
+                self.c._queues.pop(sid, None); raise ConnectionError(val)
             else: break
         self.c._queues.pop(sid, None)
         return status, bytes(body)
@@ -128,6 +148,7 @@ class H3Session:
                 kind, val = await q.get()
                 if kind == "h": yield val
                 elif kind == "d": yield val
+                elif kind == "err": raise ConnectionError(val)
                 else: break
         finally:
             self.c._queues.pop(sid, None)
@@ -156,6 +177,8 @@ class H3Session:
         while True:
             kind, val = await q.get()
             if kind == "h": status = val
+            elif kind == "err":
+                self.c._queues.pop(sid, None); raise ConnectionError(val)
             elif kind == "end": break
         self.c._queues.pop(sid, None)
         return status
@@ -176,6 +199,8 @@ class H3Session:
         while status is None:
             kind, val = await q.get()
             if kind == "h": status = val
+            elif kind == "err":
+                self.c._queues.pop(sid, None); raise ConnectionError(val)
             elif kind == "end": raise ConnectionError("ws CONNECT stream ended")
         return H3Ws(self.c, sid, q, status)
 
@@ -199,6 +224,7 @@ class H3Ws:
                 return frames[0]
             kind, val = await self.q.get()
             if kind == "d": self._buf += val
+            elif kind == "err": raise ConnectionError(val)
             elif kind == "end": raise ConnectionError("ws stream ended")
 
     def close(self):

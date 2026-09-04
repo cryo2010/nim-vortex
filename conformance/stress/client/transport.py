@@ -110,9 +110,12 @@ async def session():
             yield HttpxSession(c)
 
 async def get_server_stats(s) -> tuple:
-    try:
-        st, body = await s.get("/stats")
-        rss, heap = body.split()
-        return int(rss), int(heap)
-    except Exception:
-        return 0, 0
+    """Sample the server's (rss, heap) bytes from /stats. Raises on a non-2xx or
+    an unparseable body; the caller renders that as `n/a` rather than a
+    misleading `0MB`, so a regressed /stats can't masquerade as a healthy zero
+    footprint and quietly defeat the soak's leak watch."""
+    st, body = await s.get("/stats")
+    if st != 200:
+        raise RuntimeError(f"/stats -> {st}")
+    rss, heap = body.split()
+    return int(rss), int(heap)
