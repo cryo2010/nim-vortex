@@ -158,12 +158,11 @@ proc headers*(res: Response): var ResponseHeaders =
 
 proc trailers*(res: Response): var ResponseHeaders =
   ## Response trailers to emit after a streamed body: the chunked trailer
-  ## section on HTTP/1.1, a trailing HEADERS frame on HTTP/2. Same shape as
-  ## `res.headers`, e.g. `res.trailers["X-Checksum"] = digest` or
+  ## section on HTTP/1.1, a trailing HEADERS frame on HTTP/2 and HTTP/3. Same
+  ## shape as `res.headers`, e.g. `res.trailers["X-Checksum"] = digest` or
   ## `res.trailers.add("Server-Timing", t)`. Set them any time before
   ## `res.finish`, which emits them. Streamed responses only
   ## (`res.sendHead`/`write`/`finish`); loop-thread only, like `res.headers`.
-  ## NOTE: HTTP/3 does not emit response trailers yet (they are dropped there).
   assert currentThreadId() == res.core.threadId,
     "res.trailers is loop-thread only; set it before res.finish on the loop"
   res.core.respTrailers.mgetOrPut((res.fd, res.gen, res.stream), ResponseHeaders())
@@ -1808,9 +1807,9 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
 
 proc finish*(res: Response) {.raises: [].} =
   ## Terminate a streaming response: the chunked 0-chunk plus any `res.trailers`
-  ## on HTTP/1.1, a final DATA / trailing HEADERS(END_STREAM) on HTTP/2, or a
-  ## connection close for HTTP/1.0; then flush and resume the connection for the
-  ## next request. Set trailers with `res.trailers` before calling.
+  ## on HTTP/1.1, a final DATA then a trailing HEADERS section on HTTP/2 and
+  ## HTTP/3, or a connection close for HTTP/1.0; then flush and resume the
+  ## connection for the next request. Set trailers with `res.trailers` first.
   ## `{.raises: [].}` (contained) for async.
   try:
     if currentThreadId() != res.core.threadId: return

@@ -493,7 +493,7 @@ through a dead connection is a safe no-op.
 | `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
 | `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
 | `res.finish()` | `void` | end a streamed response cleanly (emits `res.trailers`, if any) |
-| `res.trailers[name] = v` | `void` | set a response *trailer* emitted after the streamed body: the chunked trailer section on h1, a trailing `HEADERS` frame on h2. Same shape as `res.headers`; set before `res.finish`. Not emitted over h3 yet |
+| `res.trailers[name] = v` | `void` | set a response *trailer* emitted after the streamed body: the chunked trailer section on h1, a trailing `HEADERS` frame on h2 and h3. Same shape as `res.headers`; set before `res.finish` |
 | `res.abort()` | `void` | truncate a streamed response (error mid-body) |
 | `res.stream(code = Http200, contentType, headers = []): body` | `template` | block form of a streamed response |
 | `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
@@ -598,8 +598,9 @@ The HMAC hash defaults to SHA-256 and is selectable via `CookieMac`
 (`macSha256` / `macSha512` / `macSha1`); pass the same `algo` to `setSignedCookie`
 and `signed`. This is integrity, not confidentiality: the value stays readable,
 only unforgeable. Keep `secret` private and stable (rotating it invalidates live
-cookies). Signing uses [nimcrypto](https://github.com/cheatfate/nimcrypto) (pure
-Nim), so it works in every build, including `-d:plainHttp` (no OpenSSL).
+cookies). The HMAC runs through OpenSSL (hardware SHA where available) in the
+default build and falls back to [nimcrypto](https://github.com/cheatfate/nimcrypto)
+(pure Nim) under `-d:plainHttp`; both produce identical tags.
 
 ### Middleware
 

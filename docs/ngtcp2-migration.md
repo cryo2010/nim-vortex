@@ -22,13 +22,16 @@ with `--with-openssl` (see `conformance/h3load/deps.Dockerfile`).
   `H3Conn`/`H3Stream` + proc surface, so `request.nim`/`eventloop.nim` use it via
   an import-swap. Holds per-request state; runs the shim callbacks on the loop
   thread; translates responses to `vq_submit_*`.
-- `eventloop.nim` — only the transport *drive* branches (`when defined(quicNgtcp2)`):
+- `eventloop.nim` — only the transport *drive* branches (`when not defined(plainHttp)`):
   UDP recv -> `vq_engine_recv` -> dispatch -> `vq_engine_pump`; timers folded into
   the selector timeout. Routing, workers, Request/Response, outbox: unchanged.
 - Vendoring: `conformance/h3load/deps.Dockerfile` builds ngtcp2 v1.15 + nghttp3
   v1.11 with `--with-openssl`, matching the h2load client.
 
-## Results so far
+## Evaluation results
+
+The numbers below come from the evaluation that justified the flip, comparing
+ngtcp2/nghttp3 against the (now-deleted) OpenSSL-QUIC + hand-rolled-codec stack.
 
 | Check | ngtcp2/nghttp3 |
 |-------|----------------|
@@ -38,14 +41,13 @@ with `--with-openssl` (see `conformance/h3load/deps.Dockerfile`).
 | ASan/LSan under h2load (`conformance/memcheck/h3ngtcp2.sh`) | **clean** (no errors, no shim/backend leaks) |
 | h3load throughput 100k/32c/32s | **598k req/s vs 262k** (2.3x) |
 | h3load throughput 500k/100c/64s | **579k req/s vs 240k** (2.4x) |
-| default OpenSSL-QUIC build | still compiles + runs |
 | `-d:plainHttp` build | unaffected |
 
-Run the ngtcp2 side of any suite with `NGTCP2=1` (h3load/h3spec/h3websocket) or
-`nimble h3loadNgtcp2`; the valgrind memcheck is `conformance/memcheck/h3ngtcp2.sh`.
+The h3 conformance/load suites now build the ngtcp2 server directly (no
+`NGTCP2=1` selector); the valgrind memcheck is `conformance/memcheck/h3ngtcp2.sh`.
 
 Throughput is Docker-on-macOS (Apple M4 Pro), same h2load client for both stacks;
-see `bench/results/`. The ~2.4x gap is large and consistent.
+see `bench/results/`. The ~2.4x gap was large and consistent.
 
 Two bugs the deeper checks caught (the handshake smoke did not):
 - the stress config exposed a stall: each request is a fresh bidi stream, so the
