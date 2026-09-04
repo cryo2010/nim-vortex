@@ -21,6 +21,8 @@ type
     respTrailers*: seq[(string, string)] ## response trailers to emit at END_STREAM
     body*: string
     sendWindow*: int32
+    recvRemaining*: int              ## bytes the peer may still send into this
+                                     ## stream's receive window (we enforce it)
     endStreamSeen*: bool             ## client half-closed
     dispatched*: bool
     responded*: bool
@@ -64,6 +66,8 @@ type
     peerMaxFrame*: int
     peerInitialWindow*: int32
     prefaceDone*: bool
+    sawFirstFrame*: bool      ## the first frame after the preface was seen
+                              ## (RFC 9113 3.4: it MUST be a SETTINGS frame)
     contStream*: uint32              ## awaiting CONTINUATION for this stream
     contEndStream*: bool
     headerBlock*: string
@@ -82,6 +86,8 @@ type
     controlFrameCount*: int
     streamRecvWindow*: int    ## per-stream receive window we advertise
     connRecvWindow*: int      ## per-connection receive window (streaming cap)
+    connRecvRemaining*: int   ## bytes the peer may still send at the connection
+                              ## level before overrunning the advertised window
     pendingConnWindow*: int   ## consumed bytes not yet returned as a connection
                               ## WINDOW_UPDATE (batched at half-window)
     # Per-connection write scheduler (RFC 9218): one round-robin ready-queue per
@@ -145,7 +151,8 @@ proc newH2Conn*(core: ptr LoopCore, maxBody, maxHeaderList,
     maxResetStreams: maxResetStreams,
     maxControlFrames: maxControlFrames,
     streamRecvWindow: max(streamRecvWindow, int(defaultInitialWindow)),
-    connRecvWindow: max(connRecvWindow, int(defaultInitialWindow)))
+    connRecvWindow: max(connRecvWindow, int(defaultInitialWindow)),
+    connRecvRemaining: max(connRecvWindow, int(defaultInitialWindow)))
 
 proc sendOurSettings(c: ptr Connection) =
   var payload = ""
@@ -757,6 +764,7 @@ proc creditStream(h2: H2Conn, c: ptr Connection, sid: uint32, n: int) =
   st.pendingWindow += n
   if st.pendingWindow * 2 >= h2.streamRecvWindow:
     c.wbuf.addWindowUpdate(sid, st.pendingWindow)
+    st.recvRemaining += st.pendingWindow   # window grows by what we just granted
     st.pendingWindow = 0
 
 proc creditConn(h2: H2Conn, c: ptr Connection, n: int) =
@@ -766,6 +774,7 @@ proc creditConn(h2: H2Conn, c: ptr Connection, n: int) =
   h2.pendingConnWindow += n
   if h2.pendingConnWindow * 2 >= h2.connRecvWindow:
     c.wbuf.addWindowUpdate(0, h2.pendingConnWindow)
+    h2.connRecvRemaining += h2.pendingConnWindow  # window grows by the grant
     h2.pendingConnWindow = 0
 
 # --- inbound streaming (req.onBody) -----------------------------------------
@@ -1000,6 +1009,18 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if sid > h2.lastStreamId:
       h2.connError(c, errProtocol)   # DATA on an idle stream
       return
+    # Enforce the RECEIVE flow-control window we advertised (RFC 9113 6.9): the
+    # entire DATA payload counts against both windows, even on a stream in error.
+    # A peer that overruns the window is a FLOW_CONTROL_ERROR -- connection-level
+    # for the connection window, stream-level for the stream (matching Go's
+    # inflow.take / nghttp2). Credit is returned by creditStream/creditConn.
+    if fh.length > 0:
+      h2.connRecvRemaining -= fh.length
+      if h2.connRecvRemaining < 0: h2.connError(c, errFlowControl); return
+      if sid in h2.streams:
+        h2.streams[sid].recvRemaining -= fh.length
+        if h2.streams[sid].recvRemaining < 0:
+          h2.streamError(c, sid, errFlowControl); return
     # Flow control applies to the whole payload regardless of validity.
     # A streaming body's DATA payload has its connection-window credit deferred
     # to consumption (set below); 0 means credit the whole frame eagerly.
@@ -1096,7 +1117,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if (fh.flags and flagPriority) != 0:
       if fragLen < 5: h2.connError(c, errFrameSize); return
       if (get32(c.rbuf, fragStart) and 0x7fffffff'u32) == sid:
-        h2.connError(c, errProtocol); return   # self-dependency
+        # Self-dependency is a STREAM error (RFC 7540 5.3.1, semantics kept by
+        # 9113), not a connection teardown -- matches Go/nghttp2, which RST only
+        # this stream instead of GOAWAY-ing every concurrent one.
+        h2.streamError(c, sid, errProtocol); return
       fragStart += 5
       fragLen -= 5
     if sid in h2.streams:
@@ -1116,7 +1140,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.lastStreamId = sid
       h2.streams[sid] = H2Stream(
         sendWindow: h2.peerInitialWindow, contentLength: -1,
-        urgency: defaultUrgency)
+        recvRemaining: h2.streamRecvWindow, urgency: defaultUrgency)
       inc h2.activeStreams
       if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
         h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
@@ -1208,7 +1232,12 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.length != 4: h2.connError(c, errFrameSize); return
     let inc32 = get32(c.rbuf, payloadPos) and 0x7fffffff'u32
     if inc32 == 0:
-      if fh.streamId == 0: h2.connError(c, errProtocol)
+      # A WINDOW_UPDATE referencing an idle stream (never opened) is a
+      # connection-level PROTOCOL_ERROR (RFC 9113 5.1), like any frame on an
+      # idle stream -- check that before the stream-scoped 0-increment error, so
+      # id > lastStreamId GOAWAYs instead of RST-ing a stream that never existed.
+      if fh.streamId == 0 or fh.streamId > h2.lastStreamId:
+        h2.connError(c, errProtocol)
       else: h2.streamError(c, fh.streamId, errProtocol)
       return
     if fh.streamId == 0:
@@ -1257,7 +1286,9 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if fh.streamId == 0: h2.connError(c, errProtocol); return
     if fh.length != 5: h2.connError(c, errFrameSize); return
     if (get32(c.rbuf, payloadPos) and 0x7fffffff'u32) == fh.streamId:
-      h2.connError(c, errProtocol); return   # self-dependency
+      # Self-dependency is a STREAM error (RFC 7540 5.3.1), not a connection
+      # teardown -- matches Go/nghttp2 (RST_STREAM, connection survives).
+      h2.streamError(c, fh.streamId, errProtocol); return   # self-dependency
     h2.noteControlFrame(c)         # PRIORITY has no productive use here
     # Otherwise ignored (RFC 9113 deprecates the priority tree).
 
@@ -1293,6 +1324,14 @@ proc h2Feed*(c: ptr Connection, ready: var seq[uint32]) =
       h2.connError(c, errFrameSize)
       break
     if avail < frameHeaderLen + fh.length: break
+    # RFC 9113 3.4: the client preface MUST be followed by a SETTINGS frame.
+    # Reject any other first frame as a connection error (as Go/nghttp2 do)
+    # before it is dispatched.
+    if not h2.sawFirstFrame:
+      h2.sawFirstFrame = true
+      if fh.typ != uint8(ftSettings):
+        h2.connError(c, errProtocol)
+        break
     let payloadPos = h2.parsePos + frameHeaderLen
     h2.parsePos += frameHeaderLen + fh.length
     h2.handleFrame(c, fh, payloadPos, ready)
