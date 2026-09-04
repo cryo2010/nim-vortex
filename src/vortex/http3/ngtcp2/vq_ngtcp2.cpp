@@ -328,9 +328,14 @@ int setupHttpConn(Conn *c) {
       h3BeginHeaders,      // begin_headers
       h3RecvHeader,        // recv_header
       h3EndHeaders,        // end_headers
-      nullptr,             // begin_trailers
-      nullptr,             // recv_trailer
-      nullptr,             // end_trailers
+      // A request's trailer section reuses the header callbacks (same
+      // signatures): begin clears the field store, recv appends, end delivers
+      // via on_headers. vortex's cbHeaders routes a post-head block into
+      // req.trailers (it keys off headersDone), so request trailers over h3 are
+      // surfaced like h1/h2 -- without these nghttp3 would drop them.
+      h3BeginHeaders,      // begin_trailers
+      h3RecvHeader,        // recv_trailer
+      h3EndHeaders,        // end_trailers
       nullptr,             // stop_sending
       h3EndStream,         // end_stream
       nullptr,             // reset_stream

@@ -16,6 +16,16 @@ const tokenDelims = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
   ## RFC 9110 5.6.2 token separators: bytes that may not appear in a field
   ## name (VCHARs outside this set are valid token characters).
 
+const disallowedTrailers = ["transfer-encoding", "content-length", "host",
+  "trailer", "te", "connection", "keep-alive", "upgrade", "content-encoding",
+  "content-type", "content-range", "authorization", "proxy-authorization",
+  "www-authenticate", "proxy-authenticate", "set-cookie", "cache-control",
+  "expect", "pragma", "range", "max-forwards"]
+  ## Field names that must not appear in a trailer section (RFC 9110 6.5.1:
+  ## framing, routing, request modifiers, authentication, and response control
+  ## data). A recipient must drop them from the trailers so they can never be
+  ## merged back into the header set (a smuggling / metadata-injection guard).
+
 type
   ParseResult* = enum
     prNeedMore   ## incomplete input, read more bytes and call again
@@ -54,6 +64,7 @@ type
     chunkRemaining: int64
     trailerCount: int         ## trailer fields seen (bounded like headers)
     seenContentLength: bool
+    seenTE: bool              ## a Transfer-Encoding field line was already seen
     seenHost: bool
     errorStatus*: HttpCode
 
@@ -116,6 +127,7 @@ proc reset*(p: var RequestParser, reqStart: int) =
   p.chunkRemaining = 0
   p.trailerCount = 0
   p.seenContentLength = false
+  p.seenTE = false
   p.seenHost = false
 
 proc fail(p: var RequestParser, status: HttpCode): ParseResult =
@@ -197,6 +209,14 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
     p.seenContentLength = true
   elif ieqLit(buf, h.nameStart, h.nameLen, "transfer-encoding"):
     if p.seenContentLength: return p.fail(Http400)
+    # More than one Transfer-Encoding field line is faulty framing: the fields
+    # combine into one coding list (RFC 9110 5.3), so a second line always
+    # leaves `chunked` non-final. Matching Go net/http ("too many transfer
+    # encodings") closes the TE-desync where a front-end folds two
+    # `Transfer-Encoding: chunked` lines into one list and rejects while a
+    # per-line parser would accept both (smuggling guard).
+    if p.seenTE: return p.fail(Http400)
+    p.seenTE = true
     # Transfer-Encoding is an HTTP/1.1 feature; an HTTP/1.0 request carrying
     # it is treated as faulty framing (RFC 9112 6.1), a smuggling guard.
     if p.minor == 0: return p.fail(Http400)
@@ -222,7 +242,11 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
       inc codings
       while i < last and buf[i] != ',': inc i    # skip parameters to next comma
     if codings == 0 or chunkedNonFinal: return p.fail(Http400)
-    if lastChunked and codings == 1:
+    # `chunked` as the final coding makes the message well-framed regardless of
+    # any preceding codings (RFC 9112 6.1): e.g. `gzip, chunked` frames as
+    # chunked (the inner coding is simply not decoded), matching Go net/http and
+    # llhttp. Only a list without a final `chunked` is unsupported -> 501.
+    if lastChunked:
       p.chunked = true
     else:
       return p.fail(Http501)                     # unknown / unsupported coding
@@ -354,7 +378,16 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
         if c in '0'..'9': d = int64(uint8(c) - uint8('0'))
         elif c in 'a'..'f': d = int64(uint8(c) - uint8('a') + 10)
         elif c in 'A'..'F': d = int64(uint8(c) - uint8('A') + 10)
-        elif c == ';': break   # chunk extensions: ignored
+        elif c == ';':
+          # chunk-ext (RFC 9112 7.1.1): we do not act on extensions, but reject
+          # a chunk-ext carrying C0 control bytes / a bare CR (llhttp does the
+          # same) so control bytes can't hide desync content between parsers.
+          # The whole line length is already bounded above.
+          for j in i + 1 ..< nl - 1:           # up to (not incl.) the CR at nl-1
+            let e = uint8(buf[j])
+            if (e < 0x20'u8 and e != 0x09'u8) or e == 0x7f'u8:
+              return p.fail(Http400)
+          break
         else: return p.fail(Http400)
         if size > (int64.high - 15) shr 4: return p.fail(Http413)
         size = size shl 4 or d
@@ -419,9 +452,20 @@ proc parse*(p: var RequestParser, buf: openArray[char], dataEnd: int,
         let b = uint8(buf[i])
         if (b < 0x20'u8 and b != 0x09'u8) or b == 0x7f'u8:
           return p.fail(Http400)
-      p.trailers.add HeaderSlice(
-        nameStart: int32(p.pos), nameLen: int32(colon - p.pos),
-        valStart: int32(vs), valLen: int32(ve - vs))
+      # Drop framing/routing/control field names from the trailer section (RFC
+      # 9110 6.5.1) so they can never reach req.trailers and be merged into the
+      # headers downstream. The line is still consumed; only the field is skipped.
+      var lname = newStringOfCap(colon - p.pos)   # lowercased trailer name
+      for i in p.pos ..< colon:
+        let ch = buf[i]
+        lname.add(if ch in 'A'..'Z': char(uint8(ch) + 32'u8) else: ch)
+      var disallowed = false
+      for dn in disallowedTrailers:
+        if lname == dn: disallowed = true; break
+      if not disallowed:
+        p.trailers.add HeaderSlice(
+          nameStart: int32(p.pos), nameLen: int32(colon - p.pos),
+          valStart: int32(vs), valLen: int32(ve - vs))
       p.pos = nl + 1
 
     of ppComplete:

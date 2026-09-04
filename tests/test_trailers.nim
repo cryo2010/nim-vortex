@@ -51,6 +51,13 @@ suite "req.trailers over HTTP/1.1 (chunked)":
   test "no trailer section: req.trailers is empty":
     check bodyOf(chunkedPost("")) == "|false|0|"
 
+  test "a disallowed trailer field (Content-Length) is dropped, not exposed":
+    # RFC 9110 6.5.1: framing/routing/control fields must not appear in trailers.
+    # The request still parses; only the disallowed field is skipped, so
+    # req.trailers holds just X-Checksum (count 1) and never Content-Length.
+    check bodyOf(chunkedPost("X-Checksum: ok\r\nContent-Length: 99\r\n")) ==
+      "ok|true|1|X-Checksum"
+
 suite "req.trailers over HTTP/2 (trailing HEADERS)":
   test "a trailer HEADERS frame after DATA reaches req.trailers":
     var c = newH2TestConn(port)
