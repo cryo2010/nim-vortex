@@ -58,6 +58,7 @@ type
     pkcs12_len: csize_t
     max_body: uint64
     max_concurrent_streams: uint64
+    max_connections: uint64
     max_field_section_size: cint
     stream_recv_window: uint64
     conn_recv_window: uint64
@@ -83,6 +84,7 @@ proc vqStreamConsume(conn: ptr VqConn, sid: int64, n: csize_t) {.importc: "vq_st
 proc vqConnGoaway(conn: ptr VqConn) {.importc: "vq_conn_goaway".}
 proc vqConnShutdown(conn: ptr VqConn) {.importc: "vq_conn_shutdown".}
 proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
+proc vqConnCloseGraceful(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close_graceful".}
 {.pop.}
 
 # --- H3 state (codec-compatible surface) ------------------------------------
@@ -368,7 +370,8 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxBody, maxStreams, maxFieldSection: int,
               certPem = "", keyPem = "", keyPassword = "",
               pkcs12File = "", pkcs12 = "",
-              streamRecvWindow = 0, connRecvWindow = 0): bool =
+              streamRecvWindow = 0, connRecvWindow = 0,
+              maxConnections = 0): bool =
   gCore = core
   gUdpFd = udpFd
   var cfg: VqConfig
@@ -390,6 +393,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.pkcs12_len = csize_t(pkcs12.len)
   cfg.max_body = uint64(maxBody)
   cfg.max_concurrent_streams = uint64(maxStreams)
+  cfg.max_connections = uint64(max(0, maxConnections))
   cfg.max_field_section_size = cint(maxFieldSection)
   cfg.stream_recv_window = uint64(streamRecvWindow)
   cfg.conn_recv_window = uint64(connRecvWindow)
@@ -548,6 +552,17 @@ proc h3Shutdown*(conn: H3Conn) =
   if conn.vq == nil or conn.finalGoaway: return
   conn.finalGoaway = true
   vqConnShutdown(conn.vq)
+
+proc h3GracefulClose*(conn: H3Conn) =
+  ## Complete a clean shutdown of this connection: flush the final GOAWAY, then
+  ## emit a QUIC CONNECTION_CLOSE(NO_ERROR) instead of going silent (which would
+  ## force the peer to idle-time-out). Unlike h3Free this does NOT tear down the
+  ## Nim H3Conn/streams: the shim keeps the connection alive until the frames are
+  ## on the wire, then reaps it and fires on_conn_close -> cbConnClose, which
+  ## drives h3FreeSlot. Idempotent (guarded by `closing`).
+  if conn.vq == nil or conn.closing: return
+  conn.closing = true
+  vqConnCloseGraceful(conn.vq, 0)
 
 proc h3Free*(conn: H3Conn) =
   var empty: string

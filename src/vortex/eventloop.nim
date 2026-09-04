@@ -109,6 +109,12 @@ type
     drainDeadline: int64         # monotonic sec; force-close remaining after
     asyncDrainDeadline: int64    # monotonic sec; bound the wait for pending async
                                  # continuations once all connections are gone
+    warnedDrainStuck: bool       # one-time warning emitted when graceful
+                                 # shutdown is blocked by a still-running worker
+    acceptSuspendedUntil: int64  # monotonic sec; while > nowSec the listener is
+                                 # deregistered after an fd/memory-exhaustion
+                                 # accept() error (EMFILE/ENFILE/...), then
+                                 # re-armed in tick(). 0 = listener armed.
 
 proc monoSec(): int64 {.inline.} =
   getMonoTime().ticks div 1_000_000_000
@@ -262,7 +268,8 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  keyPassword = settings.keyPassword,
                  pkcs12File = settings.pkcs12File, pkcs12 = settings.pkcs12,
                  streamRecvWindow = settings.h3StreamWindow,
-                 connRecvWindow = settings.h3ConnWindow):
+                 connRecvWindow = settings.h3ConnWindow,
+                 maxConnections = settings.maxConnections):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
@@ -300,6 +307,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     c.registered = false
   c.deadline = 0
   c.dlKind = dkNone
+  c.writeDeadline = 0
   if c.pinned > 0:
     # A worker still holds a Request handle into this slot: keep the fd
     # open (reserving the fd number and the slot) until it unpins.
@@ -337,6 +345,13 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   dec loop.connCount
 
 proc armWrite(loop: Loop, c: ptr Connection) =
+  # The socket could not take all pending output: arm a write-stall deadline so a
+  # slow-reading client that never drains the response is closed (writeTimeout).
+  # Idle (re-armed each time we block on write), so a response that keeps making
+  # progress is never cut off; independent of c.deadline so it doesn't clobber a
+  # request/idle/response deadline. sweepTimeouts enforces it. (No-op if off.)
+  if loop.settings.writeTimeout > 0:
+    c.writeDeadline = loop.core.nowSec + int64(loop.settings.writeTimeout)
   if not c.registered:
     # Re-arm a connection unregistered while it waited half-closed for a
     # deferred response (see disarmForResponse): there is output to flush now.
@@ -348,6 +363,7 @@ proc armWrite(loop: Loop, c: ptr Connection) =
     loop.selector.updateHandle(int(c.fd), {Event.Read, Event.Write})
 
 proc disarmWrite(loop: Loop, c: ptr Connection) =
+  c.writeDeadline = 0            # output fully flushed: the write is not stalled
   if c.writeArmed:
     c.writeArmed = false
     if c.registered:
@@ -515,6 +531,16 @@ proc h2Input(loop: Loop, c: ptr Connection) =
       # regardless of ongoing traffic (e.g. a client streaming SSE batches, one
       # stream at a time).
       c.setDeadline(loop, dkIdle)
+    elif h2AwaitingClient(c):
+      # At least one open stream is still awaiting the client's request head or
+      # body (no END_STREAM yet): arm a read-idle deadline so a client that opens
+      # HEADERS/DATA and then goes silent (a slowloris hold-open) is closed. This
+      # re-arms on every pass that made progress, so an actively-transferring
+      # upload is never cut off. A stream the client has finished while the server
+      # streams a long response back (endStreamSeen) is excluded by
+      # h2AwaitingClient -- read-timing that would kill a legitimate silent-client
+      # SSE/download. bodyTimeout is the natural bound for in-flight request bytes.
+      c.setDeadline(loop, dkBody)
     else:
       c.deadline = 0
       c.dlKind = dkNone
@@ -941,6 +967,20 @@ proc startTls(loop: Loop, c: ptr Connection): bool =
       c.handshaking = true
   true
 
+proc suspendAccept(loop: Loop) =
+  ## fd/memory exhaustion during accept(): deregister the listener for a short
+  ## spell and re-arm it in tick(). The listen fd is level-triggered, so simply
+  ## returning would immediately re-fire Read -> accept() -> EMFILE -> ... and
+  ## spin a whole CPU core (Go backs off on temporary accept errors instead).
+  if loop.listenFd >= 0 and loop.acceptSuspendedUntil == 0:
+    try: loop.selector.unregister(loop.listenFd)
+    except CatchableError: discard
+    loop.acceptSuspendedUntil = loop.core.nowSec + 1
+    try: stderr.writeLine("vortex: accept() hit fd/memory exhaustion; " &
+                          "pausing new connections ~1s (raise the fd rlimit " &
+                          "or lower maxConnections)")
+    except IOError, OSError: discard
+
 proc handleAccept(loop: Loop) =
   while true:
     var sa: Sockaddr_storage
@@ -950,7 +990,14 @@ proc handleAccept(loop: Loop) =
     if cint(client) < 0:
       let err = cint(osLastError())
       if err == EINTR: continue
-      return                   # EAGAIN or transient error: back to the loop
+      if err == EAGAIN or err == EWOULDBLOCK:
+        return                 # accept queue drained: wait for the next readable
+      if err == ECONNABORTED:
+        continue               # peer vanished before accept; skip to the next
+      if err == EMFILE or err == ENFILE or err == ENOBUFS or err == ENOMEM:
+        loop.suspendAccept()   # fd/memory exhaustion: back off, don't busy-spin
+        return
+      return                   # any other error: back to the loop
     setBlocking(client, false)
     var one = cint(1)
     discard setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
@@ -1167,7 +1214,7 @@ proc processOutbox(loop: Loop) =
           continue
         if slot.gen != m.gen or slot.conn == nil: continue
         if m.kind in {omFileStart, omFileChunk}:
-          if slot.pinned > 0: dec slot.pinned
+          if not m.keepPin and slot.pinned > 0: dec slot.pinned
           if slot.closeReq:
             if slot.pinned == 0: loop.h3FreeSlot(idx)
             continue
@@ -1182,7 +1229,7 @@ proc processOutbox(loop: Loop) =
             applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
           h3Touched = true
           continue
-        if slot.pinned > 0: dec slot.pinned
+        if not m.keepPin and slot.pinned > 0: dec slot.pinned
         if slot.closeReq:
           if slot.pinned == 0: loop.h3FreeSlot(idx)
           continue
@@ -1223,7 +1270,7 @@ proc processOutbox(loop: Loop) =
             loop.flushOut(c)
       continue
     if m.kind in {omFileStart, omFileChunk}:
-      if c.pinned > 0: dec c.pinned
+      if not m.keepPin and c.pinned > 0: dec c.pinned
       # Only chunk reads (dispatchNextRead -> omFileChunk) are file pins. The
       # initial read (omFileStart -> serveResolved) reads req headers, so it is a
       # normal pin and must NOT decrement filePinned.
@@ -1259,7 +1306,7 @@ proc processOutbox(loop: Loop) =
         # interest is never armed and no later Write event would drain it.
         loop.flushOut(c)
       continue
-    if c.pinned > 0: dec c.pinned
+    if not m.keepPin and c.pinned > 0: dec c.pinned
     if c.closeRequested:
       loop.closeConn(c)          # connection died while the task ran
       continue
@@ -1291,7 +1338,14 @@ proc sweepWsPing(loop: Loop, c: ptr Connection) =
 proc sweepTimeouts(loop: Loop) =
   for i in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[i]
-    if c.state == csFree or c.deadline == 0 or c.deadline > loop.core.nowSec:
+    if c.state == csFree: continue
+    if c.writeDeadline != 0 and c.writeDeadline <= loop.core.nowSec:
+      # Output pending but the socket stayed unwritable past writeTimeout: a
+      # slow/stalled reader. Close regardless of the request deadline (which is
+      # 0 for a mid-stream or active-h2 connection).
+      loop.closeConn(c)
+      continue
+    if c.deadline == 0 or c.deadline > loop.core.nowSec:
       continue
     if c.dlKind == dkWsPing:
       loop.sweepWsPing(c)          # idle: ping, then wait for the pong
@@ -1357,6 +1411,15 @@ proc tick(loop: Loop) =
     loop.sweepTimeouts()
     loop.sweepWsIdle()
     loop.applyQuicReload()
+    if loop.acceptSuspendedUntil != 0 and now >= loop.acceptSuspendedUntil and
+        loop.listenFd >= 0 and not loop.draining:
+      # The accept() backoff (suspendAccept) elapsed: re-arm the listener. If
+      # fds are still exhausted the next accept() re-suspends it for another spell.
+      try:
+        loop.selector.registerHandle(loop.listenFd, {Event.Read}, fkListen)
+        loop.acceptSuspendedUntil = 0
+      except CatchableError:
+        loop.acceptSuspendedUntil = now + 1   # retry next tick
 
 # --- graceful shutdown ------------------------------------------------------
 
@@ -1377,8 +1440,14 @@ proc markDrain(loop: Loop, c: ptr Connection) =
     # ORC's non-atomic refcounts. It stays counted (connCount > 0) so the loop
     # will not exit, and forceCloseAll closes it once the worker unpins.
   if c.h2 != nil:
-    h2Goaway(c)                           # refuse new streams, send GOAWAY
+    # RFC 9113 6.8 two-step drain: send the GOAWAY(2^31-1) notice so streams
+    # already on the wire (and any racing new ones) still complete. An idle
+    # connection has nothing in flight, so finalize immediately (GOAWAY notice +
+    # real cutoff + close); a busy one keeps going and drainSweep finalizes it
+    # once its streams drain.
+    h2GoawayNotice(c)
     if h2ActiveStreams(c) == 0:
+      h2Goaway(c)                         # final GOAWAY(lastStreamId), then close
       c.closeAfterFlush = true
     loop.flushOut(c)
   elif c.ws != nil:
@@ -1425,7 +1494,12 @@ proc drainSweep(loop: Loop) =
       # the worker, which under ORC's non-atomic refcounts would corrupt the
       # count. forceCloseAll (deferred) closes it once the worker unpins.
     if c.h2 != nil:
-      if h2Conn(c).goingAway and h2ActiveStreams(c) == 0:
+      # An h2 connection that has drained its in-flight streams: send the final
+      # GOAWAY(lastStreamId) (the real cutoff, if only the notice went out) so a
+      # client can retry any request above it, then close.
+      let h2 = h2Conn(c)
+      if h2ActiveStreams(c) == 0 and (h2.drainNoticeSent or h2.goingAway):
+        if not h2.goingAway: h2Goaway(c)
         if c.pendingOut > 0: c.closeAfterFlush = true
         else: loop.closeConn(c)
     elif c.ws == nil and not c.awaitingResponse and c.pendingOut == 0:
@@ -1444,7 +1518,12 @@ proc drainSweep(loop: Loop) =
         # the last-accepted stream id before the connection closes.
         h3Shutdown(h3c)
         if h3c.h3StreamCount == 0:
-          loop.h3FreeSlot(i)             # no in-flight request streams left
+          # No in-flight request streams left: close cleanly. The shim flushes
+          # the queued final GOAWAY, then emits CONNECTION_CLOSE and reaps the
+          # connection, which fires on_conn_close -> the slot is freed. (Freeing
+          # the slot here instead would set c->closed immediately and the GOAWAY
+          # /CONNECTION_CLOSE would never reach the wire -- the old bug.)
+          h3GracefulClose(h3c)
 
 proc forceCloseAll(loop: Loop) =
   ## Grace expired: drop whatever is still open. A connection still pinned by a
@@ -1592,7 +1671,21 @@ proc run*(loop: Loop) =
         # Everything else is a connection still pinned by a running blocking:
         # worker; forceCloseAll deferred its teardown. Keep the loop alive and
         # processing the outbox until the workers finish and unpin, rather than
-        # freeing the loop's memory under them (use-after-free).
+        # freeing the loop's memory under them (use-after-free). Nim has no safe
+        # way to cancel a running thread, so a `blocking:` handler that never
+        # returns cannot be reclaimed -- surface it once instead of hanging
+        # silently, so the operator can see why shutdown is stuck.
+        if not loop.warnedDrainStuck:
+          loop.warnedDrainStuck = true
+          var stuck = 0
+          for fd in 0 ..< loop.core.conns.len:
+            if loop.core.conns[fd].state != csFree and
+                loop.core.conns[fd].pinned > 0: inc stuck
+          try: stderr.writeLine("vortex: graceful shutdown is waiting on " &
+            $stuck & " connection(s) held by a still-running blocking: " &
+            "handler; the loop cannot exit until they return (a handler that " &
+            "never returns will block shutdown -- blocking: bodies must finish)")
+          except IOError, OSError: discard
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
@@ -1622,6 +1715,9 @@ type LoopThreadArg* = tuple
   udpFd: SocketHandle
   streamRoute: StreamRouteCb
   quicReload: pointer
+  alive: ptr Atomic[int]     ## shared live-thread counter; decremented when this
+                             ## loop thread exits so a timed shutdown can detect a
+                             ## loop wedged by a stuck worker (nil = not tracked)
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   # An unhandled exception escaping a thread proc aborts the whole process.
@@ -1650,3 +1746,7 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
       discard posix.close(cint(arg.listenFd))
     if arg.udpFd != osInvalidSocket:
       discard posix.close(cint(arg.udpFd))
+  # Mark this loop thread as exited last (both the clean and error paths), so a
+  # timed shutdown (server.waitFor) knows every loop is truly gone before it
+  # joins/frees -- and can detach instead of hang if run() never returned.
+  if arg.alive != nil: discard arg.alive[].fetchSub(1, moAcquireRelease)

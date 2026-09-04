@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Worker-pool load shedding: `maxBlockingQueue` (default 0 = unbounded) caps the
+  number of `blocking:` tasks that may wait for a free worker. Once every worker
+  is busy and the queue is at the cap, new `blocking:` dispatches fail fast with
+  `503 Service Unavailable` (the synchronous `blocking:` template) or raise
+  `PoolSaturatedError` in the awaitable `req.blocking(...)` form, instead of
+  queuing without bound behind slow/stuck work. `blocking:` bodies should do
+  bounded work and carry their own timeouts.
+- Bounded, non-hanging shutdown: `close`/`waitFor` now wait at most
+  `shutdownHardTimeout` seconds (default `shutdownGrace + 5`) for the event loops
+  and workers to finish, then **detach** any thread still inside a
+  never-returning `blocking:` handler and return, intentionally leaking only what
+  that thread references. Nim cannot cancel a running thread, so this mirrors
+  Go's `Server.Shutdown(ctx)` returning on its deadline and tokio's
+  `Runtime::shutdown_timeout` abandoning stuck blocking threads: a misbehaving
+  handler can no longer wedge `close()` forever.
+- `writeTimeout` config (seconds, 0 = off, default off): closes a connection
+  whose socket stays unwritable with output pending for that long, bounding a
+  slow-reading client that never drains its response (a slow-read DoS the
+  read-side `bodyTimeout` did not cover). Idle-style: re-armed on send progress,
+  so a legitimately long streamed response is never cut off.
 - Trailers, both directions, shaped like `req.headers` / `res.headers`.
   `req.trailers` is a read-only view of the header fields a client sent after a
   chunked (HTTP/1.1) or streamed (HTTP/2, HTTP/3) request body:
@@ -26,6 +46,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `res.trailers` before calling `res.finish()` instead. (Migration:
   `res.finish({"X-Checksum": v})` becomes `res.trailers["X-Checksum"] = v;
   res.finish()`.)
+- Graceful shutdown now performs the RFC-standard two-step GOAWAY drain on both
+  HTTP/2 and HTTP/3 (matching Go/Node): an initial `GOAWAY(2^31-1)` "shutting
+  down" notice so in-flight and racing streams still complete, followed by the
+  final `GOAWAY(last-accepted-id)` cutoff. `maxConnections` now also caps
+  concurrent HTTP/3 (QUIC) connections.
+
+### Fixed
+
+- HTTP/1.1 use-after-free: an awaitable `req.blocking` on a keep-alive
+  connection could decrement the connection pin twice (once for the response,
+  once for the task completion) and, with a pipelined follow-up request, release
+  a different request's pin -- letting the receive buffer be reallocated under a
+  running worker. The pin is now released exactly once, by the task completion.
+- HTTP/2 slowloris hold-open: a connection with a stream still awaiting the
+  client's request head/body (no `END_STREAM`) had its read deadline cleared, so
+  a silent client held it forever. Such a stream is now bounded by `bodyTimeout`
+  (a stream the client has finished while the server streams a long response is
+  excluded, so SSE/downloads are unaffected).
+- HTTP/3 graceful shutdown now actually transmits the final `GOAWAY` and a
+  `CONNECTION_CLOSE` on a clean close: previously the connection was freed in the
+  same pass that queued them, so neither reached the wire and peers waited out
+  their idle timeout.
+- HTTP/3 now replies to an unsupported QUIC version with a Version Negotiation
+  packet (RFC 9000 6.1) instead of dropping the datagram.
+- The accept loop no longer busy-spins at 100% CPU on `EMFILE`/`ENFILE` (fd
+  exhaustion): it backs off and re-arms the listener, mirroring Go's handling of
+  temporary accept errors.
+- Graceful shutdown blocked by a `blocking:` handler that never returns now logs
+  a clear diagnostic (Nim cannot safely cancel a running thread, so such a
+  handler still blocks shutdown; the wedge is now visible instead of silent).
 
 ## [0.4.0] - 2026-08-29
 

@@ -40,6 +40,14 @@ type
                               ## explicit IPv4/IPv6 address to pin the family.
     numThreads*: int          ## 0 = countProcessors()
     workerThreads*: int       ## worker pool size for `blocking:` (0 = numThreads * 2)
+    maxBlockingQueue*: int    ## load-shedding cap: reject new `blocking:` work
+                              ## with 503 once this many tasks are queued waiting
+                              ## for a free worker (0 = unbounded). Bounds a slow/
+                              ## stuck blocking endpoint from queuing without limit.
+    shutdownHardTimeout*: int ## seconds close()/waitFor waits for loops+workers to
+                              ## finish before detaching them and returning; bounds
+                              ## a `blocking:` handler that never returns from
+                              ## hanging shutdown (0 = derive from shutdownGrace)
     listenBacklog*: int
     reusePort*: bool          ## SO_REUSEPORT per-thread listeners
     proxyProtocol*: ProxyProtocol  ## accept a HAProxy PROXY header (see enum)
@@ -91,6 +99,10 @@ type
     bodyTimeout*: int         ## from end of headers to end of body
     keepAliveTimeout*: int    ## idle time between requests
     responseTimeout*: int     ## end of request to first response byte (0 disables)
+    writeTimeout*: int        ## max time the socket may stay unwritable (no send
+                              ## progress) while output is pending; bounds a slow-
+                              ## reading client that never drains the response
+                              ## (idle, re-armed on progress). 0 disables.
     securityHeaders*: bool    ## auto-add the OWASP baseline headers to responses
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
     wsPongTimeout*: int       ## close a WebSocket if no frame arrives this long after a ping
@@ -125,6 +137,8 @@ proc initVortexConfig*(
     address = "",
     numThreads = 0,
     workerThreads = 0,
+    maxBlockingQueue = 0,
+    shutdownHardTimeout = 0,
     listenBacklog = 1024,
     reusePort = true,
     proxyProtocol = ProxyProtocol.Disabled,
@@ -150,6 +164,7 @@ proc initVortexConfig*(
     bodyTimeout = 30,
     keepAliveTimeout = 60,
     responseTimeout = 0,
+    writeTimeout = 0,
     securityHeaders = false,
     wsPingInterval = 30,
     wsPongTimeout = 10,
@@ -176,7 +191,8 @@ proc initVortexConfig*(
 ): VortexConfig =
   VortexConfig(
     port: port, address: address, numThreads: numThreads,
-    workerThreads: workerThreads, listenBacklog: listenBacklog,
+    workerThreads: workerThreads, maxBlockingQueue: maxBlockingQueue,
+    shutdownHardTimeout: shutdownHardTimeout, listenBacklog: listenBacklog,
     reusePort: reusePort, proxyProtocol: proxyProtocol,
     trustedProxies: trustedProxies, maxHeaderSize: maxHeaderSize,
     maxHeaderCount: maxHeaderCount, maxBodySize: maxBodySize,
@@ -191,7 +207,7 @@ proc initVortexConfig*(
     h3StreamWindow: h3StreamWindow, h3ConnWindow: h3ConnWindow,
     headerTimeout: headerTimeout,
     bodyTimeout: bodyTimeout, keepAliveTimeout: keepAliveTimeout,
-    responseTimeout: responseTimeout,
+    responseTimeout: responseTimeout, writeTimeout: writeTimeout,
     securityHeaders: securityHeaders,
     wsPingInterval: wsPingInterval, wsPongTimeout: wsPongTimeout,
     shutdownGrace: shutdownGrace, serverHeader: serverHeader,

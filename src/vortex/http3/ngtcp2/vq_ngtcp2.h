@@ -106,6 +106,7 @@ typedef struct {
   /* Limits mirrored from VortexConfig. */
   uint64_t max_body;
   uint64_t max_concurrent_streams;
+  uint64_t max_connections;   /* cap on concurrent QUIC conns (0 = unlimited) */
   int max_field_section_size;
   /* QUIC receive flow-control windows (0 = shim default). stream_recv_window is
    * initial_max_stream_data for client-opened bidi streams (request-body upload
@@ -172,6 +173,9 @@ void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n);
 void vq_conn_goaway(VqConn *conn);
 void vq_conn_shutdown(VqConn *conn);
 void vq_conn_close(VqConn *conn, uint64_t app_error);
+/* Clean close: flush the final GOAWAY, then emit CONNECTION_CLOSE(app_error)
+ * and reap (fires on_conn_close). Keeps conn_ud valid; shim-driven teardown. */
+void vq_conn_close_graceful(VqConn *conn, uint64_t app_error);
 
 /* Peer IP (numeric, no port) of a connection; empty string if unavailable.
  * Returned pointer is owned by the shim and valid until the conn closes. */
