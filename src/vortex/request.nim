@@ -2400,6 +2400,10 @@ proc dispatchBlockingResult*[A, R](req: Request,
   ## so it is GC-pinned here and released in the drain.
   try:
     GC_ref(box)
+    # Count this task as outstanding until the loop processes its omBlockingDone
+    # (which runs onDone and decrements this). The drain waits for it to reach 0
+    # so the future is always completed before shutdown -- see LoopCore.
+    inc req.core.pendingBlockingResults
     if req.core.pool == nil:
       blockingResultTrampoline[A, R](cast[pointer](box), cast[pointer](req.core),
                                      req.fd, req.gen, req.stream, "")   # inline
@@ -2407,11 +2411,11 @@ proc dispatchBlockingResult*[A, R](req: Request,
     if req.fd < 0:
       let idx = int(-req.fd) - 2
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        GC_unref(box); return
+        GC_unref(box); dec req.core.pendingBlockingResults; return
       inc req.core.h3slots[idx].pinned
     else:
       let c = conn(req.core, req.fd, req.gen)
-      if c == nil: (GC_unref(box); return)
+      if c == nil: (GC_unref(box); dec req.core.pendingBlockingResults; return)
       inc c.pinned
     enqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingResultTrampoline[A, R],
