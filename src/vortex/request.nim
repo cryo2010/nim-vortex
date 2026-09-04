@@ -2176,6 +2176,44 @@ proc snapshotRequest(req: Request): ReqSnapshot =
   # Trailers, if any arrived before dispatch (buffered requests have them all).
   for (n, v) in req.trailers: result.trailers.add (n, v)
 
+type PoolSaturatedError* = object of CatchableError
+  ## Raised by an awaitable `req.blocking(...)` when the worker pool is saturated
+  ## (its queue is at `maxBlockingQueue`), so the caller can fail fast instead of
+  ## queuing without bound. The synchronous `blocking:` template answers 503
+  ## directly rather than raising.
+
+proc emitPoolSaturated(core: ptr LoopCore, fd: int32, gen: uint32,
+                       stream: uint32) =
+  ## Load shedding: answer 503 on the loop thread for a `blocking:` dispatch the
+  ## saturated pool refused, without pinning or running any body.
+  const body = "503 Service Unavailable"
+  const hdrs = [("Retry-After", "1")]
+  if fd < 0:
+    when not defined(plainHttp):
+      h3Apply(core, fd, gen, stream, 503, "text/plain", hdrs, body)
+  else:
+    let c = conn(core, fd, gen)
+    if c != nil:
+      applyResponse(core, c, stream, 503, "text/plain", hdrs, body)
+
+proc undoPin(req: Request) =
+  ## Release a pin taken on this loop thread for a dispatch the pool then refused
+  ## (no worker touched it, so this is race-free).
+  if req.fd < 0:
+    let idx = int(-req.fd) - 2
+    if idx >= 0 and idx < req.core.h3slots.len and
+        req.core.h3slots[idx].gen == req.gen and req.core.h3slots[idx].pinned > 0:
+      dec req.core.h3slots[idx].pinned
+  else:
+    let c = conn(req.core, req.fd, req.gen)
+    if c != nil and c.pinned > 0: dec c.pinned
+
+proc undoPinAnd503(req: Request) =
+  ## The pool refused a `blocking:` dispatch after we pinned: release the pin and
+  ## answer 503 (load shedding for the synchronous paths).
+  undoPin(req)
+  emitPoolSaturated(req.core, req.fd, req.gen, req.stream)
+
 proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32): Request =
   ## Build the worker's Request, pointing it at the task snapshot when present
   ## (pool path); nil snapshot on the inline loop-thread path (live reads).
@@ -2232,11 +2270,12 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: return
       inc c.pinned
-    enqueue(cast[ptr WorkerPool](req.core.pool),
+    if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream,
-                       snap: snapshotRequest(req)))
+                       snap: snapshotRequest(req))):
+      undoPinAnd503(req)             # pool saturated: shed load with 503
   except Exception:
     discard
 
@@ -2281,11 +2320,12 @@ proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: return
       inc c.pinned
-    enqueue(cast[ptr WorkerPool](req.core.pool),
+    if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingDataTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream, data: data,
-                       snap: snapshotRequest(req)))
+                       snap: snapshotRequest(req))):
+      undoPinAnd503(req)             # pool saturated: shed load with 503
   except Exception:
     discard
 
@@ -2348,11 +2388,15 @@ proc dispatchBlockingArgs[T](req: Request,
       inc c.pinned
     let raw = cast[pointer](box)
     wasMoved(box)                                 # transfer ownership; no loop dec
-    enqueue(cast[ptr WorkerPool](req.core.pool),
+    if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingArgsTrampoline[T], user: raw,
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream,
-                       snap: snapshotRequest(req)))
+                       snap: snapshotRequest(req))):
+      # Pool saturated: no worker took the box, so reclaim its sole reference and
+      # free it here (loop thread), release the pin, and shed load with 503.
+      GC_unref(cast[BlockingArgsBox[T]](raw))
+      undoPinAnd503(req)
   except Exception:
     discard
 
@@ -2433,11 +2477,19 @@ proc dispatchBlockingResult*[A, R](req: Request,
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: (GC_unref(box); dec req.core.pendingBlockingResults; return)
       inc c.pinned
-    enqueue(cast[ptr WorkerPool](req.core.pool),
+    if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingResultTrampoline[A, R],
                        user: cast[pointer](box), core: cast[pointer](req.core),
                        fd: req.fd, gen: req.gen, stream: req.stream,
-                       snap: snapshotRequest(req)))
+                       snap: snapshotRequest(req))):
+      # Pool saturated: fail the awaited future with PoolSaturatedError (the
+      # caller can catch it and answer 503, or let it surface as a 500). Balance
+      # the pin, the GC_ref and the pending count taken above.
+      undoPin(req)
+      box.err = newException(PoolSaturatedError, "worker pool saturated")
+      box.onDone(box)
+      GC_unref(box)
+      dec req.core.pendingBlockingResults
   except Exception:
     discard
 

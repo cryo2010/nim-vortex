@@ -1715,6 +1715,9 @@ type LoopThreadArg* = tuple
   udpFd: SocketHandle
   streamRoute: StreamRouteCb
   quicReload: pointer
+  alive: ptr Atomic[int]     ## shared live-thread counter; decremented when this
+                             ## loop thread exits so a timed shutdown can detect a
+                             ## loop wedged by a stuck worker (nil = not tracked)
 
 proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   # An unhandled exception escaping a thread proc aborts the whole process.
@@ -1743,3 +1746,7 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
       discard posix.close(cint(arg.listenFd))
     if arg.udpFd != osInvalidSocket:
       discard posix.close(cint(arg.udpFd))
+  # Mark this loop thread as exited last (both the clean and error paths), so a
+  # timed shutdown (server.waitFor) knows every loop is truly gone before it
+  # joins/frees -- and can detach instead of hang if run() never returned.
+  if arg.alive != nil: discard arg.alive[].fetchSub(1, moAcquireRelease)

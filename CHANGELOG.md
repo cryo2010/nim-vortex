@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Worker-pool load shedding: `maxBlockingQueue` (default 0 = unbounded) caps the
+  number of `blocking:` tasks that may wait for a free worker. Once every worker
+  is busy and the queue is at the cap, new `blocking:` dispatches fail fast with
+  `503 Service Unavailable` (the synchronous `blocking:` template) or raise
+  `PoolSaturatedError` in the awaitable `req.blocking(...)` form, instead of
+  queuing without bound behind slow/stuck work. `blocking:` bodies should do
+  bounded work and carry their own timeouts.
+- Bounded, non-hanging shutdown: `close`/`waitFor` now wait at most
+  `shutdownHardTimeout` seconds (default `shutdownGrace + 5`) for the event loops
+  and workers to finish, then **detach** any thread still inside a
+  never-returning `blocking:` handler and return, intentionally leaking only what
+  that thread references. Nim cannot cancel a running thread, so this mirrors
+  Go's `Server.Shutdown(ctx)` returning on its deadline and tokio's
+  `Runtime::shutdown_timeout` abandoning stuck blocking threads: a misbehaving
+  handler can no longer wedge `close()` forever.
 - `writeTimeout` config (seconds, 0 = off, default off): closes a connection
   whose socket stays unwritable with output pending for that long, bounding a
   slow-reading client that never drains its response (a slow-read DoS the
