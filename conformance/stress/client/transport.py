@@ -17,7 +17,7 @@ try:
     from websockets.exceptions import WebSocketException
 except ImportError:
     class WebSocketException(Exception): pass
-from h3 import connect_h3, OP_TEXT
+from h3 import connect_h3, OP_TEXT, ProtocolPinError
 
 WORKLOAD = os.environ.get("VORTEX_WORKLOAD", "requests")
 PROTO    = os.environ.get("VORTEX_PROTO", "h2")
@@ -77,17 +77,33 @@ def compress(raw: bytes):
 ACCEPT = None if RESP_COMP in ("", "none") else RESP_COMP
 
 # --- transport sessions (httpx for h1/h2, aioquic for h3) --------------------
+# The negotiated HTTP version httpx must report for each pinned proto. httpx's
+# http2=True enables h2 but still ALPN-negotiates, so it *can* land on h1 if the
+# server didn't offer h2; verifying every response's version turns that silent
+# downgrade into a hard failure, so an `h2` run can never quietly measure h1.
+_PIN_VERSION = {"h1": "HTTP/1.1", "h2": "HTTP/2"}
+
+def _pin_check(r):
+    want = _PIN_VERSION.get(PROTO)
+    if want is not None and r.http_version != want:
+        raise ProtocolPinError(
+            f"negotiated {r.http_version}, want {want} (VORTEX_PROTO={PROTO}); "
+            f"no fallback allowed")
+
 class HttpxSession:
     """httpx AsyncClient with the H3Session shape (paths relative to BASE)."""
     def __init__(self, c): self.c = c
     async def get(self, path, headers=None):
         r = await self.c.get(BASE + path, headers=headers or {})
+        _pin_check(r)
         return r.status_code, r.content
     async def request(self, method, path, headers=None, content=b""):
         r = await self.c.request(method, BASE + path, headers=headers or {}, content=content)
+        _pin_check(r)
         return r.status_code, r.content
     async def stream(self, method, path, headers=None):
         async with self.c.stream(method, BASE + path, headers=headers or {}) as r:
+            _pin_check(r)
             yield r.status_code
             # aiter_bytes (content-decoded), not aiter_raw: httpx auto-negotiates
             # Accept-Encoding, so the server may gzip the stream; the sse/download
@@ -97,6 +113,7 @@ class HttpxSession:
                 yield chunk
     async def upload(self, path, headers, agen):
         r = await self.c.post(BASE + path, content=agen, headers=headers or {})
+        _pin_check(r)
         return r.status_code
 
 @asynccontextmanager
