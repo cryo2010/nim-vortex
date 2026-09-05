@@ -931,13 +931,22 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     # half-close its write side and keep reading; finish() closes it.
     if c.awaitingResponse or c.pendingOut > 0:
       c.closeAfterFlush = true
+      # Close gracefully once flushed: shutdown(SHUT_WR) drains the kernel send
+      # buffer and sends a FIN, so the peer reads the whole response. A bare
+      # close() here can trip a RST (the peer half-closed, and the kernel may
+      # still hold untransmitted response bytes) that truncates the tail -- a
+      # slow-reading reverse proxy then reports an incomplete upstream body.
+      c.lingerClose = true
       if c.awaitingResponse and c.pendingOut == 0:
         # No output yet -- the deferred/worker response arrives via the outbox
         # or kick, not this fd. Stop watching the fd so the persistent EOF
         # (EPOLLRDHUP) does not busy-spin the loop until the response lands.
         loop.disarmForResponse(c)
     else:
-      loop.closeConn(c)
+      # Response already handed to the kernel (pendingOut == 0) but not
+      # necessarily transmitted; linger-close so the send buffer flushes with a
+      # FIN instead of a possible RST that would truncate it.
+      loop.beginLingerClose(c)
 
 when not defined(plainHttp):
   proc driveHandshake(loop: Loop, c: ptr Connection) =
