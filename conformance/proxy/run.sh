@@ -184,6 +184,10 @@ run_cell() {  # prox net proto feature
     rec "$prox" "$proto" "$feat" pass
   else
     echo "  [$prox $proto $feat] FAILED (exit $rc):" >&2; tail -4 "$tmp/cell.log" >&2
+    echo "  --- origin ($prox) log tail ---" >&2
+    docker logs "vortex-origin-$prox-$id" 2>&1 | tail -12 >&2 || true
+    echo "  --- proxy ($prox) log tail ---" >&2
+    docker logs "vortex-proxysrv-$prox-$id" 2>&1 | tail -12 >&2 || true
     rec "$prox" "$proto" "$feat" fail
   fi
 }
