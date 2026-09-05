@@ -16,6 +16,11 @@
 https://proxy:8443 {
 	tls /certs/cert.pem /certs/key.pem
 
+	# /sse and /download need immediate response flushing. /upload (streamupload)
+	# does not need special handling: Caddy streams request bodies to the upstream
+	# by default (no request buffering), so the catch-all handle already exercises
+	# a true streaming upload -- unlike nginx, which needs proxy_request_buffering
+	# off. So only the response-streaming endpoints get flush_interval -1.
 	@streaming path /sse /download
 	handle @streaming {
 		reverse_proxy vortex:8080 {

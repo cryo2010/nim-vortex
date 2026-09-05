@@ -48,8 +48,12 @@ Unsupported cells render `n/a` (never dialed):
 - **`streamupload` x h3 = n/a** -- vortex does not yet ack HTTP/3 request-body
   flow control (`h3AckBody` gap); the client already skips it.
 - **h3 for a proxy whose image lacks a QUIC bind = n/a** -- nginx (>=1.25) and
-  caddy serve h3; HAProxy needs a QUIC-enabled build, so run.sh probes it at
-  startup and falls back to h1/h2 (h3 cells become `n/a`) rather than failing.
+  caddy serve h3; HAProxy needs a QUIC-enabled build, so run.sh starts it with a
+  `bind quic4@` and, if the container fails readiness (a config it can't accept),
+  restarts it without the QUIC bind and marks h3 `n/a`. The probe checks that the
+  QUIC bind config is *accepted*, not that the QUIC listener actually serves h3;
+  if the bind is accepted the h3 cells run and would fail loudly if h3 were
+  broken.
 
 ## HAProxy PROXY-protocol check
 

@@ -52,8 +52,10 @@ results="$tmp/results"
 proxy_h3=0
 
 cleanup() {
-  for c in $(docker ps -aq --filter "name=-$id" 2>/dev/null); do docker rm -f "$c" >/dev/null 2>&1 || true; done
-  for n in $(docker network ls -q --filter "name=-$id" 2>/dev/null); do docker network rm "$n" >/dev/null 2>&1 || true; done
+  # Match by an exact label, not a `name=-$id` substring: a substring filter could
+  # match (and tear down) a concurrent run whose id is a substring of this one.
+  for c in $(docker ps -aq --filter "label=vxproxy=$id" 2>/dev/null); do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  for n in $(docker network ls -q --filter "label=vxproxy=$id" 2>/dev/null); do docker network rm "$n" >/dev/null 2>&1 || true; done
   docker rmi -f "$oimg" "$cimg" >/dev/null 2>&1 || true
   rm -rf "$tmp"
 }
@@ -111,18 +113,18 @@ start_proxy() {  # prox net pcont ; sets proxy_h3
   docker rm -f "$pcont" >/dev/null 2>&1 || true
   case "$prox" in
     nginx)
-      docker run -d --name "$pcont" --network "$net" --network-alias proxy \
+      docker run -d --label "vxproxy=$id" --name "$pcont" --network "$net" --network-alias proxy \
         -v "$here/proxies/nginx/nginx.conf":/etc/nginx/nginx.conf:ro \
         -v "$certs":/certs:ro "$nginx_img" >/dev/null
       proxy_h3=1 ;;
     caddy)
-      docker run -d --name "$pcont" --network "$net" --network-alias proxy \
+      docker run -d --label "vxproxy=$id" --name "$pcont" --network "$net" --network-alias proxy \
         -v "$here/proxies/caddy/Caddyfile":/etc/caddy/Caddyfile:ro \
         -v "$certs":/certs:ro "$caddy_img" >/dev/null
       proxy_h3=1 ;;
     haproxy)
       build_haproxy_cfg "$tmp/haproxy.cfg" "" 1
-      docker run -d --name "$pcont" --network "$net" --network-alias proxy \
+      docker run -d --label "vxproxy=$id" --name "$pcont" --network "$net" --network-alias proxy \
         -v "$tmp/haproxy.cfg":/usr/local/etc/haproxy/haproxy.cfg:ro \
         -v "$certs":/certs:ro "$haproxy_img" >/dev/null
       if proxy_ready "$net"; then
@@ -131,7 +133,7 @@ start_proxy() {  # prox net pcont ; sets proxy_h3
       echo "  haproxy: QUIC bind unsupported by image; retrying h1/h2 only" >&2
       docker rm -f "$pcont" >/dev/null 2>&1 || true
       build_haproxy_cfg "$tmp/haproxy.cfg" "" 0
-      docker run -d --name "$pcont" --network "$net" --network-alias proxy \
+      docker run -d --label "vxproxy=$id" --name "$pcont" --network "$net" --network-alias proxy \
         -v "$tmp/haproxy.cfg":/usr/local/etc/haproxy/haproxy.cfg:ro \
         -v "$certs":/certs:ro "$haproxy_img" >/dev/null
       proxy_h3=0 ;;
@@ -158,8 +160,17 @@ tls_check() {  # prox net proto
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
-    echo "  [$prox $proto] tls: curl check skipped (rc=$rc; curl may lack $proto)" >&2
-    rec "$prox" "$proto" tls warn
+    # Only tolerate a curl that lacks HTTP/3 (the curl image may not be built with
+    # it) -- that's the one expected non-zero. A non-zero for h1/h2 is a real TLS
+    # fault (connect refused, handshake error, cert-chain rejection) and must fail,
+    # not silently warn, or a broken TLS termination would pass CI.
+    if [ "$proto" = h3 ]; then
+      echo "  [$prox $proto] tls: curl check skipped (rc=$rc; curl may lack h3)" >&2
+      rec "$prox" "$proto" tls warn
+    else
+      echo "  [$prox $proto] tls: curl failed (rc=$rc) -- TLS termination broken?" >&2
+      rec "$prox" "$proto" tls fail
+    fi
   elif [ "$code" = 200 ]; then
     rec "$prox" "$proto" tls pass
   else
@@ -194,13 +205,13 @@ run_cell() {  # prox net proto feature
 
 run_proxy_protocol_check() {  # HAProxy send-proxy -> vortex proxyprotocol.nim
   net="vortex-pp-$id"; oc="vortex-pp-origin-$id"; pc="vortex-pp-proxy-$id"
-  docker network create "$net" >/dev/null 2>&1 || true
-  docker run -d --name "$oc" --network "$net" --network-alias vortex \
+  docker network create --label "vxproxy=$id" "$net" >/dev/null 2>&1 || true
+  docker run -d --label "vxproxy=$id" --name "$oc" --network "$net" --network-alias vortex \
     -e STRESS_PORT=8080 -e STRESS_TLS=0 -e STRESS_COMPRESS=0 \
     -e STRESS_PROXY_PROTOCOL=require -e STREAM_BYTES="$sbytes" "$oimg" >/dev/null
   if ! wait_listening "$oc"; then rec haproxy - proxy-protocol fail; docker rm -f "$oc" >/dev/null 2>&1 || true; docker network rm "$net" >/dev/null 2>&1 || true; return; fi
   build_haproxy_cfg "$tmp/haproxy-pp.cfg" "send-proxy-v2" 0
-  docker run -d --name "$pc" --network "$net" --network-alias proxy \
+  docker run -d --label "vxproxy=$id" --name "$pc" --network "$net" --network-alias proxy \
     -v "$tmp/haproxy-pp.cfg":/usr/local/etc/haproxy/haproxy.cfg:ro \
     -v "$certs":/certs:ro "$haproxy_img" >/dev/null
   if ! proxy_ready "$net"; then rec haproxy - proxy-protocol fail; docker rm -f "$pc" "$oc" >/dev/null 2>&1 || true; docker network rm "$net" >/dev/null 2>&1 || true; return; fi
@@ -212,7 +223,10 @@ run_proxy_protocol_check() {  # HAProxy send-proxy -> vortex proxyprotocol.nim
   set -e
   # origin runs proxyProtocol=Require, so a missing/invalid PROXY header is
   # dropped; a 200 with a non-empty IP proves HAProxy's header was parsed.
-  if [ "$rc" -eq 0 ] && printf '%s' "$body" | grep -qE '[0-9a-fA-F]+[.:]'; then
+  # Require the body to be a real client IP (docker networks are IPv4, optional
+  # :port), not just any hex-ish string -- a loose match could pass on an error
+  # page or a hostname and hide a broken PROXY-header parse.
+  if [ "$rc" -eq 0 ] && printf '%s' "$body" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?$'; then
     echo "  haproxy proxy-protocol: /whoami -> $body"
     rec haproxy - proxy-protocol pass
   else
@@ -227,9 +241,9 @@ run_proxy() {  # prox
   prox=$1
   net="vortex-proxy-$prox-$id"; oc="vortex-origin-$prox-$id"; pc="vortex-proxysrv-$prox-$id"
   echo; echo "########## $prox ##########"
-  docker network create "$net" >/dev/null 2>&1 || true
+  docker network create --label "vxproxy=$id" "$net" >/dev/null 2>&1 || true
   docker rm -f "$oc" >/dev/null 2>&1 || true
-  docker run -d --name "$oc" --network "$net" --network-alias vortex \
+  docker run -d --label "vxproxy=$id" --name "$oc" --network "$net" --network-alias vortex \
     -e STRESS_PORT=8080 -e STRESS_TLS=0 -e STRESS_COMPRESS=0 \
     -e STREAM_BYTES="$sbytes" "$oimg" >/dev/null
   if ! wait_listening "$oc"; then
