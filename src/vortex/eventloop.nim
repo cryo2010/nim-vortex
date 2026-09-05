@@ -391,6 +391,18 @@ proc beginLingerClose(loop: Loop, c: ptr Connection) =
       return
   discard shutdown(SocketHandle(c.fd), cint(SHUT_WR))
   c.state = csDraining
+  # Ensure the fd watches Read so handleDrain observes the peer FIN and reaps
+  # promptly. It may be unregistered (disarmForResponse parked a deferred
+  # response before this close) or write-armed; without read interest the
+  # connection would strand in csDraining until the drain deadline (5s), holding
+  # an fd + connCount slot for every such close.
+  if not c.registered:
+    loop.selector.registerHandle(int(c.fd), {Event.Read}, fkClient)
+    c.registered = true
+    c.writeArmed = false
+  elif c.writeArmed:
+    c.writeArmed = false
+    loop.selector.updateHandle(int(c.fd), {Event.Read})
   c.setDeadline(loop, dkDrain)
 
 proc handleDrain(loop: Loop, c: ptr Connection) =
@@ -451,8 +463,16 @@ proc flushOut(loop: Loop, c: ptr Connection) =
   c.wpos = 0
   loop.disarmWrite(c)
   if c.closeAfterFlush:
-    if c.lingerClose:
-      loop.beginLingerClose(c)   # drain peer so the error is delivered
+    # Close gracefully after writing a response on a plaintext HTTP/1 connection:
+    # a bare close() while the kernel still holds untransmitted response bytes and
+    # the peer has unread/half-closed can emit a RST that truncates the tail (a
+    # slow-reading reverse proxy then reports an incomplete body). beginLingerClose
+    # does shutdown(SHUT_WR) + drain so the send buffer flushes with a clean FIN.
+    # This covers every close-after-response path (Connection: close, streaming
+    # finish, drain shutdown, peer-half-close), not just error responses. TLS
+    # (close_notify) and h2/ws keep the direct close unless lingerClose is set.
+    if c.lingerClose or (c.h2 == nil and c.ws == nil):
+      loop.beginLingerClose(c)
     else:
       loop.closeConn(c)
   elif c.ws != nil:
@@ -930,6 +950,10 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     # the response arrives). A streaming response is exempt -- the client may
     # half-close its write side and keep reading; finish() closes it.
     if c.awaitingResponse or c.pendingOut > 0:
+      # flushOut linger-closes (plaintext h1) once the response is written, so the
+      # send buffer flushes with a clean FIN rather than a RST that truncates the
+      # tail for a slow-reading peer. The deferred/worker case still disarms the
+      # fd until the response arrives via the outbox/kick.
       c.closeAfterFlush = true
       if c.awaitingResponse and c.pendingOut == 0:
         # No output yet -- the deferred/worker response arrives via the outbox
@@ -937,7 +961,10 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         # (EPOLLRDHUP) does not busy-spin the loop until the response lands.
         loop.disarmForResponse(c)
     else:
-      loop.closeConn(c)
+      # Response already handed to the kernel (pendingOut == 0) but not
+      # necessarily transmitted; linger-close so the send buffer flushes with a
+      # FIN instead of a possible RST that would truncate it.
+      loop.beginLingerClose(c)
 
 when not defined(plainHttp):
   proc driveHandshake(loop: Loop, c: ptr Connection) =

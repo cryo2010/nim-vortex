@@ -302,6 +302,16 @@ task brotli, "Cross-client brotli interop test (Node/Python/Go/Rust/Java) (Docke
   # org.brotli.dec). Needs docker + host openssl.
   exec "INTEROP_ENCODING=br sh conformance/interop/run.sh"
 
+task proxy, "Reverse-proxy interop (nginx/caddy/HAProxy) (Docker)":
+  # run.sh mints a CA + proxy cert, builds the vortex origin (stress server,
+  # -d:plainHttp) and the stress client, then stands each proxy in front of the
+  # origin and verifies TLS, every HTTP method, streaming (up+down), SSE and
+  # WebSockets through it, over h1/h2/h3 (client<->proxy; the proxy re-originates
+  # h1). Includes a HAProxy PROXY-protocol check. Fails if any supported cell
+  # fails. Needs docker + host openssl. Knobs: PROXY (nginx|caddy|haproxy|all),
+  # PROXY_PROTOS, VORTEX_SECONDS, VORTEX_STREAM_BYTES.
+  exec "sh conformance/proxy/run.sh"
+
 task testssl, "TLS configuration scan via testssl.sh (Docker)":
   # run.sh builds a vortex TLS server image and runs drwetter/testssl.sh against
   # it over a private docker network, checking protocols/ciphers/vulnerabilities;
