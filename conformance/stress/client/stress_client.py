@@ -258,8 +258,41 @@ async def w_streamdownload():
             bump(200)
     await drive(once)
 
+async def w_methods():
+    # Every HTTP method, transport-agnostic (h1/h2/h3). Used by the reverse-proxy
+    # interop suite to confirm each method survives the proxy hop. GET/POST/PUT/
+    # DELETE/PATCH echo the body; HEAD returns headers only; OPTIONS is answered
+    # automatically by the router (204 + Allow).
+    raw = b"the quick brown fox " * 8
+    body, enc = compress(raw)
+    hdrs = {}
+    if enc: hdrs["content-encoding"] = enc
+    if ACCEPT: hdrs["accept-encoding"] = ACCEPT
+    get_hdrs = {"accept-encoding": ACCEPT} if ACCEPT else {}
+    async def once():
+        async with session() as s:
+            while time.monotonic() < deadline:
+                st, b = await s.get("/plaintext", get_hdrs)
+                if st != 200 or b != b"Hello, World!":
+                    raise Fail(f"GET /plaintext -> {st}")
+                bump(200)
+                for meth in ("POST", "PUT", "DELETE", "PATCH"):
+                    st, b = await s.request(meth, "/echo", hdrs, body)
+                    if st != 200 or b != raw:
+                        raise Fail(f"{meth} /echo -> {st}, {len(b)}B (want {len(raw)}B)")
+                    bump(200)
+                st, b = await s.request("HEAD", "/echo", get_hdrs)
+                if st != 200 or (b or b"") != b"":
+                    raise Fail(f"HEAD /echo -> {st}, {len(b or b'')}B (want 0)")
+                bump(200)
+                st, _ = await s.request("OPTIONS", "/echo", {})
+                if st not in (200, 204):
+                    raise Fail(f"OPTIONS /echo -> {st}")
+                bump(st)
+    await asyncio.gather(*[drive(once) for _ in range(CONC)])
+
 WORKLOADS = {
-    "requests": w_requests, "ws": w_ws, "sse": w_sse,
+    "requests": w_requests, "methods": w_methods, "ws": w_ws, "sse": w_sse,
     "streamupload": w_streamupload, "streamdownload": w_streamdownload,
 }
 

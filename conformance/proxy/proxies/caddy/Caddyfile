@@ -1,0 +1,19 @@
+# Caddy reverse proxy in front of the vortex origin (proxy interop suite).
+# Serves h1/h2/h3 with the minted cert and re-originates HTTP/1.1 to
+# http://vortex:8080. WebSocket, SSE, and streaming pass through automatically;
+# flush_interval -1 disables response buffering so SSE/streamed bodies are
+# delivered as they arrive.
+{
+	admin off
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+https://proxy:8443 {
+	tls /certs/cert.pem /certs/key.pem
+	reverse_proxy vortex:8080 {
+		flush_interval -1
+	}
+}
