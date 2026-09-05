@@ -25,7 +25,7 @@ A green run ends with `== <workload>: all cells passed ==`.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `VORTEX_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2; h3 opt-in) |
+| `VORTEX_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3) |
 | `VORTEX_SERVER` | `sync` | `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` - the handler runtime; `chronos` = `vortex/chronos`, `async` = `vortex/asyncdispatch` |
 | `VORTEX_SECONDS` | `60` | runtime per cell |
 | `VORTEX_REPORT_SECONDS` | `60` | server CPU/RSS + tally report cadence |
@@ -77,6 +77,19 @@ run over h3. One cell is a printed skip (exit 0) for now:
   control (the `h3AckBody` / NG2 gap), so a large h3 upload stalls after the
   initial window. Downloads (server -> client) are unaffected. This is an
   explicit skip, not a silent run: a hang (rather than a skip) now hard-fails.
+
+`VORTEX_PROTO=all` includes h3 (h1 + h2 + h3). h3 cells reuse the same server
+image as h2 (only the `STRESS_HTTP3` runtime toggle differs), so the extra cost
+is one client run per cell, not another build.
+
+### Protocol pinning
+
+Each run is pinned to exactly the requested wire protocol and **cannot fall
+back**. h3 uses aioquic with ALPN locked to `h3` (a different transport from
+h1/h2, so there is no TCP fallback), and the client asserts h3 was actually
+negotiated. For h1/h2 the client verifies every response's negotiated version
+(`HTTP/1.1` for `h1`, `HTTP/2` for `h2`) and hard-fails on a mismatch, so an
+`h2` run can never quietly measure an `h1` connection.
 
 ## Gaps
 

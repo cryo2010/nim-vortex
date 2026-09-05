@@ -6,7 +6,7 @@ httpx has no HTTP/3, so the h3 cells drive the vortex QUIC listener with aioquic
 generator whose first item is the status, then body chunks) / upload - so the
 workloads are transport-agnostic. One QUIC connection multiplexes many streams.
 """
-import asyncio, ssl
+import asyncio, gzip, ssl
 from contextlib import asynccontextmanager
 
 from aioquic.asyncio.client import connect
@@ -15,6 +15,28 @@ from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import HeadersReceived, DataReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated, StreamReset, ConnectionTerminated
+
+
+class ProtocolPinError(Exception):
+    """The negotiated wire protocol did not match the pinned VORTEX_PROTO. A
+    stress run must measure exactly the protocol it names -- never a silent
+    fallback (e.g. h2 -> h1, or an h3 dial that failed to negotiate h3)."""
+
+
+def decode_body(data: bytes, enc):
+    """Decode a response body by its content-encoding. httpx does this
+    automatically for h1/h2; aioquic does not, so the h3 session must decode to
+    match (vortex compresses large buffered responses like /echo)."""
+    if not enc or enc == "identity":
+        return data
+    if enc == "gzip":
+        return gzip.decompress(data)
+    if enc == "br":
+        import brotli; return brotli.decompress(data)
+    if enc == "zstd":
+        import io, zstandard
+        return zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)).read()
+    raise ValueError(f"h3: unexpected content-encoding {enc!r}")
 
 # Per-stream cap on the client's unacked upload buffer (aioquic
 # stream.sender._buffer). Bounds client RAM to ~this x concurrent streams so a
@@ -91,11 +113,13 @@ class H3Client(QuicConnectionProtocol):
         if q is None:
             return
         if isinstance(e, HeadersReceived):
-            status = 0
+            status, enc = 0, None
             for k, v in e.headers:
                 if k == b":status":
                     status = int(v)
-            q.put_nowait(("h", status))
+                elif k == b"content-encoding":
+                    enc = v.decode("ascii", "replace").strip().lower() or None
+            q.put_nowait(("h", (status, enc)))
             if e.stream_ended:
                 q.put_nowait(("end", None))
         elif isinstance(e, DataReceived):
@@ -126,16 +150,18 @@ class H3Session:
         if content:
             self.c._http.send_data(sid, content, end_stream=True)
             self.c.transmit()
-        status, body = 0, bytearray()
+        status, enc, body = 0, None, bytearray()
         while True:
             kind, val = await q.get()
-            if kind == "h": status = val
+            if kind == "h": status, enc = val
             elif kind == "d": body += val
             elif kind == "err":
                 self.c._queues.pop(sid, None); raise ConnectionError(val)
             else: break
         self.c._queues.pop(sid, None)
-        return status, bytes(body)
+        # Decode content-encoding to match httpx's transparent h1/h2 behavior; the
+        # requests workload sends accept-encoding, so /echo comes back compressed.
+        return status, decode_body(bytes(body), enc)
 
     async def get(self, path, headers=None):
         return await self.request("GET", path, headers)
@@ -146,9 +172,9 @@ class H3Session:
         try:
             while True:
                 kind, val = await q.get()
-                if kind == "h": yield val
-                elif kind == "d": yield val
-                elif kind == "err": raise ConnectionError(val)
+                if kind == "h": yield val[0]        # (status, enc); enc unused --
+                elif kind == "d": yield val         # streaming workloads send no
+                elif kind == "err": raise ConnectionError(val)  # accept-encoding
                 else: break
         finally:
             self.c._queues.pop(sid, None)
@@ -176,7 +202,7 @@ class H3Session:
         status = 0
         while True:
             kind, val = await q.get()
-            if kind == "h": status = val
+            if kind == "h": status = val[0]         # (status, enc); enc unused
             elif kind == "err":
                 self.c._queues.pop(sid, None); raise ConnectionError(val)
             elif kind == "end": break
@@ -198,7 +224,7 @@ class H3Session:
         status = None
         while status is None:
             kind, val = await q.get()
-            if kind == "h": status = val
+            if kind == "h": status = val[0]         # (status, enc); enc unused
             elif kind == "err":
                 self.c._queues.pop(sid, None); raise ConnectionError(val)
             elif kind == "end": raise ConnectionError("ws CONNECT stream ended")
@@ -233,9 +259,17 @@ class H3Ws:
 
 @asynccontextmanager
 async def connect_h3(host: str, port: int):
+    # ALPN is locked to h3 only: QUIC/h3 is a different transport from TCP h1/h2,
+    # so there is no path to fall back to h2 here. We still assert h3 was actually
+    # negotiated (H3Client builds `_http` only on an "h3" ProtocolNegotiated), so
+    # a server that somehow completed the handshake without agreeing on h3 fails
+    # loud instead of silently sending requests that never get a reply.
     cfg = QuicConfiguration(is_client=True, alpn_protocols=["h3"])
     cfg.verify_mode = ssl.CERT_NONE                # self-signed stress cert
     async with connect(host, port, configuration=cfg, create_protocol=H3Client) as client:
         await client.wait_connected()
+        if client._http is None:
+            raise ProtocolPinError("h3 was not negotiated (ALPN mismatch); "
+                                   "no fallback allowed for VORTEX_PROTO=h3")
         client.authority = f"{host}:{port}"
         yield H3Session(client)

@@ -13,7 +13,7 @@
 #
 # Env (mirrors nim-navi's NAVI_*):
 #   VORTEX_WORKLOAD  requests | ws | sse | streamupload | streamdownload
-#   VORTEX_PROTO     h1 | h2 | h3 | all           (default h2; all = h1 h2)
+#   VORTEX_PROTO     h1 | h2 | h3 | all           (default h2; all = h1 h2 h3)
 #   VORTEX_SERVER    sync | async | async-await | chronos | chronos-await | all
 #   VORTEX_SECONDS / VORTEX_REPORT_SECONDS / VORTEX_CONCURRENCY / VORTEX_CLIENTS
 #   VORTEX_REQ_COMPRESSION / VORTEX_RESP_COMPRESSION   none | gzip | br | zstd
@@ -151,7 +151,7 @@ run_cell() {
   return "$crc"
 }
 
-case "$proto"  in all) protos="h1 h2" ;; *) protos="$proto" ;; esac
+case "$proto"  in all) protos="h1 h2 h3" ;; *) protos="$proto" ;; esac
 case "$server" in all) servers="sync async async-await chronos chronos-await" ;; *) servers="$server" ;; esac
 
 rc=0

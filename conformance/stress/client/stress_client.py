@@ -27,7 +27,7 @@ import asyncio, hashlib, os, sys, time
 from collections import Counter
 import httpx
 from transport import (
-    WebSocketException, OP_TEXT,
+    WebSocketException, OP_TEXT, ProtocolPinError,
     WORKLOAD, PROTO, SERVER, BASE, SECONDS, CLIENTS, CONC, STREAM, REPORT,
     MB, IS_H3, UNIT, STREAMING, xfer,
     expected_sha1, body_gen, gen_chunk, compress, ACCEPT, session, get_server_stats)
@@ -91,6 +91,10 @@ async def drive(worker):
     while time.monotonic() < deadline:
         try:
             await worker()
+        except ProtocolPinError as e:
+            # A protocol-pin violation (silent fallback) is a defect in its own
+            # right, not a transport error: surface it verbatim as a hard fail.
+            raise Fail(f"protocol pin: {e}") from e
         except (httpx.TransportError, WebSocketException, ConnectionError, OSError) as e:
             raise Fail(f"transport error ({type(e).__name__}): {e}") from e
 
