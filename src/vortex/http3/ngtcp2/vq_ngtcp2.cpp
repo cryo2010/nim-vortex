@@ -1003,6 +1003,12 @@ void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n) {
   }
 }
 
+void vq_conn_consume(VqConn *conn, size_t n) {
+  auto *c = reinterpret_cast<Conn *>(conn);
+  if (c->conn)
+    ngtcp2_conn_extend_max_offset(c->conn, n);
+}
+
 void vq_conn_goaway(VqConn *conn) {
   auto *c = reinterpret_cast<Conn *>(conn);
   if (c->h3) { nghttp3_conn_submit_shutdown_notice(c->h3); }

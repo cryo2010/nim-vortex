@@ -166,6 +166,13 @@ void vq_stream_reset(VqConn *conn, int64_t stream_id, uint64_t app_error);
  * (mirrors req.ackBody backpressure). */
 void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n);
 
+/* Ack n consumed request-body bytes at the CONNECTION level only (MAX_DATA),
+ * without touching the per-stream window. Used for buffered request bodies: the
+ * stream window is left to bound a single request's body, while the shared
+ * connection window is replenished so cumulative body bytes across requests on
+ * one connection do not exhaust it. */
+void vq_conn_consume(VqConn *conn, size_t n);
+
 /* Connection-level graceful shutdown (RFC 9114 5.2, two-step GOAWAY):
  *   vq_conn_goaway   -- initial GOAWAY notice (max stream id: "shutting down").
  *   vq_conn_shutdown -- final GOAWAY (last-accepted stream id: the boundary).

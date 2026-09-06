@@ -81,6 +81,7 @@ proc vqStreamFinish(conn: ptr VqConn, sid: int64) {.importc: "vq_stream_finish".
 proc vqStreamBacklog(conn: ptr VqConn, sid: int64): csize_t {.importc: "vq_stream_backlog".}
 proc vqStreamReset(conn: ptr VqConn, sid: int64, appErr: uint64) {.importc: "vq_stream_reset".}
 proc vqStreamConsume(conn: ptr VqConn, sid: int64, n: csize_t) {.importc: "vq_stream_consume".}
+proc vqConnConsume(conn: ptr VqConn, n: csize_t) {.importc: "vq_conn_consume".}
 proc vqConnGoaway(conn: ptr VqConn) {.importc: "vq_conn_goaway".}
 proc vqConnShutdown(conn: ptr VqConn) {.importc: "vq_conn_shutdown".}
 proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
@@ -291,7 +292,19 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   let old = st.body.len
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
-  if st.streamingReq: deliverBody(h3c, usid, false)
+  if st.streamingReq:
+    deliverBody(h3c, usid, false)
+  elif len > 0 and h3c.vq != nil:
+    # Buffered request body (#220): the bytes are now retained in st.body, which
+    # is bounded per stream by the initial QUIC stream window (h3 does not
+    # otherwise enforce a max body size). nghttp3_conn_read_stream does not
+    # credit DATA-frame payload to QUIC flow control, so return CONNECTION-level
+    # credit here as the body is consumed into the buffer. Without it the
+    # request-body bytes are never given back and accumulate across every request
+    # on the connection until the shared MAX_DATA window is exhausted and the
+    # peer stalls (QUIC code 1). The per-stream window is deliberately left
+    # un-extended so it still caps a single request's body.
+    vqConnConsume(h3c.vq, len)
 
 proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
