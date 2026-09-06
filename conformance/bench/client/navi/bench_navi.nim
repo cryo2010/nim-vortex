@@ -244,7 +244,15 @@ proc main() {.async.} =
   # ws/streamupload use one connection per worker; requests/sse/download fan out
   let n = if workload == "streamupload": clients else: clients * conc
   for _ in 0 ..< n: ws.add worker()
-  await all(ws)
+  # Workers self-stop at the deadline, but a wedged await (e.g. an SSE stream that
+  # never surfaces end-of-batch over h2) would hang `all` forever. Bound it so the
+  # client always prints a RESULT and the harness moves on instead of hanging --
+  # mirrors the stress client's timeout backstop.
+  let done = all(ws)
+  discard await withTimeout(done, (seconds + 30) * 1000)
+  if not done.finished:
+    stderr.writeLine "[" & workload & " " & proto & " " & fwLabel &
+      "] WARN: workers did not stop within deadline+30s (wedged await); reporting partial"
   report("final ")
   let elapsed = max(1e-9, inMilliseconds(getMonoTime() - startT).float / 1000.0)
   let status =
