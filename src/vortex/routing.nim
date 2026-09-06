@@ -140,6 +140,14 @@ proc head*(r: Router, path: string, h: RequestHandler, streaming = false) =
 proc options*(r: Router, path: string, h: RequestHandler, streaming = false) =
   r.addRoute(HttpOptions, path, h, streaming)
 
+proc segEq(path: string, i, j: int, s: string): bool {.inline.} =
+  ## Byte-compare path[i ..< j] to `s` without allocating a substring. Valid only
+  ## when the slice has no percent-encoding (the caller decodes otherwise).
+  if j - i != s.len: return false
+  for k in 0 ..< s.len:
+    if path[i + k] != s[k]: return false
+  true
+
 proc match(node: RouteNode, path: string, start: int,
            params: var PathParams): ptr RouteNodeObj =
   ## Recursive segment match: exact children win over params over wildcard.
@@ -150,18 +158,26 @@ proc match(node: RouteNode, path: string, start: int,
   if i >= path.len:
     return cast[ptr RouteNodeObj](node)
   var j = i
-  while j < path.len and path[j] != '/': inc j
-  let seg = decodeSegment(path.substr(i, j - 1))
+  var hasPct = false
+  while j < path.len and path[j] != '/':
+    if path[j] == '%': hasPct = true
+    inc j
+  # Decode the segment only when it is percent-encoded (rare). On the common
+  # literal path, byte-compare exact children against the raw slice (segEq, no
+  # alloc) and substr only when a param actually captures -- so a clean route like
+  # /plaintext or /echo allocates no per-segment substring.
+  let decoded = if hasPct: decodeSegment(path.substr(i, j - 1)) else: ""
   # Exact matches first.
   for k in 0 ..< node.children.len:
     let child {.cursor.} = node.children[k]
-    if not child.isParam and not child.isWild and child.segment == seg:
+    if not child.isParam and not child.isWild and
+        (if hasPct: child.segment == decoded else: segEq(path, i, j, child.segment)):
       let found = match(child, path, j, params)
       if found != nil: return found
   for k in 0 ..< node.children.len:
     let child {.cursor.} = node.children[k]
     if child.isParam:
-      params.add (child.segment, seg)
+      params.add (child.segment, if hasPct: decoded else: path.substr(i, j - 1))
       let found = match(child, path, j, params)
       if found != nil: return found
       params.setLen(params.len - 1)
