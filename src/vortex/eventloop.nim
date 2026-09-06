@@ -339,6 +339,16 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   c.h2 = nil
   clearRespHeaders(addr loop.core, c.fd, c.gen)  # drop pending res.headers, if any
   discard posix.close(cint(c.fd))
+  # Return the read/write buffers to the allocator now, rather than pinning their
+  # peak capacity until the slot is reused (which may never happen). setLen(0) on
+  # flush/reset keeps capacity, and clear()'s wbuf shrink check reads .len (0 after
+  # a flush) so it never fires -- without this a slot that once streamed a large
+  # body or response holds its high-water buffers for the server's lifetime. clear()
+  # reallocates both from initialBufferSize on the next accept into this slot.
+  c.rbuf = ""
+  c.wbuf = ""
+  c.rlen = 0
+  c.wpos = 0
   inc c.gen
   c.state = csFree
   c.closeRequested = false
