@@ -285,7 +285,10 @@ while read -r p pr f st; do
 done < "$results"
 echo
 if [ "$fails" -gt 0 ]; then
-  echo "RESULT: proxy interop FAILED ($fails cell(s))." >&2
+  # Print the verdict on stdout, same stream as the table above -- writing it to
+  # stderr let the unbuffered stderr line race ahead of the block-buffered stdout
+  # table and land mid-table on a merged stream. The non-zero exit is the signal.
+  echo "RESULT: proxy interop FAILED ($fails cell(s))."
   exit 1
 fi
 echo "RESULT: proxy interop passed (proxies: $proxies; protos: $protos)."
