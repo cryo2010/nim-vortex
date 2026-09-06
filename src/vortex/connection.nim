@@ -378,9 +378,22 @@ proc chunkTake*(p: var ChunkPool): pointer =
   result = alloc(fileChunkCap)
   p.all.add result
 
+const chunkPoolMaxFree* = 16
+  ## Cap on idle pooled buffers kept per loop (16 x 128KiB = 2MiB). Without a cap
+  ## the free-list floats to peak-ever concurrency and pins that memory for the
+  ## loop's life after a burst subsides; buffers returned past the cap are freed.
+
 proc chunkReturn*(p: var ChunkPool, buf: pointer) =
   ## Return a buffer after the loop copied it into the response (loop thread).
-  if buf != nil: p.free.add buf
+  ## Recycle up to the cap; free the rest so idle memory tracks current demand.
+  if buf == nil: return
+  if p.free.len < chunkPoolMaxFree:
+    p.free.add buf
+  else:
+    dealloc(buf)
+    for i in 0 ..< p.all.len:      # drop from the teardown list (small: ~peak concurrency)
+      if p.all[i] == buf:
+        p.all[i] = p.all[^1]; p.all.setLen(p.all.len - 1); break
 
 proc chunkPoolFree*(p: var ChunkPool) =
   ## Free every pooled buffer at loop teardown (workers already joined).
@@ -388,10 +401,14 @@ proc chunkPoolFree*(p: var ChunkPool) =
   p.free.setLen 0
   p.all.setLen 0
 
-const respHighWater* = 256 * 1024
+const respHighWater* = 64 * 1024
   ## write() reports backpressure once the unsent backlog reaches this many
   ## bytes; the producer should pause and resume from onDrain. Lives here (not
   ## request.nim) so the HTTP/2 codec can apply the same connection-level cap.
+  ## 64KiB (was 256KiB): the kernel socket send buffer already pipelines, so a
+  ## smaller app-level high-water keeps the wire full while cutting the retained
+  ## per-connection wbuf and per-stream pendingBody backlog ~4x (streamdownload
+  ## RSS). Well above one segment batch, so streaming throughput is unaffected.
 
 proc pendingOut*(c: ptr Connection): int {.inline.} =
   c.wbuf.len - c.wpos

@@ -1164,9 +1164,9 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
         h2.pendingPriority.del(sid)
       h2.controlFrameCount = 0       # a real request: reset the flood budget
-    h2.headerBlock.setLen(0)
-    for i in 0 ..< fragLen:
-      h2.headerBlock.add c.rbuf[fragStart + i]
+    h2.headerBlock.setLen(fragLen)
+    if fragLen > 0:
+      copyMem(addr h2.headerBlock[0], addr c.rbuf[fragStart], fragLen)
     if (fh.flags and flagEndHeaders) != 0:
       h2.finishHeaders(c, sid, (fh.flags and flagEndStream) != 0, ready)
     else:
@@ -1186,8 +1186,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if h2.headerBlock.len + fh.length > h2.maxHeaderList * 2:
       h2.connError(c, errEnhanceYourCalm)
       return
-    for i in 0 ..< fh.length:
-      h2.headerBlock.add c.rbuf[payloadPos + i]
+    let hbOld = h2.headerBlock.len
+    h2.headerBlock.setLen(hbOld + fh.length)
+    if fh.length > 0:
+      copyMem(addr h2.headerBlock[hbOld], addr c.rbuf[payloadPos], fh.length)
     if (fh.flags and flagEndHeaders) != 0:
       let sid = h2.contStream
       h2.contStream = 0
