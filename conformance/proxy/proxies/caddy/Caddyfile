@@ -13,6 +13,18 @@
 	}
 }
 
+# Size the upstream idle-connection pool to the load. With a small pool Caddy's Go
+# transport evicts idle keep-alive connections under concurrency and can race
+# reusing one that is concurrently closing, surfacing "use of closed network
+# connection" on a non-idempotent request (Go retries idempotent ones
+# transparently). Not a vortex issue -- a tuned production Caddy sizes this pool
+# too. 64 comfortably covers the suite's concurrency.
+(upstream) {
+	transport http {
+		keepalive_idle_conns_per_host 64
+	}
+}
+
 https://proxy:8443 {
 	tls /certs/cert.pem /certs/key.pem
 
@@ -25,9 +37,12 @@ https://proxy:8443 {
 	handle @streaming {
 		reverse_proxy vortex:8080 {
 			flush_interval -1
+			import upstream
 		}
 	}
 	handle {
-		reverse_proxy vortex:8080
+		reverse_proxy vortex:8080 {
+			import upstream
+		}
 	}
 }
