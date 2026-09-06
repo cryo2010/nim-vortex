@@ -998,7 +998,11 @@ void vq_stream_reset(VqConn *conn, int64_t stream_id, uint64_t app_error) {
 void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n) {
   auto *c = reinterpret_cast<Conn *>(conn);
   if (c->conn) {
-    ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, n);
+    // stream_id < 0 credits the connection window (MAX_DATA) only, e.g. for
+    // buffered-body bytes that were discarded (an over-limit request whose stream
+    // is being reset): there is no stream window worth replenishing.
+    if (stream_id >= 0)
+      ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, n);
     ngtcp2_conn_extend_max_offset(c->conn, n);
   }
 }
