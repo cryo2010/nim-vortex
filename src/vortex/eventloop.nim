@@ -866,6 +866,19 @@ const streamRecvBufferCap = 1024 * 1024
   ## body to dispatch.
 
 proc handleRead(loop: Loop, c: ptr Connection) =
+  # processInput (called from the grow branches below) can transition the
+  # connection out of csActive -- e.g. a frame-size / protocol error queues a
+  # GOAWAY and sets csClosing. Returning straight out of handleRead would skip
+  # the post-read flush at the end, stranding that GOAWAY unsent, so the socket
+  # never closes and the peer times out (h2spec 4.2). This only surfaces when the
+  # error frame does not fit in one buffer-fill (so it is handled from the grow
+  # branch rather than after the read loop). Flush the pending output here before
+  # unwinding. csFree means processInput already closed the slot: nothing to
+  # flush -- just return.
+  template returnAfterStateChange() =
+    if c.state != csFree and (c.pendingOut > 0 or c.closeAfterFlush):
+      loop.flushOut(c)
+    return
   while true:
     if c.rlen == c.rbuf.len:
       if c.h2 != nil:
@@ -874,7 +887,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         # not clipped by a tight h1 body limit. Grow only if nothing could
         # be compacted (e.g. pinned by a worker), up to a hard ceiling.
         loop.processInput(c)
-        if c.state != csActive: return
+        if c.state != csActive: returnAfterStateChange()
         if c.rlen == c.rbuf.len:
           if c.rbuf.len >= h2RecvBufferCap:
             loop.closeConn(c)
@@ -902,7 +915,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           # ~maxBodySize per connection; across many concurrent uploads that is
           # gigabytes -> OOM. Mirrors the h2 process-and-compact path above.
           loop.processInput(c)
-          if c.state != csActive: return
+          if c.state != csActive: returnAfterStateChange()
           if c.rlen < c.rbuf.len: continue   # compacted: read into the freed room
         let cap =
           if c.ws != nil: loop.settings.maxWsMessageSize + 1024
