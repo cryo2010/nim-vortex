@@ -1,0 +1,33 @@
+# Caddy reverse proxy in front of the vortex origin (proxy interop suite).
+# Serves h1/h2/h3 with the minted cert and re-originates HTTP/1.1 to
+# http://vortex:8080. WebSocket and buffered responses pass through with Caddy's
+# defaults; only the streaming endpoints (SSE + chunked download) use
+# flush_interval -1 so events/chunks are delivered as they arrive. Flushing every
+# write on a *buffered* response (the ~4 KiB echo) widened a keep-alive close race
+# that truncated the body under load, so it is scoped to streaming only.
+{
+	admin off
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+https://proxy:8443 {
+	tls /certs/cert.pem /certs/key.pem
+
+	# /sse and /download need immediate response flushing. /upload (streamupload)
+	# does not need special handling: Caddy streams request bodies to the upstream
+	# by default (no request buffering), so the catch-all handle already exercises
+	# a true streaming upload -- unlike nginx, which needs proxy_request_buffering
+	# off. So only the response-streaming endpoints get flush_interval -1.
+	@streaming path /sse /download
+	handle @streaming {
+		reverse_proxy vortex:8080 {
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy vortex:8080
+	}
+}

@@ -91,12 +91,19 @@ template statsBody(req, res: untyped) =
   ## the live GC heap of the loop thread that handled this request.
   vortex.send(res, Http200, $rssBytes() & " " & $getOccupiedMem())
 
+template whoamiBody(req, res: untyped) =
+  ## The remote address as vortex sees it: the PROXY-protocol source when behind
+  ## a trusted L4 proxy (HAProxy `send-proxy`), else the direct peer. The proxy
+  ## interop suite asserts this to confirm PROXY-header parsing.
+  vortex.send(res, Http200, req.remoteAddress)
+
 # --- runtime-specific handlers -----------------------------------------------
 
 when asyncMode:
   proc hEcho(req: Request, res: Response) {.async.} = echoBody(req, res)
   proc hSse(req: Request, res: Response) {.async.} = sseBody(req, res)
   proc hStats(req: Request, res: Response) {.async.} = statsBody(req, res)
+  proc hWhoami(req: Request, res: Response) {.async.} = whoamiBody(req, res)
 
   proc hWs(req: Request, res: Response) {.async.} =
     let ws = req.acceptWebSocket()
@@ -127,6 +134,7 @@ else:
   proc hEcho(req: Request, res: Response) {.gcsafe.} = echoBody(req, res)
   proc hSse(req: Request, res: Response) {.gcsafe.} = sseBody(req, res)
   proc hStats(req: Request, res: Response) {.gcsafe.} = statsBody(req, res)
+  proc hWhoami(req: Request, res: Response) {.gcsafe.} = whoamiBody(req, res)
 
   proc hWs(req: Request, res: Response) {.gcsafe.} =
     let ws = req.acceptWebSocket()
@@ -168,6 +176,9 @@ when isMainModule:
   rt.get("/echo", hEcho)
   rt.post("/echo", hEcho)
   rt.put("/echo", hEcho)
+  rt.delete("/echo", hEcho)                # every-method coverage (proxy interop);
+  rt.patch("/echo", hEcho)                 # HEAD derives from GET, OPTIONS auto-answers
+  rt.get("/whoami", hWhoami)               # remote addr (PROXY-protocol assertion)
   rt.get("/ws", hWs)                       # h1/h2 WebSocket (GET Upgrade)
   when asyncMode:
     rt.addRoute(HttpConnect, "/ws", toHandler(hWs))   # h2/h3 Extended CONNECT (RFC 9220)
@@ -183,6 +194,16 @@ when isMainModule:
       compress = getEnv("STRESS_COMPRESS") == "1",
       decompressRequest = true,
       maxBodySize = streamBytes + 1024 * 1024)    # allow the upload workload
+  # PROXY protocol (HAProxy send-proxy in front): the proxy interop suite sets
+  # STRESS_PROXY_PROTOCOL=require so a missing/invalid header is dropped, proving
+  # the header was parsed when /whoami returns the real client IP. An empty
+  # trusted list trusts the direct peer (the proxy on the private docker network).
+  case getEnv("STRESS_PROXY_PROTOCOL", "off").toLowerAscii
+  of "require": settings.proxyProtocol = ProxyProtocol.Require
+  of "optional": settings.proxyProtocol = ProxyProtocol.Optional
+  else: discard
+  let trusted = getEnv("STRESS_TRUSTED_PROXIES", "")
+  if trusted.len > 0: settings.trustedProxies = trusted.split(',')
   when not defined(plainHttp):
     if getEnv("STRESS_TLS") == "1":
       settings.certFile = getEnv("STRESS_CERT", "/vortex/cert.pem")

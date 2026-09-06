@@ -495,6 +495,27 @@ jobs:
           INTEROP_ENCODING=br INTEROP_RUNTIME=3 INTEROP_CLIENTS=5
           sh conformance/interop/run.sh
 
+  proxy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        proxy: [nginx, caddy, haproxy]
+    name: proxy (${{ matrix.proxy }})
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reverse-proxy interop (${{ matrix.proxy }})
+        # run.sh mints a CA + proxy cert, builds the vortex origin (stress server,
+        # -d:plainHttp) + stress client, then stands the proxy in front of the
+        # origin and verifies TLS, every HTTP method, streaming, SSE, and
+        # WebSockets through it over h1/h2/h3 (client<->proxy; proxy re-originates
+        # h1). haproxy also runs a PROXY-protocol check. Unsupported cells (ws over
+        # h2/h3, streamupload over h3, h3 where the image lacks QUIC) render n/a.
+        # It picks the x86_64 origin base itself; short runtime keeps CI quick.
+        run: >-
+          PROXY=${{ matrix.proxy }} VORTEX_SECONDS=3
+          sh conformance/proxy/run.sh
+
   # --- Memory / race scenario matrix (conformance/memcheck/harness.nim) --------
   # Self-driving server+client scenarios under valgrind memcheck, helgrind, and
   # ThreadSanitizer, across backends (sync/async/chronos) and memory managers.

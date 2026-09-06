@@ -258,8 +258,51 @@ async def w_streamdownload():
             bump(200)
     await drive(once)
 
+async def w_methods():
+    # Every HTTP method, transport-agnostic (h1/h2/h3). Used by the reverse-proxy
+    # interop suite to confirm each method survives the proxy hop. The body-bearing
+    # methods (POST/PUT/DELETE/PATCH) carry realistic, varied payloads -- a small
+    # JSON-ish document and a few-KiB blob, cycled -- not empty pings, and the h3
+    # client advertises Content-Length like httpx does for h1/h2. GET/HEAD/OPTIONS
+    # carry no body; HEAD returns headers only; OPTIONS is auto-answered (204/Allow).
+    raws = [
+        b'{"user":"alice","op":"update","note":"' + b"x" * 240 + b'"}',   # ~290 B
+        b"the quick brown fox jumps over the lazy dog. " * 96,            # ~4.3 KiB
+    ]
+    prepared = []
+    for raw in raws:
+        body, enc = compress(raw)
+        h = {}
+        if enc: h["content-encoding"] = enc
+        if ACCEPT: h["accept-encoding"] = ACCEPT
+        prepared.append((raw, body, h))
+    get_hdrs = {"accept-encoding": ACCEPT} if ACCEPT else {}
+    async def once():
+        async with session() as s:
+            k = 0
+            while time.monotonic() < deadline:
+                st, b = await s.get("/plaintext", get_hdrs)
+                if st != 200 or b != b"Hello, World!":
+                    raise Fail(f"GET /plaintext -> {st}")
+                bump(200)
+                raw, body, hdrs = prepared[k % len(prepared)]; k += 1
+                for meth in ("POST", "PUT", "DELETE", "PATCH"):
+                    st, b = await s.request(meth, "/echo", hdrs, body)
+                    if st != 200 or b != raw:
+                        raise Fail(f"{meth} /echo -> {st}, {len(b)}B (want {len(raw)}B)")
+                    bump(200)
+                st, b = await s.request("HEAD", "/echo", get_hdrs)
+                if st != 200 or (b or b"") != b"":
+                    raise Fail(f"HEAD /echo -> {st}, {len(b or b'')}B (want 0)")
+                bump(200)
+                st, _ = await s.request("OPTIONS", "/echo", {})
+                if st not in (200, 204):
+                    raise Fail(f"OPTIONS /echo -> {st}")
+                bump(st)
+    await asyncio.gather(*[drive(once) for _ in range(CONC)])
+
 WORKLOADS = {
-    "requests": w_requests, "ws": w_ws, "sse": w_sse,
+    "requests": w_requests, "methods": w_methods, "ws": w_ws, "sse": w_sse,
     "streamupload": w_streamupload, "streamdownload": w_streamdownload,
 }
 

@@ -33,8 +33,9 @@ RESP_COMP = os.environ.get("VORTEX_RESP_COMPRESSION", "gzip")
 CHUNK = 64 * 1024
 MB = 1024 * 1024
 IS_H3 = PROTO == "h3"
-UNIT = {"requests": "requests", "ws": "messages", "sse": "events",
-        "streamupload": "transfers", "streamdownload": "transfers"}.get(WORKLOAD, "ok")
+UNIT = {"requests": "requests", "methods": "requests", "ws": "messages",
+        "sse": "events", "streamupload": "transfers",
+        "streamdownload": "transfers"}.get(WORKLOAD, "ok")
 STREAMING = WORKLOAD in ("streamupload", "streamdownload")
 
 xfer = [0]              # cumulative bytes streamed (upload sent / download received)

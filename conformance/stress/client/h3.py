@@ -146,7 +146,13 @@ class H3Session:
         self.c = client
 
     async def request(self, method, path, headers=None, content=b""):
-        sid, q = self.c._open(method, path, headers or {}, end=(not content))
+        hdrs = dict(headers or {})
+        if content and not any(k.lower() == "content-length" for k in hdrs):
+            # Advertise the body length like a real client (httpx does this for
+            # h1/h2). A known-length buffered POST is the common case; streaming,
+            # unknown-length uploads go through upload() and stay length-less.
+            hdrs["content-length"] = str(len(content))
+        sid, q = self.c._open(method, path, hdrs, end=(not content))
         if content:
             self.c._http.send_data(sid, content, end_stream=True)
             self.c.transmit()
