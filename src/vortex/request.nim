@@ -966,7 +966,10 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
       if not c.parser.keepAlive:
         c.closeAfterFlush = true
   let key = (c.fd, c.gen, stream)
-  if core.respHeaders.hasKey(key):
+  # Skip the tuple hash + table probe unless some response actually set headers
+  # (the table is empty and drained otherwise); the common no-custom-header case
+  # then pays only an O(1) len check. Mirrors the respTrailers guard in finish().
+  if core.respHeaders.len > 0 and core.respHeaders.hasKey(key):
     let merged = core.respHeaders[key].mergedWith(headers)
     core.respHeaders.del key
     # a Content-Type among the merged headers wins over the (auto) contentType
@@ -985,7 +988,7 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
     let h3c = h3ConnOf(core, fd, gen)
     if h3c != nil:
       let key = (fd, gen, stream)
-      if core.respHeaders.hasKey(key):
+      if core.respHeaders.len > 0 and core.respHeaders.hasKey(key):
         let merged = core.respHeaders[key].mergedWith(headers)
         core.respHeaders.del key
         let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
@@ -1663,7 +1666,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # applyResponse (which also merges) does not double-apply it.
     let hkey = (res.fd, res.gen, res.stream)
     var userHeaders: seq[(string, string)]
-    if res.core.respHeaders.hasKey(hkey):
+    if res.core.respHeaders.len > 0 and res.core.respHeaders.hasKey(hkey):
       userHeaders = res.core.respHeaders[hkey].mergedWith(headers)
       res.core.respHeaders.del hkey
     else:
