@@ -163,15 +163,11 @@ size_t vq_stream_backlog(VqConn *conn, int64_t stream_id);
 void vq_stream_reset(VqConn *conn, int64_t stream_id, uint64_t app_error);
 
 /* Ack n consumed request-body bytes: extend the peer's flow-control window
- * (mirrors req.ackBody backpressure). */
+ * (mirrors req.ackBody backpressure). stream_id < 0 extends the CONNECTION-level
+ * window (MAX_DATA) only, leaving the per-stream window untouched -- used for
+ * buffered-body bytes with no stream to replenish (e.g. an over-limit request
+ * whose stream is being reset). */
 void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n);
-
-/* Ack n consumed request-body bytes at the CONNECTION level only (MAX_DATA),
- * without touching the per-stream window. Used for buffered request bodies: the
- * stream window is left to bound a single request's body, while the shared
- * connection window is replenished so cumulative body bytes across requests on
- * one connection do not exhaust it. */
-void vq_conn_consume(VqConn *conn, size_t n);
 
 /* Connection-level graceful shutdown (RFC 9114 5.2, two-step GOAWAY):
  *   vq_conn_goaway   -- initial GOAWAY notice (max stream id: "shutting down").

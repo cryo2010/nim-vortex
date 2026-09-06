@@ -81,7 +81,10 @@ proc vqStreamFinish(conn: ptr VqConn, sid: int64) {.importc: "vq_stream_finish".
 proc vqStreamBacklog(conn: ptr VqConn, sid: int64): csize_t {.importc: "vq_stream_backlog".}
 proc vqStreamReset(conn: ptr VqConn, sid: int64, appErr: uint64) {.importc: "vq_stream_reset".}
 proc vqStreamConsume(conn: ptr VqConn, sid: int64, n: csize_t) {.importc: "vq_stream_consume".}
-proc vqConnConsume(conn: ptr VqConn, n: csize_t) {.importc: "vq_conn_consume".}
+template vqConnConsume(conn: ptr VqConn, n: csize_t) =
+  ## Connection-level (MAX_DATA) credit only; sid < 0 skips the per-stream window
+  ## (see vq_stream_consume). For received body bytes with no stream to replenish.
+  vqStreamConsume(conn, -1, n)
 proc vqConnGoaway(conn: ptr VqConn) {.importc: "vq_conn_goaway".}
 proc vqConnShutdown(conn: ptr VqConn) {.importc: "vq_conn_shutdown".}
 proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
@@ -135,6 +138,7 @@ var
   gEngine {.threadvar.}: ptr VqEngine
   gCore {.threadvar.}: ptr LoopCore
   gUdpFd {.threadvar.}: cint
+  gMaxBody {.threadvar.}: uint64             # buffered request-body cap (0 = none)
   gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
@@ -289,22 +293,31 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     let arr = cast[ptr UncheckedArray[char]](data)
     wsFeed(h3c.core, nil, WsConn(st.ws), arr.toOpenArray(0, int(len) - 1))
     return
+  if not st.streamingReq and gMaxBody > 0'u64 and
+      uint64(st.body.len) + uint64(len) > gMaxBody:
+    # Buffered request body over maxBodySize: reject with a stream reset rather
+    # than buffering unboundedly (mirrors the h2 maxBody guard in codec.nim, which
+    # is the 413 boundary). Return connection-level flow-control credit for these
+    # received-but-discarded bytes first -- they counted against MAX_DATA, so
+    # without it a client could leak the shared window with oversized requests --
+    # then STOP_SENDING+RESET the stream.
+    if len > 0 and h3c.vq != nil: vqConnConsume(h3c.vq, len)
+    if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
+    h3c.streams.del(usid)
+    return
   let old = st.body.len
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
   if st.streamingReq:
     deliverBody(h3c, usid, false)
   elif len > 0 and h3c.vq != nil:
-    # Buffered request body (#220): the bytes are now retained in st.body, which
-    # is bounded per stream by the initial QUIC stream window (h3 does not
-    # otherwise enforce a max body size). nghttp3_conn_read_stream does not
-    # credit DATA-frame payload to QUIC flow control, so return CONNECTION-level
-    # credit here as the body is consumed into the buffer. Without it the
-    # request-body bytes are never given back and accumulate across every request
-    # on the connection until the shared MAX_DATA window is exhausted and the
-    # peer stalls (QUIC code 1). The per-stream window is deliberately left
-    # un-extended so it still caps a single request's body.
-    vqConnConsume(h3c.vq, len)
+    # Buffered request body (#220): nghttp3_conn_read_stream does not credit
+    # DATA-frame payload to QUIC flow control, so replenish it here as the body is
+    # consumed into st.body. Both windows are credited (bounded by the maxBody
+    # guard above, mirroring the h2 buffered path) so a body up to maxBodySize
+    # flows and cumulative body bytes across requests do not exhaust the
+    # connection's MAX_DATA window and stall the peer (QUIC code 1).
+    vqStreamConsume(h3c.vq, sid, len)
 
 proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -387,6 +400,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxConnections = 0): bool =
   gCore = core
   gUdpFd = udpFd
+  gMaxBody = uint64(maxBody)
   var cfg: VqConfig
   cfg.user = core
   cfg.cb = VqCallbacks(on_accept: cbAccept, on_headers: cbHeaders, on_body: cbBody,
