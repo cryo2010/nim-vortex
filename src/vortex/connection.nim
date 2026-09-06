@@ -401,10 +401,14 @@ proc chunkPoolFree*(p: var ChunkPool) =
   p.free.setLen 0
   p.all.setLen 0
 
-const respHighWater* = 256 * 1024
+const respHighWater* = 64 * 1024
   ## write() reports backpressure once the unsent backlog reaches this many
   ## bytes; the producer should pause and resume from onDrain. Lives here (not
   ## request.nim) so the HTTP/2 codec can apply the same connection-level cap.
+  ## 64KiB (was 256KiB): the kernel socket send buffer already pipelines, so a
+  ## smaller app-level high-water keeps the wire full while cutting the retained
+  ## per-connection wbuf and per-stream pendingBody backlog ~4x (streamdownload
+  ## RSS). Well above one segment batch, so streaming throughput is unaffected.
 
 proc pendingOut*(c: ptr Connection): int {.inline.} =
   c.wbuf.len - c.wpos
