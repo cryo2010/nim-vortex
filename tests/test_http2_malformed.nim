@@ -15,7 +15,8 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 var srv = newVortex(RequestHandler(handler),
                     initVortexConfig(numThreads = 1)).start(0)
 
-const base = @[(":method", "POST"), (":scheme", "http"), (":path", "/")]
+const base = @[(":method", "POST"), (":scheme", "http"), (":path", "/"),
+               (":authority", "localhost")]
 
 proc sendReq(headers: openArray[(string, string)]): seq[Frame] =
   var c = newH2TestConn(srv.port)
@@ -55,9 +56,19 @@ suite "HTTP/2 malformed header rejection":
   test "separator in a header name is rejected (R10)":
     check sendReq(base & @[("x(bad)", "v")]).rstError(1) == int(errProtocol)
 
+  test "an http request without :authority or Host is rejected (RFC 9113 8.3.1)":
+    check sendReq(@[(":method", "GET"), (":scheme", "http"), (":path", "/")])
+      .rstError(1) == int(errProtocol)
+
+  test "a Host field satisfies the authority requirement":
+    let frames = sendReq(@[(":method", "GET"), (":scheme", "http"),
+                           (":path", "/"), ("host", "localhost")])
+    check frames.rstError(1) == -1
+    check frames.count(ftHeaders) >= 1
+
   test "a well-formed request still succeeds":
     let frames = sendReq(@[(":method", "GET"), (":scheme", "http"),
-                           (":path", "/")])
+                           (":path", "/"), (":authority", "localhost")])
     check frames.rstError(1) == -1
     check frames.count(ftHeaders) >= 1
 

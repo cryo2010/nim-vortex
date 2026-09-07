@@ -1,15 +1,18 @@
 ## Minimal frame-level HTTP/2 client for security tests: connect, send the
 ## preface, and build/inject individual frames (HEADERS, RST_STREAM, PING,
 ## SETTINGS), then read and classify what the server sends back. Built on
-## src/vortex/http2/frames; requests use the three static-table HPACK
-## indexes (:method GET / :scheme http / :path /), so no encoder is needed.
+## src/vortex/http2/frames; requests use three static-table HPACK indexes
+## (:method GET / :scheme http / :path /) plus a literal :authority (RFC 9113
+## 8.3.1 requires one for http(s) schemes), so no encoder is needed.
 
 import std/[net, posix, oserrors]
 import vortex/http2/frames
 import vortex/http2/hpack
 
 const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-const getRequest = "\x82\x86\x84"    # :method GET, :scheme http, :path /
+const getRequest = "\x82\x86\x84\x01\x09localhost"
+  # :method GET, :scheme http, :path / (static indexes), then :authority
+  # "localhost" as a literal without indexing (0x01 = name index 1)
 
 type
   H2TestConn* = object

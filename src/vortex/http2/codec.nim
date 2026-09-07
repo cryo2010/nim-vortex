@@ -6,13 +6,9 @@
 import std/[tables, strutils, uri, json, deques]
 import ./frames, ./hpack
 import ../connection
+import ../fieldrules   # token delimiters + pseudo-header machine shared with
+                       # the h1 parser and the h3 backend (no drift)
 import ../websocket/codec as wscodec
-
-const h2FieldNameDelims = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
-                           '?', '@', '[', '\\', ']', '{', '}'}
-  ## RFC 9110 5.6.2 token separators forbidden in a field name. Mirrors the h1
-  ## parser's tokenDelims, kept local so the h2 codec has no dependency on the
-  ## h1 parser.
 
 type
   H2Stream* = object
@@ -878,97 +874,51 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
     # A buffered route falls through: the dispatch tail runs the handler now
     # that endStreamSeen is set.
   else:
-    var meth, path, scheme, protocol: string
-    var hasAuthority = false
-    var pseudoDone = false
+    # Shared machine (fieldrules.classifyRequestHead, also the h3 backend's):
+    # pseudo-header dedup/ordering, unknown pseudo names, field name/value
+    # byte validation (RFC 9113 8.2.1), the authority-or-Host rule
+    # (RFC 9113 8.3.1), and RFC 8441 Extended CONNECT classification (the
+    # stream stays open for WebSocket framing after dispatch).
+    var meth, path, scheme, authority, protocol: string
+    let klass = classifyRequestHead(fields, meth, path, scheme, authority,
+                                    protocol)
+    if klass == rhInvalid:
+      h2.streamError(c, sid, errProtocol)
+      return
+    st.isWsConnect = klass == rhWebSocket
+    # h2-local concerns: header-list size accounting, connection-specific
+    # field bans (RFC 9113 8.2.2), and content-length capture.
     var listSize = 0
     for (name, val) in fields:
       listSize += name.len + val.len + 32
-      if name.len == 0:
+      if name[0] == ':': continue        # pseudo-headers validated above
+      case name
+      of "connection", "proxy-connection", "keep-alive",
+         "transfer-encoding", "upgrade":
         h2.streamError(c, sid, errProtocol)
         return
-      # RFC 9113 8.2.1: no field (pseudo or regular) may carry NUL, CR, or LF in
-      # its value -- a header-injection / smuggling vector if reflected or
-      # proxied to h1. The strict h1 parser rejects these bytes outright.
-      for ch in val:
-        let b = uint8(ch)
-        if b == 0x00'u8 or b == 0x0a'u8 or b == 0x0d'u8:
+      of "te":
+        if val != "trailers":
           h2.streamError(c, sid, errProtocol)
           return
-      if name[0] == ':':
-        if pseudoDone:
-          h2.streamError(c, sid, errProtocol)  # pseudo after regular
-          return
-        case name
-        of ":method":
-          if meth.len > 0: h2.streamError(c, sid, errProtocol); return
-          meth = val
-        of ":path":
-          if path.len > 0: h2.streamError(c, sid, errProtocol); return
-          path = val
-        of ":scheme":
-          if scheme.len > 0: h2.streamError(c, sid, errProtocol); return
-          scheme = val
-        of ":authority":
-          if hasAuthority: h2.streamError(c, sid, errProtocol); return
-          hasAuthority = true
-        of ":protocol":                        # RFC 8441 Extended CONNECT
-          if protocol.len > 0: h2.streamError(c, sid, errProtocol); return
-          protocol = val
-        else:
-          h2.streamError(c, sid, errProtocol)  # unknown/response pseudo
-          return
-      else:
-        pseudoDone = true
-        # RFC 9113 8.2.1: a regular field name must be a valid lowercase token;
-        # uppercase, controls, or separators make it malformed (mirrors the h1
-        # parser's token check so h2 cannot smuggle a name h1 would reject).
-        for ch in name:
-          let b = uint8(ch)
-          if ch in 'A'..'Z' or b <= 0x20'u8 or b >= 0x7f'u8 or
-             ch in h2FieldNameDelims:
-            h2.streamError(c, sid, errProtocol)
-            return
-        case name
-        of "connection", "proxy-connection", "keep-alive",
-           "transfer-encoding", "upgrade":
+      of "priority":
+        parsePriorityField(val, st.urgency, st.incremental)  # RFC 9218 request signal
+      of "content-length":
+        var n: BiggestInt
+        try:
+          n = parseBiggestInt(val)
+        except ValueError:
           h2.streamError(c, sid, errProtocol)
           return
-        of "te":
-          if val != "trailers":
-            h2.streamError(c, sid, errProtocol)
-            return
-        of "priority":
-          parsePriorityField(val, st.urgency, st.incremental)  # RFC 9218 request signal
-        of "content-length":
-          var n: BiggestInt
-          try:
-            n = parseBiggestInt(val)
-          except ValueError:
-            h2.streamError(c, sid, errProtocol)
-            return
-          # RFC 9113 8.1.1: a negative length, or a second content-length whose
-          # value differs from the first, is malformed. A negative value would
-          # also disable the body-length reconciliation below (a smuggling
-          # vector when proxied to h1). st.contentLength starts at -1 (unset).
-          if n < 0 or (st.contentLength >= 0 and st.contentLength != n):
-            h2.streamError(c, sid, errProtocol)
-            return
-          st.contentLength = n
-        else: discard
-    # RFC 8441: an Extended CONNECT websocket carries :protocol plus a full
-    # :scheme/:path/:authority (unlike a plain CONNECT, which omits them and
-    # we do not support). The stream stays open for framing after dispatch.
-    let isWs = meth == "CONNECT" and protocol == "websocket"
-    if isWs:
-      if path.len == 0 or scheme.len == 0 or not hasAuthority:
-        h2.streamError(c, sid, errProtocol); return
-      st.isWsConnect = true
-    else:
-      if protocol.len > 0:                 # :protocol only for a ws-connect
-        h2.streamError(c, sid, errProtocol); return
-      if meth.len == 0 or path.len == 0 or scheme.len == 0:
-        h2.streamError(c, sid, errProtocol); return
+        # RFC 9113 8.1.1: a negative length, or a second content-length whose
+        # value differs from the first, is malformed. A negative value would
+        # also disable the body-length reconciliation below (a smuggling
+        # vector when proxied to h1). st.contentLength starts at -1 (unset).
+        if n < 0 or (st.contentLength >= 0 and st.contentLength != n):
+          h2.streamError(c, sid, errProtocol)
+          return
+        st.contentLength = n
+      else: discard
     if listSize > h2.maxHeaderList:
       h2.streamError(c, sid, errEnhanceYourCalm)
       return

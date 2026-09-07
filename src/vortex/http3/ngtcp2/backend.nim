@@ -7,6 +7,7 @@
 
 import std/[tables, strutils, uri, json, os, monotimes]
 import ../../connection
+import ../../fieldrules   # pseudo-header machine shared with the h2 codec
 import ../../websocket/codec as wscodec
 
 # The shim is a C++ TU compiled by g++ (via {.compile.} on a .cpp), while the
@@ -163,46 +164,15 @@ type H3HeaderKind* = enum h3hInvalid, h3hRequest, h3hWebSocket
 
 proc classifyH3Headers*(headers: openArray[(string, string)]): H3HeaderKind =
   ## Validate the pseudo-header set and classify it as a normal request, an
-  ## RFC 9220 Extended CONNECT websocket, or invalid. Pure (no live connection),
-  ## so it is unit-testable. nghttp3 also enforces its own checks on the wire.
-  var meth, path, scheme, protocol: string
-  var seenMethod, seenPath, seenScheme, seenAuthority, seenProtocol = false
-  var hasHost = false
-  var pseudoDone = false
-  for (name, val) in headers:
-    if name.len == 0: return h3hInvalid
-    if name[0] == ':':
-      if pseudoDone: return h3hInvalid
-      case name
-      of ":method":
-        if seenMethod: return h3hInvalid
-        seenMethod = true; meth = val
-      of ":path":
-        if seenPath: return h3hInvalid
-        seenPath = true; path = val
-      of ":scheme":
-        if seenScheme: return h3hInvalid
-        seenScheme = true; scheme = val
-      of ":authority":
-        if seenAuthority: return h3hInvalid
-        seenAuthority = true
-      of ":protocol":
-        if seenProtocol: return h3hInvalid
-        seenProtocol = true; protocol = val
-      else: return h3hInvalid
-    else:
-      pseudoDone = true
-      for ch in name:
-        if ch in 'A'..'Z': return h3hInvalid
-      if name == "host": hasHost = true
-  if meth == "CONNECT" and protocol == "websocket":
-    if path.len == 0 or scheme.len == 0 or not seenAuthority: return h3hInvalid
-    return h3hWebSocket
-  if seenProtocol: return h3hInvalid
-  if meth.len == 0 or path.len == 0 or scheme.len == 0: return h3hInvalid
-  if (scheme == "http" or scheme == "https") and not seenAuthority and
-      not hasHost: return h3hInvalid
-  h3hRequest
+  ## RFC 9220 Extended CONNECT websocket, or invalid. Delegates to the machine
+  ## shared with the h2 codec (fieldrules.classifyRequestHead), so h3 enforces
+  ## the same name/value byte rules itself rather than trusting nghttp3's
+  ## wire-level checks. Pure (no live connection), so it is unit-testable.
+  var meth, path, scheme, authority, protocol: string
+  case classifyRequestHead(headers, meth, path, scheme, authority, protocol)
+  of rhInvalid: h3hInvalid
+  of rhRequest: h3hRequest
+  of rhWebSocket: h3hWebSocket
 
 # --- shim callbacks (all loop-thread) ---------------------------------------
 proc cbAccept(user: pointer, conn: ptr VqConn, peerIp: cstring): pointer {.cdecl.} =

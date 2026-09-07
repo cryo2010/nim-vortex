@@ -10,11 +10,9 @@
 ## bytes arrive. On `prError`, `errorStatus` holds the HTTP status to send.
 
 import std/httpcore
-
-const tokenDelims = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
-                     '?', '@', '[', '\\', ']', '{', '}'}
-  ## RFC 9110 5.6.2 token separators: bytes that may not appear in a field
-  ## name (VCHARs outside this set are valid token characters).
+from ../fieldrules import tokenDelims
+  # RFC 9110 5.6.2 token separators (shared with the h2 codec and h3 backend
+  # so the parsers cannot drift apart on what a field name may contain).
 
 const disallowedTrailers = ["transfer-encoding", "content-length", "host",
   "trailer", "te", "connection", "keep-alive", "upgrade", "content-encoding",

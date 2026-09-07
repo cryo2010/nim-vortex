@@ -61,6 +61,19 @@ when not defined(plainHttp):
         [(":method", "GET"), (":scheme", "https"), (":path", "/"),
          ("X-Foo", "bar")]) == h3hInvalid
 
+    test "NUL/CR/LF in a field value is invalid (shared with h2, RFC 9114 4.1.2)":
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x"), ("x-bad", "a\x00b")]) == h3hInvalid
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x"), ("x-bad", "a\r\nb")]) == h3hInvalid
+
+    test "a separator in a field name is invalid (shared token rules)":
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x"), ("x(bad)", "v")]) == h3hInvalid
+
     test "an unknown websocket subprotocol still classifies (negotiation later)":
       check classifyH3Headers(
         [(":method", "CONNECT"), (":protocol", "websocket"),
