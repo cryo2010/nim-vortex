@@ -473,7 +473,7 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
   if core.serverHeader.len > 0: result.add ("server", core.serverHeader)
   result.add ("date", core.dateStr)
   if contentType.len > 0 and not bodiless: result.add ("content-type", contentType)
-  if not bodiless: result.add ("content-length", $bodyLen)
+  if not bodiless and bodyLen >= 0: result.add ("content-length", $bodyLen)
   for (name, val) in extra: result.add (name.toLowerAscii, val)
 
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
@@ -482,7 +482,7 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   if conn.vq == nil or sid notin conn.streams or conn.streams[sid].responded: return
   template st: H3Stream = conn.streams[sid]
   st.responded = true
-  let bodiless = code in 100 .. 199 or code == 204 or code == 304
+  let bodiless = bodilessStatus(code)
   let hdrs = buildRespHeaders(core, code, contentType, extraHeaders, body.len,
                               st.isHead, bodiless)
   var nv = toVq(hdrs)
@@ -497,12 +497,8 @@ proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   template st: H3Stream = conn.streams[sid]
   st.responded = true
   st.streaming = not st.isHead
-  var hdrs: seq[(string, string)]
-  hdrs.add (":status", $code)
-  if core.serverHeader.len > 0: hdrs.add ("server", core.serverHeader)
-  hdrs.add ("date", core.dateStr)
-  if contentType.len > 0: hdrs.add ("content-type", contentType)
-  for (name, val) in extraHeaders: hdrs.add (name.toLowerAscii, val)
+  let hdrs = buildRespHeaders(core, code, contentType, extraHeaders,
+                              bodyLen = -1, st.isHead, bodiless = false)
   var nv = toVq(hdrs)
   vqSubmitHead(conn.vq, int64(sid), cint(code), addr nv[0], csize_t(nv.len))
   if st.isHead: vqStreamFinish(conn.vq, int64(sid))

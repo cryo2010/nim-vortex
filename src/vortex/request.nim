@@ -1391,8 +1391,6 @@ type CookiePrefix* = enum
   cpSecure     ## `__Secure-`: forces Secure
   cpHost       ## `__Host-`: forces Secure, Path=/ and no Domain (host-locked)
 
-const cookieDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"  # RFC 7231 IMF-fixdate
-
 var mpBoundaryCtr {.threadvar.}: uint64
 
 proc serveContent*(req: Request, res: Response, body: openArray[char],
@@ -1481,7 +1479,7 @@ proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
   if p.len > 0: v.add "; Path=" & p
   if dom.len > 0: v.add "; Domain=" & dom
   if maxAge >= 0: v.add "; Max-Age=" & $maxAge
-  if expires.isSome: v.add "; Expires=" & expires.get.utc.format(cookieDateFmt)
+  if expires.isSome: v.add "; Expires=" & expires.get.utc.format(httpDateFmt)
   if sec: v.add "; Secure"
   if httpOnly: v.add "; HttpOnly"
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
@@ -1718,7 +1716,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
       # length, fall back to a plain empty response.
       if effLen >= 0:
         c.respStreaming = true
-        c.respCLDelimited = true
+        c.respFraming = rfContentLength
         let ka = c.parser.keepAlive
         appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
                          contentType, hdrs, chunked = false, keepAlive = ka,
@@ -1733,8 +1731,9 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # Known length -> Content-Length + length-delimited keep-alive. Unknown ->
     # chunked (HTTP/1.1) or close-delimited (HTTP/1.0).
     let chunked = effLen < 0 and c.parser.minor >= 1
-    c.respChunked = chunked
-    c.respCLDelimited = effLen >= 0
+    c.respFraming = if effLen >= 0: rfContentLength
+                    elif chunked: rfChunked
+                    else: rfCloseDelimited
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc.len > 0:
         c.respComp = makeStreamComp(enc)
@@ -1789,7 +1788,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       if c.respComp != nil:
         let z = compChunk(c.respComp, c.respEnc, data, false)
         if z.len > 0:
-          if c.respChunked: appendChunk(c.wbuf, z)
+          if c.respFraming == rfChunked: appendChunk(c.wbuf, z)
           else:
             let oldLen = c.wbuf.len
             c.wbuf.setLen(oldLen + z.len)
@@ -1801,7 +1800,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
           c.respBackedUp = true
           return false
         return true
-    if c.respChunked:
+    if c.respFraming == rfChunked:
       appendChunk(c.wbuf, data)
     elif data.len > 0:
       let oldLen = c.wbuf.len
@@ -1860,25 +1859,25 @@ proc finish*(res: Response) {.raises: [].} =
     c.respStreaming = false
     c.respBackedUp = false
     c.onRespDrain = nil
-    let clDelimited = c.respCLDelimited
-    c.respCLDelimited = false
+    let framing = c.respFraming
+    c.respFraming = rfNone
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.respComp != nil:
         let z = compChunk(c.respComp, c.respEnc, "", true)   # trailer/finish
         if z.len > 0 and c.parser.httpMethod != HttpHead:
-          if c.respChunked: appendChunk(c.wbuf, z)
+          if framing == rfChunked: appendChunk(c.wbuf, z)
           else:
             let oldLen = c.wbuf.len
             c.wbuf.setLen(oldLen + z.len)
             copyMem(addr c.wbuf[oldLen], unsafeAddr z[0], z.len)
         c.respComp = nil
         c.respEnc = ""
-    if c.respChunked and c.parser.httpMethod != HttpHead:
+    if framing == rfChunked and c.parser.httpMethod != HttpHead:
       appendLastChunk(c.wbuf, trailers)
     # Close-delimited (HTTP/1.0, neither chunked nor Content-Length) must close;
     # chunked and Content-Length bodies keep the connection alive.
     if not c.parser.keepAlive or c.peerHalfClosed or
-        not (c.respChunked or clDelimited):
+        framing == rfCloseDelimited:
       c.closeAfterFlush = true
     # kick resumes the paused pipeline when finish runs after the handler
     # returned (deferred); inline finish is a no-op here and the dispatch

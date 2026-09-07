@@ -78,6 +78,13 @@ type
     dkWsPing,   ## WebSocket idle: send a keepalive ping when it expires
     dkWsPong    ## ping sent: close the connection if it expires with no reply
 
+  RespFraming* = enum
+    ## How an open HTTP/1 streaming response body is delimited.
+    rfNone,           ## no streaming response open / framing not decided
+    rfChunked,        ## Transfer-Encoding: chunked
+    rfContentLength,  ## known Content-Length (keep-alive survives finish)
+    rfCloseDelimited  ## HTTP/1.0 with unknown length; close ends the body
+
   RespDrainCb* = proc (core: ptr LoopCore, fd: int32, gen: uint32,
                        stream: uint32) {.gcsafe.}
     ## A streaming response's onDrain: called on the loop thread when the
@@ -168,9 +175,7 @@ type
     # Streaming response state (res.sendHead/write/finish). HTTP/1 only;
     # h2/h3 keep their streaming flags on the per-stream struct.
     respStreaming*: bool      ## a chunked/close-delimited response is open
-    respChunked*: bool        ## true = Transfer-Encoding: chunked framing
-    respCLDelimited*: bool     ## streaming with a known Content-Length (keep-alive
-                               ## survives finish; not close-delimited)
+    respFraming*: RespFraming ## how the open streaming body is delimited
     respComp*: RootRef        ## streaming compressor (Gzip/BrotliStream upcast);
                                ## nil = identity. Its =destroy frees the codec
                                ## state when the connection is reset/closed.
@@ -320,6 +325,12 @@ proc drain*(ob: ptr Outbox, into: var seq[OutMsg]) =
   swap(into, ob.msgs)
   release ob.lock
 
+func bodilessStatus*(code: int): bool {.inline.} =
+  ## RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
+  ## they must not advertise Content-Length (or Content-Type). Distinct from
+  ## HEAD, which keeps the Content-Length a GET would have sent.
+  code in 100 .. 199 or code == 204 or code == 304
+
 proc addU32(s: var string, v: uint32) =
   s.add char(uint8(v))
   s.add char(uint8(v shr 8))
@@ -428,6 +439,30 @@ proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
       if k[0] == fd and k[1] == gen: stale.add k
     for k in stale: core.respTrailers.del k
 
+proc resetRequestState(c: var Connection) =
+  ## Clear the per-request fields shared by resetForNextRequest (keep-alive)
+  ## and clear (slot recycling).
+  c.chunkBody.setLen(0)
+  c.bodyDecoded.setLen(0)
+  c.bodyDecodedSet = false
+  c.urlCached = false
+  c.queryCached = false
+  c.jsonCached = false
+  c.pathParams.setLen(0)
+  c.responded = false
+  c.sent100 = false
+  c.awaitingResponse = false
+  c.respStreaming = false
+  c.respFraming = rfNone
+  c.respComp = nil            # frees the streaming codec state (=destroy)
+  c.respEnc = ""
+  c.respBackedUp = false
+  c.onRespDrain = nil
+  c.reqStreaming = false
+  c.bodyFed = 0
+  c.onBodyCb = nil
+  c.parser.reset(0)
+
 proc resetForNextRequest*(c: var Connection) =
   ## Compact consumed bytes and prepare the parser for a pipelined or
   ## subsequent keep-alive request.
@@ -437,27 +472,7 @@ proc resetForNextRequest*(c: var Connection) =
   else:
     moveMem(addr c.rbuf[0], addr c.rbuf[consumed], c.rlen - consumed)
     c.rlen -= consumed
-  c.chunkBody.setLen(0)
-  c.urlCached = false
-  c.queryCached = false
-  c.jsonCached = false
-  c.pathParams.setLen(0)
-  c.responded = false
-  c.sent100 = false
-  c.awaitingResponse = false
-  c.respStreaming = false
-  c.respChunked = false
-  c.respCLDelimited = false
-  c.respComp = nil            # frees the streaming codec state (=destroy)
-  c.respEnc = ""
-  c.respBackedUp = false
-  c.onRespDrain = nil
-  c.reqStreaming = false
-  c.bodyFed = 0
-  c.onBodyCb = nil
-  c.bodyDecoded.setLen(0)
-  c.bodyDecodedSet = false
-  c.parser.reset(0)
+  c.resetRequestState()
 
 proc clear*(c: var Connection, initialBufSize: int) =
   ## Recycle a slot for a fresh connection (fd stays, gen already bumped).
@@ -465,15 +480,11 @@ proc clear*(c: var Connection, initialBufSize: int) =
   if c.rbuf.len == 0 or c.rbuf.len > shrinkThreshold:
     c.rbuf = newString(initialBufSize)
   if c.wbuf.len > shrinkThreshold:
-    c.wbuf.setLen(0)
     c.wbuf = ""
   c.wbuf.setLen(0)
   c.remoteAddr = ""
   c.rlen = 0
   c.wpos = 0
-  c.chunkBody.setLen(0)
-  c.bodyDecoded.setLen(0)
-  c.bodyDecodedSet = false
   c.ssl = nil                # owner (closeConn) frees before recycling
   c.handshaking = false
   c.awaitingProxy = false
@@ -485,26 +496,9 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.writeArmed = false
   c.pinned = 0
   c.closeRequested = false
-  c.urlCached = false
-  c.queryCached = false
-  c.jsonCached = false
-  c.pathParams.setLen(0)
-  c.responded = false
-  c.sent100 = false
-  c.awaitingResponse = false
   c.closeAfterFlush = false
   c.lingerClose = false
   c.peerHalfClosed = false
-  c.respStreaming = false
-  c.respChunked = false
-  c.respCLDelimited = false
-  c.respComp = nil
-  c.respEnc = ""
-  c.respBackedUp = false
-  c.onRespDrain = nil
-  c.reqStreaming = false
-  c.bodyFed = 0
-  c.onBodyCb = nil
   c.requestCount = 0
-  c.parser.reset(0)
+  c.resetRequestState()
   c.state = csActive

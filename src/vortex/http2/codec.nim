@@ -703,10 +703,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
   if h2.streams[sid].responded: return
   h2.streams[sid].responded = true
   let skipBody = h2.streams[sid].isHead
-  # RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
-  # they must not advertise content-length (or content-type). Distinct
-  # from HEAD (skipBody), which keeps the length a GET would have sent.
-  let bodiless = code in 100 .. 199 or code == 204 or code == 304
+  let bodiless = bodilessStatus(code)
   var hb = ""
   encodeStatus(hb, code)
   if serverHeader.len > 0:

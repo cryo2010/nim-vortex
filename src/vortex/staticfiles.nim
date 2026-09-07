@@ -22,7 +22,7 @@
 import std/[os, times, strutils, uri, httpcore, options]
 import ./request
 from ./conditional import evalPreconditions, ifRangeApplies,
-                          pcProceed, pcNotModified, pcFailed
+                          pcProceed, pcNotModified, pcFailed, httpDate
 
 type
   StaticOptions* = object
@@ -78,11 +78,6 @@ proc mimeType(path: string): string =
   else: "application/octet-stream"
 
 # --- HTTP-date + validators ------------------------------------------------
-
-const httpDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"
-
-proc httpDate(t: Time): string =
-  t.utc.format(httpDateFmt)
 
 proc makeEtag(size: int64, mtime: Time): string =
   ## Strong validator from size + mtime; opaque to the client.

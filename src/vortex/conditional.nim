@@ -7,6 +7,7 @@ import std/[strutils, times, options]
 
 const httpDateFmt* = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"
   ## RFC 7231 IMF-fixdate; the only format we emit and the primary one we parse.
+  ## http1/codec.httpDate renders the same format std/times-free; keep in sync.
 
 proc httpDate*(t: Time): string = t.utc.format(httpDateFmt)
 
