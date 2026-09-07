@@ -1181,7 +1181,7 @@ when not defined(plainHttp):
     if slot.conn != nil:
       h3Free(H3Conn(slot.conn))
       slot.conn = nil
-    clearRespHeaders(addr loop.core, int32(-(idx + 2)), slot.gen)
+    clearRespHeaders(addr loop.core, h3SlotFd(idx), slot.gen)
     inc slot.gen
     slot.closeReq = false
 
@@ -1194,13 +1194,13 @@ when not defined(plainHttp):
       if slot < loop.core.h3slots.len and
           loop.core.h3slots[slot].gen == gen and
           loop.core.h3slots[slot].conn != nil:
-        let req = Request(core: addr loop.core, fd: int32(-(slot + 2)),
+        let req = Request(core: addr loop.core, fd: h3SlotFd(slot),
                           gen: gen, stream: uint32(sid))
         try:
           {.gcsafe.}:
             loop.callHandler(req, response(req))
         except CatchableError:
-          h3Apply(addr loop.core, int32(-(slot + 2)), gen, uint32(sid),
+          h3Apply(addr loop.core, h3SlotFd(slot), gen, uint32(sid),
                   500, "text/plain", [], "500 Internal Server Error")
     ngHandleExpiry()
     ngPump()
@@ -1211,6 +1211,30 @@ when not defined(plainHttp):
 
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing.
+  ##
+  ## Invariant for every outbox message: check the endpoint's generation BEFORE
+  ## touching its pin. A stale message (its request's connection/slot was freed
+  ## and possibly reused) must never dec a pin the *current* occupant took for
+  ## an in-flight task -- that would let the loop free the endpoint under a
+  ## worker. The stale* guards below name that check; every branch runs one
+  ## before any pin bookkeeping.
+  template staleConn(c: ptr Connection, msgGen: uint32): bool =
+    ## h1/h2: the message's connection died or its fd slot was reused.
+    c.gen != msgGen or c.state == csFree
+  when not defined(plainHttp):
+    template staleH3(slot: ptr H3SlotEntry, msgGen: uint32): bool =
+      ## h3: the message's slot was freed (gen bumped) or holds no connection.
+      slot.gen != msgGen or slot.conn == nil
+    template unpinH3AndSkipIfClosing(slot: ptr H3SlotEntry, idx: int,
+                                     keep: bool) =
+      ## Release the worker pin (unless the worker kept it across a follow-up
+      ## message) and honor a close deferred while pinned: free the slot once
+      ## the last pin drops and skip the payload -- the slot is condemned, so
+      ## there is nothing left to respond to. (`continue`s the message loop.)
+      if not keep and slot.pinned > 0: dec slot.pinned
+      if slot.closeReq:
+        if slot.pinned == 0: loop.h3FreeSlot(idx)
+        continue
   loop.outboxScratch.setLen(0)
   drain(loop.core.outbox, loop.outboxScratch)
   var h3Touched = false
@@ -1227,7 +1251,7 @@ proc processOutbox(loop: Loop) =
         dec loop.core.pendingBlockingResults
       if m.fd < 0:
         when not defined(plainHttp):
-          let idx = int(-m.fd) - 2
+          let idx = h3SlotOf(m.fd)
           if idx < loop.core.h3slots.len and loop.core.h3slots[idx].gen == m.gen:
             let slot = addr loop.core.h3slots[idx]
             if slot.pinned > 0: dec slot.pinned
@@ -1235,24 +1259,24 @@ proc processOutbox(loop: Loop) =
             h3Touched = true
       elif int(m.fd) < loop.core.conns.len:
         let c = addr loop.core.conns[int(m.fd)]
-        if c.gen == m.gen and c.state != csFree:  # unpin/resume only if alive
+        if not staleConn(c, m.gen):               # unpin/resume only if alive
           if c.pinned > 0: dec c.pinned
           if c.closeRequested: loop.closeConn(c)
       continue
     if m.fd < 0:
       when not defined(plainHttp):
-        let idx = int(-m.fd) - 2
+        let idx = h3SlotOf(m.fd)
         if idx >= loop.core.h3slots.len: continue
         let slot = addr loop.core.h3slots[idx]
         # RFC 9220 WebSocket messages use per-stream pinning, not the slot
         # pin. Handle (or, when stale, drop) them entirely before the omHttp
         # pin bookkeeping: a stale ws message must never fall through to the
-        # `dec slot.pinned` below and steal a pin the slot's *current*
+        # unpinH3AndSkipIfClosing below and steal a pin the slot's *current*
         # occupant took for an in-flight blocking: task (which would let the
-        # loop free the slot under that worker). Mirrors the h1 branch, which
-        # checks gen before touching the pin.
+        # loop free the slot under that worker). Mirrors the h1 branch (see
+        # the staleConn/staleH3 invariant above).
         if m.kind in {omWs, omWsClose, omWsDone}:
-          if slot.conn != nil and slot.gen == m.gen:
+          if not staleH3(slot, m.gen):
             let conn = H3Conn(slot.conn)
             if m.kind == omWsDone:
               h3WsResume(addr loop.core, conn, uint64(m.stream))
@@ -1262,12 +1286,9 @@ proc processOutbox(loop: Loop) =
                 wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
             h3Touched = true
           continue
-        if slot.gen != m.gen or slot.conn == nil: continue
+        if staleH3(slot, m.gen): continue
         if m.kind in {omFileStart, omFileChunk}:
-          if not m.keepPin and slot.pinned > 0: dec slot.pinned
-          if slot.closeReq:
-            if slot.pinned == 0: loop.h3FreeSlot(idx)
-            continue
+          unpinH3AndSkipIfClosing(slot, idx, m.keepPin)
           let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
                              stream: m.stream)
           if m.kind == omFileStart:
@@ -1279,10 +1300,7 @@ proc processOutbox(loop: Loop) =
             applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
           h3Touched = true
           continue
-        if not m.keepPin and slot.pinned > 0: dec slot.pinned
-        if slot.closeReq:
-          if slot.pinned == 0: loop.h3FreeSlot(idx)
-          continue
+        unpinH3AndSkipIfClosing(slot, idx, m.keepPin)
         let (contentType, headers, bodyStart) = unpackResponse(m.data)
         h3Apply(addr loop.core, m.fd, m.gen, m.stream, int(m.code),
                 contentType, headers,
@@ -1291,7 +1309,7 @@ proc processOutbox(loop: Loop) =
       continue
     if int(m.fd) >= loop.core.conns.len: continue
     let c = addr loop.core.conns[int(m.fd)]
-    if c.gen != m.gen or c.state == csFree: continue
+    if staleConn(c, m.gen): continue
     if m.kind == omWs or m.kind == omWsClose:
       # A WebSocket frame from an off-loop sender (already serialized): route
       # to the h1 connection or the h2 stream, then flush.
@@ -1348,9 +1366,9 @@ proc processOutbox(loop: Loop) =
       # The final chunk finished the response: reset and resume the pipeline
       # (the blocking-dispatch path doesn't set awaitingResponse, so finish()'s
       # kick is a no-op here -- mirror the buffered omHttp path explicitly).
-      if m.last and c.gen == m.gen and c.state != csFree:
+      if m.last and not staleConn(c, m.gen):
         loop.resumeAfterRespond(c, m.stream)
-      elif c.gen == m.gen and c.state != csFree and c.pendingOut > 0:
+      elif not staleConn(c, m.gen) and c.pendingOut > 0:
         # The write scheduler fills c.wbuf up to respHighWater and stops; push it
         # to the socket now. On a fast socket flushOut never hits EAGAIN, so write
         # interest is never armed and no later Write event would drain it.

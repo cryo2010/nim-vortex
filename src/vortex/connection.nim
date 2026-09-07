@@ -196,7 +196,7 @@ type
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
-    ## A Request handle encodes slot i as fd = -(i+2).
+    ## A Request handle encodes slot i as fd = -(i+2); see h3SlotFd/h3SlotOf.
     conn*: RootRef            ## http3.codec.H3Conn; nil = free slot
     gen*: uint32
     pinned*: int32            ## outstanding worker tasks
@@ -296,6 +296,17 @@ type
 proc hasStreamRoute*(core: ptr LoopCore): bool {.inline.} =
   ## True when a streaming predicate is configured (see streamRouteRaw).
   core.streamRouteRaw.prc != nil
+
+func h3SlotFd*(slot: int): int32 {.inline.} =
+  ## Encode h3 slot index `slot` as a Request-handle fd: a negative fd tags an
+  ## h3 slot (not a socket); the -2 offset keeps -1 free as the conventional
+  ## invalid-fd sentinel (e.g. "no HTTP/3" udpFd), so slot 0 encodes as -2.
+  int32(-(slot + 2))
+
+func h3SlotOf*(fd: int32): int {.inline.} =
+  ## Decode a negative h3 Request-handle fd back to its slot index (inverse of
+  ## h3SlotFd). Callers must bounds/gen-check the slot; only valid for fd < 0.
+  int(-fd) - 2
 
 proc callStreamRoute*(core: ptr LoopCore, fd: int32, gen: uint32,
                       stream: uint32): bool {.inline.} =

@@ -2131,7 +2131,7 @@ proc undoPin(req: Request) =
   ## Release a pin taken on this loop thread for a dispatch the pool then refused
   ## (no worker touched it, so this is race-free).
   if req.fd < 0:
-    let idx = int(-req.fd) - 2
+    let idx = h3SlotOf(req.fd)
     if idx >= 0 and idx < req.core.h3slots.len and
         req.core.h3slots[idx].gen == req.gen and req.core.h3slots[idx].pinned > 0:
       dec req.core.h3slots[idx].pinned
@@ -2193,7 +2193,7 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
                          req.fd, req.gen, req.stream, "")  # no pool: inline
       return
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
       inc req.core.h3slots[idx].pinned
@@ -2243,7 +2243,7 @@ proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
                              req.fd, req.gen, req.stream, data)  # no pool: inline
       return
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
       inc req.core.h3slots[idx].pinned
@@ -2309,7 +2309,7 @@ proc dispatchBlockingArgs[T](req: Request,
     # blocking(args) path). An early return below (dead conn) still decs the
     # local here, but only on the loop thread, which is safe.
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
       inc req.core.h3slots[idx].pinned
@@ -2400,7 +2400,7 @@ proc dispatchBlockingResult*[A, R](req: Request,
                                      req.fd, req.gen, req.stream, "")   # inline
       return
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         GC_unref(box); dec req.core.pendingBlockingResults; return
       inc req.core.h3slots[idx].pinned

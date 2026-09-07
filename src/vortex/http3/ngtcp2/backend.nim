@@ -136,7 +136,7 @@ proc nowNs(): uint64 = getMonoTime().ticks.uint64
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
-  let idx = int(-fd) - 2
+  let idx = h3SlotOf(fd)
   if idx < 0 or idx >= core.h3slots.len: return nil
   if core.h3slots[idx].gen != gen or core.h3slots[idx].conn == nil: return nil
   H3Conn(core.h3slots[idx].conn)
@@ -214,7 +214,7 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   if usid > h3c.lastStreamId: h3c.lastStreamId = usid
   # Streaming route or ws-connect dispatch on headers; body flows via onBody.
   if not st.isWsConnect and hasStreamRoute(h3c.core) and
-      callStreamRoute(h3c.core, int32(-(h3c.slot + 2)),
+      callStreamRoute(h3c.core, h3SlotFd(h3c.slot),
                       h3c.core.h3slots[h3c.slot].gen, uint32(sid)):
     st.rs.reqStreaming = true
   if (st.isWsConnect or st.rs.reqStreaming) and not st.dispatched:
@@ -321,7 +321,7 @@ proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
       # drain re-registers itself per chunk (res.onDrain in applyFileChunk).
       let cb = st.rs.onRespDrain
       st.rs.onRespDrain = nil
-      cb(h3c.core, int32(-(h3c.slot + 2)),
+      cb(h3c.core, h3SlotFd(h3c.slot),
          h3c.core.h3slots[h3c.slot].gen, uint32(usid))
 
 proc cbConnClose(user, connUd: pointer) {.cdecl.} =
