@@ -8,6 +8,7 @@
 import std/[net, posix, oserrors]
 import vortex/http2/frames
 import vortex/http2/hpack
+import ./helper
 
 const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 const getRequest = "\x82\x86\x84\x01\x09localhost"
@@ -20,11 +21,7 @@ type
     buf: string                      # unparsed received bytes
 
 proc setTimeout(c: var H2TestConn, ms: int) =
-  var tv: Timeval
-  tv.tv_sec = posix.Time(ms div 1000)
-  tv.tv_usec = Suseconds((ms mod 1000) * 1000)
-  discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_RCVTIMEO,
-                     addr tv, SockLen(sizeof(tv)))
+  c.sock.setRecvTimeout(ms)
 
 proc sendRaw*(c: var H2TestConn, data: string) =
   if data.len > 0: c.sock.send(data)

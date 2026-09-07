@@ -19,10 +19,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2, shutdownGrace = 5)).start(0)
 let port = srv.port
 
-proc connectSock(): Socket =
-  result = newSocket(buffered = false)
-  result.connect("127.0.0.1", port)
-  result.setRecvTimeout(4000)
+proc connectSock(): Socket = connectTimeout(port, 4000)
 
 suite "graceful shutdown":
   test "an in-flight request completes, then the server exits":

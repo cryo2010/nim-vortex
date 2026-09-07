@@ -3,14 +3,7 @@ import std/httpclient except Response
 import vortex/[settings, request, server]
 import ./helper
 
-let certDir = getTempDir() / "nhs_test_certs_" & $getCurrentProcessId()
-createDir(certDir)
-let certFile = certDir / "cert.pem"
-let keyFile = certDir / "key.pem"
-let (genOut, genRc) = execCmdEx(
-  "openssl req -x509 -newkey rsa:2048 -nodes -keyout " & keyFile &
-  " -out " & certFile & " -days 2 -subj /CN=localhost")
-check genRc == 0
+let (certFile, keyFile) = makeCertPair("nhs_test_certs_")
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
@@ -111,5 +104,5 @@ srvCipher.close()
 srv12.close()
 srv13.close()
 srv.close()
-removeDir(certDir)
+removeDir(certFile.parentDir)
 echo "server shut down cleanly"

@@ -11,6 +11,7 @@ import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
 import ./helper                              # macro would clash with the async
+import ./wsclient
 when defined(vortexChronos):
   import vortex/chronos as nhsasync          # adapter's; Request/Response via facade
   const suiteName = "chronos adapter"
@@ -145,186 +146,148 @@ appRouter.post("/upload-reject", hUploadReject, streaming = true)
 appRouter.post("/upload-boom", hUploadBoom, streaming = true)
 appRouter.post("/upload-read", hUploadRead, streaming = true)
 
-var srv = newVortex(appRouter.toHandler,
-                    initVortexConfig(numThreads = 1, workerThreads = 2),
-                    appRouter.streamPredicate).start(0)
-let base = "http://127.0.0.1:" & $srv.port
+withServer(appRouter.toHandler,
+           initVortexConfig(numThreads = 1, workerThreads = 2),
+           appRouter.streamPredicate, srv):
+  let base = "http://127.0.0.1:" & $srv.port
 
-proc fetch(path: string): string =
-  var client = newHttpClient()
-  defer: client.close()
-  client.getContent(base & path)
-
-proc wsRecvN(s: Socket, n: int): string =
-  result = newString(n)
-  var got = 0
-  while got < n:
-    let k = recv(s.getFd, addr result[got], n - got, cint(0))
-    if k <= 0: raise newException(IOError, "short read")
-    got += k
-
-proc wsRecvFrame(s: Socket): tuple[op: int, payload: string] =
-  let h = wsRecvN(s, 2)
-  var ln = int(uint8(h[1]) and 0x7f)
-  if ln == 126:
-    let e = wsRecvN(s, 2); ln = (int(uint8(e[0])) shl 8) or int(uint8(e[1]))
-  ((int(uint8(h[0])) and 0x0f), (if ln > 0: wsRecvN(s, ln) else: ""))
-
-proc openWs(path: string): Socket =
-  result = newSocket(buffered = false)
-  result.connect("127.0.0.1", srv.port)
-  result.send("GET " & path & " HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n" &
-              "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" &
-              "Sec-WebSocket-Version: 13\r\n\r\n")
-  result.setRecvTimeout(2000)
-  var hdr = ""
-  var one = newString(1)
-  while not hdr.endsWith("\r\n\r\n"):
-    let k = recv(result.getFd, addr one[0], 1, cint(0))
-    if k <= 0: break
-    hdr.add one[0]
-  doAssert "101" in hdr, hdr
-
-proc sendMasked(sock: Socket, msg: string) =
-  var f = "\x81" & char(0x80 or msg.len)
-  let mask = [0x11'u8, 0x22, 0x33, 0x44]
-  for m in mask: f.add char(m)
-  for i in 0 ..< msg.len: f.add char(uint8(msg[i]) xor mask[i and 3])
-  sock.send(f)
-
-suite suiteName:
-  test "async handler without await":
-    check fetch("/") == "sync-in-async"
-
-  test "deferred response after sleepAsync":
-    check fetch("/delay") == "slept"
-
-  test "captures in async body":
-    check fetch("/hello/craig") == "hello craig"
-
-  test "multiple sequential awaits":
-    check fetch("/fan") == "6"
-
-  test "keep-alive works across deferred responses":
+  proc fetch(path: string): string =
     var client = newHttpClient()
     defer: client.close()
-    check client.getContent(base & "/delay") == "slept"
-    check client.getContent(base & "/") == "sync-in-async"
-    check client.getContent(base & "/delay") == "slept"
+    client.getContent(base & path)
 
-  test "concurrent delays overlap (loop is not blocked)":
-    # Two /delay requests on separate connections should complete in
-    # ~150ms total, not ~300ms: the loop must keep serving during await.
-    var socks: seq[Socket]
-    let t0 = epochTime()
-    for i in 0 ..< 2:
+  suite suiteName:
+    test "async handler without await":
+      check fetch("/") == "sync-in-async"
+
+    test "deferred response after sleepAsync":
+      check fetch("/delay") == "slept"
+
+    test "captures in async body":
+      check fetch("/hello/craig") == "hello craig"
+
+    test "multiple sequential awaits":
+      check fetch("/fan") == "6"
+
+    test "keep-alive works across deferred responses":
+      var client = newHttpClient()
+      defer: client.close()
+      check client.getContent(base & "/delay") == "slept"
+      check client.getContent(base & "/") == "sync-in-async"
+      check client.getContent(base & "/delay") == "slept"
+
+    test "concurrent delays overlap (loop is not blocked)":
+      # Two /delay requests on separate connections should complete in
+      # ~150ms total, not ~300ms: the loop must keep serving during await.
+      var socks: seq[Socket]
+      let t0 = epochTime()
+      for i in 0 ..< 2:
+        let s = newSocket(buffered = false)
+        s.connect("127.0.0.1", srv.port)
+        s.send("GET /delay HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        socks.add s
+      for s in socks:
+        let resp = s.recvUntilClose(2000)
+        s.close()
+        check resp.endsWith("slept")
+      let elapsed = epochTime() - t0
+      check elapsed < 0.28
+
+    test "exception in async body gives 500":
+      var client = newHttpClient()
+      defer: client.close()
+      check client.get(base & "/boom").code == Http500
+
+    test "exception before first await gives 500 (fast path)":
+      var client = newHttpClient()
+      defer: client.close()
+      check client.get(base & "/boomsync").code == Http500
+
+    test "blocking: works inside an async handler":
+      check fetch("/worker") == "worker done"
+
+    test "awaitable req.blocking moves values in and returns the result":
+      check fetch("/worker-value/ada") == "ada:6"
+
+    test "res.stream + await res.write streams with backpressure, body intact":
+      let body = fetch("/stream")
+      check body.len == streamChunk.len * streamCount
+      check body == streamChunk.repeat(streamCount)
+
+    test "sendHead/write/finish + await res.write streams an outbound body":
+      check fetch("/streamraw") == "chunk".repeat(50)
+
+    test "res.stream(emit) block form streams an outbound body":
+      check fetch("/streamemit") == "chunk".repeat(50)
+
+    test "await req.read() streams a request body":
+      let body = "z".repeat(200 * 1024)
       let s = newSocket(buffered = false)
+      defer: s.close()
       s.connect("127.0.0.1", srv.port)
-      s.send("GET /delay HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-      socks.add s
-    for s in socks:
-      let resp = s.recvUntilClose(2000)
-      s.close()
-      check resp.endsWith("slept")
-    let elapsed = epochTime() - t0
-    check elapsed < 0.28
+      s.send("POST /upload-read HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
+             "Content-Length: " & $body.len & "\r\n\r\n")
+      var off = 0
+      while off < body.len:
+        let n = min(16 * 1024, body.len - off)
+        s.send(body[off ..< off + n]); inc off, n
+      s.setRecvTimeout(4000)
+      var resp: string
+      var buf = newString(65536)
+      while true:
+        let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
+        if k <= 0: break
+        resp.add buf[0 ..< k]
+      check resp.endsWith("got " & $body.len)
 
-  test "exception in async body gives 500":
-    var client = newHttpClient()
-    defer: client.close()
-    check client.get(base & "/boom").code == Http500
+    test "upload: req.stream auto-200 on clean exit":
+      var client = newHttpClient()
+      defer: client.close()
+      let r = client.post(base & "/upload", "hello world")
+      check r.code == Http200
+      check r.body == ""
 
-  test "exception before first await gives 500 (fast path)":
-    var client = newHttpClient()
-    defer: client.close()
-    check client.get(base & "/boomsync").code == Http500
+    test "upload: a response from inside the block overrides the auto-200":
+      var client = newHttpClient()
+      defer: client.close()
+      check client.post(base & "/upload-reject", "BAD").code == Http400
+      check client.post(base & "/upload-reject", "fine").code == Http200   # auto-200
 
-  test "blocking: works inside an async handler":
-    check fetch("/worker") == "worker done"
+    test "upload: a raise in the block gives 500, never 200":
+      var client = newHttpClient()
+      defer: client.close()
+      check client.post(base & "/upload-boom", "x").code == Http500
 
-  test "awaitable req.blocking moves values in and returns the result":
-    check fetch("/worker-value/ada") == "ada:6"
+    test "async handler over HTTP/2":
+      let (output, rc) = execCmdEx(
+        "curl -s --http2-prior-knowledge -w '|%{http_version}' " &
+        base & "/delay")
+      check rc == 0
+      check output.strip() == "slept|2"
 
-  test "res.stream + await res.write streams with backpressure, body intact":
-    let body = fetch("/stream")
-    check body.len == streamChunk.len * streamCount
-    check body == streamChunk.repeat(streamCount)
+    test "ws.doAsync: await inside a websocket message handler":
+      let s = openWs(srv.port, "/ws").sock
+      defer: s.close()
+      s.sendText("howdy")
+      let r = s.recvFrame()
+      check r.op == 0x1
+      check r.payload == "async: howdy"
 
-  test "sendHead/write/finish + await res.write streams an outbound body":
-    check fetch("/streamraw") == "chunk".repeat(50)
+    test "ws.messages: async iterator loop echoes each message":
+      let s = openWs(srv.port, "/wsmsg").sock
+      defer: s.close()
+      s.sendText("one")
+      check s.recvFrame().payload == "echo: one"
+      s.sendText("two")
+      check s.recvFrame().payload == "echo: two"
 
-  test "res.stream(emit) block form streams an outbound body":
-    check fetch("/streamemit") == "chunk".repeat(50)
+    test "newVortex overload accepts a bare async handler (no toHandler)":
+      proc bare(req: Request, res: Response) {.async.} =
+        res.send(Http200, "bare-async")
+      let s = newVortex(bare).start(0)
+      defer: s.close()
+      var client = newHttpClient()
+      defer: client.close()
+      check client.getContent("http://127.0.0.1:" & $s.port & "/") == "bare-async"
 
-  test "await req.read() streams a request body":
-    let body = "z".repeat(200 * 1024)
-    let s = newSocket(buffered = false)
-    defer: s.close()
-    s.connect("127.0.0.1", srv.port)
-    s.send("POST /upload-read HTTP/1.1\r\nHost: x\r\nConnection: close\r\n" &
-           "Content-Length: " & $body.len & "\r\n\r\n")
-    var off = 0
-    while off < body.len:
-      let n = min(16 * 1024, body.len - off)
-      s.send(body[off ..< off + n]); inc off, n
-    s.setRecvTimeout(4000)
-    var resp: string
-    var buf = newString(65536)
-    while true:
-      let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
-      if k <= 0: break
-      resp.add buf[0 ..< k]
-    check resp.endsWith("got " & $body.len)
-
-  test "upload: req.stream auto-200 on clean exit":
-    var client = newHttpClient()
-    defer: client.close()
-    let r = client.post(base & "/upload", "hello world")
-    check r.code == Http200
-    check r.body == ""
-
-  test "upload: a response from inside the block overrides the auto-200":
-    var client = newHttpClient()
-    defer: client.close()
-    check client.post(base & "/upload-reject", "BAD").code == Http400
-    check client.post(base & "/upload-reject", "fine").code == Http200   # auto-200
-
-  test "upload: a raise in the block gives 500, never 200":
-    var client = newHttpClient()
-    defer: client.close()
-    check client.post(base & "/upload-boom", "x").code == Http500
-
-  test "async handler over HTTP/2":
-    let (output, rc) = execCmdEx(
-      "curl -s --http2-prior-knowledge -w '|%{http_version}' " &
-      base & "/delay")
-    check rc == 0
-    check output.strip() == "slept|2"
-
-  test "ws.doAsync: await inside a websocket message handler":
-    let s = openWs("/ws")
-    defer: s.close()
-    s.sendMasked("howdy")
-    let r = s.wsRecvFrame()
-    check r.op == 0x1
-    check r.payload == "async: howdy"
-
-  test "ws.messages: async iterator loop echoes each message":
-    let s = openWs("/wsmsg")
-    defer: s.close()
-    s.sendMasked("one")
-    check s.wsRecvFrame().payload == "echo: one"
-    s.sendMasked("two")
-    check s.wsRecvFrame().payload == "echo: two"
-
-  test "newVortex overload accepts a bare async handler (no toHandler)":
-    proc bare(req: Request, res: Response) {.async.} =
-      res.send(Http200, "bare-async")
-    let s = newVortex(bare).start(0)
-    defer: s.close()
-    var client = newHttpClient()
-    defer: client.close()
-    check client.getContent("http://127.0.0.1:" & $s.port & "/") == "bare-async"
-
-srv.close()
 echo "server shut down cleanly"

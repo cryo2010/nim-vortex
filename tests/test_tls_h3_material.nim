@@ -13,35 +13,17 @@
 
 import std/[unittest, net, httpcore, osproc, strutils, os]
 import vortex/[settings, request, server, connection]
-
-proc findH3Curl(): string =
-  ## Any curl advertising HTTP3 (system, then Homebrew). "" if none.
-  var cands: seq[string]
-  let sys = findExe("curl")
-  if sys.len > 0: cands.add sys
-  cands.add "/opt/homebrew/opt/curl/bin/curl"
-  for exe in cands:
-    if fileExists(exe):
-      let (ver, rc) = execCmdEx(exe & " --version")
-      if rc == 0 and "HTTP3" in ver.toUpperAscii: return exe
-  ""
+import ./helper
 
 let h3curlBin = findH3Curl()
-let plainCurl = findExe("curl")
-if plainCurl.len == 0:
-  echo "SKIP: no curl found"
-  quit 0
+let plainCurl = requireCurl("SKIP: no curl found")
 
 # --- generate cert + an unencrypted and an encrypted copy of the key ----------
 const pass = "s3cr3t-pass"
-let dir = getTempDir() / "nhs_h3_mat_" & $getCurrentProcessId()
-createDir(dir)
-let certPath = dir / "cert.pem"
-let keyPath = dir / "key.pem"          # unencrypted
+let (certPath, keyPath) = makeCertPair("nhs_h3_mat_")   # key.pem is unencrypted
+let dir = certPath.parentDir
 let encKeyPath = dir / "enc.pem"       # same key, AES-256 encrypted
 let p12Path = dir / "bundle.p12"       # cert + key as a PKCS#12 bundle
-check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
-  keyPath & " -out " & certPath & " -days 2 -subj /CN=localhost")[1] == 0
 check execCmdEx("openssl rsa -in " & keyPath & " -aes256 -out " & encKeyPath &
   " -passout pass:" & pass)[1] == 0
 check execCmdEx("openssl pkcs12 -export -inkey " & keyPath & " -in " & certPath &

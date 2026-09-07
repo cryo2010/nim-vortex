@@ -13,14 +13,12 @@ when not defined(httpGzip) and not defined(httpBrotli) and not defined(httpZstd)
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 when defined(httpGzip): import vortex/gzip
 when defined(httpBrotli): import vortex/brotli
 when defined(httpZstd): import vortex/zstd
 
-let curlBin = findExe("curl")
-if curlBin.len == 0:
-  echo "SKIP: no curl"
-  quit 0
+let curlBin = requireCurl()
 
 const maxBody = 1_000_000
 proc handler(req: Request, res: Response) {.gcsafe.} =

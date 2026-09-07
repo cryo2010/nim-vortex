@@ -60,8 +60,9 @@ below are covered by those three CI runs.
 Configuration lives in `tests/config.nims` (adds `src` to the path, `--threads:on`,
 `-d:ssl`, and reads `NIM_MM` / `NIM_SANITIZE` / `NIM_COMPRESS`). Shared helpers:
 `tests/helper.nim`
-(raw-socket client with faithful recv), `tests/h2client.nim` (minimal HTTP/2
-client).
+(raw-socket client with faithful recv, curl/cert fixtures, `withServer`),
+`tests/h2client.nim` (minimal HTTP/2 client), `tests/wsclient.nim` (raw
+WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 
 ### Protocol parsers & decoders (unit, RFC vectors)
 

@@ -3,24 +3,18 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 
 when defined(plainHttp):
   echo "SKIP: -d:plainHttp has no TLS"
   quit 0
-let curlBin = findExe("curl")
-if curlBin.len == 0:
-  echo "SKIP: no curl"
-  quit 0
+let curlBin = requireCurl()
 
-let dir = getTempDir() / "vortex_tlskey_" & $getCurrentProcessId()
-removeDir(dir); createDir(dir)
-let cert = dir / "cert.pem"
-let key = dir / "key.pem"          # unencrypted
+let (cert, key) = makeCertPair("vortex_tlskey_")   # key.pem is unencrypted
+let dir = cert.parentDir
 let enckey = dir / "enc.pem"       # same key, AES-encrypted with a passphrase
 const pass = "s3cr3t-pass"
 
-check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
-  key & " -out " & cert & " -days 2 -subj /CN=localhost")[1] == 0
 check execCmdEx("openssl rsa -in " & key & " -aes256 -out " & enckey &
   " -passout pass:" & pass)[1] == 0
 

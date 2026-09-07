@@ -2,6 +2,7 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 
 when defined(plainHttp):
   echo "SKIP: -d:plainHttp has no TLS"
@@ -17,15 +18,12 @@ removeDir(dir); createDir(dir)
 proc sh(cmd: string) = check execCmdEx(cmd)[1] == 0
 
 # server cert (CN=localhost), a PKCS#12 bundle of it, and an alt cert for SNI
-sh("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/key.pem -out " &
-   dir & "/cert.pem -days 2 -subj /CN=localhost")
+genCert(dir / "cert.pem", dir / "key.pem")
 sh("openssl pkcs12 -export -out " & dir & "/bundle.p12 -inkey " & dir &
    "/key.pem -in " & dir & "/cert.pem -passout pass:p12pass")
-sh("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/altkey.pem -out " &
-   dir & "/alt.pem -days 2 -subj /CN=alt.example")
+genCert(dir / "alt.pem", dir / "altkey.pem", "alt.example")
 # a client CA and a client cert signed by it (mTLS)
-sh("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/ca.key -out " &
-   dir & "/ca.pem -days 2 -subj /CN=TestCA")
+genCert(dir / "ca.pem", dir / "ca.key", "TestCA")
 sh("openssl req -newkey rsa:2048 -nodes -keyout " & dir & "/client.key -out " &
    dir & "/client.csr -subj /CN=test-client")
 sh("openssl x509 -req -in " & dir & "/client.csr -CA " & dir & "/ca.pem -CAkey " &

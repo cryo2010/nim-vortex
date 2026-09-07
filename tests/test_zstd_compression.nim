@@ -14,11 +14,9 @@ when not defined(httpZstd):
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 
-let curlBin = findExe("curl")
-if curlBin.len == 0:
-  echo "SKIP: no curl"
-  quit 0
+let curlBin = requireCurl()
 
 const bufText = "the quick brown fox. ".repeat(300)     # ~6 KB buffered body
 const chunkText = "streamed zstd chunk. ".repeat(20)

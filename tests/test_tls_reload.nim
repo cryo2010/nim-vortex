@@ -6,6 +6,7 @@
 import std/[unittest, net, httpcore, os, osproc, strutils]
 import std/httpclient except Response
 import vortex/[settings, request, server]
+import ./helper
 
 let dir = getTempDir() / "vortex_tls_reload_" & $getCurrentProcessId()
 createDir(dir)
@@ -14,13 +15,7 @@ let liveKey  = dir / "key.pem"
 let altCert  = dir / "alt.pem"
 let altKey   = dir / "altkey.pem"
 
-proc gen(cert, key, cn: string) =
-  let (o, rc) = execCmdEx(
-    "openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
-    " -out " & cert & " -days 2 -subj /CN=" & cn)
-  check rc == 0
-
-gen(liveCert, liveKey, "alpha.vortex")
+genCert(liveCert, liveKey, "alpha.vortex")
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "ok")
@@ -47,13 +42,13 @@ suite "TLS certificate hot-reload":
 
   test "reload with no args re-reads the configured paths (in-place renewal)":
     # Overwrite the configured files in place, as certbot would, then reload.
-    gen(liveCert, liveKey, "bravo.vortex")
+    genCert(liveCert, liveKey, "bravo.vortex")
     check srv.reloadTls()
     check "bravo.vortex" in servedCN()
     check stillServes()
 
   test "reload from explicit new paths swaps the presented cert":
-    gen(altCert, altKey, "charlie.vortex")
+    genCert(altCert, altKey, "charlie.vortex")
     check srv.reloadTls(altCert, altKey)
     check "charlie.vortex" in servedCN()
     check stillServes()
@@ -64,7 +59,7 @@ suite "TLS certificate hot-reload":
     check stillServes()
 
   test "reload with a cert/key mismatch is rejected":
-    gen(dir / "delta.pem", dir / "deltakey.pem", "delta.vortex")
+    genCert(dir / "delta.pem", dir / "deltakey.pem", "delta.vortex")
     check not srv.reloadTls(dir / "delta.pem", liveKey)  # cert + wrong key
     check "charlie.vortex" in servedCN()
 

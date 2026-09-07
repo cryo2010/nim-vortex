@@ -9,6 +9,7 @@ import std/[unittest, net, posix, os, httpcore, times]
 import vortex/[settings, request, server, routing]
 import vortex/http2/frames
 import ./h2client
+import ./helper
 
 proc hello(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "ok")
@@ -36,9 +37,7 @@ suite "HTTP/2 half-open stream slowloris timeout (#201)":
                      (":authority", "x")], endStream = false)   # body promised, never sent
     c.sendRaw(f)
     # Within ~bodyTimeout the server closes the connection: recv sees EOF (0).
-    var tv = Timeval(tv_sec: posix.Time(4), tv_usec: Suseconds(0))
-    discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_RCVTIMEO,
-                       addr tv, SockLen(sizeof(tv)))
+    c.sock.setRecvTimeout(4000)
     var buf = newString(4096)
     var closed = false
     let deadline = epochTime() + 3.5

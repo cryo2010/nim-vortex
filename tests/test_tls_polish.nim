@@ -2,6 +2,7 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 
 when defined(plainHttp):
   echo "SKIP: -d:plainHttp has no TLS"
@@ -17,10 +18,8 @@ proc sh(cmd: string): int = execCmdEx(cmd)[1]
 proc must(cmd: string) = check sh(cmd) == 0
 
 # default cert (CN=localhost) and a wildcard cert (CN=*.example.com)
-must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/key.pem -out " &
-     dir & "/cert.pem -days 2 -subj /CN=localhost")
-must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
-     "/wildkey.pem -out " & dir & "/wild.pem -days 2 -subj '/CN=*.example.com'")
+genCert(dir / "cert.pem", dir / "key.pem")
+genCert(dir / "wild.pem", dir / "wildkey.pem", "*.example.com")
 let cert = dir / "cert.pem"
 let key = dir / "key.pem"
 

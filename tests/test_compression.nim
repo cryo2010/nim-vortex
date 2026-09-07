@@ -12,11 +12,9 @@ when not defined(httpGzip):
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 
-let curlBin = findExe("curl")
-if curlBin.len == 0:
-  echo "SKIP: no curl"
-  quit 0
+let curlBin = requireCurl()
 
 const bigText = "The quick brown fox jumps over the lazy dog. ".repeat(120)  # ~5 KiB
 
