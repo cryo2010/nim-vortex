@@ -194,14 +194,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Test the chronos adapter
         # chronos is an opt-in dependency kept out of the default suite; install
-        # it, then build/run the adapter's suite directly (orc). Not via
-        # `nimble testchronos`: a failure there would be masked by
-        # nim-lang/nimble#1802. The raw `nim c` resolves chronos from the global
-        # nimble package path.
+        # it, then build/run the shared adapter suite against the chronos
+        # backend (-d:vortexChronos) directly (orc). Not via `nimble
+        # testchronos`: a failure there would be masked by nim-lang/nimble#1802.
+        # The raw `nim c` resolves chronos from the global nimble package path.
         run: |
           nimble install -y "chronos@>= 4.0.0"
-          nim c -r --mm:orc --threads:on -d:ssl -p:src \
-            -o:tests/chronos_adapter tests/chronos_adapter.nim
+          nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos -p:src \
+            -o:tests/test_adapter_chronos tests/test_adapter.nim
 
   testdeflate:
     runs-on: ubuntu-latest

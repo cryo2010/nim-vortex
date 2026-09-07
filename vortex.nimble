@@ -73,8 +73,11 @@ taskRequires "testchronos", "chronos >= 4.0.0"
 
 task testchronos, "Test the chronos async adapter (needs chronos)":
   ensureNimblePath()
-  exec "nim c -r --mm:orc --threads:on -d:ssl -p:src " &
-       "-o:tests/chronos_adapter tests/chronos_adapter.nim"
+  # The shared adapter suite (tests/test_adapter.nim) built against the
+  # chronos backend via -d:vortexChronos; a distinct output name so it never
+  # clobbers the default (asyncdispatch) build of the same file.
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos -p:src " &
+       "-o:tests/test_adapter_chronos tests/test_adapter.nim"
 
 proc runCodecTest(test, flags: string) =
   ## Compile-and-run one opt-in codec test: the shared orc/threads/ssl prefix,
