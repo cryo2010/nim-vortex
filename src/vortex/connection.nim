@@ -119,6 +119,30 @@ type
     ## argument is precisely how the compiler invokes a closure. `prc == nil`
     ## means unset.
 
+  RequestState* = object
+    ## Per-request state common to every protocol carrier: the Connection for
+    ## HTTP/1, an H2Stream, and an H3Stream each embed one as `rs`, so
+    ## request.nim can resolve a single RequestState (see request.reqState)
+    ## instead of re-implementing the h3/h2/h1 discrimination per accessor.
+    ## Only the exact intersection lives here; carrier-specific request state
+    ## (h1 sent100/respFraming, h2/h3 isHead/trailers/...) stays on the carrier.
+    responded*: bool          ## current request has been answered
+    urlCached*: bool          ## lazy per-request caches (see request.url)
+    queryCached*: bool
+    jsonCached*: bool
+    cachedUrl*: Uri
+    cachedQuery*: Table[string, string]
+    cachedJson*: JsonNode
+    pathParams*: PathParams   ## written by the router at match time
+    respStreaming*: bool      ## a streamed response is open (res.sendHead)
+    respComp*: RootRef        ## streaming compressor (Gzip/BrotliStream upcast);
+                              ## nil = identity. Its =destroy frees the codec
+                              ## state when the carrier is reset/deleted.
+    respEnc*: string          ## "gzip"/"br" for respComp (empty = none)
+    onRespDrain*: RespDrainCb ## streamed-response drain callback
+    reqStreaming*: bool       ## dispatched early; body flows to onBody
+    onBodyCb*: BodyCb         ## inbound streaming sink (req.onBody)
+
   Connection* = object
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
@@ -157,37 +181,18 @@ type
                               ## WINDOW_UPDATEs flowing while it is mid-stream,
                               ## instead of starving them until the read unpins.
     closeRequested*: bool     ## close deferred until unpinned
-    responded*: bool          ## current request has been answered
+    rs*: RequestState         ## per-request state shared with the h2/h3 streams
     sent100*: bool            ## 100 Continue already sent for this request
     requestCount*: int        ## HTTP/1 requests served on this connection
-    urlCached*: bool          ## lazy per-request caches (see request.url)
-    queryCached*: bool
-    jsonCached*: bool
-    cachedUrl*: Uri
-    cachedQuery*: Table[string, string]
-    cachedJson*: JsonNode
-    pathParams*: PathParams   ## written by the router at match time
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
     lingerClose*: bool        ## drain peer before close (reliable error delivery)
     peerHalfClosed*: bool     ## peer sent FIN (half-close): no more requests,
                               ## but a buffered one still gets its response
-    # Streaming response state (res.sendHead/write/finish). HTTP/1 only;
-    # h2/h3 keep their streaming flags on the per-stream struct.
-    respStreaming*: bool      ## a chunked/close-delimited response is open
+    # HTTP/1-only streaming state; the shared flags/callbacks live in `rs`.
     respFraming*: RespFraming ## how the open streaming body is delimited
-    respComp*: RootRef        ## streaming compressor (Gzip/BrotliStream upcast);
-                               ## nil = identity. Its =destroy frees the codec
-                               ## state when the connection is reset/closed.
-    respEnc*: string          ## "gzip"/"br" for respComp (empty = none)
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
-    onRespDrain*: RespDrainCb
-    # Inbound streaming (req.onBody). A streaming route is dispatched at
-    # headers-complete; body bytes are delivered incrementally instead of
-    # buffered whole.
-    reqStreaming*: bool       ## dispatched early; body flows to onBody
     bodyFed*: int             ## body bytes already delivered to onBody
-    onBodyCb*: BodyCb
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
@@ -439,28 +444,37 @@ proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
       if k[0] == fd and k[1] == gen: stale.add k
     for k in stale: core.respTrailers.del k
 
+proc resetRequest*(rs: var RequestState) =
+  ## Clear every shared per-request field for carrier reuse. cachedUrl and
+  ## cachedQuery deliberately keep their storage (the `urlCached`/`queryCached`
+  ## flags guard reads, and the lazy caches overwrite in place on next use --
+  ## see request.lazyQuery); cachedJson is dropped so a large parsed body is
+  ## released between keep-alive requests.
+  rs.responded = false
+  rs.urlCached = false
+  rs.queryCached = false
+  rs.jsonCached = false
+  rs.cachedJson = nil
+  rs.pathParams.setLen(0)
+  rs.respStreaming = false
+  rs.respComp = nil           # frees the streaming codec state (=destroy)
+  rs.respEnc = ""
+  rs.onRespDrain = nil
+  rs.reqStreaming = false
+  rs.onBodyCb = nil
+
 proc resetRequestState(c: var Connection) =
   ## Clear the per-request fields shared by resetForNextRequest (keep-alive)
   ## and clear (slot recycling).
   c.chunkBody.setLen(0)
   c.bodyDecoded.setLen(0)
   c.bodyDecodedSet = false
-  c.urlCached = false
-  c.queryCached = false
-  c.jsonCached = false
-  c.pathParams.setLen(0)
-  c.responded = false
+  c.rs.resetRequest()
   c.sent100 = false
   c.awaitingResponse = false
-  c.respStreaming = false
   c.respFraming = rfNone
-  c.respComp = nil            # frees the streaming codec state (=destroy)
-  c.respEnc = ""
   c.respBackedUp = false
-  c.onRespDrain = nil
-  c.reqStreaming = false
   c.bodyFed = 0
-  c.onBodyCb = nil
   c.parser.reset(0)
 
 proc resetForNextRequest*(c: var Connection) =

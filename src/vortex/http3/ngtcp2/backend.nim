@@ -5,7 +5,7 @@
 ## (one engine per thread). Building HTTP/3 (any non -d:plainHttp build) links
 ## ngtcp2 + nghttp3 (see the passL below).
 
-import std/[tables, strutils, uri, json, os, monotimes]
+import std/[tables, strutils, json, os, monotimes]
 import ../../connection
 import ../../fieldrules   # pseudo-header machine shared with the h2 codec
 import ../../websocket/codec as wscodec
@@ -100,23 +100,11 @@ type
     trailers*: seq[(string, string)]  ## request trailer fields (after the body)
     body*: string
     headersDone*: bool
-    responded*: bool
     isHead*: bool
-    streaming*: bool
-    streamingReq*: bool
     isWsConnect*: bool
     ws*: RootRef
-    respComp*: RootRef
-    respEnc*: string
-    pathParams*: PathParams
-    urlCached*: bool
-    queryCached*: bool
-    jsonCached*: bool
-    cachedUrl*: Uri
-    cachedQuery*: Table[string, string]
-    cachedJson*: JsonNode
-    onBodyCb*: BodyCb
-    onRespDrain*: RespDrainCb
+    rs*: RequestState        ## per-request state shared with h1/h2 (responded,
+                             ## lazy caches, pathParams, streaming flags/callbacks)
     dispatched: bool
     finSeen: bool
     bodyManualAck: bool
@@ -228,20 +216,20 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   if not st.isWsConnect and hasStreamRoute(h3c.core) and
       callStreamRoute(h3c.core, int32(-(h3c.slot + 2)),
                       h3c.core.h3slots[h3c.slot].gen, uint32(sid)):
-    st.streamingReq = true
-  if (st.isWsConnect or st.streamingReq) and not st.dispatched:
+    st.rs.reqStreaming = true
+  if (st.isWsConnect or st.rs.reqStreaming) and not st.dispatched:
     st.dispatched = true
     gReady.add (h3c.slot, h3c.core.h3slots[h3c.slot].gen, usid)
 
 proc deliverBody(h3c: H3Conn, usid: uint64, last: bool) =
   if usid notin h3c.streams: return
   template st: H3Stream = h3c.streams[usid]
-  if st.onBodyCb == nil: return
+  if st.rs.onBodyCb == nil: return
   if st.body.len > 0 or last:
     # The callback may res.send (deleting this stream from the table), so move
     # the buffer out and capture manualAck *before* the call, and touch nothing
     # on `st` afterwards -- re-check membership before crediting flow control.
-    let cb = st.onBodyCb
+    let cb = st.rs.onBodyCb
     let manualAck = st.bodyManualAck
     var buf: string
     swap(buf, st.body)
@@ -263,7 +251,7 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     let arr = cast[ptr UncheckedArray[char]](data)
     wsFeed(h3c.core, nil, WsConn(st.ws), arr.toOpenArray(0, int(len) - 1))
     return
-  if not st.streamingReq and gMaxBody > 0'u64 and
+  if not st.rs.reqStreaming and gMaxBody > 0'u64 and
       uint64(st.body.len) + uint64(len) > gMaxBody:
     # Buffered request body over maxBodySize: reject with a stream reset rather
     # than buffering unboundedly (mirrors the h2 maxBody guard in codec.nim, which
@@ -278,7 +266,7 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   let old = st.body.len
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
-  if st.streamingReq:
+  if st.rs.reqStreaming:
     deliverBody(h3c, usid, false)
   elif len > 0 and h3c.vq != nil:
     # Buffered request body (#220): nghttp3_conn_read_stream does not credit
@@ -297,7 +285,7 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   st.finSeen = true
   if st.ws != nil:
     wsPeerClosed(h3c.core, nil, WsConn(st.ws))
-  elif st.streamingReq:
+  elif st.rs.reqStreaming:
     deliverBody(h3c, usid, true)
   elif not st.dispatched and st.headersDone:
     st.dispatched = true
@@ -311,9 +299,9 @@ proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} 
     if st.ws != nil:
       wsStreamClosed(h3c.core, nil, WsConn(st.ws))
       st.ws = nil
-    if st.onBodyCb != nil:
-      let cb = st.onBodyCb
-      st.onBodyCb = nil
+    if st.rs.onBodyCb != nil:
+      let cb = st.rs.onBodyCb
+      st.rs.onBodyCb = nil
       var empty: string
       try: cb(toOpenArray(empty, 0, -1), true)
       except CatchableError: discard
@@ -324,15 +312,15 @@ proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
   let usid = uint64(sid)
   if usid in h3c.streams:
     template st: H3Stream = h3c.streams[usid]
-    if st.onRespDrain != nil and vqStreamBacklog(h3c.vq, sid) == 0:
+    if st.rs.onRespDrain != nil and vqStreamBacklog(h3c.vq, sid) == 0:
       # One-shot: clear the callback before firing. nghttp3's acked_stream_data
       # can fire on_stream_writable more than once while the backlog is 0 (before
       # the drain callback has queued and written the next chunk); re-firing would
       # dispatch the next file read twice (two workers reading the same offset ->
       # duplicate bytes past Content-Length -> the client aborts the stream). The
       # drain re-registers itself per chunk (res.onDrain in applyFileChunk).
-      let cb = st.onRespDrain
-      st.onRespDrain = nil
+      let cb = st.rs.onRespDrain
+      st.rs.onRespDrain = nil
       cb(h3c.core, int32(-(h3c.slot + 2)),
          h3c.core.h3slots[h3c.slot].gen, uint32(usid))
 
@@ -449,9 +437,9 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
                 body: openArray[char]) =
-  if conn.vq == nil or sid notin conn.streams or conn.streams[sid].responded: return
+  if conn.vq == nil or sid notin conn.streams or conn.streams[sid].rs.responded: return
   template st: H3Stream = conn.streams[sid]
-  st.responded = true
+  st.rs.responded = true
   let bodiless = bodilessStatus(code)
   let hdrs = buildRespHeaders(core, code, contentType, extraHeaders, body.len,
                               st.isHead, bodiless)
@@ -463,10 +451,10 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
 
 proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                  contentType: string, extraHeaders: openArray[(string, string)]) =
-  if conn.vq == nil or sid notin conn.streams or conn.streams[sid].responded: return
+  if conn.vq == nil or sid notin conn.streams or conn.streams[sid].rs.responded: return
   template st: H3Stream = conn.streams[sid]
-  st.responded = true
-  st.streaming = not st.isHead
+  st.rs.responded = true
+  st.rs.respStreaming = not st.isHead
   let hdrs = buildRespHeaders(core, code, contentType, extraHeaders,
                               bodyLen = -1, st.isHead, bodiless = false)
   var nv = toVq(hdrs)
@@ -474,7 +462,7 @@ proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   if st.isHead: vqStreamFinish(conn.vq, int64(sid))
 
 proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
-  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return 0
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return 0
   if data.len > 0:
     return int(vqStreamWrite(conn.vq, int64(sid),
                              cast[ptr uint8](unsafeAddr data[0]), csize_t(data.len)))
@@ -482,9 +470,9 @@ proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
 
 proc h3StreamFinish*(conn: H3Conn, sid: uint64,
                      trailers: openArray[(string, string)] = []) =
-  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return
-  conn.streams[sid].streaming = false
-  conn.streams[sid].onRespDrain = nil
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
+  conn.streams[sid].rs.respStreaming = false
+  conn.streams[sid].rs.onRespDrain = nil
   # Submit any trailer fields before the FIN so nghttp3 keeps the stream open for
   # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
   if trailers.len > 0:
@@ -502,23 +490,23 @@ proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
   int(vqStreamBacklog(conn.vq, int64(sid)))
 
 proc h3StreamAbort*(conn: H3Conn, sid: uint64) =
-  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].streaming: return
-  conn.streams[sid].streaming = false
-  conn.streams[sid].onRespDrain = nil
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
+  conn.streams[sid].rs.respStreaming = false
+  conn.streams[sid].rs.onRespDrain = nil
   vqStreamReset(conn.vq, int64(sid), 0x0102)   # H3_INTERNAL_ERROR
 
 proc h3RespComp*(conn: H3Conn, sid: uint64): RootRef =
-  if sid in conn.streams: conn.streams[sid].respComp else: nil
+  if sid in conn.streams: conn.streams[sid].rs.respComp else: nil
 proc h3RespEnc*(conn: H3Conn, sid: uint64): string =
-  if sid in conn.streams: conn.streams[sid].respEnc else: ""
+  if sid in conn.streams: conn.streams[sid].rs.respEnc else: ""
 proc h3SetRespComp*(conn: H3Conn, sid: uint64, comp: RootRef, enc: string) =
   if sid in conn.streams:
-    conn.streams[sid].respComp = comp
-    conn.streams[sid].respEnc = enc
+    conn.streams[sid].rs.respComp = comp
+    conn.streams[sid].rs.respEnc = enc
 
 proc h3SetOnBody*(conn: H3Conn, sid: uint64, cb: BodyCb, manualAck = false) =
   if sid notin conn.streams: return
-  conn.streams[sid].onBodyCb = cb
+  conn.streams[sid].rs.onBodyCb = cb
   conn.streams[sid].bodyManualAck = manualAck
   deliverBody(conn, sid, conn.streams[sid].finSeen)
 
@@ -563,9 +551,9 @@ proc h3Free*(conn: H3Conn) =
     if st.ws != nil:                  # onClose(1006) for any open ws stream
       wsStreamClosed(conn.core, nil, WsConn(st.ws))
       st.ws = nil
-    if st.onBodyCb != nil:
-      let cb = st.onBodyCb
-      st.onBodyCb = nil
+    if st.rs.onBodyCb != nil:
+      let cb = st.rs.onBodyCb
+      st.rs.onBodyCb = nil
       try: cb(toOpenArray(empty, 0, -1), true)
       except CatchableError: discard
   conn.streams.clear()
@@ -607,8 +595,8 @@ proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
   ## open) and attach a WsConn whose frames tunnel through h3 DATA.
   if sid notin conn.streams: return false
   template st: H3Stream = conn.streams[sid]
-  if not st.isWsConnect or st.responded or st.ws != nil: return false
-  st.responded = true
+  if not st.isWsConnect or st.rs.responded or st.ws != nil: return false
+  st.rs.responded = true
   let (w, proto, ext) = wsSetup(core, fd, gen, maxMessage, uint32(sid),
                                 extensionsOffer, protocolsOffer, serverProtocols)
   w.flush = wsFlushH3ng

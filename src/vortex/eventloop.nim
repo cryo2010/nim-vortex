@@ -314,14 +314,14 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     c.closeRequested = true
     c.state = csClosing
     return
-  if c.onBodyCb != nil:
+  if c.rs.onBodyCb != nil:
     # A streaming request's body sink is still open (the client disconnected
     # mid-upload). Deliver a final last=true so an async adapter suspended in
     # await req.read() resumes at end-of-body and its Future / reader-table
     # entry are released instead of leaking forever (the entry is keyed by the
     # about-to-be-bumped generation and would never be reused or deleted).
-    let cb = c.onBodyCb
-    c.onBodyCb = nil
+    let cb = c.rs.onBodyCb
+    c.rs.onBodyCb = nil
     var empty: string
     try: cb(toOpenArray(empty, 0, -1), true)
     except CatchableError: discard
@@ -487,10 +487,10 @@ proc flushOut(loop: Loop, c: ptr Connection) =
       loop.closeConn(c)
   elif c.ws != nil:
     wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
-  elif c.respStreaming and c.respBackedUp:
+  elif c.rs.respStreaming and c.respBackedUp:
     c.respBackedUp = false
-    if c.onRespDrain != nil:
-      c.onRespDrain(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
+    if c.rs.onRespDrain != nil:
+      c.rs.onRespDrain(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
   else:
     # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it and
     # resume producers parked on the cap (no-op for non-h2 connections). It may
@@ -503,7 +503,7 @@ proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code
   appendResponse(c.wbuf, code, loop.core.dateStr, loop.core.serverHeader,
                  "text/plain", msg, [], keepAlive = false, skipBody = false)
-  c.responded = true
+  c.rs.responded = true
   c.closeAfterFlush = true
   c.lingerClose = true       # drain the peer so the error is delivered, no RST
   c.state = csClosing
@@ -588,8 +588,8 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
   ## Deliver newly-arrived request-body bytes to a streaming handler's onBody.
   ## `c.bodyFed` tracks how much has been delivered; `last` is set once the
   ## whole body is in so the final call carries the tail with last=true.
-  if c.onBodyCb == nil: return
-  let cb = c.onBodyCb
+  if c.rs.onBodyCb == nil: return
+  let cb = c.rs.onBodyCb
   if c.parser.chunked:
     # Decoded chunk bytes accumulate in c.chunkBody; end-of-body (the 0-chunk)
     # is only known when the parser reaches prComplete, i.e. `last`.
@@ -651,14 +651,14 @@ proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   ## register `req.onBody` before the body arrives. Handles both
   ## Content-Length and chunked (Transfer-Encoding) request bodies.
   if not callStreamRoute(addr loop.core, c.fd, c.gen, 0): return
-  c.reqStreaming = true
+  c.rs.reqStreaming = true
   c.bodyFed = 0
   let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
   try:
     {.gcsafe.}:
       loop.callHandler(req, response(req))
   except CatchableError:
-    if not c.responded:
+    if not c.rs.responded:
       loop.respondError(c, Http500)
 
 proc processInput(loop: Loop, c: ptr Connection) =
@@ -716,12 +716,12 @@ proc processInput(loop: Loop, c: ptr Connection) =
         # 100 Continue is sent implicitly when the handler first reads
         # (req.onBody / req.read), Go-style; a handler that responds before
         # reading (a reject) never prompts the body.
-        if hasStreamRoute(addr loop.core) and not c.reqStreaming and
-            not c.responded:
+        if hasStreamRoute(addr loop.core) and not c.rs.reqStreaming and
+            not c.rs.responded:
           loop.startStreamingDispatch(c)
-        if c.reqStreaming:
+        if c.rs.reqStreaming:
           loop.feedBody(c, last = false)
-        elif c.parser.expectContinue and not c.sent100 and not c.responded:
+        elif c.parser.expectContinue and not c.sent100 and not c.rs.responded:
           # Buffered route: the loop must receive the whole body to dispatch, so
           # prompt an Expect: 100-continue client to send it (buffering is the
           # read).
@@ -746,9 +746,9 @@ proc processInput(loop: Loop, c: ptr Connection) =
       # A whole streaming request that arrived in one read never hit the
       # prNeedMore path, so try to dispatch it here (startStreamingDispatch
       # evaluates the predicate and sets reqStreaming only for a stream route).
-      if not c.reqStreaming and hasStreamRoute(addr loop.core):
+      if not c.rs.reqStreaming and hasStreamRoute(addr loop.core):
         loop.startStreamingDispatch(c)
-      if c.reqStreaming:
+      if c.rs.reqStreaming:
         # Streaming handler already ran (early or just now): deliver the tail.
         loop.feedBody(c, last = true)
       else:
@@ -757,16 +757,16 @@ proc processInput(loop: Loop, c: ptr Connection) =
           {.gcsafe.}:
             loop.callHandler(req, response(req))
         except CatchableError:
-          if not c.responded:
+          if not c.rs.responded:
             loop.respondError(c, Http500)
             return
-          if c.respStreaming:
+          if c.rs.respStreaming:
             # Raised after sendHead: the chunked body can't be terminated and
             # the connection can't be reused, so close after flushing the
             # partial response rather than parking it forever (below).
-            c.respStreaming = false
+            c.rs.respStreaming = false
             c.closeAfterFlush = true
-      if not c.responded:
+      if not c.rs.responded:
         # Deferred response (worker pool / adapter); pause until respond.
         c.awaitingResponse = true
         # Backstop a stuck/never-arriving deferred response with responseTimeout
@@ -776,7 +776,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
         if c.pinned == 0 and loop.settings.responseTimeout > 0:
           c.setDeadline(loop, dkResponse)
         return
-      if c.respStreaming:
+      if c.rs.respStreaming:
         # A streaming response is open (sendHead sent, not finished): pause
         # the pipeline until finish() resumes it via kick.
         c.awaitingResponse = true
@@ -807,13 +807,13 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
   elif c.closeAfterFlush:
     c.state = csClosing
     loop.flushOut(c)
-  elif c.respStreaming:
+  elif c.rs.respStreaming:
     # The response was left mid-stream: a handler (or its async future) failed
     # or completed without calling finish(). The chunked body was never
     # terminated, so the connection cannot be safely reused -- reusing it would
     # let the next response's bytes be read as chunk data of this one (response
     # desync). Flush whatever is buffered and close instead of resetting.
-    c.respStreaming = false
+    c.rs.respStreaming = false
     c.state = csClosing
     loop.flushOut(c)
   else:
@@ -837,7 +837,7 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
       return                     # h3 responses flush inside h3Respond
     let c = conn(addr loop.core, fd, gen)
     if c == nil: return
-    if stream == 0 and not (c.awaitingResponse and c.responded):
+    if stream == 0 and not (c.awaitingResponse and c.rs.responded):
       return                     # nothing deferred is pending
     loop.resumeAfterRespond(c, stream)
 
@@ -907,7 +907,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           # (backpressure) and are consumed once the worker unpins. The current
           # request is already fully buffered; only the next pipelined one waits.
           break
-        if c.reqStreaming and c.onBodyCb != nil and
+        if c.rs.reqStreaming and c.rs.onBodyCb != nil and
             c.rbuf.len >= streamRecvBufferCap:
           # Streaming request body at the ceiling: feed the buffered bytes to
           # onBody and drop them (feedBody compacts rbuf) instead of doubling
@@ -967,7 +967,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
   loop.processInput(c)
   if c.state != csFree and (c.pendingOut > 0 or c.closeAfterFlush):
     loop.flushOut(c)
-  if c.peerHalfClosed and c.state == csActive and not c.respStreaming:
+  if c.peerHalfClosed and c.state == csActive and not c.rs.respStreaming:
     # The peer will send no more requests: close once any response has been
     # written (the deferred/worker case sets closeAfterFlush and closes when
     # the response arrives). A streaming response is exempt -- the client may
@@ -1399,7 +1399,7 @@ proc sweepTimeouts(loop: Loop) =
       continue
     if c.dlKind == dkWsPing:
       loop.sweepWsPing(c)          # idle: ping, then wait for the pong
-    elif c.dlKind == dkResponse and not c.responded and c.pinned == 0:
+    elif c.dlKind == dkResponse and not c.rs.responded and c.pinned == 0:
       # A deferred/async response never arrived within responseTimeout: answer
       # 503 and close instead of hanging. A late response arriving afterward is
       # dropped by the generation check on the (by then torn-down) connection.

@@ -259,7 +259,7 @@ proc wsAccept*(core: ptr LoopCore, c: ptr Connection, clientKey: string,
     c.wbuf.add ext
     c.wbuf.add "\r\n"
   c.wbuf.add "\r\n"
-  c.responded = true
+  c.rs.responded = true
   c.ws = w
   # Drop the consumed HTTP request bytes so the frame pump starts at the
   # first WebSocket byte (any the client pipelined after the upgrade).

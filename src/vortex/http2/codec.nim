@@ -3,7 +3,7 @@
 ## One H2Conn per connection, touched only by the owning loop thread
 ## (workers respond through the protocol-neutral outbox).
 
-import std/[tables, strutils, uri, json, deques]
+import std/[tables, strutils, json, deques]
 import ./frames, ./hpack
 import ../connection
 import ../fieldrules   # token delimiters + pseudo-header machine shared with
@@ -21,28 +21,16 @@ type
                                      ## stream's receive window (we enforce it)
     endStreamSeen*: bool             ## client half-closed
     dispatched*: bool
-    responded*: bool
     isHead*: bool
     headersDone*: bool
     contentLength*: int64            ## -1 unknown; validated vs body
-    urlCached*: bool                 ## lazy per-request caches
-    queryCached*: bool
-    jsonCached*: bool
-    cachedUrl*: Uri
-    cachedQuery*: Table[string, string]
-    cachedJson*: JsonNode
-    pathParams*: PathParams          ## written by the router at match time
+    rs*: RequestState                ## per-request state shared with h1/h3
+                                     ## (responded, lazy caches, pathParams,
+                                     ## streaming flags/callbacks)
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool
-    streaming*: bool                 ## res.sendHead opened a streamed body
-    respComp*: RootRef               ## streaming compressor (Gzip/BrotliStream);
-                                     ## =destroy frees it on streams.del
-    respEnc*: string                 ## "gzip"/"br" for respComp
     respBackedUp*: bool              ## write() hit the window; onDrain pending
-    onRespDrain*: RespDrainCb        ## streamed-response drain callback
-    streamingReq*: bool              ## router.stream route: dispatch on headers
-    onBodyCb*: BodyCb                ## inbound streaming sink (req.onBody)
     bodyManualAck*: bool             ## defer stream WINDOW_UPDATE to req.ackBody
     isWsConnect*: bool               ## RFC 8441 Extended CONNECT websocket
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
@@ -213,9 +201,9 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
     if h2.streams[sid].ws != nil:               # WebSocket aborted: onClose
       wsStreamClosed(h2.core, c, WsConn(h2.streams[sid].ws))
       h2.streams[sid].ws = nil
-    if h2.streams[sid].onBodyCb != nil:         # streaming request aborted: EOF
-      let cb = h2.streams[sid].onBodyCb
-      h2.streams[sid].onBodyCb = nil
+    if h2.streams[sid].rs.onBodyCb != nil:         # streaming request aborted: EOF
+      let cb = h2.streams[sid].rs.onBodyCb
+      h2.streams[sid].rs.onBodyCb = nil
       var empty: string
       try: cb(toOpenArray(empty, 0, -1), true)
       except CatchableError: discard
@@ -375,17 +363,17 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
   var resumable: seq[uint32]
   for sid in h2.streams.keys:
     template st: H2Stream = h2.streams[sid]
-    if st.respBackedUp and st.onRespDrain != nil and
+    if st.respBackedUp and st.rs.onRespDrain != nil and
        st.pendingBody.len - st.pendingPos < respHighWater:
       resumable.add sid
   for sid in resumable:
     if pendingOut(c) >= respHighWater: break
     if sid notin h2.streams: continue
     template st: H2Stream = h2.streams[sid]
-    if not st.respBackedUp or st.onRespDrain == nil: continue
+    if not st.respBackedUp or st.rs.onRespDrain == nil: continue
     st.respBackedUp = false
-    let cb = st.onRespDrain
-    st.onRespDrain = nil            # fire once; the producer re-registers if it
+    let cb = st.rs.onRespDrain
+    st.rs.onRespDrain = nil            # fire once; the producer re-registers if it
     # backs up again (res.write -> enqueue+schedule). Contain a raising producer
     # so the effect stays `raises: []`: the scheduler is reachable from a
     # strict-effect async handler (res.send -> h2Respond -> h2Schedule).
@@ -511,10 +499,10 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
   ## Send a streamed response's HEADERS (no content-length, no END_STREAM) and
   ## open the body. Subsequent bytes flow via h2StreamWrite/h2StreamFinish.
   let h2 = h2Conn(c)
-  if sid notin h2.streams or h2.streams[sid].responded: return
+  if sid notin h2.streams or h2.streams[sid].rs.responded: return
   template st: H2Stream = h2.streams[sid]
-  st.responded = true
-  st.streaming = true
+  st.rs.responded = true
+  st.rs.respStreaming = true
   if st.isHead:
     st.pendingIsLast = true            # HEAD: headers only, close the stream
   var hb = ""
@@ -549,7 +537,7 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   ## Append a body chunk to a streamed response and push it bounded by flow
   ## control. Returns the unsent backlog (pending body bytes) for backpressure.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
     return 0
   template st: H2Stream = h2.streams[sid]
   if st.isHead: return 0
@@ -571,11 +559,11 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   ## DATA frame carries END_STREAM (or, when `trailers` are given, a trailing
   ## HEADERS frame does), then push.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
     return
   template st: H2Stream = h2.streams[sid]
-  st.streaming = false
-  st.onRespDrain = nil
+  st.rs.respStreaming = false
+  st.rs.onRespDrain = nil
   st.respBackedUp = false          # finished: never let a drain path resume it
   if st.isHead:
     return                               # HEAD stream already closed at head
@@ -602,10 +590,10 @@ proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
   ## sees the transfer was cut short, not cleanly completed. No-op unless the
   ## stream is an open streamed response.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streaming:
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
     return
-  h2.streams[sid].streaming = false
-  h2.streams[sid].onRespDrain = nil
+  h2.streams[sid].rs.respStreaming = false
+  h2.streams[sid].rs.onRespDrain = nil
   h2.streamError(c, sid, errInternal)
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
@@ -640,9 +628,9 @@ proc h2NotifyClosed*(c: ptr Connection) =
   let h2 = H2Conn(c.h2)
   var empty: string
   for sid, st in h2.streams.mpairs:
-    if st.onBodyCb != nil:
-      let cb = st.onBodyCb
-      st.onBodyCb = nil
+    if st.rs.onBodyCb != nil:
+      let cb = st.rs.onBodyCb
+      st.rs.onBodyCb = nil
       try: cb(toOpenArray(empty, 0, -1), true)
       except CatchableError: discard
 
@@ -656,8 +644,8 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
   let h2 = h2Conn(c)
   if sid notin h2.streams: return false
   template st: H2Stream = h2.streams[sid]
-  if not st.isWsConnect or st.responded or st.ws != nil: return false
-  st.responded = true
+  if not st.isWsConnect or st.rs.responded or st.ws != nil: return false
+  st.rs.responded = true
   let (w, proto, ext) = wsSetup(h2.core, c.fd, c.gen, maxMessage, sid,
                                 extensionsOffer, protocolsOffer,
                                 serverProtocols)
@@ -696,8 +684,8 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
                 body: openArray[char], altSvc = "") =
   let h2 = h2Conn(c)
   if sid notin h2.streams: return
-  if h2.streams[sid].responded: return
-  h2.streams[sid].responded = true
+  if h2.streams[sid].rs.responded: return
+  h2.streams[sid].rs.responded = true
   let skipBody = h2.streams[sid].isHead
   let bodiless = bodilessStatus(code)
   var hb = ""
@@ -747,7 +735,7 @@ proc h2SendInformational*(c: ptr Connection, code: int, sid: uint32,
   ## `code` is not 1xx, or the stream is gone / already finally answered.
   if code < 100 or code > 199: return
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or h2.streams[sid].responded: return
+  if h2 == nil or sid notin h2.streams or h2.streams[sid].rs.responded: return
   var hb = ""
   encodeStatus(hb, code)
   for (name, val) in headers:
@@ -798,12 +786,12 @@ proc h2DeliverBody(h2: H2Conn, c: ptr Connection, sid: uint32, last: bool) =
   ## req.ackBody so a slow consumer throttles the peer.
   if sid notin h2.streams: return
   template st: H2Stream = h2.streams[sid]
-  if st.onBodyCb == nil: return
+  if st.rs.onBodyCb == nil: return
   if st.body.len > 0 or last:
     # The callback may res.send (deleting this stream from the table), so move
     # the buffer out and clear it *before* the call, and touch nothing on `st`
     # afterwards.
-    let cb = st.onBodyCb
+    let cb = st.rs.onBodyCb
     let manualAck = st.bodyManualAck
     var buf: string
     swap(buf, st.body)
@@ -821,7 +809,7 @@ proc h2AckBody*(c: ptr Connection, sid: uint32, n: int) =
   ## for a streaming body the connection window is credited on consumption (not
   ## receipt), so it caps total un-consumed upload buffer across all streams.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].streamingReq:
+  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.reqStreaming:
     return
   h2.creditStream(c, sid, n)
   h2.creditConn(c, n)
@@ -833,7 +821,7 @@ proc h2SetOnBody*(c: ptr Connection, sid: uint32, cb: BodyCb,
   ## already half-closed).
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams: return
-  h2.streams[sid].onBodyCb = cb
+  h2.streams[sid].rs.onBodyCb = cb
   h2.streams[sid].bodyManualAck = manualAck
   h2DeliverBody(h2, c, sid, h2.streams[sid].endStreamSeen)
 
@@ -864,7 +852,7 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
         return
       st.trailers.add (name, val)
     st.endStreamSeen = true
-    if st.streamingReq and st.dispatched:
+    if st.rs.reqStreaming and st.dispatched:
       # A streaming route consumed the DATA via onBody as it arrived; the
       # trailers carry no body, but the sink still needs its terminating
       # last=true callback (otherwise the handler hangs and the stream leaks).
@@ -932,12 +920,12 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       st.endStreamSeen = true
     if not st.isWsConnect and hasStreamRoute(h2.core) and
         callStreamRoute(h2.core, c.fd, c.gen, sid):
-      st.streamingReq = true          # dispatch on headers; DATA -> onBody
+      st.rs.reqStreaming = true          # dispatch on headers; DATA -> onBody
   if st.isWsConnect and not st.dispatched:
     # Dispatch as soon as the headers are in; DATA becomes WebSocket framing.
     st.dispatched = true
     ready.add sid
-  elif st.streamingReq and not st.dispatched:
+  elif st.rs.reqStreaming and not st.dispatched:
     # Streaming route: run the handler now so it can register req.onBody; the
     # body is delivered as DATA frames arrive.
     st.dispatched = true
@@ -1023,7 +1011,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
           copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
         if (fh.flags and flagEndStream) != 0:
           st.endStreamSeen = true
-      elif st.streamingReq:
+      elif st.rs.reqStreaming:
         # Inbound streaming: hand DATA to onBody and clear (bounded memory);
         # no content-length reconciliation since the body is not retained. The
         # stream AND connection flow-control windows are replenished on consume
@@ -1064,7 +1052,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.creditConn(c, connNow)
       if fh.streamId in h2.streams and
           not h2.streams[fh.streamId].endStreamSeen and
-          not h2.streams[fh.streamId].streamingReq:
+          not h2.streams[fh.streamId].rs.reqStreaming:
         h2.creditStream(c, fh.streamId, fh.length)
 
   of ftHeaders:
