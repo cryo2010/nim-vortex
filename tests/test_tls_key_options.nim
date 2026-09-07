@@ -26,10 +26,14 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "ok")
 
 proc get(port: Port): (string, int) =
-  # -k: self-signed; --http1.1 keeps it simple.
-  let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 https://127.0.0.1:" &
-                          $port & "/")
-  (o.strip(), rc)
+  # -k: self-signed; --http1.1 keeps it simple. The first connect can race
+  # the TLS listener coming up right after start(0), so retry briefly.
+  for attempt in 1 .. 3:
+    let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 https://127.0.0.1:" &
+                            $port & "/")
+    result = (o.strip(), rc)
+    if rc == 0 and result[0].len > 0: return
+    sleep(150)
 
 suite "TLS key options":
   test "in-memory cert + key (certPem/keyPem)":
