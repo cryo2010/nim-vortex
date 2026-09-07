@@ -70,7 +70,6 @@ client).
 | `test_http1_parser.nim` | HTTP/1.1 request-line and header parsing |
 | `test_http1_codec.nim` | HTTP/1.1 response framing |
 | `test_hpack.nim` | HPACK decoding against RFC 7541 Appendix C vectors |
-| `test_qpack_dyn.nim` | QPACK dynamic table (RFC 9204 3.2): insertion, byte-size eviction, capacity |
 | `test_http3_connect.nim` | HTTP/3 Extended CONNECT header classifier (RFC 9220), without a live QUIC stream |
 
 ### HTTP/1.1
@@ -87,6 +86,9 @@ client).
 |------|----------|
 | `test_http2.nim` | HTTP/2 integration (h2c prior knowledge, via curl) |
 | `test_http2_flowcontrol.nim` | Flow-control regression for h2spec 6.9.2 (SETTINGS_INITIAL_WINDOW_SIZE change) |
+| `test_http2_malformed.nim` | Malformed HEADERS answered with RST_STREAM(PROTOCOL_ERROR): bad/duplicate Content-Length (RFC 9113 8.1.1), NUL/CR/LF in field names/values (8.2.1) |
+| `test_http2_priority.nim` | RFC 9218 prioritization: urgency ordering, incremental interleaving, PRIORITY_UPDATE, `res.setPriority` override |
+| `test_connect_disconnect.nim` | Half-open stream closed by the read-idle deadline (slowloris, #201); two-step GOAWAY on graceful shutdown (RFC 9113 6.8, #208) |
 | `test_http2_websocket.nim` | HTTP/2 Extended CONNECT WebSockets (RFC 8441), frame level |
 
 ### HTTP/3
@@ -122,6 +124,7 @@ client).
 | `test_tls_polish.nim` | Wildcard SNI, max TLS version cap, OCSP stapling |
 | `test_tls_reload.nim` | Certificate hot-reload for new h1/h2 connections (`reloadTls`) |
 | `test_tls_reload_h3.nim` | Certificate hot-reload for HTTP/3 (QUIC), cross-thread reload signal |
+| `test_tls_h3_material.nim` | TLS key/cert material matrix (files, in-memory PEM, encrypted keys) actually reaching the HTTP/3 (QUIC) engine, not just h1 |
 | `test_tls_helpers.nim` | TLS deployment helpers: `res.redirect`, `req.isSecure` (SEC5) |
 
 ### Routing, adapters & core API
@@ -129,7 +132,26 @@ client).
 | Test | Verifies |
 |------|----------|
 | `test_router.nim` | Router matching, path params, per-method dispatch, 404/405 |
+| `test_router_features.nim` | Automatic OPTIONS (Allow header), duplicate-route detection at registration, an explicit OPTIONS handler wins |
+| `test_router_middleware.nim` | `router.use` middleware: ordering/nesting, short-circuit, wraps unmatched (404) routes too |
+| `test_router_mount.nim` | Mounting a child router under a path prefix: `:params` carry over, child middleware scoped to its routes |
+| `test_router_race.nim` | Concurrent route-trie traversal against a multi-threaded server (the race itself only shows under `nimble testrace` / TSan) |
+| `test_app_entry.nim` | `newVortex()` app entry: routes on the app, `start`/`serve` wire the streaming predicate |
 | `test_adapter.nim` | asyncdispatch async-handler adapter |
+| `test_cors.nim` | CORS middleware: Access-Control-* on cross-origin requests, preflight answered with 204, origin allowlist rejects others |
+
+### Request & response API
+
+| Test | Verifies |
+|------|----------|
+| `test_cookies.nim` | Cookie round-trip (`req.cookies` / `Set-Cookie` building) over h1, h2 and h3, incl. recombining split `cookie` fields (RFC 7540 8.1.2.5 / RFC 9114 4.2.1) |
+| `test_signed_cookies.nim` | HMAC-signed cookies (`setSignedCookie` / `cookies.signed`): SHA-256/-1/-512; tamper, wrong secret or wrong algo yield none |
+| `test_json.nim` | `req.json` (lazy-parsed + cached, empty body -> `{}`, raises on malformed) and `res.send(json)` |
+| `test_content.nim` | `req.form` (application/x-www-form-urlencoded) and content negotiation (`req.accepts` / `acceptsLanguage`) |
+| `test_multipart.nim` | multipart/form-data (RFC 7578): pure parser plus `req.form` / `req.files` end-to-end with a real curl `-F` upload |
+| `test_response_headers.nim` | `res.headers` pending headers (middleware/handler) merged into the eventual send; the send call's headers win per name |
+| `test_early_hints.nim` | 103 Early Hints (`res.earlyHints` / `res.informational`) before the final response, over HTTP/1.1 and HTTP/2 |
+| `test_trailers.nim` | Request trailers (`req.trailers`) over h1 chunked framing and an h2 trailing HEADERS frame (response side: `test_streaming.nim`) |
 
 ### Streaming & static files
 
@@ -141,15 +163,20 @@ client).
 | `test_streaming_read.nim` | Pull-based request-body streaming (asyncdispatch adapter) |
 | `test_streaming_drain.nim` | Awaitable outbound backpressure (producer yields on a full buffer) |
 | `test_static_files.nim` | Static file serving (`res.sendFile`): status/headers/body over raw sockets |
+| `test_serve_content.nim` | `serveContent` + `conditional.nim`: conditional GET (304), write preconditions (412), byte ranges (206 / multipart/byteranges / 416) |
 
 ### Server lifecycle & concurrency
 
 | Test | Verifies |
 |------|----------|
 | `test_blocking.nim` | Worker pool / `req.blocking:` escape hatch |
+| `test_blocking_args.nim` | `req.blocking(a, b, ...)`: values moved into the worker, usable by name in the block (the refcount race only shows under `nimble testrace` / TSan) |
+| `test_blocking_guard.nim` | Compile-time guard on `req.blocking` captures: value data allowed, ref/ptr/closure rejected, `isolate(...)` may cross |
+| `test_blocking_pool.nim` | Worker-pool load shedding: a saturated pool answers 503 (`maxBlockingQueue`); `close()` detaches a wedged worker after `shutdownHardTimeout` (#204) |
 | `test_graceful_shutdown.nim` | `requestShutdown()` drains in-flight requests, frees the port |
 | `test_multi_server.nim` | Multiple `Server` instances in one process are independent |
 | `test_remote_address.nim` | `req.remoteAddress` (peer IP) and `req.forwardedFor` (SEC1) |
+| `test_forwarded.nim` | X-Forwarded-Proto/-Host/-For and RFC 7239 Forwarded believed only from `settings.trustedProxies`, ignored otherwise (fail-safe) |
 | `test_proxy_protocol.nim` | PROXY protocol v1/v2 parsing + trust gating; overrides `req.remoteAddress` (SEC1) |
 
 ### Security
@@ -163,12 +190,13 @@ client).
 | `test_ratelimit.nim` | Per-client token-bucket rate limiting (SEC3, OWASP API4:2023) |
 
 > The compression tests (`test_compression`, `test_streaming_compression`,
-> `test_request_decompression`, `test_zstd_compression`) and `test_thread_race`
-> match the default `tests/t*` glob but only carry weight with the right build:
-> the compression tests skip without their `-d:http*` flags (CI's `NIM_COMPRESS=1`
-> supplies them; a plain local `nimble test` skips them), and `test_thread_race`
-> only detects the race under ThreadSanitizer. All have dedicated tasks too (see
-> [Opt-in feature tests](#opt-in-feature-tests)).
+> `test_request_decompression`, `test_zstd_compression`) and the TSan suites
+> `test_thread_race` and `test_blocking_race` match the default `tests/test_*.nim`
+> glob but only carry weight with the right build: the compression tests skip
+> without their `-d:http*` flags (CI's `NIM_COMPRESS=1` supplies them; a plain
+> local `nimble test` skips them), and `test_thread_race` / `test_blocking_race`
+> only detect their races under ThreadSanitizer. All have dedicated tasks too
+> (see [Opt-in feature tests](#opt-in-feature-tests)).
 
 ---
 
@@ -183,7 +211,7 @@ Separate `nimble` tasks because they need a build flag or an extra dependency.
 | `nimble testreqdecomp` | **yes** (`testreqdecomp`) | Inbound request-body decompression (`settings.decompressRequest`): gzip/br bodies decoded into `req.body` over h1 + h2c, a decompression bomb rejected with 413, a corrupt body with 400. |
 | `nimble testzstd` | **yes** (`testzstd`) | Zstd response compression, buffered + streamed over HTTP/1.1 and h2c, plus br/zstd/gzip Accept-Encoding negotiation (q-values + tie-break); byte-exact round-trip via the zstd/brotli/gzip CLIs. |
 | `nimble testdeflate` | **yes** (`testdeflate`) | WebSocket permessage-deflate (RFC 7692, `-d:wsDeflate`, links zlib) over a live server, plus the h2 (RFC 8441) deflate case. |
-| `nimble testrace` | **yes** (`testrace`) | Two ThreadSanitizer regressions: (1) the handler/stream-route closure refcount race across loop threads at `start()`/shutdown; (2) C3/IMP2 -- a `req.blocking:` worker reading a request snapshot rather than live h2 state, under concurrent h2c blocking requests. TSan aborts on any data race. |
+| `nimble testrace` | **yes** (`testrace`) | Four ThreadSanitizer regression suites: `test_thread_race` (the handler/stream-route closure refcount race across loop threads at `start()`/shutdown), `test_blocking_race` (C3/IMP2 -- a `req.blocking:` worker reading a request snapshot rather than live h2 state, under concurrent h2c blocking requests), `test_blocking_args` (the `req.blocking(a, b, ...)` box refcount touched on one thread only), and `test_router_race` (concurrent route-trie traversal on a multi-threaded server). TSan aborts on any data race. |
 | `nimble testchronos` | **yes** (`testchronos`) | The chronos async adapter (`chronos_adapter.nim`); chronos is opt-in so it is kept out of the default suite. |
 
 ---
@@ -292,7 +320,7 @@ is now the per-workload soaks above.) See `conformance/stress/README.md`.
 
 | Task | CI | Verifies |
 |------|----|----------|
-| `nimble fuzz` | **yes** (`fuzz`) | libFuzzer targets over the HTTP/1.1 parser and the HPACK / QPACK decoders (30s per target in CI); a crash writes a reproducer and exits non-zero. |
+| `nimble fuzz` | **yes** (`fuzz`) | libFuzzer targets over the HTTP/1.1 parser, the HPACK decoder and the WebSocket permessage-deflate path (30s per target in CI); a crash writes a reproducer and exits non-zero. |
 
 ---
 
