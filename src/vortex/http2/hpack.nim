@@ -4,6 +4,7 @@
 ## and keeps response serialization allocation-light; dynamic-table
 ## encoding is a post-1.0 optimization.
 
+import std/deques
 import ./hpack_tables
 
 type
@@ -13,7 +14,7 @@ type
     name, value: string
 
   HpackDecoder* = object
-    entries: seq[DynEntry]    ## newest first; bounded by maxSize/32
+    entries: Deque[DynEntry]  ## newest first; bounded by maxSize/32
     size: int                 ## RFC size: sum(name+value+32)
     maxSize*: int             ## current limit (after size-update instr.)
     settingsMax*: int         ## cap we advertised via SETTINGS
@@ -121,13 +122,13 @@ proc decodeString(buf: openArray[char], pos: var int, endPos: int,
 
 proc evict(d: var HpackDecoder) =
   while d.size > d.maxSize and d.entries.len > 0:
-    let last = d.entries.pop()
+    let last = d.entries.popLast()
     d.size -= last.name.len + last.value.len + 32
 
 proc addEntry(d: var HpackDecoder, name, value: string) =
   let esz = name.len + value.len + 32
   d.size += esz
-  d.entries.insert(DynEntry(name: name, value: value), 0)
+  d.entries.addFirst DynEntry(name: name, value: value)
   d.evict()
 
 proc lookup(d: HpackDecoder, idx: int): (string, string) =
@@ -215,10 +216,74 @@ proc encodeRawString(buf: var string, s: string) =
   buf.add s
 
 proc staticIndexOf(name: string): int =
-  ## First static entry with this (lowercase) name, 0 if none.
+  ## First static entry with this (lowercase) name, 0 if none. A string
+  ## `case` compiles to hash-based dispatch, so this is O(1) per header
+  ## (vs scanning hpackStaticTable); verified against the table below.
+  case name
+  of ":authority": 1
+  of ":method": 2
+  of ":path": 4
+  of ":scheme": 6
+  of ":status": 8
+  of "accept-charset": 15
+  of "accept-encoding": 16
+  of "accept-language": 17
+  of "accept-ranges": 18
+  of "accept": 19
+  of "access-control-allow-origin": 20
+  of "age": 21
+  of "allow": 22
+  of "authorization": 23
+  of "cache-control": 24
+  of "content-disposition": 25
+  of "content-encoding": 26
+  of "content-language": 27
+  of "content-length": 28
+  of "content-location": 29
+  of "content-range": 30
+  of "content-type": 31
+  of "cookie": 32
+  of "date": 33
+  of "etag": 34
+  of "expect": 35
+  of "expires": 36
+  of "from": 37
+  of "host": 38
+  of "if-match": 39
+  of "if-modified-since": 40
+  of "if-none-match": 41
+  of "if-range": 42
+  of "if-unmodified-since": 43
+  of "last-modified": 44
+  of "link": 45
+  of "location": 46
+  of "max-forwards": 47
+  of "proxy-authenticate": 48
+  of "proxy-authorization": 49
+  of "range": 50
+  of "referer": 51
+  of "refresh": 52
+  of "retry-after": 53
+  of "server": 54
+  of "set-cookie": 55
+  of "strict-transport-security": 56
+  of "transfer-encoding": 57
+  of "user-agent": 58
+  of "vary": 59
+  of "via": 60
+  of "www-authenticate": 61
+  else: 0
+
+static:
+  # Prove the case statement matches a first-match linear scan of the table.
   for i in 1 .. 61:
-    if hpackStaticTable[i][0] == name: return i
-  0
+    var first = 0
+    for j in 1 .. i:
+      if hpackStaticTable[j][0] == hpackStaticTable[i][0]:
+        first = j
+        break
+    doAssert staticIndexOf(hpackStaticTable[i][0]) == first,
+      "staticIndexOf mismatch for " & hpackStaticTable[i][0]
 
 proc encodeStatus*(buf: var string, status: int) =
   ## :status via full static index when possible.
