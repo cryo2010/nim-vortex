@@ -58,11 +58,13 @@ nim c --mm:orc --threads:on -d:plainHttp -o:/tmp/vortex_plain src/vortex.nim
 
 ### chronos adapter test
 
-The chronos async adapter has its own suite, kept out of `nimble test`
-because chronos is an opt-in dependency rather than a vortex requirement:
+The async-adapter suite (`tests/test_adapter.nim`) runs against asyncdispatch
+in `nimble test`; the same file rebuilt with `-d:vortexChronos` tests the
+chronos backend, kept out of `nimble test` because chronos is an opt-in
+dependency rather than a vortex requirement:
 
 ```sh
-nimble testchronos      # installs chronos, then runs tests/chronos_adapter.nim
+nimble testchronos      # installs chronos, then runs tests/test_adapter.nim -d:vortexChronos
 ```
 
 ### Manual tests

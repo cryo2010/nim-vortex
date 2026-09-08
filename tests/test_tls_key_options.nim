@@ -3,24 +3,18 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import ./helper
 
 when defined(plainHttp):
   echo "SKIP: -d:plainHttp has no TLS"
   quit 0
-let curlBin = findExe("curl")
-if curlBin.len == 0:
-  echo "SKIP: no curl"
-  quit 0
+let curlBin = requireCurl()
 
-let dir = getTempDir() / "vortex_tlskey_" & $getCurrentProcessId()
-removeDir(dir); createDir(dir)
-let cert = dir / "cert.pem"
-let key = dir / "key.pem"          # unencrypted
+let (cert, key) = makeCertPair("vortex_tlskey_")   # key.pem is unencrypted
+let dir = cert.parentDir
 let enckey = dir / "enc.pem"       # same key, AES-encrypted with a passphrase
 const pass = "s3cr3t-pass"
 
-check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
-  key & " -out " & cert & " -days 2 -subj /CN=localhost")[1] == 0
 check execCmdEx("openssl rsa -in " & key & " -aes256 -out " & enckey &
   " -passout pass:" & pass)[1] == 0
 
@@ -32,10 +26,14 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "ok")
 
 proc get(port: Port): (string, int) =
-  # -k: self-signed; --http1.1 keeps it simple.
-  let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 https://127.0.0.1:" &
-                          $port & "/")
-  (o.strip(), rc)
+  # -k: self-signed; --http1.1 keeps it simple. The first connect can race
+  # the TLS listener coming up right after start(0), so retry briefly.
+  for attempt in 1 .. 3:
+    let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 https://127.0.0.1:" &
+                            $port & "/")
+    result = (o.strip(), rc)
+    if rc == 0 and result[0].len > 0: return
+    sleep(150)
 
 suite "TLS key options":
   test "in-memory cert + key (certPem/keyPem)":

@@ -95,24 +95,41 @@ proc isAlive*(req: Request): bool =
   if req.stream == 0: true
   else: h2StreamAlive(c, req.stream)
 
+proc reqStateOf(core: ptr LoopCore, fd: int32, gen: uint32,
+                stream: uint32): ptr RequestState =
+  ## Resolve a handle's shared per-request state (connection.RequestState) by
+  ## discriminating the carrier once: the H3Stream (fd < 0 is an h3 slot), the
+  ## H2Stream (stream != 0), or the Connection itself (HTTP/1). nil for a stale
+  ## handle. Loop-thread only; callers on the worker path must consult req.snap
+  ## first (a snapshot request never reads live loop memory).
+  if fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(core, fd, gen)
+      if h3c != nil:
+        let st = h3StreamPtr(h3c, uint64(stream))
+        if st != nil: return addr st.rs
+    return nil
+  let c = conn(core, fd, gen)
+  if c == nil: return nil
+  if stream != 0:
+    let st = h2Stream(c, stream)
+    if st == nil: return nil
+    return addr st.rs
+  addr c.rs
+
+template reqState(req: Request): ptr RequestState =
+  reqStateOf(req.core, req.fd, req.gen, req.stream)
+
+template reqState(res: Response): ptr RequestState =
+  reqStateOf(res.core, res.fd, res.gen, res.stream)
+
 proc responded*(res: Response): bool =
   ## True once a response has been sent (or a streamed response started) for this
   ## request, on any protocol. Used by the async `req.stream` sugar to auto-ack
   ## with 200 only when the handler hasn't answered itself. A dead connection
   ## reads as `true` (nothing left to answer).
-  if res.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(res.core, res.fd, res.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(res.stream))
-        if st != nil: return st.responded
-    return true
-  let c = conn(res.core, res.fd, res.gen)
-  if c == nil: return true
-  if res.stream != 0:
-    let st = h2Stream(c, res.stream)
-    return st == nil or st.responded
-  c.responded
+  let rs = reqState(res)
+  rs == nil or rs.responded
 
 when not defined(plainHttp):
   template withH3(req: Request, st, body: untyped) =
@@ -224,17 +241,17 @@ iterator items*(h: RequestHeaders): (string, string) =
   if req.snap != nil:
     for (n, v) in req.snap.headers:
       if n.len > 0 and n[0] != ':': yield (n, v)
+  elif req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        let st = h3StreamPtr(h3c, uint64(req.stream))
+        if st != nil:
+          for (n, v) in st.headers:
+            if n.len > 0 and n[0] != ':':
+              yield (n, v)
   else:
-    if req.fd < 0:
-      when not defined(plainHttp):
-        let h3c = h3ConnOf(req.core, req.fd, req.gen)
-        if h3c != nil:
-          let st = h3StreamPtr(h3c, uint64(req.stream))
-          if st != nil:
-            for (n, v) in st.headers:
-              if n.len > 0 and n[0] != ':':
-                yield (n, v)
-    let c = if req.fd < 0: nil else: conn(req.core, req.fd, req.gen)
+    let c = conn(req.core, req.fd, req.gen)
     if c != nil:
       if req.stream != 0:
         let st = h2Stream(c, req.stream)
@@ -248,6 +265,16 @@ iterator items*(h: RequestHeaders): (string, string) =
                                int(hs.nameStart + hs.nameLen) - 1),
                  c.rbuf.substr(int(hs.valStart),
                                int(hs.valStart + hs.valLen) - 1))
+
+proc h1NameMatches(c: ptr Connection, hs: HeaderSlice,
+                   name: string): bool {.inline.} =
+  ## Case-insensitive compare of an HTTP/1 header name (a slice of the read
+  ## buffer) against `name`, without allocating. Shared by header/contains.
+  if int(hs.nameLen) != name.len: return false
+  for i in 0 ..< name.len:
+    if lowerA(c.rbuf[int(hs.nameStart) + i]) != lowerA(name[i]):
+      return false
+  true
 
 proc header*(req: Request, name: string): string =
   ## Case-insensitive single-header lookup; "" when absent.
@@ -264,15 +291,9 @@ proc header*(req: Request, name: string): string =
     if req.stream != 0:
       return h2Field(c, req.stream, name.toLowerAscii)
     for h in c.parser.headers:
-      if int(h.nameLen) == name.len:
-        var match = true
-        for i in 0 ..< name.len:
-          if lowerA(c.rbuf[int(h.nameStart) + i]) != lowerA(name[i]):
-            match = false
-            break
-        if match:
-          return c.rbuf.substr(int(h.valStart),
-                               int(h.valStart + h.valLen) - 1)
+      if h1NameMatches(c, h, name):
+        return c.rbuf.substr(int(h.valStart),
+                             int(h.valStart + h.valLen) - 1)
 
 proc headers*(req: Request): RequestHeaders {.inline.} =
   ## A read-only, case-insensitive view of the request headers, matching the
@@ -310,12 +331,7 @@ proc contains*(h: RequestHeaders, name: string): bool =
     let st = h2Stream(c, req.stream)
     return st != nil and scanSeq(st.headers)
   for hs in c.parser.headers:                 # HTTP/1: compare against the read buffer
-    if int(hs.nameLen) == name.len:
-      var match = true
-      for i in 0 ..< name.len:
-        if lowerA(c.rbuf[int(hs.nameStart) + i]) != lowerA(name[i]):
-          match = false; break
-      if match: return true
+    if h1NameMatches(c, hs, name): return true
   false
 
 # --- request trailers -------------------------------------------------------
@@ -626,19 +642,9 @@ proc url*(req: Request): Uri =
   ## The request target parsed as a Uri (so `req.url.path` excludes the
   ## query string). Parsed lazily on first access, cached per request.
   if req.snap != nil: return parseUri(req.snap.target)  # no live cache to reuse
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = lazyUrl(st, h3FieldOf(req, ":path"))
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil:
-        result = lazyUrl(st, h2Field(c, req.stream, ":path"))
-    else:
-      result = lazyUrl(c, c.rbuf.substr(int(c.parser.pathStart),
-                       int(c.parser.pathStart + c.parser.pathLen) - 1))
+  let rs = reqState(req)
+  if rs == nil: return
+  lazyUrl(rs[], req.path)
 
 proc query*(req: Request): Table[string, string] =
   ## Decoded query parameters, built lazily on first access and cached
@@ -647,21 +653,9 @@ proc query*(req: Request): Table[string, string] =
   if req.snap != nil:
     for (k, v) in decodeQuery(parseUri(req.snap.target).query): result[k] = v
     return
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = lazyQuery(st, lazyUrl(st, h3FieldOf(req, ":path")).query)
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil:
-        result = lazyQuery(st,
-          lazyUrl(st, h2Field(c, req.stream, ":path")).query)
-    else:
-      result = lazyQuery(c, lazyUrl(c,
-        c.rbuf.substr(int(c.parser.pathStart),
-                      int(c.parser.pathStart + c.parser.pathLen) - 1)).query)
+  let rs = reqState(req)
+  if rs == nil: return
+  lazyQuery(rs[], lazyUrl(rs[], req.path).query)
 
 template lazyJson(store: untyped, raw: string): JsonNode =
   if not store.jsonCached:
@@ -678,17 +672,9 @@ proc json*(req: Request): JsonNode =
   if req.snap != nil:
     return (if req.snap.body.len == 0: newJObject() else: parseJson(req.snap.body))
   let raw = req.body
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = lazyJson(st, raw)
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: result = lazyJson(st, raw)
-    else:
-      result = lazyJson(c, raw)
+  let rs = reqState(req)
+  if rs == nil: return
+  lazyJson(rs[], raw)
 
 proc mediaType*(req: Request): string =
   ## The request's Content-Type media type, lowercased and without parameters
@@ -821,49 +807,22 @@ proc setParams*(req: Request, params: sink PathParams) =
   ## Store route parameters for req.params. Called by the router on the
   ## loop thread at match time; params are computed by matching anyway,
   ## so they are stored eagerly (a move) rather than lazily.
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        st.pathParams = params
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: st.pathParams = params
-    else:
-      c.pathParams = params
+  let rs = reqState(req)
+  if rs != nil: rs.pathParams = params
 
 proc params*(req: Request): PathParams =
   ## Route parameters captured by the router ("/users/:id" etc.); empty
   ## when no router matched. Valid from any thread holding the handle,
   ## same as req.body.
   if req.snap != nil: return req.snap.params
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = st.pathParams
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: result = st.pathParams
-    else:
-      result = c.pathParams
+  let rs = reqState(req)
+  if rs != nil: result = rs.pathParams
 
 proc param*(req: Request, name: string): string =
   ## Single path-parameter lookup; "" when absent.
   if req.snap != nil: return req.snap.params.param(name)
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        return st.pathParams.param(name)
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: return st.pathParams.param(name)
-    else:
-      return c.pathParams.param(name)
+  let rs = reqState(req)
+  if rs != nil: result = rs.pathParams.param(name)
 
 proc httpVersion*(req: Request): int =
   ## 1 for HTTP/1.x, 2 for HTTP/2, 3 for HTTP/3.
@@ -954,8 +913,8 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
       h2Respond(c, code, stream, core.dateStr, core.serverHeader,
                 ct, h, body, core.altSvc)
     else:
-      if c.responded: return
-      c.responded = true
+      if c.rs.responded: return
+      c.rs.responded = true
       appendResponse(c.wbuf, HttpCode(code), core.dateStr, core.serverHeader,
                      ct, body, h,
                      keepAlive = c.parser.keepAlive,
@@ -1167,53 +1126,42 @@ proc sendBody(res: Response, code: HttpCode, body: openArray[char],
         return
   sendRaw(res, code, body, writeCt, headers)
 
-proc send*(res: Response, code: HttpCode, body: openArray[char],
+proc send*(res: Response, code: HttpCode | int, body: openArray[char],
            headers: openArray[(string, string)] = []) =
   ## Queue the response. `Content-Type` defaults to `text/plain` unless a
   ## `Content-Type` is present in `headers` (which then wins). Safe to call once
   ## per request -- from the handler, later (deferred), or from a worker inside
   ## `blocking:` -- and a no-op if the connection is gone. With
   ## `settings.compress` and a compression build, an eligible body is compressed.
-  sendBody(res, code, body, "text/plain", headers)
+  ## Every `send` accepts the status as an `HttpCode` or a plain integer.
+  sendBody(res, HttpCode(code), body, "text/plain", headers)
 
-proc send*(res: Response, code: HttpCode, json: JsonNode,
+proc send*(res: Response, code: HttpCode | int, json: JsonNode,
            headers: openArray[(string, string)] = []) =
   ## Send `json` stringified; `Content-Type` defaults to `application/json`
   ## (a `Content-Type` in `headers` overrides it). Convert a Table/object with
   ## `%`/`%*`: `res.send(Http200, %*{"ok": true})`, `res.send(Http200, %myTable)`.
-  sendBody(res, code, $json, "application/json", headers)
+  sendBody(res, HttpCode(code), $json, "application/json", headers)
 
-proc send*(res: Response, code: HttpCode, body: openArray[char], headers: JsonNode) =
+proc send*(res: Response, code: HttpCode | int, body: openArray[char],
+           headers: JsonNode) =
   ## As `send` above, with headers as a JSON object:
   ## `res.send(Http200, "hi", %*{"X-Trace": "abc"})`.
-  send(res, code, body, toHeaderPairs(headers))
+  send(res, HttpCode(code), body, toHeaderPairs(headers))
 
-proc send*(res: Response, code: HttpCode, json: JsonNode, headers: JsonNode) =
-  send(res, code, json, toHeaderPairs(headers))
+proc send*(res: Response, code: HttpCode | int, json: JsonNode,
+           headers: JsonNode) =
+  send(res, HttpCode(code), json, toHeaderPairs(headers))
 
-proc send*(res: Response, code: HttpCode) =
+proc send*(res: Response, code: HttpCode | int) =
   ## An empty-body response (no Content-Type).
-  sendRaw(res, code, "", "", [])
-
-proc send*(res: Response, code: int, body: openArray[char],
-           headers: openArray[(string, string)] = []) =
-  send(res, HttpCode(code), body, headers)
-
-proc send*(res: Response, code: int, json: JsonNode,
-           headers: openArray[(string, string)] = []) =
-  send(res, HttpCode(code), json, headers)
-
-proc send*(res: Response, code: int, body: openArray[char], headers: JsonNode) =
-  send(res, HttpCode(code), body, headers)
-
-proc send*(res: Response, code: int, json: JsonNode, headers: JsonNode) =
-  send(res, HttpCode(code), json, headers)
+  sendRaw(res, HttpCode(code), "", "", [])
 
 # --- Structured bodies: send any `%`-able value or a named tuple as JSON ------
 # These forward to the JsonNode overload, so `Content-Type` defaults to
 # application/json (a `Content-Type` in `headers` still wins) and compression
 # applies. `string` keeps its own text/plain overload and `JsonNode` its own;
-# both are concrete matches, so they win over these generics.
+# their body parameter is a concrete match, so they win over these generics.
 
 type JsonBody* = (object | ref object | Table | OrderedTable | seq | enum | Option)
   ## Value families std/json's `%` serializes, minus `string` (which has its own
@@ -1236,24 +1184,18 @@ proc tupleToJson[T: tuple](t: T): JsonNode =
     result = newJArray()
     for v in t.fields: result.add toJsonField(v)
 
-proc send*[T: JsonBody](res: Response, code: HttpCode, body: T,
+proc send*[T: JsonBody](res: Response, code: HttpCode | int, body: T,
                         headers: openArray[(string, string)] = []) =
   ## Send any `%`-able value as JSON (`Content-Type` defaults to
   ## `application/json`): `res.send(Http200, user)`, `res.send(Http200, myTable)`,
   ## `res.send(Http200, @[1, 2, 3])`. Tables must be string-keyed.
-  send(res, code, %body, headers)
+  send(res, HttpCode(code), %body, headers)
 
-proc send*[T: JsonBody](res: Response, code: HttpCode, body: T, headers: JsonNode) =
-  send(res, code, %body, headers)
+proc send*[T: JsonBody](res: Response, code: HttpCode | int, body: T,
+                        headers: JsonNode) =
+  send(res, HttpCode(code), %body, toHeaderPairs(headers))
 
-proc send*[T: JsonBody](res: Response, code: int, body: T,
-                        headers: openArray[(string, string)] = []) =
-  send(res, HttpCode(code), body, headers)
-
-proc send*[T: JsonBody](res: Response, code: int, body: T, headers: JsonNode) =
-  send(res, HttpCode(code), body, headers)
-
-proc send*[T: tuple](res: Response, code: HttpCode, body: T,
+proc send*[T: tuple](res: Response, code: HttpCode | int, body: T,
                      headers: openArray[(string, string)] = []) =
   ## Send a named tuple as a JSON object: `res.send(Http200, (ok: true, n: 3))`.
   ## Anonymous tuples are rejected (their array mapping is a footgun) -- use a
@@ -1263,17 +1205,14 @@ proc send*[T: tuple](res: Response, code: HttpCode, body: T,
   when not isNamedTuple(T):
     {.error: "res.send accepts named tuples only (got an anonymous tuple); " &
              "use a named tuple, an object, or %*{...}.".}
-  send(res, code, tupleToJson(body), headers)
+  send(res, HttpCode(code), tupleToJson(body), headers)
 
-proc send*[T: tuple](res: Response, code: HttpCode, body: T, headers: JsonNode) =
-  send(res, code, body, toHeaderPairs(headers))
-
-proc send*[T: tuple](res: Response, code: int, body: T,
-                     headers: openArray[(string, string)] = []) =
-  send(res, HttpCode(code), body, headers)
-
-proc send*[T: tuple](res: Response, code: int, body: T, headers: JsonNode) =
-  send(res, HttpCode(code), body, headers)
+proc send*[T: tuple](res: Response, code: HttpCode | int, body: T,
+                     headers: JsonNode) =
+  when not isNamedTuple(T):
+    {.error: "res.send accepts named tuples only (got an anonymous tuple); " &
+             "use a named tuple, an object, or %*{...}.".}
+  send(res, HttpCode(code), tupleToJson(body), toHeaderPairs(headers))
 
 when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
   proc decodeRequestBody*(req: Request, res: Response): bool =
@@ -1342,7 +1281,7 @@ proc informational*(res: Response, code: HttpCode,
   if res.stream != 0:
     h2SendInformational(c, ci, res.stream, headers)
   else:
-    if c.responded: return
+    if c.rs.responded: return
     var s = "HTTP/1.1 " & $code & "\r\n"
     for (n, v) in headers: s.add n & ": " & v & "\r\n"
     s.add "\r\n"
@@ -1390,8 +1329,6 @@ type CookiePrefix* = enum
   cpNone       ## no prefix
   cpSecure     ## `__Secure-`: forces Secure
   cpHost       ## `__Host-`: forces Secure, Path=/ and no Domain (host-locked)
-
-const cookieDateFmt = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"  # RFC 7231 IMF-fixdate
 
 var mpBoundaryCtr {.threadvar.}: uint64
 
@@ -1481,7 +1418,7 @@ proc setCookie*(name, value: string, maxAge = -1, path = "/", domain = "",
   if p.len > 0: v.add "; Path=" & p
   if dom.len > 0: v.add "; Domain=" & dom
   if maxAge >= 0: v.add "; Max-Age=" & $maxAge
-  if expires.isSome: v.add "; Expires=" & expires.get.utc.format(cookieDateFmt)
+  if expires.isSome: v.add "; Expires=" & expires.get.utc.format(httpDateFmt)
   if sec: v.add "; Secure"
   if httpOnly: v.add "; HttpOnly"
   if sameSite.len > 0: v.add "; SameSite=" & sameSite
@@ -1590,12 +1527,12 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
   if req.stream != 0:
     h2SetOnBody(c, req.stream, cb, manualAck)
     return
-  c.onBodyCb = cb
+  c.rs.onBodyCb = cb
   # HTTP/1 Expect: 100-continue -> send it now that the handler is reading the
   # body (Go's send-on-read model; h2/h3 have no Expect flow). Loop-thread only;
   # a handler that responds before reading never reaches here, so it never
   # prompts the client for the body.
-  if c.parser.expectContinue and not c.sent100 and not c.responded and
+  if c.parser.expectContinue and not c.sent100 and not c.rs.responded and
       currentThreadId() == req.core.threadId:
     c.sent100 = true
     c.wbuf.add continue100
@@ -1613,6 +1550,10 @@ proc ackBody*(req: Request, n: int) =
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
       if h3c != nil:
         h3AckBody(h3c, uint64(req.stream), n)
+        # No flush needed here (unlike the h2 path below): flushHook resolves an
+        # fd-backed Connection, which an h3 handle (fd < 0) never is, and the
+        # MAX_(STREAM_)DATA frames vqStreamConsume produces go out on the QUIC
+        # engine pump this same loop iteration.
     return
   let c = conn(req.core, req.fd, req.gen)
   if c == nil or req.stream == 0: return
@@ -1704,12 +1645,12 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
         if enc.len > 0:
           let st = h2Stream(c, res.stream)
           if st != nil and not st.isHead:
-            st.respComp = makeStreamComp(enc)
-            st.respEnc = enc
+            st.rs.respComp = makeStreamComp(enc)
+            st.rs.respEnc = enc
       flushConn(res)
       return
-    if c.responded: return
-    c.responded = true
+    if c.rs.responded: return
+    c.rs.responded = true
     if c.parser.httpMethod == HttpHead:
       # HEAD carries no body. When the caller declared a length (file serving),
       # report it as the Content-Length a GET would return -- length-delimited
@@ -1717,8 +1658,8 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
       # 0. finish() completes it (write() is a no-op on HEAD). With no declared
       # length, fall back to a plain empty response.
       if effLen >= 0:
-        c.respStreaming = true
-        c.respCLDelimited = true
+        c.rs.respStreaming = true
+        c.respFraming = rfContentLength
         let ka = c.parser.keepAlive
         appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
                          contentType, hdrs, chunked = false, keepAlive = ka,
@@ -1728,17 +1669,18 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
       else:
         applyResponse(res.core, c, 0, int(code), contentType, userHeaders, "")
       return
-    c.respStreaming = true
+    c.rs.respStreaming = true
     let ka = c.parser.keepAlive
     # Known length -> Content-Length + length-delimited keep-alive. Unknown ->
     # chunked (HTTP/1.1) or close-delimited (HTTP/1.0).
     let chunked = effLen < 0 and c.parser.minor >= 1
-    c.respChunked = chunked
-    c.respCLDelimited = effLen >= 0
+    c.respFraming = if effLen >= 0: rfContentLength
+                    elif chunked: rfChunked
+                    else: rfCloseDelimited
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc.len > 0:
-        c.respComp = makeStreamComp(enc)
-        c.respEnc = enc
+        c.rs.respComp = makeStreamComp(enc)
+        c.rs.respEnc = enc
     appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
                      contentType, hdrs, chunked, keepAlive = ka,
                      announceKeepAlive = ka and c.parser.minor == 0,
@@ -1774,8 +1716,8 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
     if res.stream != 0:
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
-        if st != nil and st.respComp != nil:
-          let z = compChunk(st.respComp, st.respEnc, data, false)
+        if st != nil and st.rs.respComp != nil:
+          let z = compChunk(st.rs.respComp, st.rs.respEnc, data, false)
           if z.len == 0: return true
           let backlog = h2StreamWrite(c, res.stream, z)
           flushConn(res)
@@ -1783,13 +1725,13 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       let backlog = h2StreamWrite(c, res.stream, data)
       flushConn(res)
       return h2Writable(res, backlog)
-    if not c.respStreaming: return false
+    if not c.rs.respStreaming: return false
     if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-      if c.respComp != nil:
-        let z = compChunk(c.respComp, c.respEnc, data, false)
+      if c.rs.respComp != nil:
+        let z = compChunk(c.rs.respComp, c.rs.respEnc, data, false)
         if z.len > 0:
-          if c.respChunked: appendChunk(c.wbuf, z)
+          if c.respFraming == rfChunked: appendChunk(c.wbuf, z)
           else:
             let oldLen = c.wbuf.len
             c.wbuf.setLen(oldLen + z.len)
@@ -1801,7 +1743,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
           c.respBackedUp = true
           return false
         return true
-    if c.respChunked:
+    if c.respFraming == rfChunked:
       appendChunk(c.wbuf, data)
     elif data.len > 0:
       let oldLen = c.wbuf.len
@@ -1848,37 +1790,37 @@ proc finish*(res: Response) {.raises: [].} =
     if res.stream != 0:
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
-        if st != nil and st.respComp != nil:
-          let z = compChunk(st.respComp, st.respEnc, "", true)
+        if st != nil and st.rs.respComp != nil:
+          let z = compChunk(st.rs.respComp, st.rs.respEnc, "", true)
           if z.len > 0: discard h2StreamWrite(c, res.stream, z)
-          st.respComp = nil
-          st.respEnc = ""
+          st.rs.respComp = nil
+          st.rs.respEnc = ""
       h2StreamFinish(c, res.stream, trailers)
       flushConn(res)
       return
-    if not c.respStreaming: return
-    c.respStreaming = false
+    if not c.rs.respStreaming: return
+    c.rs.respStreaming = false
     c.respBackedUp = false
-    c.onRespDrain = nil
-    let clDelimited = c.respCLDelimited
-    c.respCLDelimited = false
+    c.rs.onRespDrain = nil
+    let framing = c.respFraming
+    c.respFraming = rfNone
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-      if c.respComp != nil:
-        let z = compChunk(c.respComp, c.respEnc, "", true)   # trailer/finish
+      if c.rs.respComp != nil:
+        let z = compChunk(c.rs.respComp, c.rs.respEnc, "", true)   # trailer/finish
         if z.len > 0 and c.parser.httpMethod != HttpHead:
-          if c.respChunked: appendChunk(c.wbuf, z)
+          if framing == rfChunked: appendChunk(c.wbuf, z)
           else:
             let oldLen = c.wbuf.len
             c.wbuf.setLen(oldLen + z.len)
             copyMem(addr c.wbuf[oldLen], unsafeAddr z[0], z.len)
-        c.respComp = nil
-        c.respEnc = ""
-    if c.respChunked and c.parser.httpMethod != HttpHead:
+        c.rs.respComp = nil
+        c.rs.respEnc = ""
+    if framing == rfChunked and c.parser.httpMethod != HttpHead:
       appendLastChunk(c.wbuf, trailers)
     # Close-delimited (HTTP/1.0, neither chunked nor Content-Length) must close;
     # chunked and Content-Length bodies keep the connection alive.
     if not c.parser.keepAlive or c.peerHalfClosed or
-        not (c.respChunked or clDelimited):
+        framing == rfCloseDelimited:
       c.closeAfterFlush = true
     # kick resumes the paused pipeline when finish runs after the handler
     # returned (deferred); inline finish is a no-op here and the dispatch
@@ -1892,29 +1834,15 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## response's write backlog empties, so the producer can resume writing.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
-  if res.fd < 0:
-    when not defined(plainHttp):
-      # The h3 reflush path cannot pass the handle words, so h3's callback
-      # closes over the Response; h1/h2 reconstruct it from the passed words.
-      let held = res
-      let h3c = h3ConnOf(res.core, res.fd, res.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(res.stream))
-        if st != nil:
-          st.onRespDrain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
-                                stream: uint32) {.gcsafe.} =
-            captured(held)
-    return
-  let c = conn(res.core, res.fd, res.gen)
-  if c == nil: return
-  let drain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
-                   stream: uint32) {.gcsafe.} =
-    captured(Response(core: core, fd: fd, gen: gen, stream: stream))
-  if res.stream != 0:
-    let st = h2Stream(c, res.stream)
-    if st != nil: st.onRespDrain = drain
-    return
-  c.onRespDrain = drain
+  # The h3 reflush path cannot pass the handle words, so the callback closes
+  # over the Response itself; the h1/h2 invocations pass words equal to
+  # `held`'s, so one closure shape serves all three carriers.
+  let held = res
+  let rs = reqState(res)
+  if rs == nil: return
+  rs.onRespDrain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
+                        stream: uint32) {.gcsafe.} =
+    captured(held)
 
 proc bufferedAmount*(res: Response): int =
   ## Bytes queued for the streaming response but not yet written to the
@@ -1972,10 +1900,10 @@ proc abort*(res: Response) {.raises: [].} =
       h2StreamAbort(c, res.stream)
       flushConn(res)
       return
-    if not c.respStreaming: return
-    c.respStreaming = false
+    if not c.rs.respStreaming: return
+    c.rs.respStreaming = false
     c.respBackedUp = false
-    c.onRespDrain = nil
+    c.rs.onRespDrain = nil
     # No terminating chunk: closing mid-stream is the truncation signal. (For a
     # close-delimited HTTP/1.0 body there is no in-band signal; close is all we
     # have.)
@@ -2203,7 +2131,7 @@ proc undoPin(req: Request) =
   ## Release a pin taken on this loop thread for a dispatch the pool then refused
   ## (no worker touched it, so this is race-free).
   if req.fd < 0:
-    let idx = int(-req.fd) - 2
+    let idx = h3SlotOf(req.fd)
     if idx >= 0 and idx < req.core.h3slots.len and
         req.core.h3slots[idx].gen == req.gen and req.core.h3slots[idx].pinned > 0:
       dec req.core.h3slots[idx].pinned
@@ -2265,7 +2193,7 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
                          req.fd, req.gen, req.stream, "")  # no pool: inline
       return
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
       inc req.core.h3slots[idx].pinned
@@ -2315,7 +2243,7 @@ proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
                              req.fd, req.gen, req.stream, data)  # no pool: inline
       return
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
       inc req.core.h3slots[idx].pinned
@@ -2381,7 +2309,7 @@ proc dispatchBlockingArgs[T](req: Request,
     # blocking(args) path). An early return below (dead conn) still decs the
     # local here, but only on the loop thread, which is safe.
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
       inc req.core.h3slots[idx].pinned
@@ -2472,7 +2400,7 @@ proc dispatchBlockingResult*[A, R](req: Request,
                                      req.fd, req.gen, req.stream, "")   # inline
       return
     if req.fd < 0:
-      let idx = int(-req.fd) - 2
+      let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         GC_unref(box); dec req.core.pendingBlockingResults; return
       inc req.core.h3slots[idx].pinned
@@ -2708,7 +2636,7 @@ proc acceptWebSocket*(req: Request,
                        req.header("sec-websocket-protocol"), protocols,
                        req.core.dateStr, req.core.serverHeader)
     return
-  if c.responded or c.ws != nil: return
+  if c.rs.responded or c.ws != nil: return
   discard wsAccept(req.core, c, req.header("sec-websocket-key"),
                    req.core.maxWsMessage,
                    req.header("sec-websocket-extensions"),

@@ -1,30 +1,14 @@
 import std/[unittest, net, httpcore, osproc, strutils, os]
 import vortex/[settings, request, server, connection, staticfiles]
+import ./helper
 
-# HTTP/3 needs a curl built with HTTP/3 (libnghttp3/ngtcp2 or OpenSSL QUIC).
-# Prefer any system curl that advertises HTTP3; fall back to Homebrew's path.
-proc findH3Curl(): string =
-  var cands: seq[string]
-  let sys = findExe("curl")
-  if sys.len > 0: cands.add sys
-  cands.add "/opt/homebrew/opt/curl/bin/curl"
-  for exe in cands:
-    if fileExists(exe):
-      let (ver, rc) = execCmdEx(exe & " --version")
-      if rc == 0 and "HTTP3" in ver.toUpperAscii: return exe
-  ""
+# HTTP/3 needs a curl built with HTTP/3 (libnghttp3/ngtcp2 or OpenSSL QUIC);
+# helper.requireH3Curl prefers any system curl that advertises HTTP3 and falls
+# back to Homebrew's path.
+let h3curlBin = requireH3Curl()
 
-let h3curlBin = findH3Curl()
-if h3curlBin.len == 0:
-  echo "SKIP: no HTTP/3-capable curl found"
-  quit 0
-
-let certDir = getTempDir() / "nhs_h3_certs_" & $getCurrentProcessId()
-createDir(certDir)
-let certFile = certDir / "cert.pem"
-let keyFile = certDir / "key.pem"
-check execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
-  keyFile & " -out " & certFile & " -days 2 -subj /CN=localhost")[1] == 0
+let (certFile, keyFile) = makeCertPair("nhs_h3_certs_")
+let certDir = certFile.parentDir
 
 const bigBody = "0123456789abcdef".repeat(8 * 1024)   # 128 KiB
 const bigFilePath = "/tmp/nhs_h3_bigfile.dat"
@@ -82,99 +66,99 @@ proc streamPred(core: ptr LoopCore, fd: int32, gen: uint32,
   let req = Request(core: core, fd: fd, gen: gen, stream: stream)
   req.path == "/up" and req.method == HttpPost
 
-var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2, certFile = certFile, keyFile = keyFile, maxBodySize = 1024 * 1024), streamPred).start(0)
-let base = "https://localhost:" & $srv.port
+withServer(RequestHandler(handler),
+           initVortexConfig(numThreads = 1, workerThreads = 2,
+                            certFile = certFile, keyFile = keyFile,
+                            maxBodySize = 1024 * 1024), streamPred, srv):
+  let base = "https://localhost:" & $srv.port
 
-proc h3curl(args: string): (string, int) =
-  let (output, rc) = execCmdEx(h3curlBin & " -sk --http3-only -m 10 " & args)
-  (output.strip(), rc)
+  proc h3curl(args: string): (string, int) = helper.h3curl(h3curlBin, args)
 
-suite "HTTP/3 (QUIC, via curl)":
-  test "GET":
-    let (output, rc) = h3curl("-w '|%{http_version}' " & base & "/")
-    check rc == 0
-    check output == "hello h3|3"
+  suite "HTTP/3 (QUIC, via curl)":
+    test "GET":
+      let (output, rc) = h3curl("-w '|%{http_version}' " & base & "/")
+      check rc == 0
+      check output == "hello h3|3"
 
-  test "POST echo":
-    let (output, rc) = h3curl(
-      "-H 'Content-Type: text/plain' -d 'payload h3' " &
-      "-w '|%{http_version}' " & base & "/echo")
-    check rc == 0
-    check output == "payload h3|3"
+    test "POST echo":
+      let (output, rc) = h3curl(
+        "-H 'Content-Type: text/plain' -d 'payload h3' " &
+        "-w '|%{http_version}' " & base & "/echo")
+      check rc == 0
+      check output == "payload h3|3"
 
-  test "404":
-    let (output, rc) = h3curl("-o /dev/null -w '%{http_code}' " & base & "/x")
-    check rc == 0
-    check output == "404"
+    test "404":
+      let (output, rc) = h3curl("-o /dev/null -w '%{http_code}' " & base & "/x")
+      check rc == 0
+      check output == "404"
 
-  test "HEAD has no body":
-    let (output, rc) = h3curl("-I -w '%{size_download}' " & base & "/")
-    check rc == 0
-    check "HTTP/3 200" in output
-    check output.endsWith("0")
+    test "HEAD has no body":
+      let (output, rc) = h3curl("-I -w '%{size_download}' " & base & "/")
+      check rc == 0
+      check "HTTP/3 200" in output
+      check output.endsWith("0")
 
-  test "large response":
-    let (output, rc) = h3curl("-o /dev/null -w '%{size_download}' " & base & "/big")
-    check rc == 0
-    check output == $bigBody.len
+    test "large response":
+      let (output, rc) = h3curl("-o /dev/null -w '%{size_download}' " & base & "/big")
+      check rc == 0
+      check output == $bigBody.len
 
-  test "blocking route over h3 (worker respond path)":
-    let (output, rc) = h3curl(base & "/slow")
-    check rc == 0
-    check output == "slow h3 done"
+    test "blocking route over h3 (worker respond path)":
+      let (output, rc) = h3curl(base & "/slow")
+      check rc == 0
+      check output == "slow h3 done"
 
-  test "several sequential requests":
-    for i in 0 ..< 3:
-      check h3curl(base & "/")[0] == "hello h3"
+    test "several sequential requests":
+      for i in 0 ..< 3:
+        check h3curl(base & "/")[0] == "hello h3"
 
-  test "streamed response over h3":
-    let (output, rc) = h3curl("-w '|%{http_version}' " & base & "/stream")
-    check rc == 0
-    check output == "Hello, streamed h3!|3"
+    test "streamed response over h3":
+      let (output, rc) = h3curl("-w '|%{http_version}' " & base & "/stream")
+      check rc == 0
+      check output == "Hello, streamed h3!|3"
 
-  test "large streamed response over h3":
-    let (output, rc) = h3curl(
-      "-o /dev/null -w '%{size_download}' " & base & "/streambig")
-    check rc == 0
-    check output == $(64 * 4096)
+    test "large streamed response over h3":
+      let (output, rc) = h3curl(
+        "-o /dev/null -w '%{size_download}' " & base & "/streambig")
+      check rc == 0
+      check output == $(64 * 4096)
 
-  test "response trailers are emitted over h3 (trailing HEADERS)":
-    # curl surfaces h3 trailers by dumping them with the response headers (-D).
-    # Before the fix the h3 finish path dropped res.trailers entirely.
-    let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailer")
-    check rc == 0
-    check "x-checksum: abc123" in output.toLowerAscii
+    test "response trailers are emitted over h3 (trailing HEADERS)":
+      # curl surfaces h3 trailers by dumping them with the response headers (-D).
+      # Before the fix the h3 finish path dropped res.trailers entirely.
+      let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailer")
+      check rc == 0
+      check "x-checksum: abc123" in output.toLowerAscii
 
-  test "a mid-stream exception resets the h3 stream (client sees an error)":
-    let (_, rc) = h3curl("-o /dev/null " & base & "/boom")
-    check rc != 0
+    test "a mid-stream exception resets the h3 stream (client sees an error)":
+      let (_, rc) = h3curl("-o /dev/null " & base & "/boom")
+      check rc != 0
 
-  test "streamed request body over h3 (DATA -> onBody)":
-    let tmp = certDir / "up.bin"
-    writeFile(tmp, "u".repeat(300 * 1024))
-    let (output, rc) = h3curl("--data-binary @" & tmp & " " & base & "/up")
-    check rc == 0
-    check output == "got " & $(300 * 1024)
+    test "streamed request body over h3 (DATA -> onBody)":
+      let tmp = certDir / "up.bin"
+      writeFile(tmp, "u".repeat(300 * 1024))
+      let (output, rc) = h3curl("--data-binary @" & tmp & " " & base & "/up")
+      check rc == 0
+      check output == "got " & $(300 * 1024)
 
-  test "remoteAddress reports the QUIC peer IP":
-    # Over h3 the peer address comes from ngtcp2 (the connection path's remote
-    # sockaddr), reported at accept; it must be a loopback here (empty allowed
-    # only defensively for a stale handle).
-    let (output, rc) = h3curl(base & "/whoami")
-    check rc == 0
-    check output in ["", "127.0.0.1", "::1"]
+    test "remoteAddress reports the QUIC peer IP":
+      # Over h3 the peer address comes from ngtcp2 (the connection path's remote
+      # sockaddr), reported at accept; it must be a loopback here (empty allowed
+      # only defensively for a stale handle).
+      let (output, rc) = h3curl(base & "/whoami")
+      check rc == 0
+      check output in ["", "127.0.0.1", "::1"]
 
-  test "large file streams over h3 (full body)":
-    let (output, rc) = h3curl("-o /dev/null -w '%{size_download}' " & base & "/bigfile")
-    check rc == 0
-    check output == "1048576"
+    test "large file streams over h3 (full body)":
+      let (output, rc) = h3curl("-o /dev/null -w '%{size_download}' " & base & "/bigfile")
+      check rc == 0
+      check output == "1048576"
 
-  test "alt-svc advertised on h1/h2":
-    let (output, rc) = execCmdEx(
-      "curl -skI -m 5 " & base & "/")
-    check rc == 0
-    check ("h3=\":" & $srv.port & "\"") in output
+    test "alt-svc advertised on h1/h2":
+      let (output, rc) = execCmdEx(
+        "curl -skI -m 5 " & base & "/")
+      check rc == 0
+      check ("h3=\":" & $srv.port & "\"") in output
 
-srv.close()
 removeDir(certDir)
 echo "server shut down cleanly"

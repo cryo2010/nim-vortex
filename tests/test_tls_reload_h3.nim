@@ -12,18 +12,13 @@ import std/[unittest, os, osproc, net, httpcore, strutils]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 import vortex/transport/tls
+import ./helper
 
 let dir = getTempDir() / "vortex_h3reload_" & $getCurrentProcessId()
 createDir(dir)
-proc gen(cert, key, cn: string) =
-  let (o, rc) = execCmdEx(
-    "openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
-    " -out " & cert & " -days 2 -subj /CN=" & cn)
-  check rc == 0
-
 let certA = dir / "a.pem"
 let keyA = dir / "akey.pem"
-gen(certA, keyA, "alpha.vortex")
+genCert(certA, keyA, "alpha.vortex")
 
 suite "QUIC cert reload signaling":
   test "request/pending carries paths and advances the generation":
@@ -64,7 +59,7 @@ suite "http3 server survives a certificate reload":
     check "alpha.vortex" in cn()
     let certC = dir / "c.pem"
     let keyC = dir / "ckey.pem"
-    gen(certC, keyC, "charlie.vortex")
+    genCert(certC, keyC, "charlie.vortex")
     check srv.reloadTls(certC, keyC)      # TCP + signals h3 loops
     sleep(1500)                           # let the loop ticks apply the h3 swap
     check "charlie.vortex" in cn()         # TCP presents the new cert

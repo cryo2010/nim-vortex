@@ -8,8 +8,6 @@ demos/minimal
 bench/perf_http2
 tests/t*
 !tests/t*.nim
-tests/chronos_adapter
-!tests/chronos_adapter.nim
 tests/websocket_deflate
 !tests/websocket_deflate.nim
 fuzz/fuzz_http1

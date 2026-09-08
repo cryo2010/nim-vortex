@@ -5,7 +5,7 @@
 ## and misreports EOF when data+FIN are already buffered before the first
 ## read, which made responses "vanish" in earlier test versions.
 
-import std/[net, posix]
+import std/[net, posix, os, osproc, strutils]
 
 proc setRecvTimeout*(s: Socket, ms: int) =
   var tv: Timeval
@@ -48,3 +48,96 @@ proc rawExchange*(port: Port, data: string, timeoutMs = 2000): string =
   s.connect("127.0.0.1", port)
   s.send(data)
   s.recvUntilClose(timeoutMs)
+
+proc connectTimeout*(port: Port, ms = 2000): Socket =
+  ## Connect to 127.0.0.1:port with a receive timeout already applied.
+  result = newSocket(buffered = false)
+  result.connect("127.0.0.1", port)
+  result.setRecvTimeout(ms)
+
+# --- curl helpers -------------------------------------------------------------
+
+proc h2curl*(args: string): (string, int) =
+  ## Run curl with HTTP/2 prior knowledge; returns (stripped output, exit code).
+  let (output, rc) = execCmdEx("curl -s --http2-prior-knowledge " & args)
+  (output.strip(), rc)
+
+proc h3curl*(bin, args: string): (string, int) =
+  ## Run an HTTP/3-capable curl (`bin`, from findH3Curl) with --http3-only.
+  let (output, rc) = execCmdEx(bin & " -sk --http3-only -m 10 " & args)
+  (output.strip(), rc)
+
+proc findH3Curl*(): string =
+  ## Any curl advertising HTTP3 (system, then Homebrew). "" if none.
+  var cands: seq[string]
+  let sys = findExe("curl")
+  if sys.len > 0: cands.add sys
+  cands.add "/opt/homebrew/opt/curl/bin/curl"
+  for exe in cands:
+    if fileExists(exe):
+      let (ver, rc) = execCmdEx(exe & " --version")
+      if rc == 0 and "HTTP3" in ver.toUpperAscii: return exe
+  ""
+
+proc requireCurl*(msg = "SKIP: no curl"): string =
+  ## The curl executable, or echo the suite's SKIP line and exit cleanly.
+  result = findExe("curl")
+  if result.len == 0:
+    echo msg
+    quit 0
+
+proc requireH3Curl*(msg = "SKIP: no HTTP/3-capable curl found"): string =
+  ## An HTTP/3-capable curl, or echo the suite's SKIP line and exit cleanly.
+  result = findH3Curl()
+  if result.len == 0:
+    echo msg
+    quit 0
+
+# --- TLS fixtures -------------------------------------------------------------
+
+proc genCert*(cert, key: string, cn = "localhost") =
+  ## Self-signed RSA-2048 cert + unencrypted key at the given paths.
+  let (o, rc) = execCmdEx(
+    "openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
+    " -out " & cert & " -days 2 -subj '/CN=" & cn & "'")
+  doAssert rc == 0, o
+
+proc makeCertPair*(dirPrefix: string, cn = "localhost"):
+    tuple[cert, key: string] =
+  ## A fresh per-process temp dir (getTempDir()/dirPrefix<pid>) holding a
+  ## vanilla self-signed cert.pem/key.pem. Not cached across processes: tests
+  ## may mutate or reload the files. Clean up with removeDir(result.cert.parentDir).
+  let dir = getTempDir() / (dirPrefix & $getCurrentProcessId())
+  removeDir(dir)
+  createDir(dir)
+  result = (cert: dir / "cert.pem", key: dir / "key.pem")
+  genCert(result.cert, result.key, cn)
+
+# --- server fixture -----------------------------------------------------------
+
+template withServer*(handler, cfg, pred, srvVar, body: untyped) =
+  ## Start a vortex server (with a stream-route predicate) on port 0, expose it
+  ## as `srvVar`, and guarantee close when `body` exits.
+  mixin newVortex, start, close
+  block:
+    var srvVar = newVortex(handler, cfg, pred).start(0)
+    try:
+      body
+    finally:
+      srvVar.close()
+
+template withServer*(handler, cfg, srvVar, body: untyped) =
+  ## Start a vortex server on port 0, expose it as `srvVar`, and guarantee
+  ## close when `body` exits.
+  mixin newVortex, start, close
+  block:
+    var srvVar = newVortex(handler, cfg).start(0)
+    try:
+      body
+    finally:
+      srvVar.close()
+
+template withServer*(handler, srvVar, body: untyped) =
+  ## withServer with the default config.
+  mixin initVortexConfig
+  withServer(handler, initVortexConfig(), srvVar, body)

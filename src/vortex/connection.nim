@@ -78,6 +78,13 @@ type
     dkWsPing,   ## WebSocket idle: send a keepalive ping when it expires
     dkWsPong    ## ping sent: close the connection if it expires with no reply
 
+  RespFraming* = enum
+    ## How an open HTTP/1 streaming response body is delimited.
+    rfNone,           ## no streaming response open / framing not decided
+    rfChunked,        ## Transfer-Encoding: chunked
+    rfContentLength,  ## known Content-Length (keep-alive survives finish)
+    rfCloseDelimited  ## HTTP/1.0 with unknown length; close ends the body
+
   RespDrainCb* = proc (core: ptr LoopCore, fd: int32, gen: uint32,
                        stream: uint32) {.gcsafe.}
     ## A streaming response's onDrain: called on the loop thread when the
@@ -111,6 +118,30 @@ type
     ## without a refcount, and calling `prc` with `env` as the trailing
     ## argument is precisely how the compiler invokes a closure. `prc == nil`
     ## means unset.
+
+  RequestState* = object
+    ## Per-request state common to every protocol carrier: the Connection for
+    ## HTTP/1, an H2Stream, and an H3Stream each embed one as `rs`, so
+    ## request.nim can resolve a single RequestState (see request.reqState)
+    ## instead of re-implementing the h3/h2/h1 discrimination per accessor.
+    ## Only the exact intersection lives here; carrier-specific request state
+    ## (h1 sent100/respFraming, h2/h3 isHead/trailers/...) stays on the carrier.
+    responded*: bool          ## current request has been answered
+    urlCached*: bool          ## lazy per-request caches (see request.url)
+    queryCached*: bool
+    jsonCached*: bool
+    cachedUrl*: Uri
+    cachedQuery*: Table[string, string]
+    cachedJson*: JsonNode
+    pathParams*: PathParams   ## written by the router at match time
+    respStreaming*: bool      ## a streamed response is open (res.sendHead)
+    respComp*: RootRef        ## streaming compressor (Gzip/BrotliStream upcast);
+                              ## nil = identity. Its =destroy frees the codec
+                              ## state when the carrier is reset/deleted.
+    respEnc*: string          ## "gzip"/"br" for respComp (empty = none)
+    onRespDrain*: RespDrainCb ## streamed-response drain callback
+    reqStreaming*: bool       ## dispatched early; body flows to onBody
+    onBodyCb*: BodyCb         ## inbound streaming sink (req.onBody)
 
   Connection* = object
     fd*: int32
@@ -150,43 +181,22 @@ type
                               ## WINDOW_UPDATEs flowing while it is mid-stream,
                               ## instead of starving them until the read unpins.
     closeRequested*: bool     ## close deferred until unpinned
-    responded*: bool          ## current request has been answered
+    rs*: RequestState         ## per-request state shared with the h2/h3 streams
     sent100*: bool            ## 100 Continue already sent for this request
     requestCount*: int        ## HTTP/1 requests served on this connection
-    urlCached*: bool          ## lazy per-request caches (see request.url)
-    queryCached*: bool
-    jsonCached*: bool
-    cachedUrl*: Uri
-    cachedQuery*: Table[string, string]
-    cachedJson*: JsonNode
-    pathParams*: PathParams   ## written by the router at match time
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
     lingerClose*: bool        ## drain peer before close (reliable error delivery)
     peerHalfClosed*: bool     ## peer sent FIN (half-close): no more requests,
                               ## but a buffered one still gets its response
-    # Streaming response state (res.sendHead/write/finish). HTTP/1 only;
-    # h2/h3 keep their streaming flags on the per-stream struct.
-    respStreaming*: bool      ## a chunked/close-delimited response is open
-    respChunked*: bool        ## true = Transfer-Encoding: chunked framing
-    respCLDelimited*: bool     ## streaming with a known Content-Length (keep-alive
-                               ## survives finish; not close-delimited)
-    respComp*: RootRef        ## streaming compressor (Gzip/BrotliStream upcast);
-                               ## nil = identity. Its =destroy frees the codec
-                               ## state when the connection is reset/closed.
-    respEnc*: string          ## "gzip"/"br" for respComp (empty = none)
+    # HTTP/1-only streaming state; the shared flags/callbacks live in `rs`.
+    respFraming*: RespFraming ## how the open streaming body is delimited
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
-    onRespDrain*: RespDrainCb
-    # Inbound streaming (req.onBody). A streaming route is dispatched at
-    # headers-complete; body bytes are delivered incrementally instead of
-    # buffered whole.
-    reqStreaming*: bool       ## dispatched early; body flows to onBody
     bodyFed*: int             ## body bytes already delivered to onBody
-    onBodyCb*: BodyCb
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
-    ## A Request handle encodes slot i as fd = -(i+2).
+    ## A Request handle encodes slot i as fd = -(i+2); see h3SlotFd/h3SlotOf.
     conn*: RootRef            ## http3.codec.H3Conn; nil = free slot
     gen*: uint32
     pinned*: int32            ## outstanding worker tasks
@@ -287,6 +297,17 @@ proc hasStreamRoute*(core: ptr LoopCore): bool {.inline.} =
   ## True when a streaming predicate is configured (see streamRouteRaw).
   core.streamRouteRaw.prc != nil
 
+func h3SlotFd*(slot: int): int32 {.inline.} =
+  ## Encode h3 slot index `slot` as a Request-handle fd: a negative fd tags an
+  ## h3 slot (not a socket); the -2 offset keeps -1 free as the conventional
+  ## invalid-fd sentinel (e.g. "no HTTP/3" udpFd), so slot 0 encodes as -2.
+  int32(-(slot + 2))
+
+func h3SlotOf*(fd: int32): int {.inline.} =
+  ## Decode a negative h3 Request-handle fd back to its slot index (inverse of
+  ## h3SlotFd). Callers must bounds/gen-check the slot; only valid for fd < 0.
+  int(-fd) - 2
+
 proc callStreamRoute*(core: ptr LoopCore, fd: int32, gen: uint32,
                       stream: uint32): bool {.inline.} =
   ## Invoke the streaming predicate from its raw (proc, env) pair -- exactly how
@@ -319,6 +340,12 @@ proc drain*(ob: ptr Outbox, into: var seq[OutMsg]) =
   acquire ob.lock
   swap(into, ob.msgs)
   release ob.lock
+
+func bodilessStatus*(code: int): bool {.inline.} =
+  ## RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
+  ## they must not advertise Content-Length (or Content-Type). Distinct from
+  ## HEAD, which keeps the Content-Length a GET would have sent.
+  code in 100 .. 199 or code == 204 or code == 304
 
 proc addU32(s: var string, v: uint32) =
   s.add char(uint8(v))
@@ -428,6 +455,39 @@ proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
       if k[0] == fd and k[1] == gen: stale.add k
     for k in stale: core.respTrailers.del k
 
+proc resetRequest*(rs: var RequestState) =
+  ## Clear every shared per-request field for carrier reuse. cachedUrl and
+  ## cachedQuery deliberately keep their storage (the `urlCached`/`queryCached`
+  ## flags guard reads, and the lazy caches overwrite in place on next use --
+  ## see request.lazyQuery); cachedJson is dropped so a large parsed body is
+  ## released between keep-alive requests.
+  rs.responded = false
+  rs.urlCached = false
+  rs.queryCached = false
+  rs.jsonCached = false
+  rs.cachedJson = nil
+  rs.pathParams.setLen(0)
+  rs.respStreaming = false
+  rs.respComp = nil           # frees the streaming codec state (=destroy)
+  rs.respEnc = ""
+  rs.onRespDrain = nil
+  rs.reqStreaming = false
+  rs.onBodyCb = nil
+
+proc resetRequestState(c: var Connection) =
+  ## Clear the per-request fields shared by resetForNextRequest (keep-alive)
+  ## and clear (slot recycling).
+  c.chunkBody.setLen(0)
+  c.bodyDecoded.setLen(0)
+  c.bodyDecodedSet = false
+  c.rs.resetRequest()
+  c.sent100 = false
+  c.awaitingResponse = false
+  c.respFraming = rfNone
+  c.respBackedUp = false
+  c.bodyFed = 0
+  c.parser.reset(0)
+
 proc resetForNextRequest*(c: var Connection) =
   ## Compact consumed bytes and prepare the parser for a pipelined or
   ## subsequent keep-alive request.
@@ -437,27 +497,7 @@ proc resetForNextRequest*(c: var Connection) =
   else:
     moveMem(addr c.rbuf[0], addr c.rbuf[consumed], c.rlen - consumed)
     c.rlen -= consumed
-  c.chunkBody.setLen(0)
-  c.urlCached = false
-  c.queryCached = false
-  c.jsonCached = false
-  c.pathParams.setLen(0)
-  c.responded = false
-  c.sent100 = false
-  c.awaitingResponse = false
-  c.respStreaming = false
-  c.respChunked = false
-  c.respCLDelimited = false
-  c.respComp = nil            # frees the streaming codec state (=destroy)
-  c.respEnc = ""
-  c.respBackedUp = false
-  c.onRespDrain = nil
-  c.reqStreaming = false
-  c.bodyFed = 0
-  c.onBodyCb = nil
-  c.bodyDecoded.setLen(0)
-  c.bodyDecodedSet = false
-  c.parser.reset(0)
+  c.resetRequestState()
 
 proc clear*(c: var Connection, initialBufSize: int) =
   ## Recycle a slot for a fresh connection (fd stays, gen already bumped).
@@ -465,15 +505,11 @@ proc clear*(c: var Connection, initialBufSize: int) =
   if c.rbuf.len == 0 or c.rbuf.len > shrinkThreshold:
     c.rbuf = newString(initialBufSize)
   if c.wbuf.len > shrinkThreshold:
-    c.wbuf.setLen(0)
     c.wbuf = ""
   c.wbuf.setLen(0)
   c.remoteAddr = ""
   c.rlen = 0
   c.wpos = 0
-  c.chunkBody.setLen(0)
-  c.bodyDecoded.setLen(0)
-  c.bodyDecodedSet = false
   c.ssl = nil                # owner (closeConn) frees before recycling
   c.handshaking = false
   c.awaitingProxy = false
@@ -485,26 +521,9 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.writeArmed = false
   c.pinned = 0
   c.closeRequested = false
-  c.urlCached = false
-  c.queryCached = false
-  c.jsonCached = false
-  c.pathParams.setLen(0)
-  c.responded = false
-  c.sent100 = false
-  c.awaitingResponse = false
   c.closeAfterFlush = false
   c.lingerClose = false
   c.peerHalfClosed = false
-  c.respStreaming = false
-  c.respChunked = false
-  c.respCLDelimited = false
-  c.respComp = nil
-  c.respEnc = ""
-  c.respBackedUp = false
-  c.onRespDrain = nil
-  c.reqStreaming = false
-  c.bodyFed = 0
-  c.onBodyCb = nil
   c.requestCount = 0
-  c.parser.reset(0)
+  c.resetRequestState()
   c.state = csActive

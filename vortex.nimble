@@ -73,44 +73,48 @@ taskRequires "testchronos", "chronos >= 4.0.0"
 
 task testchronos, "Test the chronos async adapter (needs chronos)":
   ensureNimblePath()
-  exec "nim c -r --mm:orc --threads:on -d:ssl -p:src " &
-       "-o:tests/chronos_adapter tests/chronos_adapter.nim"
+  # The shared adapter suite (tests/test_adapter.nim) built against the
+  # chronos backend via -d:vortexChronos; a distinct output name so it never
+  # clobbers the default (asyncdispatch) build of the same file.
+  exec "nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos -p:src " &
+       "-o:tests/test_adapter_chronos tests/test_adapter.nim"
+
+proc runCodecTest(test, flags: string) =
+  ## Compile-and-run one opt-in codec test: the shared orc/threads/ssl prefix,
+  ## the per-task defines + linker libs, binary written next to the source.
+  exec "nim c -r --mm:orc --threads:on -d:ssl " & flags &
+       " -p:src -o:tests/" & test & " tests/" & test & ".nim"
 
 task testdeflate, "Test WebSocket permessage-deflate (needs zlib)":
-  exec "nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src " &
-       "-o:tests/websocket_deflate tests/websocket_deflate.nim"
+  runCodecTest "websocket_deflate", "-d:wsDeflate --passL:-lz"
   # The HTTP/2 (RFC 8441) suite gains a permessage-deflate case under the flag.
-  exec "nim c -r --mm:orc --threads:on -d:ssl -d:wsDeflate --passL:-lz -p:src " &
-       "-o:tests/test_http2_websocket tests/test_http2_websocket.nim"
+  runCodecTest "test_http2_websocket", "-d:wsDeflate --passL:-lz"
 
 task testgzip, "Test gzip response compression (needs zlib)":
-  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip --passL:-lz -p:src " &
-       "-o:tests/test_compression tests/test_compression.nim"
+  runCodecTest "test_compression", "-d:httpGzip --passL:-lz"
 
 task teststreamcomp, "Test streaming response compression (needs zlib + brotli)":
   # Streaming (res.sendHead/write/finish, SSE, file streaming) compressed with
   # gzip + brotli, over HTTP/1.1 (chunked) and h2c; curl + the gzip/brotli CLIs
   # verify the framing and a byte-exact round-trip.
-  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli " &
-       "--passL:-lz --passL:\"-lbrotlienc -lbrotlicommon\" -p:src " &
-       "-o:tests/test_streaming_compression tests/test_streaming_compression.nim"
+  runCodecTest "test_streaming_compression",
+    "-d:httpGzip -d:httpBrotli --passL:-lz --passL:\"-lbrotlienc -lbrotlicommon\""
 
 task testreqdecomp, "Test request-body decompression (needs zlib + brotli + zstd)":
   # Inbound gzip/br/zstd request bodies decoded into req.body (settings.
   # decompressRequest), bounded by maxBodySize: over-cap -> 413, corrupt -> 400.
-  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli " &
-       "-d:httpZstd --passL:-lz " &
-       "--passL:\"-lbrotlienc -lbrotlidec -lbrotlicommon\" --passL:-lzstd -p:src " &
-       "-o:tests/test_request_decompression tests/test_request_decompression.nim"
+  # Decoding also needs -lbrotlidec, unlike the response-side tasks.
+  runCodecTest "test_request_decompression",
+    "-d:httpGzip -d:httpBrotli -d:httpZstd --passL:-lz " &
+    "--passL:\"-lbrotlienc -lbrotlidec -lbrotlicommon\" --passL:-lzstd"
 
 task testzstd, "Test zstd response compression (needs zstd + zlib + brotli)":
   # Buffered + streamed zstd responses over HTTP/1.1 and h2c, plus br/zstd/gzip
   # Accept-Encoding negotiation (built with all three encoders); curl + the
   # gzip/brotli/zstd CLIs verify framing and a byte-exact round-trip.
-  exec "nim c -r --mm:orc --threads:on -d:ssl -d:httpGzip -d:httpBrotli " &
-       "-d:httpZstd --passL:-lz --passL:\"-lbrotlienc -lbrotlicommon\" " &
-       "--passL:-lzstd -p:src " &
-       "-o:tests/test_zstd_compression tests/test_zstd_compression.nim"
+  runCodecTest "test_zstd_compression",
+    "-d:httpGzip -d:httpBrotli -d:httpZstd --passL:-lz " &
+    "--passL:\"-lbrotlienc -lbrotlicommon\" --passL:-lzstd"
 
 task testrace, "ThreadSanitizer regressions for the cross-thread races":
   # TSan stress tests; TSan aborts the process on any data race, failing the
@@ -131,7 +135,7 @@ task testrace, "ThreadSanitizer regressions for the cross-thread races":
          "--passC:-fsanitize=thread --passL:-fsanitize=thread --debugger:native " &
          "-p:src -o:tests/" & t & " tests/" & t & ".nim"
 
-task fuzz, "Fuzz the parser/HPACK/QPACK decoders in Docker (needs docker)":
+task fuzz, "Fuzz the HTTP/1.1 parser / HPACK / ws-deflate in Docker (needs docker)":
   # The Dockerfile bundles clang + the libFuzzer runtime; the image's
   # default base is arm64, so override it on x86_64 hosts. Fuzzes each
   # target for 30s (override with `-e DUR=<seconds>` on the docker run).

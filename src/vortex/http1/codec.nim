@@ -4,6 +4,7 @@
 ## memcopies and one integer format.
 
 import std/httpcore
+from ../connection import bodilessStatus
 
 proc addField*(wbuf: var string, s: string) =
   ## Append a handler-supplied header name or value with CR and LF removed,
@@ -83,11 +84,7 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
   ## Serialize a full response. `skipBody` (HEAD) writes the head with the
   ## real Content-Length but omits the body bytes.
   let codeInt = int(code)
-  # RFC 9110 8.6: 1xx, 204, and 304 responses carry no representation, so
-  # they must not advertise Content-Length (or Content-Type). This is
-  # distinct from HEAD (skipBody), which keeps the Content-Length a GET
-  # would have sent.
-  let bodiless = codeInt in 100 .. 199 or codeInt == 204 or codeInt == 304
+  let bodiless = bodilessStatus(codeInt)
   if codeInt in 100 .. 599:
     wbuf.add statusLines[codeInt]
   else:
