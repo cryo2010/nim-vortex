@@ -2127,22 +2127,23 @@ proc emitPoolSaturated(core: ptr LoopCore, fd: int32, gen: uint32,
     if c != nil:
       applyResponse(core, c, stream, 503, "text/plain", hdrs, body)
 
-proc undoPin(req: Request) =
+proc undoPin(req: Request, k: PinKind) =
   ## Release a pin taken on this loop thread for a dispatch the pool then refused
-  ## (no worker touched it, so this is race-free).
+  ## (no worker touched it, so this is race-free). `k` must be the kind the
+  ## refused dispatch acquired -- releasePin doAsserts the match.
   if req.fd < 0:
     let idx = h3SlotOf(req.fd)
     if idx >= 0 and idx < req.core.h3slots.len and
-        req.core.h3slots[idx].gen == req.gen and req.core.h3slots[idx].pinned > 0:
-      dec req.core.h3slots[idx].pinned
+        req.core.h3slots[idx].gen == req.gen:
+      releasePin(addr req.core.h3slots[idx], k)
   else:
     let c = conn(req.core, req.fd, req.gen)
-    if c != nil and c.pinned > 0: dec c.pinned
+    if c != nil: releasePin(c, k)
 
-proc undoPinAnd503(req: Request) =
+proc undoPinAnd503(req: Request, k: PinKind) =
   ## The pool refused a `blocking:` dispatch after we pinned: release the pin and
   ## answer 503 (load shedding for the synchronous paths).
-  undoPin(req)
+  undoPin(req, k)
   emitPoolSaturated(req.core, req.fd, req.gen, req.stream)
 
 proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32): Request =
@@ -2196,17 +2197,17 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
       let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
-      inc req.core.h3slots[idx].pinned
+      acquirePin(req.core, addr req.core.h3slots[idx], pkBlocking)
     else:
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: return
-      inc c.pinned
+      acquirePin(req.core, c, pkBlocking)
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream,
                        snap: snapshotRequest(req))):
-      undoPinAnd503(req)             # pool saturated: shed load with 503
+      undoPinAnd503(req, pkBlocking) # pool saturated: shed load with 503
   except Exception:
     discard
 
@@ -2232,11 +2233,14 @@ proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
   if onWorker and not workerResponded:
     res.send(Http500, "500 Internal Server Error")
 
-proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
-                           data: sink string) {.raises: [].} =
-  ## Like dispatchBlocking, but moves `data` into the worker task so the
-  ## capture-free `fn` can read per-request config from it. Call from the
-  ## owning loop thread. The pin/enqueue bookkeeping mirrors dispatchBlocking.
+proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
+                             data: sink string,
+                             pin: PinKind) {.raises: [].} =
+  ## Internal: dispatchBlockingData with the pin kind named by the caller --
+  ## pkBlocking for handler bodies (incl. the sendFile INITIAL read, which
+  ## reads request headers/preconditions and must pause input), pkFileChunk
+  ## for dispatchNextRead's chunk reads (file-only workers that must not).
+  ## A refusal releases the same kind, so the counters cannot diverge.
   try:
     if req.core.pool == nil:
       blockingDataTrampoline(cast[pointer](fn), cast[pointer](req.core),
@@ -2246,19 +2250,26 @@ proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
       let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
-      inc req.core.h3slots[idx].pinned
+      acquirePin(req.core, addr req.core.h3slots[idx], pin)
     else:
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: return
-      inc c.pinned
+      acquirePin(req.core, c, pin)
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingDataTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream, data: data,
                        snap: snapshotRequest(req))):
-      undoPinAnd503(req)             # pool saturated: shed load with 503
+      undoPinAnd503(req, pin)        # pool saturated: shed load with 503
   except Exception:
     discard
+
+proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
+                           data: sink string) {.raises: [].} =
+  ## Like dispatchBlocking, but moves `data` into the worker task so the
+  ## capture-free `fn` can read per-request config from it. Call from the
+  ## owning loop thread. The pin/enqueue bookkeeping mirrors dispatchBlocking.
+  dispatchBlockingDataPin(req, fn, data, pkBlocking)
 
 type
   BlockingArgsBox[T] = ref object
@@ -2312,11 +2323,11 @@ proc dispatchBlockingArgs[T](req: Request,
       let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         return
-      inc req.core.h3slots[idx].pinned
+      acquirePin(req.core, addr req.core.h3slots[idx], pkBlocking)
     else:
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: return
-      inc c.pinned
+      acquirePin(req.core, c, pkBlocking)
     let raw = cast[pointer](box)
     wasMoved(box)                                 # transfer ownership; no loop dec
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
@@ -2327,7 +2338,7 @@ proc dispatchBlockingArgs[T](req: Request,
       # Pool saturated: no worker took the box, so reclaim its sole reference and
       # free it here (loop thread), release the pin, and shed load with 503.
       GC_unref(cast[BlockingArgsBox[T]](raw))
-      undoPinAnd503(req)
+      undoPinAnd503(req, pkBlocking)
   except Exception:
     discard
 
@@ -2403,11 +2414,11 @@ proc dispatchBlockingResult*[A, R](req: Request,
       let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
         GC_unref(box); dec req.core.pendingBlockingResults; return
-      inc req.core.h3slots[idx].pinned
+      acquirePin(req.core, addr req.core.h3slots[idx], pkAwait)
     else:
       let c = conn(req.core, req.fd, req.gen)
       if c == nil: (GC_unref(box); dec req.core.pendingBlockingResults; return)
-      inc c.pinned
+      acquirePin(req.core, c, pkAwait)
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingResultTrampoline[A, R],
                        user: cast[pointer](box), core: cast[pointer](req.core),
@@ -2416,7 +2427,7 @@ proc dispatchBlockingResult*[A, R](req: Request,
       # Pool saturated: fail the awaited future with PoolSaturatedError (the
       # caller can catch it and answer 503, or let it surface as a 500). Balance
       # the pin, the GC_ref and the pending count taken above.
-      undoPin(req)
+      undoPin(req, pkAwait)
       box.err = newException(PoolSaturatedError, "worker pool saturated")
       box.onDone(box)
       GC_unref(box)
@@ -2457,18 +2468,18 @@ proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
   ## Loop-side: borrow a pool buffer and enqueue the next chunk read INTO it
   ## (the pointer rides in the read request; the worker fills it, never
   ## allocates). The chunk-read worker only reads a file (never the h2 stream
-  ## table), so mark the pin as a file pin (c.filePinned): h2Input may keep
-  ## processing flow-control frames while the read is in flight, so a streamed
-  ## sendFile response never starves its own WINDOW_UPDATEs. The INITIAL read
-  ## (sendFile -> serveResolved) is dispatched separately and reads req headers,
-  ## so it is NOT a file pin and correctly pauses input.
+  ## table), so it acquires a pkFileChunk pin: h2Input may keep processing
+  ## flow-control frames while the read is in flight, so a streamed sendFile
+  ## response never starves its own WINDOW_UPDATEs. The INITIAL read
+  ## (sendFile -> serveResolved) is dispatched separately and reads req
+  ## headers, so it is pkBlocking and correctly pauses input. One acquisition,
+  ## one kind: a saturated-pool refusal (undoPin) releases the same
+  ## pkFileChunk, so the counters stay balanced by construction.
   let buf = res.core.chunkPool.chunkTake()
-  dispatchBlockingData(
+  dispatchBlockingDataPin(
     Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
-    cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf))
-  if res.fd >= 0:
-    let c = conn(res.core, res.fd, res.gen)
-    if c != nil: inc c.filePinned
+    cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf),
+    pkFileChunk)
 
 proc pullNext(res: Response, room: bool, nextRead: string, reader: pointer) =
   ## Pull the next chunk now if the write backlog has room, else after it drains.
@@ -2690,7 +2701,8 @@ proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
       let c = conn(ws.core, ws.fd, ws.gen)
       if c == nil: return
       if ws.stream == 0:
-        inc c.pinned                     # HTTP/1: pin the whole connection
+        # HTTP/1: pin the whole connection (released by omWsDone stream==0).
+        acquirePin(ws.core, c, pkWsBlocking)
       else:
         # HTTP/2: pin only this stream so the other multiplexed streams stay
         # responsive while the worker runs.

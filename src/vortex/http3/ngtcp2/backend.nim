@@ -167,7 +167,7 @@ proc cbAccept(user: pointer, conn: ptr VqConn, peerIp: cstring): pointer {.cdecl
   let core = cast[ptr LoopCore](user)
   var idx = -1
   for i in 0 ..< core.h3slots.len:
-    if core.h3slots[i].conn == nil and core.h3slots[i].pinned == 0:
+    if core.h3slots[i].conn == nil and core.h3slots[i].totalPins == 0:
       idx = i; break
   if idx < 0:
     core.h3slots.add H3SlotEntry()

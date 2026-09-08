@@ -467,7 +467,7 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       # A ws.blocking dispatch paused this WebSocket (connection pin for
       # HTTP/1, per-stream pin for HTTP/2 and HTTP/3): stop and leave the rest
       # buffered so messages run one at a time, in order. `c` is nil for h3.
-      if (c != nil and c.pinned > 0) or w.blockingPinned: break
+      if (c != nil and c.totalPins > 0) or w.blockingPinned: break
   pos
 
 proc wsInput*(core: ptr LoopCore, c: ptr Connection) =

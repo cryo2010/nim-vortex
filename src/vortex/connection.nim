@@ -22,6 +22,21 @@ type
     ## Set-Cookie and friends). Operators live in request.nim (which is exported).
     s*: seq[(string, string)]
 
+  PinKind* = enum
+    ## Why an outstanding worker task pins a connection/h3 slot (typed pin
+    ## accounting). Every acquisition names its kind and every release must
+    ## name the same kind, so a mismatched or double release is a caught
+    ## defect instead of a silently-masked counter imbalance.
+    pkBlocking,   ## sync `blocking:` / `blocking(args)` body, or the sendFile
+                  ## INITIAL read (serveResolved reads request headers /
+                  ## preconditions, so it is a normal pin); pauses input
+    pkAwait,      ## awaitable `req.blocking`; held until its omBlockingDone
+                  ## (the body's own responses ride keepPin); pauses input
+    pkFileChunk,  ## sendFile chunk read (dispatchNextRead): the worker only
+                  ## reads a file, never protocol state, so it does NOT pause
+                  ## input -- h2 flow-control frames keep flowing mid-stream
+    pkWsBlocking  ## h1 `ws.blocking` (stream 0); pauses ws frame dispatch
+
   OutMsgKind* = enum
     omHttp,                   ## data is a packed HTTP response (see packResponse)
     omWs,                     ## data is a ready-to-write WebSocket frame
@@ -171,15 +186,17 @@ type
                               ## without clobbering the request/idle deadline.
     writeArmed*: bool         ## selector currently watching writability
     registered*: bool         ## fd registered with the selector
-    pinned*: int32            ## outstanding worker tasks; slot can't recycle
-    filePinned*: int32        ## subset of `pinned` that are sendFile chunk reads
-                              ## (dispatchNextRead). Such a worker only reads a
-                              ## file -- it never touches the HTTP/2 stream table --
-                              ## so h2 input (flow-control frames, other streams'
-                              ## data) is safe to process while ONLY file pins are
-                              ## held. That keeps a streamed response's own
-                              ## WINDOW_UPDATEs flowing while it is mid-stream,
-                              ## instead of starving them until the read unpins.
+    pins*: array[PinKind, int32]
+                              ## outstanding worker tasks by pin kind; the slot
+                              ## can't recycle while any is held (totalPins).
+                              ## pkFileChunk workers only read a file -- never
+                              ## the HTTP/2 stream table -- so h2 input (flow
+                              ## control frames, other streams' data) is safe to
+                              ## process while only file pins are held
+                              ## (inputPausePins excludes them). That keeps a
+                              ## streamed response's own WINDOW_UPDATEs flowing
+                              ## while it is mid-stream, instead of starving
+                              ## them until the read unpins. Loop-thread only.
     closeRequested*: bool     ## close deferred until unpinned
     rs*: RequestState         ## per-request state shared with the h2/h3 streams
     sent100*: bool            ## 100 Continue already sent for this request
@@ -199,7 +216,11 @@ type
     ## A Request handle encodes slot i as fd = -(i+2); see h3SlotFd/h3SlotOf.
     conn*: RootRef            ## http3.codec.H3Conn; nil = free slot
     gen*: uint32
-    pinned*: int32            ## outstanding worker tasks
+    pins*: array[PinKind, int32]
+                              ## outstanding worker tasks by pin kind. Same
+                              ## array as Connection for one code path; the h3
+                              ## shim is driven by h3Drive (no input pause), so
+                              ## only totalPins is ever consulted here.
     closeReq*: bool           ## free deferred until unpinned
 
   ChunkPool* = object
@@ -396,6 +417,66 @@ proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
   result = addr core.conns[int(fd)]
   if result.gen != gen or result.state == csFree: return nil
 
+# --- typed pin accounting ---------------------------------------------------
+
+func totalPins*(c: Connection): int32 =
+  ## Any outstanding worker task: the slot must not recycle, `conns` must not
+  ## realloc, and the loop must not touch the carrier's ORC-counted protocol
+  ## refs. Replaces every former `pinned > 0` gate.
+  for k in PinKind: result += c.pins[k]
+
+func totalPins*(c: ptr Connection): int32 {.inline.} = totalPins(c[])
+
+func totalPins*(s: H3SlotEntry): int32 =
+  for k in PinKind: result += s.pins[k]
+
+func totalPins*(s: ptr H3SlotEntry): int32 {.inline.} = totalPins(s[])
+
+func inputPausePins*(c: Connection): int32 =
+  ## Pins that must pause input processing (their workers may read live
+  ## request state: rbuf slices, the h2 stream table). Every kind except
+  ## pkFileChunk -- file-chunk workers only read a file, so flow-control
+  ## frames keep flowing while a streamed sendFile is mid-flight (the former
+  ## `pinned > filePinned` gate).
+  c.pins[pkBlocking] + c.pins[pkAwait] + c.pins[pkWsBlocking]
+
+func inputPausePins*(c: ptr Connection): int32 {.inline.} = inputPausePins(c[])
+
+var pinThreadId {.threadvar.}: int
+
+proc onOwnLoopThread(core: ptr LoopCore): bool {.inline.} =
+  ## Same cached-getThreadId pattern as request.currentThreadId (a syscall on
+  ## Linux; caching matters on per-chunk paths).
+  if pinThreadId == 0: pinThreadId = getThreadId()
+  pinThreadId == core.threadId
+
+proc acquirePin*(core: ptr LoopCore, c: ptr Connection, k: PinKind) {.inline.} =
+  ## Pin `c` for one worker task of kind `k`. Loop thread only, by API
+  ## contract; the doAssert turns the (unsupported) cross-thread acquisition --
+  ## e.g. res.sendFile called from inside a `blocking:` body, a non-atomic
+  ## int32 inc racing the loop -- from silent UB into a caught defect.
+  doAssert onOwnLoopThread(core),
+    "pins may only be acquired on the owning loop thread"
+  inc c.pins[k]
+
+proc acquirePin*(core: ptr LoopCore, s: ptr H3SlotEntry,
+                 k: PinKind) {.inline.} =
+  doAssert onOwnLoopThread(core),
+    "pins may only be acquired on the owning loop thread"
+  inc s.pins[k]
+
+proc releasePin*(c: ptr Connection, k: PinKind) {.inline.} =
+  ## Bare counter release (loop thread). Outbox message application must go
+  ## through the eventloop wrapper, which adds the post-release hooks
+  ## (deferred close, input resume); this primitive backs that wrapper and the
+  ## same-stretch refusal path (request.undoPin), where no message applies.
+  doAssert c.pins[k] > 0, "pin release without a matching acquire"
+  dec c.pins[k]
+
+proc releasePin*(s: ptr H3SlotEntry, k: PinKind) {.inline.} =
+  doAssert s.pins[k] > 0, "pin release without a matching acquire"
+  dec s.pins[k]
+
 const fileChunkCap* = 128 * 1024
   ## Size of a pooled sendFile read buffer (one worker read hop).
 
@@ -519,7 +600,13 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.deadline = 0
   c.dlKind = dkNone
   c.writeArmed = false
-  c.pinned = 0
+  # A recycled slot must never inherit pin residue (R4): leftover counts would
+  # make totalPins/inputPausePins lie for the next occupant -- input running
+  # under a live worker (UAF) or a permanently-paused fresh connection. A
+  # nonzero count here means some release was mis-skipped upstream (e.g. by a
+  # staleness-check bug); crash at the source in debug, scrub in release.
+  doAssert c.totalPins == 0, "slot recycled with live worker pins"
+  for k in PinKind: c.pins[k] = 0
   c.closeRequested = false
   c.closeAfterFlush = false
   c.lingerClose = false
