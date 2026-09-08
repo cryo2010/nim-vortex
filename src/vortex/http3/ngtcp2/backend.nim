@@ -167,7 +167,7 @@ proc cbAccept(user: pointer, conn: ptr VqConn, peerIp: cstring): pointer {.cdecl
   let core = cast[ptr LoopCore](user)
   var idx = -1
   for i in 0 ..< core.h3slots.len:
-    if core.h3slots[i].conn == nil and core.h3slots[i].pinned == 0:
+    if core.h3slots[i].conn == nil and core.h3slots[i].totalPins == 0:
       idx = i; break
   if idx < 0:
     core.h3slots.add H3SlotEntry()
@@ -610,10 +610,6 @@ proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
   var nv = toVq(hdrs)
   vqSubmitHead(conn.vq, int64(sid), cint(200), addr nv[0], csize_t(nv.len))
   true
-
-proc h3WsResume*(core: ptr LoopCore, conn: H3Conn, sid: uint64) =
-  if sid in conn.streams and conn.streams[sid].ws != nil:
-    wsResume(core, nil, WsConn(conn.streams[sid].ws))
 
 proc h3WsLookup(corep: pointer, fd: int32, gen: uint32,
                 stream: uint32): RootRef {.nimcall, gcsafe.} =

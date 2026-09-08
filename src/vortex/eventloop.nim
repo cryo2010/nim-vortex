@@ -308,7 +308,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   c.deadline = 0
   c.dlKind = dkNone
   c.writeDeadline = 0
-  if c.pinned > 0:
+  if c.totalPins > 0:
     # A worker still holds a Request handle into this slot: keep the fd
     # open (reserving the fd number and the slot) until it unpins.
     c.closeRequested = true
@@ -338,6 +338,11 @@ proc closeConn(loop: Loop, c: ptr Connection) =
       c.ssl = nil
   c.h2 = nil
   clearRespHeaders(addr loop.core, c.fd, c.gen)  # drop pending res.headers, if any
+  # Actually freeing: no worker task may still pin this slot (R2). The guard at
+  # the top defers while pinned, so this can only fire if one of the teardown
+  # callbacks above re-pinned a dying connection (e.g. a blocking dispatch from
+  # an onClose handler) -- a defect to catch, not mask.
+  doAssert c.totalPins == 0, "connection freed with live worker pins"
   discard posix.close(cint(c.fd))
   # Return the read/write buffers to the allocator now, rather than pinning their
   # peak capacity until the slot is reused (which may never happen). setLen(0) on
@@ -510,14 +515,14 @@ proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
 
 proc h2Input(loop: Loop, c: ptr Connection) =
   ## Feed buffered bytes to the HTTP/2 codec and dispatch ready streams.
-  if c.pinned > c.filePinned:
-    # A general blocking: worker holds a Request into this connection (it reads
-    # req.body / req.header, which are slices of c.rbuf): pause input so the
-    # streams table and receive buffer are not mutated under it. sendFile
-    # chunk-read pins (c.filePinned) are excluded -- those workers only read a
-    # file, never the stream table, so processing input (flow-control frames,
-    # other streams) is safe and keeps a streamed response's WINDOW_UPDATEs
-    # flowing while it is mid-stream.
+  if c.inputPausePins > 0:
+    # A general blocking:/awaitable worker holds a Request into this connection
+    # (it reads req.body / req.header, which are slices of c.rbuf): pause input
+    # so the streams table and receive buffer are not mutated under it.
+    # sendFile chunk-read pins (pkFileChunk) are excluded -- those workers only
+    # read a file, never the stream table, so processing input (flow-control
+    # frames, other streams) is safe and keeps a streamed response's
+    # WINDOW_UPDATEs flowing while it is mid-stream.
     return
   loop.readyStreams.setLen(0)
   h2Feed(c, loop.readyStreams)
@@ -539,7 +544,7 @@ proc h2Input(loop: Loop, c: ptr Connection) =
     # pipelined with the CONNECT handshake (buffered during accept). Pump them
     # now that the handler has installed onMessage; deliver a deferred
     # peer-close if the client half-closed before we accepted.
-    if c.pinned == 0 and h2StreamAlive(c, sid):
+    if c.inputPausePins == 0 and h2StreamAlive(c, sid):
       let w = wsConnForStream(addr loop.core, c, sid)
       if w != nil and (w.inBuf.len > 0 or w.preAcceptFin):
         if w.inBuf.len > 0:
@@ -668,7 +673,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
   if c.ws != nil:
     # Pause frame dispatch while a ws.blocking worker holds the connection:
     # buffered frames wait until it unpins (one message at a time).
-    if c.pinned == 0:
+    if c.inputPausePins == 0:
       wsInput(addr loop.core, c)
     else:
       # We can't parse frames to observe the peer's pong while pinned, but this
@@ -773,7 +778,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
         # (opt-in, 0 = off), but not while pinned: a blocking: worker may take
         # arbitrarily long and always responds (blockingTrampoline guarantees
         # it), so timing it out would kill legitimate long jobs.
-        if c.pinned == 0 and loop.settings.responseTimeout > 0:
+        if c.totalPins == 0 and loop.settings.responseTimeout > 0:
           c.setDeadline(loop, dkResponse)
         return
       if c.rs.respStreaming:
@@ -800,7 +805,7 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
   ## resume the paused pipeline.
   if stream != 0:
     loop.flushOut(c)
-    if c.state != csFree and c.pinned == 0:
+    if c.state != csFree and c.inputPausePins == 0:
       loop.processInput(c)       # resume input paused during pinning
       if c.state != csFree and c.pendingOut > 0:
         loop.flushOut(c)
@@ -826,6 +831,41 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
       loop.flushOut(c)
     if c.state == csActive and c.rlen == 0 and not c.awaitingResponse:
       c.setDeadline(loop, dkIdle)
+
+proc releasePin(loop: Loop, c: ptr Connection, k: PinKind): bool {.discardable.} =
+  ## Release one typed pin after applying its outbox message, then run the
+  ## post-release hooks that used to be scattered per message kind:
+  ##  * honor a close deferred while pinned (closeRequested -> closeConn), and
+  ##  * the generalized input resume (formerly only on the omFile* branch): the
+  ##    moment no input-pausing pin remains and bytes are buffered, re-process
+  ##    input. A WINDOW_UPDATE or pipelined request parked in rbuf while input
+  ##    was paused has NO other re-processing trigger once the socket goes
+  ##    idle (the #167 deadlock class), so this is a property of every release,
+  ##    not of specific message kinds. Note this means input can now resume one
+  ##    message earlier than before (e.g. on omBlockingDone) -- strictly less
+  ##    stall, and every path below the resume tolerates a state change.
+  ## Returns false when the connection is no longer safe to touch (the
+  ## deferred close ran, or the resume freed the slot).
+  ##
+  ## No-pool servers dispatch inline without acquiring pins but still route
+  ## omBlockingDone/omFile* through the outbox: skip the counter (releasePin
+  ## would underflow a pin that was never taken), keep the hooks.
+  if loop.core.pool != nil:
+    releasePin(c, k)               # doAssert-guarded dec (connection.nim)
+  if c.closeRequested:
+    loop.closeConn(c)              # re-defers if other pins remain
+    return false
+  if c.inputPausePins == 0 and c.rlen > 0:
+    loop.processInput(c)
+    if c.state == csFree: return false
+  true
+
+proc releasePin(loop: Loop, slot: ptr H3SlotEntry, k: PinKind) =
+  ## h3 twin: slots have no input to pause and their deferred free must
+  ## `continue` the outbox message loop, so it stays at the call sites
+  ## (unpinH3AndSkipIfClosing / omBlockingDone). Counter only.
+  if loop.core.pool != nil:
+    releasePin(slot, k)
 
 proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
               stream: uint32) {.nimcall, gcsafe.} =
@@ -899,7 +939,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         # single request head plus body. parseFrame rejects an oversized
         # frame from its length header before this cap is reached, so for
         # a WebSocket this is only a backstop.
-        if c.pinned > 0:
+        if c.totalPins > 0:
           # A blocking: worker holds a Request into this connection and may be
           # reading req.body/req.header, which are slices of c.rbuf. Growing it
           # reallocates the buffer and moves those bytes, a use-after-free on the
@@ -1071,7 +1111,7 @@ proc handleAccept(loop: Loop) =
       # table stops growing. The scan is O(len) but only runs on a growth event.
       var pinnedAny = false
       for i in 0 ..< loop.core.conns.len:
-        if loop.core.conns[i].pinned > 0:
+        if loop.core.conns[i].totalPins > 0:
           pinnedAny = true
           break
       if pinnedAny:
@@ -1175,7 +1215,7 @@ proc handleProxyHeader(loop: Loop, c: ptr Connection) =
 when not defined(plainHttp):
   proc h3FreeSlot(loop: Loop, idx: int) =
     let slot = addr loop.core.h3slots[idx]
-    if slot.pinned > 0:
+    if slot.totalPins > 0:
       slot.closeReq = true
       return
     if slot.conn != nil:
@@ -1206,7 +1246,8 @@ when not defined(plainHttp):
     ngPump()
     for idx in 0 ..< loop.core.h3slots.len:
       if loop.core.h3slots[idx].conn != nil and
-          loop.core.h3slots[idx].closeReq and loop.core.h3slots[idx].pinned == 0:
+          loop.core.h3slots[idx].closeReq and
+          loop.core.h3slots[idx].totalPins == 0:
         loop.h3FreeSlot(idx)
 
 proc processOutbox(loop: Loop) =
@@ -1226,14 +1267,16 @@ proc processOutbox(loop: Loop) =
       ## h3: the message's slot was freed (gen bumped) or holds no connection.
       slot.gen != msgGen or slot.conn == nil
     template unpinH3AndSkipIfClosing(slot: ptr H3SlotEntry, idx: int,
-                                     keep: bool) =
-      ## Release the worker pin (unless the worker kept it across a follow-up
-      ## message) and honor a close deferred while pinned: free the slot once
-      ## the last pin drops and skip the payload -- the slot is condemned, so
-      ## there is nothing left to respond to. (`continue`s the message loop.)
-      if not keep and slot.pinned > 0: dec slot.pinned
+                                     rel: PinRelease) =
+      ## Release the pin the message names (prNone releases nothing -- e.g. an
+      ## awaitable body's own response, whose pkAwait rides its later
+      ## omBlockingDone) and honor a close deferred while pinned: free the
+      ## slot once the last pin drops and skip the payload -- the slot is
+      ## condemned, so there is nothing left to respond to. (`continue`s the
+      ## message loop.)
+      if rel != prNone: loop.releasePin(slot, pinKindOf(rel))
       if slot.closeReq:
-        if slot.pinned == 0: loop.h3FreeSlot(idx)
+        if slot.totalPins == 0: loop.h3FreeSlot(idx)
         continue
   loop.outboxScratch.setLen(0)
   drain(loop.core.outbox, loop.outboxScratch)
@@ -1249,19 +1292,24 @@ proc processOutbox(loop: Loop) =
       GC_unref(base)                             # release the box
       if loop.core.pendingBlockingResults > 0:   # this task is no longer outstanding
         dec loop.core.pendingBlockingResults
+      # The mapping is fixed: omBlockingDone is the one and only carrier of an
+      # awaitable task's release (blockingResultTrampoline stamps it).
+      doAssert m.release == prAwait, "omBlockingDone must release prAwait"
       if m.fd < 0:
         when not defined(plainHttp):
           let idx = h3SlotOf(m.fd)
           if idx < loop.core.h3slots.len and loop.core.h3slots[idx].gen == m.gen:
             let slot = addr loop.core.h3slots[idx]
-            if slot.pinned > 0: dec slot.pinned
-            if slot.closeReq and slot.pinned == 0: loop.h3FreeSlot(idx)
+            loop.releasePin(slot, pkAwait)
+            if slot.closeReq and slot.totalPins == 0: loop.h3FreeSlot(idx)
             h3Touched = true
       elif int(m.fd) < loop.core.conns.len:
         let c = addr loop.core.conns[int(m.fd)]
         if not staleConn(c, m.gen):               # unpin/resume only if alive
-          if c.pinned > 0: dec c.pinned
-          if c.closeRequested: loop.closeConn(c)
+          # releasePin's hook covers the deferred close, and now also resumes
+          # buffered input (e.g. pipelined h1 bytes after an awaitable body):
+          # previously those waited for the next socket event.
+          discard loop.releasePin(c, pkAwait)
       continue
     if m.fd < 0:
       when not defined(plainHttp):
@@ -1277,9 +1325,15 @@ proc processOutbox(loop: Loop) =
         # the staleConn/staleH3 invariant above).
         if m.kind in {omWs, omWsClose, omWsDone}:
           if not staleH3(slot, m.gen):
-            let conn = H3Conn(slot.conn)
             if m.kind == omWsDone:
-              h3WsResume(addr loop.core, conn, uint64(m.stream))
+              # An h3 ws.blocking worker finished. Same dispatch as the h2
+              # stream case below: release the per-stream pin and pump the
+              # frames buffered while it ran. h3 ws messages never carry a
+              # slot-pin release (per-stream pinnedByWorker instead).
+              doAssert m.release == prNone
+              let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
+              if w != nil:
+                wsResume(addr loop.core, nil, w)
             else:
               let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
               if w != nil:
@@ -1288,7 +1342,12 @@ proc processOutbox(loop: Loop) =
           continue
         if staleH3(slot, m.gen): continue
         if m.kind in {omFileStart, omFileChunk}:
-          unpinH3AndSkipIfClosing(slot, idx, m.keepPin)
+          # The initial read (omFileStart <- serveResolved) holds pkBlocking (it
+          # reads request headers -- risk R3: a file-classified release here
+          # would let input mutate state under it); chunk reads are pkFileChunk.
+          doAssert (if m.kind == omFileStart: m.release != prFileChunk
+                    else: m.release in {prFileChunk, prNone})
+          unpinH3AndSkipIfClosing(slot, idx, m.release)
           let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
                              stream: m.stream)
           if m.kind == omFileStart:
@@ -1300,7 +1359,13 @@ proc processOutbox(loop: Loop) =
             applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
           h3Touched = true
           continue
-        unpinH3AndSkipIfClosing(slot, idx, m.keepPin)
+        # omHttp releases what its task held: prBlocking (a sync task's first
+        # response), prFileChunk (a chunk reader's error-fallback 500), or
+        # prNone (an awaitable body's response; its pkAwait rides
+        # omBlockingDone). Never prAwait/prWsBlocking, which have their own
+        # dedicated carrier messages.
+        doAssert m.release notin {prAwait, prWsBlocking}
+        unpinH3AndSkipIfClosing(slot, idx, m.release)
         let (contentType, headers, bodyStart) = unpackResponse(m.data)
         h3Apply(addr loop.core, m.fd, m.gen, m.stream, int(m.code),
                 contentType, headers,
@@ -1319,18 +1384,21 @@ proc processOutbox(loop: Loop) =
         loop.flushOut(c)
       continue
     if m.kind == omWsDone:
-      # A ws.blocking worker finished: unpin and resume dispatching the
-      # frames held back while it ran (connection pin for h1, stream for h2).
+      # A ws.blocking worker finished: release its pin and resume dispatching
+      # the frames held back while it ran. One dispatch on the stream id,
+      # mirrored by the h3 branch above: stream 0 (h1) holds a pkWsBlocking
+      # connection pin; an h2 stream holds the per-stream pin, released by
+      # wsResume via wsReleaseStreamPin.
       if m.stream == 0:
-        if c.pinned > 0: dec c.pinned
-        if c.closeRequested:
-          loop.closeConn(c)        # close was deferred while pinned
-          continue
-        if c.pinned == 0 and c.ws != nil:
-          loop.processInput(c)     # dispatch the next buffered message
-          if c.state != csFree and c.pendingOut > 0:
-            loop.flushOut(c)
+        # releasePin's hook covers the deferred close and, when frames are
+        # buffered (rlen > 0), dispatches the next message via processInput ->
+        # wsInput; only the flush of anything that dispatch queued stays here.
+        doAssert m.release == prWsBlocking
+        if not loop.releasePin(c, pkWsBlocking): continue
+        if c.state != csFree and c.pendingOut > 0:
+          loop.flushOut(c)
       else:
+        doAssert m.release == prNone
         let w = wsConnForStream(addr loop.core, c, m.stream)
         if w != nil:
           wsResume(addr loop.core, c, w)
@@ -1338,22 +1406,22 @@ proc processOutbox(loop: Loop) =
             loop.flushOut(c)
       continue
     if m.kind in {omFileStart, omFileChunk}:
-      if not m.keepPin and c.pinned > 0: dec c.pinned
-      # Only chunk reads (dispatchNextRead -> omFileChunk) are file pins. The
-      # initial read (omFileStart -> serveResolved) reads req headers, so it is a
-      # normal pin and must NOT decrement filePinned.
-      if m.kind == omFileChunk and c.filePinned > 0: dec c.filePinned
-      if c.closeRequested:
-        loop.closeConn(c)
+      # Only chunk reads (dispatchNextRead -> omFileChunk) release prFileChunk.
+      # The initial read (omFileStart -> serveResolved) reads req headers, so
+      # its message releases the pkBlocking pin it held (risk R3: never
+      # classify it as a file pin). releasePin's hook covers the deferred
+      # close and the input resume that lived here -- draining buffered HTTP/2
+      # frames (chiefly the peer's WINDOW_UPDATEs, which a streamed sendFile
+      # response needs) the moment only file pins, if any, remain.
+      doAssert (if m.kind == omFileStart: m.release != prFileChunk
+                else: m.release in {prFileChunk, prNone})
+      if m.release != prNone:
+        if not loop.releasePin(c, pinKindOf(m.release)):
+          continue
+      elif c.closeRequested:
+        loop.closeConn(c)          # re-defers while other pins remain
         continue
-      # A pin just released: if the connection is now runnable (only file pins,
-      # if any, remain) drain any HTTP/2 frames buffered in the receive buffer --
-      # chiefly the peer's WINDOW_UPDATEs, which a streamed sendFile response
-      # needs to keep sending. (With h2Input now running during file pins on the
-      # read path, this covers updates that arrived while a general pin was held.)
-      if c.h2 != nil and c.pinned == c.filePinned and c.rlen > 0:
-        loop.processInput(c)
-        if c.state != csActive: continue
+      if c.state != csActive: continue
       let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
                          stream: m.stream)
       if m.kind == omFileStart:
@@ -1374,8 +1442,16 @@ proc processOutbox(loop: Loop) =
         # interest is never armed and no later Write event would drain it.
         loop.flushOut(c)
       continue
-    if not m.keepPin and c.pinned > 0: dec c.pinned
-    if c.closeRequested:
+    # omHttp releases what its task held: prBlocking (a sync task's first
+    # response), prFileChunk (a chunk reader's error-fallback 500), or prNone
+    # (an awaitable body's response -- its pkAwait rides omBlockingDone -- or
+    # a send from a non-task thread). Hook as above; the resume may now run
+    # just before the apply instead of just after (resumeAfterRespond) -- one
+    # message earlier.
+    doAssert m.release notin {prAwait, prWsBlocking}
+    if m.release != prNone:
+      if not loop.releasePin(c, pinKindOf(m.release)): continue
+    elif c.closeRequested:
       loop.closeConn(c)          # connection died while the task ran
       continue
     let (contentType, headers, bodyStart) = unpackResponse(m.data)
@@ -1417,7 +1493,7 @@ proc sweepTimeouts(loop: Loop) =
       continue
     if c.dlKind == dkWsPing:
       loop.sweepWsPing(c)          # idle: ping, then wait for the pong
-    elif c.dlKind == dkResponse and not c.rs.responded and c.pinned == 0:
+    elif c.dlKind == dkResponse and not c.rs.responded and c.totalPins == 0:
       # A deferred/async response never arrived within responseTimeout: answer
       # 503 and close instead of hanging. A late response arriving afterward is
       # dropped by the generation check on the (by then torn-down) connection.
@@ -1502,7 +1578,7 @@ proc activeH3Conns(loop: Loop): int =
 proc markDrain(loop: Loop, c: ptr Connection) =
   ## Signal one TCP connection to finish its in-flight work and close.
   if c.state != csActive: return
-  if c.pinned > 0: return
+  if c.totalPins > 0: return
     # A blocking: worker holds this connection. Don't touch its h2 ref here
     # (h2Goaway materializes H2Conn(c.h2)) concurrently with the worker under
     # ORC's non-atomic refcounts. It stays counted (connCount > 0) so the loop
@@ -1545,7 +1621,7 @@ proc beginDrain(loop: Loop) =
       let slot = addr loop.core.h3slots[i]
       # Skip a slot pinned by an h3 blocking: worker (see markDrain): touching
       # H3Conn(slot.conn) here would race the worker's non-atomic ORC refcount.
-      if slot.pinned == 0 and slot.conn != nil:
+      if slot.totalPins == 0 and slot.conn != nil:
         h3Goaway(H3Conn(slot.conn))   # RFC 9114 GOAWAY
   let grace = max(0, loop.settings.shutdownGrace)
   loop.drainDeadline = loop.core.nowSec + int64(grace)
@@ -1555,7 +1631,7 @@ proc drainSweep(loop: Loop) =
   for fd in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[fd]
     if c.state != csActive: continue
-    if c.pinned > 0: continue
+    if c.totalPins > 0: continue
       # A pinned connection is not "finished" (a blocking: worker is running),
       # so it never met the close conditions below anyway. Skipping it also
       # avoids materializing its h2 ref here (H2Conn(c.h2)) concurrently with
@@ -1578,7 +1654,7 @@ proc drainSweep(loop: Loop) =
       # Skip a slot pinned by an h3 blocking: worker: h3FreeSlot would defer
       # anyway, and this avoids materializing H3Conn(slot.conn) here while the
       # worker holds the same ref (non-atomic ORC refcount race).
-      if slot.pinned > 0: continue
+      if slot.totalPins > 0: continue
       if slot.conn != nil:
         let h3c = H3Conn(slot.conn)
         # Final GOAWAY (once), after beginDrain's notice went out on a prior
@@ -1748,7 +1824,7 @@ proc run*(loop: Loop) =
           var stuck = 0
           for fd in 0 ..< loop.core.conns.len:
             if loop.core.conns[fd].state != csFree and
-                loop.core.conns[fd].pinned > 0: inc stuck
+                loop.core.conns[fd].totalPins > 0: inc stuck
           try: stderr.writeLine("vortex: graceful shutdown is waiting on " &
             $stuck & " connection(s) held by a still-running blocking: " &
             "handler; the loop cannot exit until they return (a handler that " &
@@ -1757,7 +1833,7 @@ proc run*(loop: Loop) =
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
-        loop.core.h3slots[i].pinned = 0
+        for k in PinKind: loop.core.h3slots[i].pins[k] = 0
         loop.h3FreeSlot(i)
       ngEngineFree()              # frees the shim engine (all conns + TLS ctx)
       discard posix.close(cint(loop.udpFd))
