@@ -31,11 +31,25 @@ type
                   ## INITIAL read (serveResolved reads request headers /
                   ## preconditions, so it is a normal pin); pauses input
     pkAwait,      ## awaitable `req.blocking`; held until its omBlockingDone
-                  ## (the body's own responses ride keepPin); pauses input
+                  ## (the body's own responses carry release = prNone); pauses
+                  ## input
     pkFileChunk,  ## sendFile chunk read (dispatchNextRead): the worker only
                   ## reads a file, never protocol state, so it does NOT pause
                   ## input -- h2 flow-control frames keep flowing mid-stream
     pkWsBlocking  ## h1 `ws.blocking` (stream 0); pauses ws frame dispatch
+
+  PinRelease* = enum
+    ## Which pin (if any) applying an outbox message releases. The message IS
+    ## the release token: the trampoline that owns a worker task decides the
+    ## kind once (Response.relKind), the emit path stamps it into exactly one
+    ## message, and processOutbox releases exactly that -- no ambient
+    ## thread-local state, no per-message-kind release rules to keep in sync.
+    prNone,       ## releases nothing (ws frames, an awaitable body's own
+                  ## responses, duplicate sends). The default.
+    prBlocking,   ## releases one pkBlocking (a sync task's first response)
+    prAwait,      ## releases one pkAwait (omBlockingDone only)
+    prFileChunk,  ## releases one pkFileChunk (a chunk-read task's message)
+    prWsBlocking  ## releases one pkWsBlocking (omWsDone, h1 stream 0)
 
   OutMsgKind* = enum
     omHttp,                   ## data is a packed HTTP response (see packResponse)
@@ -67,12 +81,16 @@ type
     buf*: pointer             ## omFileChunk: the pooled read buffer (code = bytes read)
     n64*: int64               ## total Content-Length (omFileStart)
     last*: bool               ## this chunk completes the file
-    keepPin*: bool            ## this response was produced by an awaitable
-                              ## req.blocking body: its connection/slot pin is
-                              ## released by the task's later omBlockingDone, not
-                              ## by applying this message, so the apply path must
-                              ## NOT decrement the pin (double-dec -> UAF). See
-                              ## request.blockingResultTrampoline / eventloop.
+    release*: PinRelease      ## the pin this message releases when applied
+                              ## (prNone = none). Exactly one message per pin
+                              ## acquisition carries a non-prNone release: a
+                              ## sync task's first response carries prBlocking,
+                              ## a chunk read's omFileChunk carries prFileChunk,
+                              ## an awaitable task's omBlockingDone carries
+                              ## prAwait (its body's own responses carry
+                              ## prNone -- releasing there too would double-dec
+                              ## and free the slot under the worker, UAF), and
+                              ## an h1 ws.blocking omWsDone carries prWsBlocking.
 
   Outbox* = object
     ## MPSC channel into an event loop: workers push, the loop drains on
@@ -441,6 +459,15 @@ func inputPausePins*(c: Connection): int32 =
   c.pins[pkBlocking] + c.pins[pkAwait] + c.pins[pkWsBlocking]
 
 func inputPausePins*(c: ptr Connection): int32 {.inline.} = inputPausePins(c[])
+
+func pinKindOf*(r: PinRelease): PinKind =
+  ## The pin kind a non-prNone release names. Callers gate on prNone first.
+  case r
+  of prBlocking: pkBlocking
+  of prAwait: pkAwait
+  of prFileChunk: pkFileChunk
+  of prWsBlocking: pkWsBlocking
+  of prNone: raiseAssert "prNone names no pin kind"
 
 var pinThreadId {.threadvar.}: int
 

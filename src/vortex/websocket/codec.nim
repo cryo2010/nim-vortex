@@ -61,7 +61,7 @@ type
     subprotocol: string      ## negotiated Sec-WebSocket-Protocol ("" = none)
     # Transport abstraction: the core appends serialized frames to `outBuf`
     # and sets `wantClose`; `flush` drains them (HTTP/1 -> c.wbuf, HTTP/2 ->
-    # stream DATA). `stream`/`inBuf`/`blockingPinned` back the HTTP/2 side.
+    # stream DATA). `stream`/`inBuf`/`pinnedByWorker` back the HTTP/2 side.
     stream*: uint32          ## 0 for HTTP/1.1, else the h2/h3 stream id
     fd*: int32               ## handle identity for callbacks (h3 has no Connection)
     gen*: uint32
@@ -70,7 +70,12 @@ type
     flush*: WsFlush
     inBuf*: string           ## h2/h3 inbound bytes accumulated from DATA frames
     preAcceptFin*: bool      ## client half-closed (END_STREAM) before accept
-    blockingPinned*: bool    ## a per-stream ws.blocking worker holds this stream
+    pinnedByWorker*: bool    ## a per-stream ws.blocking worker holds this h2/h3
+                             ## stream (the per-stream twin of pkWsBlocking; at
+                             ## most one ws.blocking runs per stream, so a bool
+                             ## is the honest type). Loop-thread only; set and
+                             ## cleared exclusively via wsAcquireStreamPin /
+                             ## wsReleaseStreamPin.
     h2Pending*: int          ## h2/h3 outbound bytes queued but not yet on the wire
     h3conn*: RootRef         ## the H3Conn for an h3 stream (reach it + stream)
     # Idle keepalive for h2/h3 streams (h1 uses the connection deadline wheel).
@@ -464,10 +469,19 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       open = false
     of wpFrame:
       open = handleFrame(core, c, w, fr)
-      # A ws.blocking dispatch paused this WebSocket (connection pin for
-      # HTTP/1, per-stream pin for HTTP/2 and HTTP/3): stop and leave the rest
-      # buffered so messages run one at a time, in order. `c` is nil for h3.
-      if (c != nil and c.totalPins > 0) or w.blockingPinned: break
+      # A ws.blocking dispatch paused this WebSocket: stop and leave the rest
+      # buffered so messages run one at a time, in order. An upgraded HTTP/1
+      # connection holds a pkWsBlocking connection pin -- the only pin kind
+      # that can be live on an upgraded conn, since no HTTP request can
+      # dispatch after the 101 (so this deliberately narrows the former
+      # totalPins gate to the ws kind). h2 and h3 use the per-stream
+      # pinnedByWorker instead, so one pinned stream never stalls its
+      # siblings' frames; on an h2 conn pins[pkWsBlocking] is always 0, and
+      # `c != nil` is only deref-safety for h3 (which has no Connection --
+      # note QUIC stream ids start at 0, so w.stream alone cannot
+      # discriminate h1 from h3 here).
+      if (c != nil and c.pins[pkWsBlocking] > 0) or w.pinnedByWorker:
+        break
   pos
 
 proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
@@ -500,7 +514,7 @@ proc wsFeed*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     let old = w.inBuf.len
     w.inBuf.setLen(old + data.len)
     copyMem(addr w.inBuf[old], unsafeAddr data[0], data.len)
-  if not w.blockingPinned:
+  if not w.pinnedByWorker:
     let consumed = wsPump(core, c, w, w.inBuf, w.inBuf.len)
     if consumed > 0:
       let remain = w.inBuf.len - consumed
@@ -515,10 +529,24 @@ proc wsFeed*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   if w.flush != nil:
     w.flush(core, c, w)
 
+proc wsAcquireStreamPin*(core: ptr LoopCore, w: WsConn) =
+  ## Pin one h2/h3 WebSocket stream for a ws.blocking worker: frame dispatch
+  ## for this stream pauses until wsReleaseStreamPin. The per-stream twin of
+  ## acquirePin(pkWsBlocking); loop thread only, same contract.
+  doAssert currentThreadId() == core.threadId,
+    "ws stream pins may only be acquired on the owning loop thread"
+  w.pinnedByWorker = true
+
+proc wsReleaseStreamPin*(core: ptr LoopCore, w: WsConn) =
+  ## Release the stream pin. Loop thread only (applied from omWsDone).
+  doAssert currentThreadId() == core.threadId,
+    "ws stream pins may only be released on the owning loop thread"
+  w.pinnedByWorker = false
+
 proc wsResume*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
-  ## A per-stream ws.blocking worker (h2 or h3) finished: clear the pin and
-  ## pump any frames buffered while it ran.
-  w.blockingPinned = false
+  ## A per-stream ws.blocking worker (h2 or h3) finished: release the stream
+  ## pin and pump any frames buffered while it ran.
+  wsReleaseStreamPin(core, w)
   wsFeed(core, c, w, [])
 
 proc wsStreamClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =

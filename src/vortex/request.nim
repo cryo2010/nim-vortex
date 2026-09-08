@@ -55,6 +55,15 @@ type
     fd*: int32
     gen*: uint32
     stream*: uint32
+    relKind*: PinRelease      ## the pin release the first outbox message this
+                              ## handle emits from a worker must carry. Set
+                              ## once by the owning trampoline (prBlocking for
+                              ## sync tasks, prFileChunk for chunk reads,
+                              ## prNone for awaitable bodies -- their release
+                              ## rides omBlockingDone); prNone (the default)
+                              ## everywhere a Response is rebuilt on the loop
+                              ## thread, where sends apply directly and no
+                              ## worker pin is in play.
 
   RequestHandler* = proc (req: Request, res: Response) {.gcsafe.}
 
@@ -969,28 +978,20 @@ var workerResponded* {.threadvar.}: bool
   ## worker) must still get a default response emitted, otherwise the outbox push
   ## that releases the connection's pin never happens and it hangs forever.
 
-var blockingPinHeld* {.threadvar.}: bool
-  ## Set only while an *awaitable* req.blocking body runs on a worker
-  ## (blockingResultTrampoline). Such a task releases its connection/slot pin via
-  ## the omBlockingDone message that follows the body, so any response the body
-  ## emits (omHttp / omFile*) must be stamped keepPin=true and must NOT release
-  ## the pin when applied -- otherwise the pin is decremented twice (once by the
-  ## response, once by omBlockingDone), which can free/reuse the slot under the
-  ## still-running worker (use-after-free). See eventloop.processOutbox.
-
 proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
              contentType: string, headers: openArray[(string, string)]) =
   if currentThreadId() != res.core.threadId:
     # Worker thread: pack protocol-neutrally; the loop serializes.
     # Idempotent (R3): a blocking: body that calls send twice must not push a
-    # second response. Each push is one OutMsg, and the loop decrements the
-    # connection pin once per OutMsg (eventloop.processOutbox), so a duplicate
-    # would both corrupt the pipeline (a spurious extra response) and
-    # over-release the pin. First send wins; later ones are dropped.
+    # second response. Each push is one OutMsg carrying res.relKind as its pin
+    # release, so a duplicate would both corrupt the pipeline (a spurious
+    # extra response) and double-release the task's pin. First send wins;
+    # later ones are dropped -- which is what makes "exactly one non-prNone
+    # release per sync task" hold on this path.
     if workerResponded: return
     push(res.core.outbox, OutMsg(
       fd: res.fd, gen: res.gen, stream: res.stream, code: int32(code),
-      data: packResponse(contentType, headers, body), keepPin: blockingPinHeld))
+      data: packResponse(contentType, headers, body), release: res.relKind))
     workerResponded = true
     return
   if res.fd < 0:
@@ -2153,13 +2154,20 @@ proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32): Reques
   if workerSnapshot != nil and workerSnapshot.present: snap = workerSnapshot
   Request(core: lc, fd: fd, gen: gen, stream: stream, snap: snap)
 
+proc workerResponse(req: Request, rel: PinRelease): Response =
+  ## The Response for a worker task, carrying the pin release its first outbox
+  ## message must stamp (Response.relKind). Each trampoline constructs a fresh
+  ## Response, so worker-thread reuse cannot leak a previous task's kind.
+  Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
+           relKind: rel)
+
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, data: string) {.nimcall, gcsafe.} =
   discard data                 # HTTP bodies read the request via `req`
   let fn = cast[BlockingProc](user)
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
-  let res = response(req)
+  let res = workerResponse(req, prBlocking)   # sync task: first send releases
   # On the pool path this runs on a worker thread and holds the connection pin;
   # the inline no-pool path runs on the loop thread with no pin. Only the worker
   # path needs the "always respond" guard (and its send routes via the outbox).
@@ -2218,12 +2226,12 @@ type
     ## task (config the capture-free body cannot close over). Used by static
     ## file serving to carry the resolved path + options to the worker.
 
-proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                            stream: uint32, data: string) {.nimcall, gcsafe.} =
+proc blockingDataImpl(user, core: pointer, fd: int32, gen: uint32,
+                      stream: uint32, data: string, rel: PinRelease) {.gcsafe.} =
   let fn = cast[BlockingDataProc](user)
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
-  let res = response(req)
+  let res = workerResponse(req, rel)
   let onWorker = currentThreadId() != lc.threadId
   if onWorker: workerResponded = false
   try:
@@ -2233,6 +2241,20 @@ proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
   if onWorker and not workerResponded:
     res.send(Http500, "500 Internal Server Error")
 
+proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
+                            stream: uint32, data: string) {.nimcall, gcsafe.} =
+  ## Sync data body (incl. the sendFile initial read): holds pkBlocking, so
+  ## the one message it emits releases prBlocking.
+  blockingDataImpl(user, core, fd, gen, stream, data, prBlocking)
+
+proc fileChunkTrampoline(user, core: pointer, fd: int32, gen: uint32,
+                         stream: uint32, data: string) {.nimcall, gcsafe.} =
+  ## sendFile chunk read (dispatchNextRead): holds pkFileChunk. Its normal
+  ## omFileChunk stamps prFileChunk itself (emitFileChunk); relKind matters
+  ## for the error fallback (a reader that raises answers 500 via omHttp,
+  ## which must then release the pkFileChunk pin this task holds).
+  blockingDataImpl(user, core, fd, gen, stream, data, prFileChunk)
+
 proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
                              data: sink string,
                              pin: PinKind) {.raises: [].} =
@@ -2240,11 +2262,14 @@ proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
   ## pkBlocking for handler bodies (incl. the sendFile INITIAL read, which
   ## reads request headers/preconditions and must pause input), pkFileChunk
   ## for dispatchNextRead's chunk reads (file-only workers that must not).
-  ## A refusal releases the same kind, so the counters cannot diverge.
+  ## A refusal releases the same kind, and the matching trampoline stamps the
+  ## same kind as its message's release, so the counters cannot diverge.
+  let tramp = if pin == pkFileChunk: fileChunkTrampoline
+              else: blockingDataTrampoline
   try:
     if req.core.pool == nil:
-      blockingDataTrampoline(cast[pointer](fn), cast[pointer](req.core),
-                             req.fd, req.gen, req.stream, data)  # no pool: inline
+      tramp(cast[pointer](fn), cast[pointer](req.core),
+            req.fd, req.gen, req.stream, data)  # no pool: inline
       return
     if req.fd < 0:
       let idx = h3SlotOf(req.fd)
@@ -2256,7 +2281,7 @@ proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
       if c == nil: return
       acquirePin(req.core, c, pin)
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
-            WorkerTask(fn: blockingDataTrampoline, user: cast[pointer](fn),
+            WorkerTask(fn: tramp, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream, data: data,
                        snap: snapshotRequest(req))):
@@ -2284,7 +2309,7 @@ proc blockingArgsTrampoline[T](user, core: pointer, fd: int32, gen: uint32,
   let box = cast[BlockingArgsBox[T]](user)
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
-  let res = response(req)
+  let res = workerResponse(req, prBlocking)   # sync task: first send releases
   let onWorker = currentThreadId() != lc.threadId
   if onWorker: workerResponded = false
   try:
@@ -2376,12 +2401,16 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
   let box = cast[ptr typeof(BlockingResultBox[A, R]()[])](user)
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
-  let res = response(req)
-  # This task owns the connection/slot pin and releases it via the omBlockingDone
-  # pushed below. Flag any response the body emits so its apply path leaves the
-  # pin alone -- otherwise the pin is decremented twice (see blockingPinHeld).
-  let prevPinHeld = blockingPinHeld
-  blockingPinHeld = true
+  # This task owns a pkAwait pin and releases it via the omBlockingDone pushed
+  # below (release: prAwait). Any response the body emits itself must carry
+  # prNone (res.relKind) so its apply path leaves the pin alone -- releasing
+  # there too would dec the pin twice and could free/reuse the slot under this
+  # still-running worker (use-after-free).
+  let res = workerResponse(req, prNone)
+  # Reset the first-send-wins latch like the sync trampolines do: without it, a
+  # worker thread whose previous task left workerResponded=true would silently
+  # drop a response this body emits (sendRaw's duplicate guard).
+  if currentThreadId() != lc.threadId: workerResponded = false
   try:
     when R is void:
       box.body(req, res, box.args)
@@ -2389,10 +2418,8 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
       box.value = box.body(req, res, box.args)
   except CatchableError as e:
     box.err = e
-  finally:
-    blockingPinHeld = prevPinHeld
   push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
-                         stream: stream, user: user))
+                         stream: stream, user: user, release: prAwait))
 
 proc dispatchBlockingResult*[A, R](req: Request,
                                    box: BlockingResultBox[A, R]) {.raises: [].} =
@@ -2447,21 +2474,25 @@ proc emitFileStart*(res: Response, status: int, contentType: string,
                     reader: pointer, last: bool) =
   ## Worker-side: send the head (with Content-Length) plus the first chunk back
   ## to the loop. Marks the task as having responded (no fallback 500).
+  ## Releases res.relKind -- prBlocking for the initial-read task
+  ## (serveResolved), whose pin this message ends.
   push(res.core.outbox, OutMsg(
     kind: omFileStart, fd: res.fd, gen: res.gen, stream: res.stream,
     code: int32(status), data: packResponse(contentType, headers, firstChunk),
     aux: nextRead, user: reader, n64: totalLen, last: last,
-    keepPin: blockingPinHeld))
+    release: res.relKind))
   workerResponded = true
 
 proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
                     reader: pointer, last: bool) =
   ## Worker-side: hand back a filled pool buffer (no data copy). `n` = bytes
   ## read; the loop copies `buf[0..<n]` into the response and recycles `buf`.
+  ## Always releases prFileChunk: chunk-read tasks are always pkFileChunk, and
+  ## each emits exactly one omFileChunk (readChunkTramp).
   push(res.core.outbox, OutMsg(
     kind: omFileChunk, fd: res.fd, gen: res.gen, stream: res.stream,
     buf: buf, code: int32(n), aux: nextRead, user: reader, last: last,
-    keepPin: blockingPinHeld))
+    release: prFileChunk))
   workerResponded = true
 
 proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
@@ -2674,7 +2705,13 @@ proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   wsRunBody(lc, cast[WsBlockingProc](user), fd, gen, stream, data)
   try:
-    push(lc.outbox, OutMsg(kind: omWsDone, fd: fd, gen: gen, stream: stream))
+    # h1 (fd >= 0, stream 0) holds a pkWsBlocking connection pin: this message
+    # releases it. h2/h3 hold a per-stream WsConn pin instead (pinnedByWorker),
+    # cleared by the omWsDone dispatch via wsResume -- no slot/connection pin,
+    # prNone. The fd check matters: QUIC stream ids start at 0, so an h3
+    # WebSocket on stream 0 must NOT claim the h1 connection-pin release.
+    push(lc.outbox, OutMsg(kind: omWsDone, fd: fd, gen: gen, stream: stream,
+      release: (if fd >= 0 and stream == 0: prWsBlocking else: prNone)))
   except Exception:
     discard
 
@@ -2696,7 +2733,7 @@ proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
       # HTTP/3: pin only this QUIC stream (per-stream), like HTTP/2.
       let w = wsConnForH3(ws.core, ws.fd, ws.gen, ws.stream)
       if w == nil: return
-      w.blockingPinned = true
+      wsAcquireStreamPin(ws.core, w)
     else:
       let c = conn(ws.core, ws.fd, ws.gen)
       if c == nil: return
@@ -2708,7 +2745,7 @@ proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
         # responsive while the worker runs.
         let w = wsConnForStream(ws.core, c, ws.stream)
         if w == nil: return
-        w.blockingPinned = true
+        wsAcquireStreamPin(ws.core, w)
     enqueue(cast[ptr WorkerPool](ws.core.pool),
             WorkerTask(fn: wsBlockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](ws.core), fd: ws.fd, gen: ws.gen,
