@@ -70,9 +70,6 @@ Two bugs the deeper checks caught (the handshake smoke did not):
 
 ## Still open (tracked in todo.txt)
 
-- **Request-body flow-control acks** — `h3AckBody` is a no-op (the shim
-  auto-extends stream offsets on receive); real backpressure for large uploads
-  is a refinement.
 - **helgrind/tsan** — the C++ shim is single-threaded per loop (no locks); worker
   responses cross threads via the existing outbox. Run the race tooling to confirm.
 

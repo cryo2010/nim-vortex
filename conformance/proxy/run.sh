@@ -144,7 +144,6 @@ start_proxy() {  # prox net pcont ; sets proxy_h3
 supported() {  # prox feature proto  -> exit 0 if the cell should run
   case "$2" in
     ws) [ "$3" = h1 ] ;;              # proxies don't map h2/h3 Extended CONNECT to h1 ws
-    streamupload) [ "$3" != h3 ] ;;   # vortex h3 request-body flow-control gap
     *) return 0 ;;
   esac
 }

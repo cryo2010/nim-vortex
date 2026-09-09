@@ -12,9 +12,10 @@ that too is a failure.
 Transport is chosen by VORTEX_PROTO: h1/h2 via httpx, **h3 via aioquic** (see
 h3.py; httpx has no HTTP/3). Both expose the same session shape, so the
 workloads are transport-agnostic. WebSocket over HTTP/3 (RFC 9220 Extended
-CONNECT) is wired for h3 too. The one skipped cell is `streamupload` + `h3`:
-vortex does not yet ack HTTP/3 request-body flow control (the h3AckBody gap), so
-a large h3 upload stalls; that cell prints a skip and exits 0.
+CONNECT) is wired for h3 too. All five workloads run over every transport,
+including `streamupload` over h3 (vortex acks HTTP/3 request-body flow control:
+deliverBody auto-acks the QUIC stream/connection windows as the handler reads,
+and any unread remainder is credited back to the connection window at teardown).
 
 Reports each VORTEX_REPORT_SECONDS in nim-navi's format - status-code tallies
 plus the server's RSS and Nim heap (from /stats) and elapsed time:
@@ -328,15 +329,6 @@ async def main():
     global deadline, start
     if WORKLOAD not in WORKLOADS:
         print(f"unknown VORTEX_WORKLOAD: {WORKLOAD}", flush=True); return 2
-    # Known-unsupported cell: skip cleanly (exit 0) rather than run into a hang.
-    # vortex does not yet ack HTTP/3 request-body flow control (the h3AckBody
-    # gap), so a large h3 upload stalls after the initial window. With the
-    # timeout-is-a-failure fix below an unskipped stall would (correctly) fail,
-    # so this documented gap must be an explicit skip, not a silent run.
-    if WORKLOAD == "streamupload" and IS_H3:
-        print(f"== {WORKLOAD} {SERVER} {PROTO} skipped "
-              f"(h3 request-body flow-control not yet acked) ==", flush=True)
-        return 0
     start = time.monotonic()
     _rate[0] = start
     deadline = start + SECONDS
