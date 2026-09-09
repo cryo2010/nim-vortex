@@ -248,6 +248,17 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   template st: H3Stream = h3c.streams[usid]
   if st.ws != nil:
     # RFC 9220 tunnel: DATA payload is WebSocket framing.
+    if len > 0 and h3c.vq != nil:
+      # Credit the consumed tunnel bytes back to QUIC flow control. nghttp3 does
+      # not credit DATA-frame payload (only framing), and unlike a request body
+      # this stream is long-lived, so without crediting the CONNECT stream's
+      # receive window never reopens: cumulative inbound ws bytes exhaust it
+      # (1 MiB default), the peer goes flow-control-blocked and cannot send, the
+      # tunnel stalls both ways, and the idle connection is torn down (QUIC code
+      # 1). Credit before wsFeed (which may tear the stream down) so `sid` is
+      # known-valid; mirrors the request-body paths below. No manualAck throttle:
+      # wsFeed consumes each frame inline, so immediate credit is correct.
+      vqStreamConsume(h3c.vq, sid, len)
     let arr = cast[ptr UncheckedArray[char]](data)
     wsFeed(h3c.core, nil, WsConn(st.ws), arr.toOpenArray(0, int(len) - 1))
     return

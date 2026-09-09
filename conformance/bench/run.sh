@@ -45,7 +45,10 @@ cimg=vortex-bench-client-img-$id
 if [ "${BENCH_SMOKE:-0}" = "1" ]; then
   rm -rf "$results"; mkdir -p "$results"
   for w in requests ws sse streamupload streamdownload; do
-    BENCH_SMOKE=0 BENCH_KEEP_RESULTS=1 VORTEX_WORKLOAD="$w" sh "$0" >&2 || true
+    # ws is HTTP/1.1 Upgrade only (see supported()); pin it to h1 so the smoke
+    # measures it instead of emitting an h2 skip row (n/a) for every framework.
+    wproto=${VORTEX_PROTO:-h2}; [ "$w" = ws ] && wproto=h1
+    BENCH_SMOKE=0 BENCH_KEEP_RESULTS=1 VORTEX_WORKLOAD="$w" VORTEX_PROTO="$wproto" sh "$0" >&2 || true
   done
   nim r --hints:off "$here/report.nim" "$results"
   exit 0

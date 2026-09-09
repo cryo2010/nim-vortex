@@ -83,6 +83,24 @@ async def reporter():
                 rss = heap = None      # a bad /stats shows as n/a, not fake 0MB
             report_line("", rss, heap)
 
+async def loop_watchdog():
+    # Distinguish a client-side stall from a server-side one. A frozen throughput
+    # counter across every worker at once (all connections idle) can mean either
+    # the server stopped servicing us OR this client's single event loop was
+    # wedged in a blocking call (aioquic crypto, a GC pause, ...) -- and a wedged
+    # loop can't process packets, so it trips the peer's idle timeout and looks
+    # identical (`connection closed ("Idle timeout")`). A 1s sleep that takes far
+    # longer means the loop was blocked; log the lag to stdout so the two cases
+    # are separable after the fact (no WARN => the client loop stayed healthy, so
+    # the stall was the server's).
+    while time.monotonic() < deadline:
+        t0 = time.monotonic()
+        await asyncio.sleep(1.0)
+        lag = time.monotonic() - t0 - 1.0
+        if lag > 2.0:
+            print(f"WARN client event-loop stalled {lag:.1f}s (t={int(t0 - start)}s)",
+                  flush=True)
+
 async def drive(worker):
     # Call worker repeatedly until the deadline (workers that do one transfer
     # per call repeat here). A transport/connection error is a hard failure:
@@ -309,7 +327,7 @@ WORKLOADS = {
 async def main():
     global deadline, start
     if WORKLOAD not in WORKLOADS:
-        print(f"unknown VORTEX_WORKLOAD: {WORKLOAD}", file=sys.stderr); return 2
+        print(f"unknown VORTEX_WORKLOAD: {WORKLOAD}", flush=True); return 2
     # Known-unsupported cell: skip cleanly (exit 0) rather than run into a hang.
     # vortex does not yet ack HTTP/3 request-body flow control (the h3AckBody
     # gap), so a large h3 upload stalls after the initial window. With the
@@ -323,6 +341,7 @@ async def main():
     _rate[0] = start
     deadline = start + SECONDS
     rep = asyncio.ensure_future(reporter())
+    wd = asyncio.ensure_future(loop_watchdog())
     try:
         # workers self-stop at the deadline; wait_for is a safety net so a stalled
         # await (e.g. a peer flow-control stall) can never hang the harness.
@@ -330,7 +349,12 @@ async def main():
             asyncio.gather(*[WORKLOADS[WORKLOAD]() for _ in range(CLIENTS)]),
             timeout=SECONDS + 60)
     except Fail as e:
-        print(f"FAIL {WORKLOAD}: {e} ({fmt_codes()})", file=sys.stderr); return 1
+        # The failure cause must land on stdout next to the "== ... passed =="
+        # verdict lines (report_line, the pass line) -- not stderr. The harness is
+        # driven as `nimble stress | tee stress.log`, which tees only stdout, so a
+        # cause on stderr is lost to the terminal and the log shows a bare
+        # `FAILED (exit 1)` with no reason. Keep the verdict and its cause together.
+        print(f"FAIL {WORKLOAD}: {e} ({fmt_codes()})", flush=True); return 1
     except asyncio.TimeoutError:
         # A stall is exactly what this soak exists to catch (peer flow-control
         # deadlock, a stuck stream, a sendFile-pin write-scheduler deadlock), so
@@ -338,10 +362,10 @@ async def main():
         # warning. Returning here (non-zero) keeps a hang from being reported as
         # a pass once some early iterations happened to succeed.
         print(f"FAIL {WORKLOAD}: workers did not stop within deadline+60s "
-              f"(stall) ({fmt_codes()})", file=sys.stderr)
+              f"(stall) ({fmt_codes()})", flush=True)
         return 1
     finally:
-        rep.cancel()
+        rep.cancel(); wd.cancel()
     total = sum(n for c, n in codes.items() if 200 <= c < 300)
     # A fresh session just for the closing RSS/heap sample; never let a failed
     # connect (server already torn down, a transient QUIC/DNS blip) crash the
@@ -355,7 +379,7 @@ async def main():
         pass
     report_line("final ", rss, heap)
     if total == 0:
-        print(f"FAIL {WORKLOAD}: no successful iterations", file=sys.stderr); return 1
+        print(f"FAIL {WORKLOAD}: no successful iterations", flush=True); return 1
     print(f"== {WORKLOAD} {SERVER} {PROTO} passed ({total} {UNIT}) ==", flush=True)
     return 0
 
