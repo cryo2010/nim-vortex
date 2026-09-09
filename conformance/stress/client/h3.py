@@ -101,8 +101,21 @@ class H3Client(QuicConnectionProtocol):
                 q.put_nowait(("err", f"stream reset (code {event.error_code})"))
             return
         if isinstance(event, ConnectionTerminated):
+            # Include reason_phrase + frame_type so the cause is unambiguous. A
+            # client-side idle timeout surfaces here as code 1 (INTERNAL_ERROR)
+            # with reason "Idle timeout" -- indistinguishable from a peer-sent
+            # transport CONNECTION_CLOSE by code alone; the reason phrase tells
+            # them apart (idle timeout => the peer went silent for the negotiated
+            # idle window; a real peer close carries the peer's own reason).
+            detail = f"code {event.error_code}"
+            rp = getattr(event, "reason_phrase", "") or ""
+            if rp:
+                detail += f' "{rp}"'
+            ft = getattr(event, "frame_type", None)
+            if ft is not None:
+                detail += f" frame_type={ft}"
             for q in self._queues.values():
-                q.put_nowait(("err", f"connection closed (code {event.error_code})"))
+                q.put_nowait(("err", f"connection closed ({detail})"))
             return
         if self._http is not None:
             for e in self._http.handle_event(event):
