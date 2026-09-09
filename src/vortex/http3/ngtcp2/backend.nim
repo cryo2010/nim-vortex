@@ -108,6 +108,8 @@ type
     dispatched: bool
     finSeen: bool
     bodyManualAck: bool
+    uncredited: int          ## streaming body bytes received but not yet
+                             ## credited to QUIC flow control
 
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore
@@ -240,6 +242,7 @@ proc deliverBody(h3c: H3Conn, usid: uint64, last: bool) =
       # peer's stream/connection window reopens. manualAck defers this to
       # req.ackBody so a slow consumer throttles the peer. Mirrors h2DeliverBody.
       vqStreamConsume(h3c.vq, int64(usid), csize_t(buf.len))
+      h3c.streams[usid].uncredited -= buf.len
 
 proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -278,6 +281,11 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
   if st.rs.reqStreaming:
+    # Track received-but-uncredited body bytes so a stream that tears down with
+    # bytes the handler never read (or a manualAck consumer stopped early)
+    # returns them to the connection window at teardown (see creditRemainder);
+    # deliverBody's auto-ack and h3AckBody decrement this as they credit.
+    st.uncredited += int(len)
     deliverBody(h3c, usid, false)
   elif len > 0 and h3c.vq != nil:
     # Buffered request body (#220): nghttp3_conn_read_stream does not credit
@@ -302,6 +310,22 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
     st.dispatched = true
     gReady.add (h3c.slot, h3c.core.h3slots[h3c.slot].gen, usid)
 
+proc creditRemainder(h3c: H3Conn, st: var H3Stream) =
+  ## A streaming stream is going away with body bytes received but never
+  ## credited (handler never read them, or a manualAck consumer stopped
+  ## early). They counted against the connection's MAX_DATA, so return them
+  ## there or the shared window leaks (QUIC code 1 eventually); the stream
+  ## window needs nothing (the stream is gone). Mirrors the oversize path.
+  ##
+  ## Only in-order-received-but-app-uncredited bytes are tracked here. On a
+  ## client RESET_STREAM ngtcp2 reclaims the connection window itself for both
+  ## the unreceived gap up to final_size and any out-of-order buffered data
+  ## (conn_recv_reset_stream -> ngtcp2_conn_extend_max_offset); those never
+  ## enter this counter, so there is no double-credit.
+  if st.uncredited > 0 and h3c.vq != nil:
+    vqConnConsume(h3c.vq, csize_t(st.uncredited))
+    st.uncredited = 0
+
 proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
   let usid = uint64(sid)
@@ -316,6 +340,10 @@ proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} 
       var empty: string
       try: cb(toOpenArray(empty, 0, -1), true)
       except CatchableError: discard
+    # The callback may have closed the stream (res.send); re-check before the
+    # raw table access, mirroring deliverBody.
+    if usid in h3c.streams:
+      creditRemainder(h3c, h3c.streams[usid])
     h3c.streams.del(usid)
 
 proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
@@ -530,6 +558,7 @@ proc h3AckBody*(conn: H3Conn, sid: uint64, n: int) =
   ## auto-ack default replenishes in deliverBody instead.
   if conn.vq != nil and n > 0 and sid in conn.streams:
     vqStreamConsume(conn.vq, int64(sid), csize_t(n))
+    conn.streams[sid].uncredited = max(0, conn.streams[sid].uncredited - n)
 
 proc h3Goaway*(conn: H3Conn) =
   ## Initial GOAWAY notice (RFC 9114 5.2): "shutting down", max stream id.

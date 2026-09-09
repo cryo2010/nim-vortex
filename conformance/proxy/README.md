@@ -45,8 +45,6 @@ Unsupported cells render `n/a` (never dialed):
 
 - **`ws` is h1 only** -- proxies do not translate h2/h3 Extended CONNECT into an
   h1 upstream WebSocket Upgrade.
-- **`streamupload` x h3 = n/a** -- vortex does not yet ack HTTP/3 request-body
-  flow control (`h3AckBody` gap); the client already skips it.
 - **h3 for a proxy whose image lacks a QUIC bind = n/a** -- nginx (>=1.25) and
   caddy serve h3; HAProxy needs a QUIC-enabled build, so run.sh starts it with a
   `bind quic4@` and, if the container fails readiness (a config it can't accept),

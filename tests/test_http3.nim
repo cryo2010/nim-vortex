@@ -58,13 +58,18 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
       acc[] += chunk.len
       if last: res.send(Http200, "got " & $acc[])
+  of "/drain":
+    # Streaming route that responds immediately WITHOUT reading the body. The
+    # received-but-unread body bytes must be credited back to the connection
+    # window at stream teardown, or a long-lived connection leaks MAX_DATA.
+    res.send(Http200, "ok")
   else:
     res.send(Http404, "nope")
 
 proc streamPred(core: ptr LoopCore, fd: int32, gen: uint32,
                 stream: uint32): bool {.gcsafe.} =
   let req = Request(core: core, fd: fd, gen: gen, stream: stream)
-  req.path == "/up" and req.method == HttpPost
+  req.path in ["/up", "/drain"] and req.method == HttpPost
 
 withServer(RequestHandler(handler),
            initVortexConfig(numThreads = 1, workerThreads = 2,
@@ -140,6 +145,49 @@ withServer(RequestHandler(handler),
       let (output, rc) = h3curl("--data-binary @" & tmp & " " & base & "/up")
       check rc == 0
       check output == "got " & $(300 * 1024)
+
+    test "streamed upload beyond both QUIC windows":
+      # 9 MiB > 1 MiB stream window AND > 4 MiB connection window, so a completed
+      # transfer proves both MAX_STREAM_DATA and MAX_DATA replenish as the handler
+      # reads (deliverBody auto-ack), plus the maxBodySize streaming exemption.
+      # -m 60 makes a flow-control stall fail (timeout) instead of hanging.
+      let big = certDir / "up9.bin"
+      let n = 9 * 1024 * 1024
+      writeFile(big, "u".repeat(n))
+      let (output, rc) = h3curl("-m 60 --data-binary @" & big & " " & base & "/up")
+      check rc == 0
+      check output == "got " & $n
+
+    test "unread streaming upload does not leak the connection window":
+      # Regression for the teardown credit-remainder fix. Ten 512 KiB POSTs to
+      # /drain (a streaming route that responds without reading the body) over ONE
+      # reused QUIC connection: cumulative 5 MiB > the 4 MiB connection window.
+      # Each unread body's bytes must return to MAX_DATA at stream teardown (a
+      # clean close, appErr 0) or requests past the 4 MiB mark stall
+      # flow-control-blocked. All ten must return 200. Verified to time out
+      # (0 codes) with the counter change stashed, and pass with it.
+      #
+      # Driven with --next (not one multi-URL invocation): --next completes each
+      # transfer before the next, so no concurrent unread streams pile up and
+      # starve the pump; a single invocation multiplexes all ten at once and
+      # deadlocks regardless of the fix. --http3-only/-sk are re-specified per
+      # segment because they do not carry across --next (curl would otherwise
+      # fall back to h2/TCP and abort on the self-signed cert). num_connects is 1
+      # on the first transfer and 0 after, confirming one reused h3 connection.
+      # 512 KiB stays under the 1 MiB stream window so each upload completes.
+      let drainBody = certDir / "drain.bin"
+      writeFile(drainBody, "d".repeat(512 * 1024))
+      let seg = "-o /dev/null -w '%{http_code}\\n' --data-binary @" & drainBody &
+        " " & base & "/drain"
+      var args = "-m 30 " & seg
+      for i in 1 ..< 10:
+        args &= " --next -sk --http3-only -m 30 " & seg
+      let (output, rc) = h3curl(args)
+      check rc == 0
+      let codes = output.splitLines()
+      check codes.len == 10
+      for c in codes:
+        check c == "200"
 
     test "remoteAddress reports the QUIC peer IP":
       # Over h3 the peer address comes from ngtcp2 (the connection path's remote

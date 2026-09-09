@@ -70,13 +70,12 @@ VORTEX_PROTO=all VORTEX_RESP_COMPRESSION=br nimble stressRequests
 ## HTTP/3
 
 `VORTEX_PROTO=h3` drives the server's QUIC listener with **aioquic** (httpx has
-no h3). `requests`, `ws` (RFC 9220 Extended CONNECT), `sse`, and `streamdownload`
-run over h3. One cell is a printed skip (exit 0) for now:
-
-- **`streamupload` over h3** - vortex does not yet ack HTTP/3 request-body flow
-  control (the `h3AckBody` / NG2 gap), so a large h3 upload stalls after the
-  initial window. Downloads (server -> client) are unaffected. This is an
-  explicit skip, not a silent run: a hang (rather than a skip) now hard-fails.
+no h3). All five workloads - `requests`, `ws` (RFC 9220 Extended CONNECT),
+`sse`, `streamdownload`, and `streamupload` - run over h3. vortex acks HTTP/3
+request-body flow control: `deliverBody` auto-acks the QUIC stream/connection
+windows as the handler reads the body, and any bytes received but never read are
+credited back to the connection window when the stream tears down, so a large h3
+upload flows without stalling.
 
 `VORTEX_PROTO=all` includes h3 (h1 + h2 + h3). h3 cells reuse the same server
 image as h2 (only the `STRESS_HTTP3` runtime toggle differs), so the extra cost
