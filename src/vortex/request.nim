@@ -1686,6 +1686,8 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     c.respFraming = if effLen >= 0: rfContentLength
                     elif chunked: rfChunked
                     else: rfCloseDelimited
+    c.respContentLength = effLen        # >= 0 only for the length-delimited path
+    c.respBodyWritten = 0               # reconciled at finish() (#248)
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc.len > 0:
         c.rs.respComp = makeStreamComp(enc)
@@ -1736,6 +1738,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       return h2Writable(res, backlog)
     if not c.rs.respStreaming: return false
     if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
+    c.respBodyWritten += data.len   # reconciled vs respContentLength at finish() (#248)
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.rs.respComp != nil:
         let z = compChunk(c.rs.respComp, c.rs.respEnc, data, false)
@@ -1833,6 +1836,14 @@ proc finish*(res: Response) {.raises: [].} =
         c.rs.respEnc = ""
     if framing == rfChunked and c.parser.httpMethod != HttpHead:
       appendLastChunk(c.wbuf, trailers)
+    # A length-delimited (Content-Length) stream that wrote fewer/more body bytes
+    # than declared would desync the next keep-alive response (the peer reads the
+    # missing bytes from the following response's head). Force close on a mismatch
+    # rather than keep the connection alive with a wrong framing (#248). HEAD is
+    # exempt (respContentLength stays -1; it writes no body by design).
+    if c.respContentLength >= 0 and c.respBodyWritten != c.respContentLength:
+      c.closeAfterFlush = true
+    c.respContentLength = -1
     # Close-delimited (HTTP/1.0, neither chunked nor Content-Length) must close;
     # chunked and Content-Length bodies keep the connection alive.
     if not c.parser.keepAlive or c.peerHalfClosed or
