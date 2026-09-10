@@ -36,6 +36,9 @@ type
     ws*: RootRef                     ## WsConn when this stream is a WebSocket
     pendingWindow*: int              ## consumed bytes not yet returned as a
                                      ## stream WINDOW_UPDATE (batched at half-window)
+    bufferedCounted*: int            ## bytes this un-dispatched buffered body
+                                     ## currently contributes to H2Conn.bufferedBytes
+                                     ## (the per-connection memory cap, #235)
     connDeferred*: int               ## connection-window bytes debited from
                                      ## connRecvRemaining on receipt but not yet
                                      ## returned via creditConn (a streaming
@@ -89,6 +92,12 @@ type
                               ## level before overrunning the advertised window
     pendingConnWindow*: int   ## consumed bytes not yet returned as a connection
                               ## WINDOW_UPDATE (batched at half-window)
+    bufferedBytes*: int       ## total un-dispatched buffered (non-streaming)
+                              ## request-body bytes held across all streams. The
+                              ## connection receive window credits buffered bodies
+                              ## eagerly (a body larger than the window must, or it
+                              ## could never arrive), so this independent aggregate
+                              ## is what caps per-connection buffered memory (#235).
     # Per-connection write scheduler (RFC 9218): one round-robin ready-queue per
     # urgency level (0 highest .. 7). The scheduler serves the lowest non-empty
     # urgency, popping a stream and emitting one frame; incremental streams
@@ -232,6 +241,9 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe.} =
   if st.connDeferred > 0:
     h2.creditConn(c, st.connDeferred)
     st.connDeferred = 0
+  if st.bufferedCounted > 0:              # release its buffered-memory reservation
+    h2.bufferedBytes -= st.bufferedCounted
+    st.bufferedCounted = 0
   let w = if st.ws != nil: WsConn(st.ws) else: nil
   st.ws = nil
   let bodyCb = st.rs.onBodyCb
@@ -1020,6 +1032,11 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
     st.dispatched = true
     ready.add sid
   elif st.endStreamSeen and not st.dispatched:
+    # Dispatched (END_STREAM reached here, e.g. on the initial HEADERS or via a
+    # trailer section): release any un-dispatched buffered-body reservation (#235).
+    if st.bufferedCounted > 0:
+      h2.bufferedBytes -= st.bufferedCounted
+      st.bufferedCounted = 0
     if st.contentLength >= 0 and int64(st.body.len) != st.contentLength:
       h2.streamError(c, sid, errProtocol)
       return
@@ -1134,8 +1151,23 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         st.body.setLen(old + dataLen)
         if dataLen > 0:
           copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
-        if (fh.flags and flagEndStream) != 0:
+        # A buffered body is retained (not consumed on receipt) until END_STREAM
+        # dispatch, and its connection-window bytes are credited eagerly (a body
+        # larger than the window must be, or it could never arrive). So the
+        # window does NOT bound buffered memory; an independent per-connection
+        # aggregate does. cap >= maxBody, so any single upload fits; concurrent
+        # trickled bodies that together exceed it get the offender REFUSED_STREAM
+        # (retryable) instead of pinning ~2 GiB (#235).
+        st.bufferedCounted += dataLen
+        h2.bufferedBytes += dataLen
+        if h2.bufferedBytes > max(h2.connRecvWindow, h2.maxBody):
+          h2.streamError(c, sid, errRefusedStream)
+        elif (fh.flags and flagEndStream) != 0:
           st.endStreamSeen = true
+          # Dispatched now: it leaves the un-dispatched aggregate (the handler
+          # will consume st.body and complete). Release its reservation.
+          h2.bufferedBytes -= st.bufferedCounted
+          st.bufferedCounted = 0
           if st.contentLength >= 0 and
               int64(st.body.len) != st.contentLength:
             h2.streamError(c, sid, errProtocol)
