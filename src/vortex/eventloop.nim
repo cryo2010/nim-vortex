@@ -576,6 +576,15 @@ proc h2Input(loop: Loop, c: ptr Connection) =
       # h2AwaitingClient -- read-timing that would kill a legitimate silent-client
       # SSE/download. bodyTimeout is the natural bound for in-flight request bytes.
       c.setDeadline(loop, dkBody)
+    elif h2BlockedOnPeerWindow(c):
+      # Every open stream has finished its request (so h2AwaitingClient is false),
+      # but the server still owes response bytes parked on an exhausted send
+      # window. That is NOT a legitimately-silent SSE/download: the client must
+      # send WINDOW_UPDATE to receive more, so treat its silence as a stall and
+      # arm the body deadline. Otherwise the else below clears the deadline and
+      # nothing (no read deadline, no write deadline -- the bytes are in
+      # pendingBody, not wbuf) ever reaps the connection (#236).
+      c.setDeadline(loop, dkBody)
     else:
       c.deadline = 0
       c.dlKind = dkNone

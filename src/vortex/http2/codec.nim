@@ -1484,6 +1484,23 @@ proc h2AwaitingClient*(c: ptr Connection): bool =
     if not st.endStreamSeen: return true
   false
 
+proc h2BlockedOnPeerWindow*(c: ptr Connection): bool =
+  ## True if any open stream owes response bytes (queued in pendingBody) it
+  ## cannot send because a flow-control send window is exhausted. Such a stream
+  ## is waiting on the client to grant window (WINDOW_UPDATE); a client that
+  ## absorbs the initial window then stays silent would otherwise pin the fd, the
+  ## connection slot, and the multi-MB pendingBody buffers forever -- zero
+  ## traffic, no timeout (the slow-read / zero-window attack, #236). The loop
+  ## arms a body deadline while this holds so a genuinely stalled reader is cut
+  ## off; a client that keeps reading re-arms it on every pass that drains bytes.
+  if c.h2 == nil: return false
+  let h2 = h2Conn(c)
+  for sid, st in h2.streams.mpairs:
+    if st.pendingBody.len - st.pendingPos > 0 and
+        (st.sendWindow <= 0 or h2.connSendWindow <= 0):
+      return true
+  false
+
 proc h2StreamAlive*(c: ptr Connection, sid: uint32): bool =
   c.h2 != nil and sid in h2Conn(c).streams
 
