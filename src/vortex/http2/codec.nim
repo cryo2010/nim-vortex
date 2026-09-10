@@ -62,6 +62,10 @@ type
                               ## (RFC 9113 3.4: it MUST be a SETTINGS frame)
     contStream*: uint32              ## awaiting CONTINUATION for this stream
     contEndStream*: bool
+    contRefuse*: uint32              ## if non-zero, the stream now buffering its
+                                     ## header block is being REFUSED with this
+                                     ## error code: decode the block (keep HPACK
+                                     ## in sync) but RST instead of dispatch (#233)
     headerBlock*: string
     lastStreamId*: uint32
     goingAway*: bool          ## our own drain: final GOAWAY sent, refuse new streams
@@ -1139,46 +1143,62 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       fragLen -= 1
       if padLen > fragLen: h2.connError(c, errProtocol); return
       fragLen -= padLen
+    var selfDep = false
     if (fh.flags and flagPriority) != 0:
       if fragLen < 5: h2.connError(c, errFrameSize); return
-      if (get32(c.rbuf, fragStart) and 0x7fffffff'u32) == sid:
-        # Self-dependency is a STREAM error (RFC 7540 5.3.1, semantics kept by
-        # 9113), not a connection teardown -- matches Go/nghttp2, which RST only
-        # this stream instead of GOAWAY-ing every concurrent one.
-        h2.streamError(c, sid, errProtocol); return
+      selfDep = (get32(c.rbuf, fragStart) and 0x7fffffff'u32) == sid
       fragStart += 5
       fragLen -= 5
+    # A stream can be REFUSED (self-dependency, graceful drain, or the
+    # concurrency cap) without tearing the connection down. RFC 9113 4.3 still
+    # requires the field block to be HPACK-decoded even when discarded, or the
+    # server's dynamic table desyncs from the client's encoder; and the refused
+    # id must advance lastStreamId and track CONTINUATION so legally-pipelined
+    # frames behind it are not mistaken for idle-stream connection errors (#233).
+    # So: buffer + decode the block as usual, then RST with this code instead of
+    # dispatching -- never create the stream or reset the flood budget for it.
+    var refuseErr = 0'u32
     if sid in h2.streams:
       if not h2.streams[sid].headersDone:
         h2.connError(c, errProtocol); return   # HEADERS while mid-request
       if h2.streams[sid].endStreamSeen:
         h2.connError(c, errStreamClosed); return
-      # else: trailers (allowed)
+      # else: trailers (allowed); the deprecated priority flag is ignored
     else:
       if sid <= h2.lastStreamId:
         h2.connError(c, errStreamClosed); return  # closed stream reuse
-      if h2.goingAway:
-        h2.streamError(c, sid, errRefusedStream); return
-      if h2.maxConcurrentStreams > 0 and
+      if selfDep:
+        # RFC 7540 5.3.1: self-dependency is a stream error PROTOCOL_ERROR.
+        refuseErr = errProtocol
+      elif h2.goingAway:
+        refuseErr = errRefusedStream
+      elif h2.maxConcurrentStreams > 0 and
           h2.activeStreams >= h2.maxConcurrentStreams:
-        h2.streamError(c, sid, errRefusedStream); return
+        refuseErr = errRefusedStream
       h2.lastStreamId = sid
-      h2.streams[sid] = H2Stream(
-        sendWindow: h2.peerInitialWindow, contentLength: -1,
-        recvRemaining: h2.streamRecvWindow, urgency: defaultUrgency)
-      inc h2.activeStreams
-      if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
-        h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
-        h2.pendingPriority.del(sid)
-      h2.controlFrameCount = 0       # a real request: reset the flood budget
+      if refuseErr == 0:
+        h2.streams[sid] = H2Stream(
+          sendWindow: h2.peerInitialWindow, contentLength: -1,
+          recvRemaining: h2.streamRecvWindow, urgency: defaultUrgency)
+        inc h2.activeStreams
+        if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
+          h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
+          h2.pendingPriority.del(sid)
+        h2.controlFrameCount = 0     # a real request: reset the flood budget
     h2.headerBlock.setLen(fragLen)
     if fragLen > 0:
       copyMem(addr h2.headerBlock[0], addr c.rbuf[fragStart], fragLen)
     if (fh.flags and flagEndHeaders) != 0:
       h2.finishHeaders(c, sid, (fh.flags and flagEndStream) != 0, ready)
+      # finishHeaders decoded the block; a refused stream is not in the table so
+      # it returned without dispatching. Now RST it (REFUSED_STREAM lets the peer
+      # safely retry). Skip if decoding already tore the connection down.
+      if refuseErr != 0 and c.state != csClosing:
+        h2.streamError(c, sid, refuseErr)
     else:
       h2.contStream = sid
       h2.contEndStream = (fh.flags and flagEndStream) != 0
+      h2.contRefuse = refuseErr
 
   of ftContinuation:
     if h2.contStream == 0 or fh.streamId != h2.contStream:
@@ -1201,6 +1221,9 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       let sid = h2.contStream
       h2.contStream = 0
       h2.finishHeaders(c, sid, h2.contEndStream, ready)
+      if h2.contRefuse != 0 and c.state != csClosing:
+        h2.streamError(c, sid, h2.contRefuse)   # decoded above; now refuse (#233)
+      h2.contRefuse = 0
 
   of ftSettings:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
