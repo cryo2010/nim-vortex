@@ -228,6 +228,10 @@ type
     respFraming*: RespFraming ## how the open streaming body is delimited
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
     bodyFed*: int             ## body bytes already delivered to onBody
+    respContentLength*: int64 ## declared Content-Length of an open rfContentLength
+                              ## streamed response (-1 = not length-delimited);
+                              ## reconciled against respBodyWritten at finish()
+    respBodyWritten*: int64   ## body bytes written so far on that stream (#248)
 
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
@@ -594,6 +598,8 @@ proc resetRequestState(c: var Connection) =
   c.respFraming = rfNone
   c.respBackedUp = false
   c.bodyFed = 0
+  c.respContentLength = -1
+  c.respBodyWritten = 0
   c.parser.reset(0)
 
 proc resetForNextRequest*(c: var Connection) =
