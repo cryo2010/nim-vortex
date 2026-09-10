@@ -228,9 +228,9 @@ proc h2Goaway*(c: ptr Connection) =
   h2.goingAway = true
   c.wbuf.addGoaway(h2.lastStreamId, 0'u32)
 
-proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe.}
+proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe, raises: [].}
 
-proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe.} =
+proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises: [].} =
   ## The single stream-removal primitive for every teardown path (normal
   ## completion, RST_STREAM in either direction, stream error, connection
   ## close). It reconciles outstanding flow-control credit and fires any parked
@@ -248,32 +248,45 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe.} =
   ## The stream is removed BEFORE the callbacks run, so a callback that responds
   ## (res.send/res.write) sees the stream already gone and cannot double-delete
   ## or double-decrement activeStreams.
-  if sid notin h2.streams: return
-  template st: H2Stream = h2.streams[sid]
-  if st.connDeferred > 0:
-    h2.creditConn(c, st.connDeferred)
-    st.connDeferred = 0
-  if st.bufferedCounted > 0:              # release its buffered-memory reservation
-    h2.bufferedBytes -= st.bufferedCounted
-    st.bufferedCounted = 0
-  let w = if st.ws != nil: WsConn(st.ws) else: nil
-  st.ws = nil
-  let bodyCb = st.rs.onBodyCb
-  st.rs.onBodyCb = nil
-  let drainCb = st.rs.onRespDrain
-  st.rs.onRespDrain = nil
+  # withValue (not h2.streams[sid]) so this stays raises:[] -- the Table `[]`
+  # accessor raises KeyError, which would flag the whole res.send path in the
+  # strict-effect async build even behind the membership guard.
+  var w: WsConn = nil
+  var bodyCb: BodyCb = nil
+  var drainCb: RespDrainCb = nil
+  h2.streams.withValue(sid, st):
+    if st.connDeferred > 0:
+      h2.creditConn(c, st.connDeferred)
+      st.connDeferred = 0
+    if st.bufferedCounted > 0:            # release its buffered-memory reservation
+      h2.bufferedBytes -= st.bufferedCounted
+      st.bufferedCounted = 0
+    if st.ws != nil:
+      w = WsConn(st.ws)
+      st.ws = nil
+    bodyCb = st.rs.onBodyCb
+    st.rs.onBodyCb = nil
+    drainCb = st.rs.onRespDrain
+    st.rs.onRespDrain = nil
+  do:
+    return                                # not present (already gone)
   h2.streams.del(sid)
   dec h2.activeStreams
+  # teardownStream is reachable from the normal res.send path (h2Respond ->
+  # h2Schedule -> teardownStream), which in the strict-effect async build must be
+  # raises:[]. The user callbacks are unannotated (raises: [Exception]), so
+  # contain Exception (not just CatchableError) at every call, as h2ResumeProducers
+  # does -- otherwise res.send is flagged "can raise an unlisted exception".
   if w != nil:
     try: wsStreamClosed(h2.core, c, w)
-    except CatchableError: discard
+    except Exception: discard
   if bodyCb != nil:
     var empty: string
     try: bodyCb(toOpenArray(empty, 0, -1), true)
-    except CatchableError: discard
+    except Exception: discard
   if drainCb != nil:
     try: drainCb(h2.core, c.fd, c.gen, sid)
-    except CatchableError: discard
+    except Exception: discard
 
 proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
   # RFC 9113 5.1 forbids RST_STREAM on an idle stream id (one never opened): a
@@ -750,8 +763,11 @@ proc h2NotifyClosed*(c: ptr Connection) =
     try: cb(toOpenArray(empty, 0, -1), true)
     except CatchableError: discard
   for (sid, cb) in drainCbs:
+    # onRespDrain wraps an unannotated user producer (raises: [Exception]); catch
+    # Exception so the connection-close path stays raises:[] under strict-effect
+    # async (as teardownStream / h2ResumeProducers do).
     try: cb(h2.core, c.fd, c.gen, sid)
-    except CatchableError: discard
+    except Exception: discard
 
 proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
                  extensionsOffer, protocolsOffer: string,
@@ -887,7 +903,7 @@ proc creditStream(h2: H2Conn, c: ptr Connection, sid: uint32, n: int) =
     st.recvRemaining += st.pendingWindow   # window grows by what we just granted
     st.pendingWindow = 0
 
-proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe.} =
+proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe, raises: [].} =
   ## Connection-level counterpart, batched at half the connection window;
   ## accumulates across all streams on the connection.
   if n <= 0: return
