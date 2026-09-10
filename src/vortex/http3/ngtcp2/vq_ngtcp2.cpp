@@ -895,7 +895,13 @@ void vq_engine_pump(VqEngine *eng, uint64_t now_ns) {
   // Reap closed/draining connections.
   for (auto i = e->conns.begin(); i != e->conns.end();) {
     Conn *c = i->get();
-    bool dead = c->closed || (c->conn && ngtcp2_conn_in_closing_period(c->conn));
+    // Reap a connection in the DRAINING period too (peer sent CONNECTION_CLOSE):
+    // in_closing_period is true only when WE sent the close, so without this a
+    // peer-initiated close left the Conn/ngtcp2/nghttp3/SSL alive until the full
+    // idle timeout -- a slow leak / slot exhaustion (#252).
+    bool dead = c->closed || c->draining ||
+                (c->conn && (ngtcp2_conn_in_closing_period(c->conn) ||
+                             ngtcp2_conn_in_draining_period(c->conn)));
     if (dead) {
       if (e->cfg.cb.on_conn_close && c->conn_ud)
         e->cfg.cb.on_conn_close(e->cfg.user, c->conn_ud);
