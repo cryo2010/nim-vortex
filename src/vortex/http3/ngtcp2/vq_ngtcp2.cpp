@@ -562,6 +562,17 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
     c->conn_ud = e->cfg.cb.on_accept(e->cfg.user, reinterpret_cast<VqConn *>(c),
                                      const_cast<char *>(c->peer_ip.c_str()));
 
+  // on_accept returning NULL rejects the connection (per the header contract).
+  // Without honoring it the conn would handshake and drive callbacks with a nil
+  // conn_ud, which the Nim side dereferences (#255). Emit CONNECTION_CLOSE and do
+  // not admit it. (Latent today: cbAccept never returns nil, but the contract is
+  // now enforced for any future admission policy.)
+  if (e->cfg.cb.on_accept && c->conn_ud == nullptr) {
+    c->wantClose = true;
+    e->conns.push_back(std::move(owned));   // reaped on the next pump after CLOSE
+    return c;
+  }
+
   e->conns.push_back(std::move(owned));
   return c;
 }
