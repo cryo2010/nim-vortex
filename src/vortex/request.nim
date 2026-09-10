@@ -1790,12 +1790,19 @@ proc finish*(res: Response) {.raises: [].} =
     if c == nil: return
     if res.stream != 0:
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-        let st = h2Stream(c, res.stream)
+        var st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
           let z = compChunk(st.rs.respComp, st.rs.respEnc, "", true)
           if z.len > 0: discard h2StreamWrite(c, res.stream, z)
-          st.rs.respComp = nil
-          st.rs.respEnc = ""
+          # h2StreamWrite runs the scheduler, which may del OTHER streams on
+          # completion and backshift the table, invalidating the captured `st`
+          # (codec.nim: "valid until the streams table is next mutated"). Re-fetch
+          # by sid before clearing the compressor, or skip it if the stream is
+          # gone -- never write through the stale pointer (use-after-move).
+          st = h2Stream(c, res.stream)
+          if st != nil:
+            st.rs.respComp = nil
+            st.rs.respEnc = ""
       h2StreamFinish(c, res.stream, trailers)
       flushConn(res)
       return
