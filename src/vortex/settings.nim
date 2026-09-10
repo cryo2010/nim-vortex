@@ -57,7 +57,7 @@ type
 
     # Limits (bytes unless noted)
     maxHeaderSize*: int       ## request line + headers, 431 when exceeded
-    maxHeaderCount*: int      ## 400 when exceeded
+    maxHeaderCount*: int      ## 431 when exceeded
     maxBodySize*: int         ## 413 when exceeded
     initialBufferSize*: int   ## per-connection read/write buffer starting size
     maxWsMessageSize*: int    ## largest inbound WebSocket message (close 1009 over it)
