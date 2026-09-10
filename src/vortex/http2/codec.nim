@@ -3,7 +3,7 @@
 ## One H2Conn per connection, touched only by the owning loop thread
 ## (workers respond through the protocol-neutral outbox).
 
-import std/[tables, strutils, json, deques]
+import std/[tables, strutils, json, deques, sets]
 import ./frames, ./hpack
 import ../connection
 import ../fieldrules   # token delimiters + pseudo-header machine shared with
@@ -75,6 +75,14 @@ type
                                      ## in sync) but RST instead of dispatch (#233)
     headerBlock*: string
     lastStreamId*: uint32
+    # Streams the SERVER closed while the client was still open (no END_STREAM
+    # seen): a client's legally in-flight DATA/trailer HEADERS may race the
+    # deletion, so we answer those with RST_STREAM instead of a connection error
+    # (#239). A stream the client itself finished (END_STREAM) is NOT recorded --
+    # a HEADERS on it is a genuine violation and stays a connection error
+    # (RFC 9113 5.1, h2spec 5.1). Bounded FIFO so it cannot grow without limit.
+    earlyClosed*: HashSet[uint32]
+    earlyClosedQ*: Deque[uint32]
     goingAway*: bool          ## our own drain: final GOAWAY sent, refuse new streams
     drainNoticeSent*: bool    ## initial GOAWAY(2^31-1) sent (graceful drain notice);
                               ## new/racing streams are still processed until the
@@ -230,6 +238,19 @@ proc h2Goaway*(c: ptr Connection) =
 
 proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe, raises: [].}
 
+const maxEarlyClosed = 256
+  ## Cap on remembered server-early-closed stream ids (bounds the racing-frame
+  ## tolerance window; a flood of new streams evicts old entries FIFO).
+
+proc recordEarlyClosed(h2: H2Conn, sid: uint32) {.raises: [].} =
+  ## Remember `sid` as closed by the server while the client was still open, so a
+  ## racing frame gets RST_STREAM (tolerated) rather than a connection error (#239).
+  if sid in h2.earlyClosed: return
+  h2.earlyClosed.incl sid
+  h2.earlyClosedQ.addLast sid
+  if h2.earlyClosedQ.len > maxEarlyClosed:
+    h2.earlyClosed.excl h2.earlyClosedQ.popFirst()
+
 proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises: [].} =
   ## The single stream-removal primitive for every teardown path (normal
   ## completion, RST_STREAM in either direction, stream error, connection
@@ -255,6 +276,10 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises
   var bodyCb: BodyCb = nil
   var drainCb: RespDrainCb = nil
   h2.streams.withValue(sid, st):
+    if not st.endStreamSeen:
+      # Closed with the client still sending: its in-flight frames may race this
+      # deletion, so remember the id to answer them with RST rather than GOAWAY.
+      h2.recordEarlyClosed(sid)
     if st.connDeferred > 0:
       h2.creditConn(c, st.connDeferred)
       st.connDeferred = 0
@@ -1325,13 +1350,20 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.streamError(c, sid, errStreamClosed); return
       # else: trailers (allowed); the deprecated priority flag is ignored
     elif sid <= h2.lastStreamId:
-      # A closed / racing stream (never in the table now, id already used): the
-      # server may have closed it early on a final response (half-closed local)
-      # while the client's legally in-flight HEADERS raced the deletion. Decode
-      # the block (keep HPACK in sync for the client's other streams) and answer
-      # with RST_STREAM(STREAM_CLOSED) rather than GOAWAY-ing every concurrent
-      # request for correct client behavior (#239). Do NOT advance lastStreamId.
-      refuseErr = errStreamClosed
+      if sid in h2.earlyClosed:
+        # The server closed this stream early (final response before the client
+        # finished) and the client's legally in-flight HEADERS raced the
+        # deletion. Decode the block (keep HPACK in sync for the client's other
+        # streams) and answer RST_STREAM(STREAM_CLOSED) rather than GOAWAY-ing
+        # every concurrent request for correct client behavior (#239). Do NOT
+        # advance lastStreamId.
+        h2.earlyClosed.excl sid
+        refuseErr = errStreamClosed
+      else:
+        # A stream the client itself finished (END_STREAM), or an id below the
+        # high-water mark that was never opened: a HEADERS here is a genuine
+        # violation -> connection error STREAM_CLOSED (RFC 9113 5.1, h2spec 5.1).
+        h2.connError(c, errStreamClosed); return
     else:
       if selfDep:
         # RFC 7540 5.3.1: self-dependency is a stream error PROTOCOL_ERROR.
@@ -1533,10 +1565,14 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     h2.noteControlFrame(c)
     if c.state == csClosing: return
     if (get32(c.rbuf, payloadPos) and 0x7fffffff'u32) == fh.streamId:
-      # Self-dependency is a STREAM error (RFC 7540 5.3.1), not a connection
-      # teardown -- matches Go/nghttp2 (RST_STREAM only if the stream is open;
-      # streamError skips the reset for an idle id per RFC 9113 5.1).
-      h2.streamError(c, fh.streamId, errProtocol)   # self-dependency
+      # Self-dependency is a PROTOCOL_ERROR (RFC 7540 5.3.1). On an opened stream
+      # it is a STREAM error (RST_STREAM, connection survives -- Go/nghttp2). On
+      # an idle stream RST_STREAM is forbidden (RFC 9113 5.1), so the only legal
+      # signal is a connection error (h2spec expects GOAWAY here).
+      if fh.streamId > h2.lastStreamId:
+        h2.connError(c, errProtocol)
+      else:
+        h2.streamError(c, fh.streamId, errProtocol)
     # Otherwise ignored (RFC 9113 deprecates the priority tree).
 
   of ftGoaway:
