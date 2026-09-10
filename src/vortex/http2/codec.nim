@@ -656,19 +656,33 @@ proc h2WsTeardownAll*(c: ptr Connection) =
       st.ws = nil
 
 proc h2NotifyClosed*(c: ptr Connection) =
-  ## Deliver a final onBody(last=true) for every streaming request whose body
-  ## was still open when the connection died, so an async adapter suspended in
-  ## await req.read() resumes at end-of-body and its Future / reader-table entry
-  ## are released instead of leaking. Loop thread; called from closeConn.
+  ## Deliver a final onBody(last=true) AND fire any parked onRespDrain for every
+  ## stream still open when the connection died, so a handler suspended in
+  ## await req.read() (consumer) or await res.drained() (producer) resumes and
+  ## its Future / reader-table entry / finally-cleanup runs instead of leaking a
+  ## zombie coroutine. Loop thread; called from closeConn. No flow-control credit
+  ## is reconciled here -- the connection (and its windows) are being torn down.
   if c.h2 == nil: return
   let h2 = H2Conn(c.h2)
-  var empty: string
+  # Snapshot and detach the callbacks BEFORE firing any, so a callback that
+  # responds (res.write/res.send mutating the streams table) cannot invalidate
+  # the iterator we are walking.
+  var bodyCbs: seq[(uint32, BodyCb)]
+  var drainCbs: seq[(uint32, RespDrainCb)]
   for sid, st in h2.streams.mpairs:
     if st.rs.onBodyCb != nil:
-      let cb = st.rs.onBodyCb
+      bodyCbs.add (sid, st.rs.onBodyCb)
       st.rs.onBodyCb = nil
-      try: cb(toOpenArray(empty, 0, -1), true)
-      except CatchableError: discard
+    if st.rs.onRespDrain != nil:
+      drainCbs.add (sid, st.rs.onRespDrain)
+      st.rs.onRespDrain = nil
+  var empty: string
+  for (sid, cb) in bodyCbs:
+    try: cb(toOpenArray(empty, 0, -1), true)
+    except CatchableError: discard
+  for (sid, cb) in drainCbs:
+    try: cb(h2.core, c.fd, c.gen, sid)
+    except CatchableError: discard
 
 proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
                  extensionsOffer, protocolsOffer: string,
