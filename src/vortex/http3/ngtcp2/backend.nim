@@ -111,6 +111,8 @@ type
     bodyManualAck: bool
     uncredited: int          ## streaming body bytes received but not yet
                              ## credited to QUIC flow control
+    bufferedCounted: int     ## bytes this un-dispatched buffered body currently
+                             ## contributes to H3Conn.bufferedBytes (#254)
 
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore
@@ -121,6 +123,10 @@ type
     vq: ptr VqConn
     streams*: Table[uint64, H3Stream]
     closing: bool
+    bufferedBytes: int      ## total un-dispatched buffered (non-streaming) request
+                            ## -body bytes across streams; the QUIC window credits
+                            ## buffered bodies eagerly, so this independent
+                            ## aggregate is what caps per-connection memory (#254)
     lastStreamId: uint64
     goneAway: bool          ## initial GOAWAY notice sent
     finalGoaway: bool       ## final GOAWAY (nghttp3_conn_shutdown) sent
@@ -131,6 +137,7 @@ var
   gCore {.threadvar.}: ptr LoopCore
   gUdpFd {.threadvar.}: cint
   gMaxBody {.threadvar.}: uint64             # buffered request-body cap (0 = none)
+  gConnWindow {.threadvar.}: uint64          # h3 connection recv window (#254 cap)
   gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
@@ -276,6 +283,7 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     # without it a client could leak the shared window with oversized requests --
     # then STOP_SENDING+RESET the stream.
     if len > 0 and h3c.vq != nil: vqConnConsume(h3c.vq, len)
+    h3c.bufferedBytes -= st.bufferedCounted        # release its reservation (#254)
     if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
     h3c.streams.del(usid)
     return
@@ -297,6 +305,18 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     # flows and cumulative body bytes across requests do not exhaust the
     # connection's MAX_DATA window and stall the peer (QUIC code 1).
     vqStreamConsume(h3c.vq, sid, len)
+    # The eager connection-window credit above means MAX_DATA does NOT bound
+    # buffered memory; an independent per-connection aggregate does. cap >= maxBody
+    # so any single upload fits; concurrent trickled bodies that together exceed it
+    # get the offender H3_MESSAGE_ERROR reset rather than pinning maxBody x streams
+    # of memory (#254).
+    st.bufferedCounted += int(len)
+    h3c.bufferedBytes += int(len)
+    if gMaxBody > 0'u64 and
+        h3c.bufferedBytes > max(int(gConnWindow), int(gMaxBody)):
+      h3c.bufferedBytes -= st.bufferedCounted
+      vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
+      h3c.streams.del(usid)
 
 proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -309,6 +329,9 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   elif st.rs.reqStreaming:
     deliverBody(h3c, usid, true)
   elif not st.dispatched and st.headersDone:
+    # Dispatched: the buffered body leaves the un-dispatched aggregate (#254).
+    h3c.bufferedBytes -= st.bufferedCounted
+    st.bufferedCounted = 0
     st.dispatched = true
     gReady.add (h3c.slot, h3c.core.h3slots[h3c.slot].gen, usid)
 
@@ -348,6 +371,7 @@ proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} 
   st.rs.onBodyCb = nil
   let drainCb = st.rs.onRespDrain
   st.rs.onRespDrain = nil
+  h3c.bufferedBytes -= st.bufferedCounted      # release any buffered reservation (#254)
   creditRemainder(h3c, h3c.streams[usid])
   h3c.streams.del(usid)
   if w != nil:
@@ -414,6 +438,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
+  gConnWindow = uint64(connRecvWindow)
   var cfg: VqConfig
   cfg.user = core
   cfg.cb = VqCallbacks(on_accept: cbAccept, on_headers: cbHeaders, on_body: cbBody,
