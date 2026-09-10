@@ -109,6 +109,9 @@ type
     dispatched: bool
     finSeen: bool
     bodyManualAck: bool
+    contentLength: int64     ## declared content-length (-1 = absent); reconciled
+                             ## against bodyReceived at stream end (#257)
+    bodyReceived: int64      ## cumulative DATA payload bytes received
     uncredited: int          ## streaming body bytes received but not yet
                              ## credited to QUIC flow control
     bufferedCounted: int     ## bytes this un-dispatched buffered body currently
@@ -195,7 +198,7 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   let h3c = cast[H3Conn](connUd)
   let usid = uint64(sid)
   if usid notin h3c.streams:
-    h3c.streams[usid] = H3Stream(id: usid)
+    h3c.streams[usid] = H3Stream(id: usid, contentLength: -1)
   template st: H3Stream = h3c.streams[usid]
   if st.headersDone:
     # A header block after the request head is the trailer section (RFC 9114
@@ -204,8 +207,20 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
     let tarr = cast[ptr UncheckedArray[VqHeader]](hdrs)
     for i in 0 ..< int(n):
       let name = toStr(tarr[i].name, tarr[i].name_len)
-      if name.len > 0 and name[0] != ':':
-        st.trailers.add (name, toStr(tarr[i].value, tarr[i].value_len))
+      let val = toStr(tarr[i].value, tarr[i].value_len)
+      # RFC 9114 4.1/4.2: trailers are fields, so apply the same validity rules as
+      # the head. QPACK does no byte validation, so a CR/LF/NUL value or non-token
+      # name would inject via req.trailers; a pseudo-header or connection-specific
+      # field is malformed. Reject the stream rather than store it (#257).
+      if name.len == 0 or name[0] == ':' or
+          not validFieldName(name) or not validFieldValue(val):
+        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
+      case name
+      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
+         "proxy-connection":
+        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
+      else: discard
+      st.trailers.add (name, val)
     return
   let arr = cast[ptr UncheckedArray[VqHeader]](hdrs)
   for i in 0 ..< int(n):
@@ -220,6 +235,20 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   of h3hRequest: discard
   for (name, val) in st.headers:
     if name == ":method": st.isHead = val == "HEAD"
+    elif name == "content-length":
+      # RFC 9110 8.6 grammar (1*DIGIT), non-negative, no duplicate-with-different
+      # value; the Nim side owns this (nghttp3 may reconcile length but not the
+      # digits-only grammar / duplicate rule) so a mis-parsed length can't smuggle
+      # when the request is proxied (#257).
+      var cl: int64 = 0
+      var ok = val.len > 0
+      for ch in val:
+        if ch notin '0'..'9': ok = false; break
+        if cl > (int64.high - 9) div 10: ok = false; break
+        cl = cl * 10 + int64(uint8(ch) - uint8('0'))
+      if not ok or (st.contentLength >= 0 and st.contentLength != cl):
+        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
+      st.contentLength = cl
   st.headersDone = true
   if usid > h3c.lastStreamId: h3c.lastStreamId = usid
   # Streaming route or ws-connect dispatch on headers; body flows via onBody.
@@ -290,6 +319,7 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   let old = st.body.len
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
+  st.bodyReceived += int64(len)   # for content-length reconciliation (#257)
   if st.rs.reqStreaming:
     # Track received-but-uncredited body bytes so a stream that tears down with
     # bytes the handler never read (or a manualAck consumer stopped early)
@@ -326,6 +356,11 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   st.finSeen = true
   if st.ws != nil:
     wsPeerClosed(h3c.core, nil, WsConn(st.ws))
+  elif st.contentLength >= 0 and st.bodyReceived != st.contentLength:
+    # Declared content-length disagrees with the DATA received: malformed request
+    # (RFC 9110 8.6). Reset the stream; cbStreamClose delivers EOF to a suspended
+    # handler and cleans up (#257). Do not dispatch/deliver a clean completion.
+    if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
   elif st.rs.reqStreaming:
     deliverBody(h3c, usid, true)
   elif not st.dispatched and st.headersDone:
@@ -513,7 +548,16 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
   result.add ("date", core.dateStr)
   if contentType.len > 0 and not bodiless: result.add ("content-type", contentType)
   if not bodiless and bodyLen >= 0: result.add ("content-length", $bodyLen)
-  for (name, val) in extra: result.add (name.toLowerAscii, val)
+  for (name, val) in extra:
+    let ln = name.toLowerAscii
+    # RFC 9114 4.2: an h3 endpoint MUST NOT generate connection-specific fields;
+    # drop them (and any stray handler pseudo-header) rather than QPACK-encode a
+    # response a strict client would cancel (#257). Mirrors http2 encodeExtraHeader.
+    case ln
+    of "connection", "keep-alive", "transfer-encoding", "upgrade",
+       "proxy-connection": discard
+    else:
+      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
 
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
@@ -557,13 +601,24 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
   # Submit any trailer fields before the FIN so nghttp3 keeps the stream open for
   # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
   if trailers.len > 0:
-    var tv = newSeq[VqHeader](trailers.len)
-    var lower = newSeq[(string, string)](trailers.len)
-    for i, (name, val) in trailers:
-      lower[i] = (name.toLowerAscii, val)
-      tv[i] = VqHeader(name: lower[i][0].cstring, name_len: csize_t(lower[i][0].len),
-                       value: lower[i][1].cstring, value_len: csize_t(lower[i][1].len))
-    vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
+    # Validate handler-supplied response trailers before submission: drop a
+    # pseudo/connection-specific name or a value with CR/LF/NUL, so a handler
+    # concatenating untrusted data into a trailer can't split the response on an
+    # h1 relay (#257). Build the wire list from only the accepted entries.
+    var lower: seq[(string, string)]
+    for (name, val) in trailers:
+      let ln = name.toLowerAscii
+      if ln.len == 0 or ln[0] == ':' or not validFieldValue(val): continue
+      case ln
+      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
+         "proxy-connection": continue
+      else: lower.add (ln, val)
+    if lower.len > 0:
+      var tv = newSeq[VqHeader](lower.len)
+      for i in 0 ..< lower.len:
+        tv[i] = VqHeader(name: lower[i][0].cstring, name_len: csize_t(lower[i][0].len),
+                         value: lower[i][1].cstring, value_len: csize_t(lower[i][1].len))
+      vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
   vqStreamFinish(conn.vq, int64(sid))
 
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
