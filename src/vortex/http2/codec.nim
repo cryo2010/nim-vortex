@@ -949,7 +949,10 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
     # req.trailers; a pseudo-header in the trailer section is malformed
     # (RFC 9113 8.1), so reject it rather than expose it.
     if not endStream:
-      h2.connError(c, errProtocol)
+      # A malformed request is a STREAM error (RFC 9113 8.1, as Go's http2
+      # does), not a connection teardown that would abort every concurrent
+      # request on the connection (#239).
+      h2.streamError(c, sid, errProtocol)
       return
     for (name, val) in fields:
       # RFC 9113 8.2.1 applies the field-validity rules to the trailer section
@@ -1252,11 +1255,19 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       if not h2.streams[sid].headersDone:
         h2.connError(c, errProtocol); return   # HEADERS while mid-request
       if h2.streams[sid].endStreamSeen:
-        h2.connError(c, errStreamClosed); return
+        # HEADERS on a half-closed(remote) stream: RFC 9113 5.1 mandates a
+        # STREAM error STREAM_CLOSED, not a connection teardown (#239).
+        h2.streamError(c, sid, errStreamClosed); return
       # else: trailers (allowed); the deprecated priority flag is ignored
+    elif sid <= h2.lastStreamId:
+      # A closed / racing stream (never in the table now, id already used): the
+      # server may have closed it early on a final response (half-closed local)
+      # while the client's legally in-flight HEADERS raced the deletion. Decode
+      # the block (keep HPACK in sync for the client's other streams) and answer
+      # with RST_STREAM(STREAM_CLOSED) rather than GOAWAY-ing every concurrent
+      # request for correct client behavior (#239). Do NOT advance lastStreamId.
+      refuseErr = errStreamClosed
     else:
-      if sid <= h2.lastStreamId:
-        h2.connError(c, errStreamClosed); return  # closed stream reuse
       if selfDep:
         # RFC 7540 5.3.1: self-dependency is a stream error PROTOCOL_ERROR.
         refuseErr = errProtocol
@@ -1281,10 +1292,11 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if (fh.flags and flagEndHeaders) != 0:
       h2.finishHeaders(c, sid, (fh.flags and flagEndStream) != 0, ready)
       # finishHeaders decoded the block; a refused stream is not in the table so
-      # it returned without dispatching. Now RST it (REFUSED_STREAM lets the peer
-      # safely retry). Skip if decoding already tore the connection down.
+      # it returned without dispatching. Budget the refusal (overhead) then RST
+      # it. Skip if decoding or the budget already tore the connection down.
       if refuseErr != 0 and c.state != csClosing:
-        h2.streamError(c, sid, refuseErr)
+        h2.noteControlFrame(c)
+        if c.state != csClosing: h2.streamError(c, sid, refuseErr)
     else:
       h2.contStream = sid
       h2.contEndStream = (fh.flags and flagEndStream) != 0
@@ -1310,10 +1322,12 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     if (fh.flags and flagEndHeaders) != 0:
       let sid = h2.contStream
       h2.contStream = 0
-      h2.finishHeaders(c, sid, h2.contEndStream, ready)
-      if h2.contRefuse != 0 and c.state != csClosing:
-        h2.streamError(c, sid, h2.contRefuse)   # decoded above; now refuse (#233)
+      let refuse = h2.contRefuse
       h2.contRefuse = 0
+      h2.finishHeaders(c, sid, h2.contEndStream, ready)
+      if refuse != 0 and c.state != csClosing:   # decoded above; now refuse (#233/#239)
+        h2.noteControlFrame(c)
+        if c.state != csClosing: h2.streamError(c, sid, refuse)
 
   of ftSettings:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
