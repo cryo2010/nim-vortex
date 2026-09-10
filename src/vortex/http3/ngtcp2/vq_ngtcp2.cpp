@@ -321,6 +321,13 @@ int setupHttpConn(Conn *c) {
   settings.qpack_blocked_streams = 0;
   settings.qpack_max_dtable_capacity = 4096;
   settings.enable_connect_protocol = 1;   // RFC 9220 WebSockets over HTTP/3
+  // Advertise the configured header-section limit (#253). Without this nghttp3
+  // leaves it unlimited, so the operator's max_field_section_size is silently
+  // ignored and a client can send an oversized header section (bounded only by
+  // the stream flow-control window).
+  if (c->engine->cfg.max_field_section_size > 0)
+    settings.max_field_section_size =
+        (uint64_t)c->engine->cfg.max_field_section_size;
 
   static const nghttp3_callbacks cbs = {
       h3AckedStreamData,   // acked_stream_data
