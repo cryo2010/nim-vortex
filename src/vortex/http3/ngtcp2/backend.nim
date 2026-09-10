@@ -233,6 +233,7 @@ proc deliverBody(h3c: H3Conn, usid: uint64, last: bool) =
     # on `st` afterwards -- re-check membership before crediting flow control.
     let cb = st.rs.onBodyCb
     let manualAck = st.bodyManualAck
+    if last: st.rs.onBodyCb = nil   # single EOF: cbStreamClose must not re-fire (#256)
     var buf: string
     swap(buf, st.body)
     cb(buf.toOpenArray(0, buf.len - 1), last)
