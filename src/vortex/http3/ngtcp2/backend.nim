@@ -331,22 +331,36 @@ proc creditRemainder(h3c: H3Conn, st: var H3Stream) =
 proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
   let usid = uint64(sid)
-  if usid in h3c.streams:
-    template st: H3Stream = h3c.streams[usid]
-    if st.ws != nil:
-      wsStreamClosed(h3c.core, nil, WsConn(st.ws))
-      st.ws = nil
-    if st.rs.onBodyCb != nil:
-      let cb = st.rs.onBodyCb
-      st.rs.onBodyCb = nil
-      var empty: string
-      try: cb(toOpenArray(empty, 0, -1), true)
-      except CatchableError: discard
-    # The callback may have closed the stream (res.send); re-check before the
-    # raw table access, mirroring deliverBody.
-    if usid in h3c.streams:
-      creditRemainder(h3c, h3c.streams[usid])
-    h3c.streams.del(usid)
+  if usid notin h3c.streams: return
+  template st: H3Stream = h3c.streams[usid]
+  # Snapshot the WebSocket + parked callbacks and reconcile flow-control credit
+  # BEFORE removing the stream, then fire the callbacks after -- so a callback
+  # that responds (res.send/res.write) cannot invalidate the table access, and
+  # BOTH onBodyCb(last=true) AND onRespDrain fire on every teardown (RST /
+  # STOP_SENDING / abnormal close). Firing onBodyCb resumes a suspended
+  # req.read(); firing onRespDrain resumes a producer parked in res.drained()
+  # instead of stranding it forever (#232 analog, #250). Contain Exception (not
+  # just CatchableError) so an unannotated user callback cannot unwind across the
+  # C++ boundary.
+  let w = if st.ws != nil: WsConn(st.ws) else: nil
+  st.ws = nil
+  let bodyCb = st.rs.onBodyCb
+  st.rs.onBodyCb = nil
+  let drainCb = st.rs.onRespDrain
+  st.rs.onRespDrain = nil
+  creditRemainder(h3c, h3c.streams[usid])
+  h3c.streams.del(usid)
+  if w != nil:
+    try: wsStreamClosed(h3c.core, nil, w)
+    except Exception: discard
+  if bodyCb != nil:
+    var empty: string
+    try: bodyCb(toOpenArray(empty, 0, -1), true)
+    except Exception: discard
+  if drainCb != nil:
+    try: drainCb(h3c.core, h3SlotFd(h3c.slot),
+                 h3c.core.h3slots[h3c.slot].gen, uint32(usid))
+    except Exception: discard
 
 proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -589,17 +603,32 @@ proc h3GracefulClose*(conn: H3Conn) =
   vqConnCloseGraceful(conn.vq, 0)
 
 proc h3Free*(conn: H3Conn) =
-  var empty: string
+  # Snapshot ws + parked callbacks and detach them BEFORE firing any, so a
+  # callback that responds cannot invalidate the mpairs iterator; then clear the
+  # table and fire. Deliver onBodyCb(last=true) AND onRespDrain for every open
+  # stream so a suspended req.read()/res.drained() resumes instead of stranding a
+  # zombie coroutine when the whole connection dies (#250; matches h2NotifyClosed).
+  var wss: seq[WsConn]
+  var bodyCbs: seq[BodyCb]
+  var drainCbs: seq[(uint32, RespDrainCb)]
   for sid, st in conn.streams.mpairs:
-    if st.ws != nil:                  # onClose(1006) for any open ws stream
-      wsStreamClosed(conn.core, nil, WsConn(st.ws))
-      st.ws = nil
+    if st.ws != nil:
+      wss.add WsConn(st.ws); st.ws = nil
     if st.rs.onBodyCb != nil:
-      let cb = st.rs.onBodyCb
-      st.rs.onBodyCb = nil
-      try: cb(toOpenArray(empty, 0, -1), true)
-      except CatchableError: discard
+      bodyCbs.add st.rs.onBodyCb; st.rs.onBodyCb = nil
+    if st.rs.onRespDrain != nil:
+      drainCbs.add (uint32(sid), st.rs.onRespDrain); st.rs.onRespDrain = nil
   conn.streams.clear()
+  var empty: string
+  for w in wss:
+    try: wsStreamClosed(conn.core, nil, w)
+    except Exception: discard
+  for cb in bodyCbs:
+    try: cb(toOpenArray(empty, 0, -1), true)
+    except Exception: discard
+  for (sid, cb) in drainCbs:
+    try: cb(conn.core, h3SlotFd(conn.slot), conn.core.h3slots[conn.slot].gen, sid)
+    except Exception: discard
   if conn.vq != nil:
     vqConnClose(conn.vq, 0)
     conn.vq = nil
