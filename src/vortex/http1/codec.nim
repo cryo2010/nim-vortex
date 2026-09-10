@@ -4,6 +4,7 @@
 ## memcopies and one integer format.
 
 import std/httpcore
+from std/strutils import toLowerAscii
 from ../connection import bodilessStatus
 
 proc addField*(wbuf: var string, s: string) =
@@ -22,6 +23,18 @@ proc addField*(wbuf: var string, s: string) =
     for ch in s:
       if ch != '\r' and ch != '\n':
         wbuf.add ch
+
+proc connSpecificField*(name: string): bool =
+  ## True for a hop-by-hop / framing field name a handler must NOT set on an h1
+  ## response (RFC 9110 7.6.1 / 9112 6.1): the codec generates Content-Length and
+  ## Connection itself, so echoing a handler-supplied one produces conflicting
+  ## framing (a second Content-Length, or Transfer-Encoding alongside it) that a
+  ## downstream intermediary reads as request/response smuggling. Content-Type is
+  ## NOT in this set (it is carried separately). Mirrors http2 encodeExtraHeader.
+  case name.toLowerAscii
+  of "connection", "proxy-connection", "keep-alive", "transfer-encoding",
+     "upgrade", "content-length": true
+  else: false
 
 const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -116,6 +129,7 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
     wbuf.add altSvc
     wbuf.add "\r\n"
   for (name, val) in extraHeaders:
+    if connSpecificField(name): continue    # never echo handler framing headers
     wbuf.addField name
     wbuf.add ": "
     wbuf.addField val
@@ -192,6 +206,7 @@ proc appendStreamHead*(wbuf: var string, code: HttpCode,
     wbuf.add altSvc
     wbuf.add "\r\n"
   for (name, val) in extraHeaders:
+    if connSpecificField(name): continue    # never echo handler framing headers
     wbuf.addField name
     wbuf.add ": "
     wbuf.addField val
@@ -214,6 +229,7 @@ proc appendLastChunk*(wbuf: var string,
   ## Terminate a chunked body: the zero-length chunk plus optional trailers.
   wbuf.add "0\r\n"
   for (name, val) in trailers:
+    if connSpecificField(name): continue    # never echo handler framing headers
     wbuf.addField name
     wbuf.add ": "
     wbuf.addField val
