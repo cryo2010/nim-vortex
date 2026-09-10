@@ -96,6 +96,13 @@ type
                               ## level before overrunning the advertised window
     pendingConnWindow*: int   ## consumed bytes not yet returned as a connection
                               ## WINDOW_UPDATE (batched at half-window)
+    encTableMax*: int         ## the dynamic-table max our (static-only) encoder
+                              ## currently signals to the peer's decoder (starts
+                              ## at the HPACK default 4096)
+    pendingTableSizeUpdate*: int  ## >=0: emit an HPACK dynamic-table-size-update
+                              ## instruction of this value at the start of the
+                              ## next response header block (-1 = none), owed when
+                              ## the peer lowers SETTINGS_HEADER_TABLE_SIZE (#240.8)
     bufferedBytes*: int       ## total un-dispatched buffered (non-streaming)
                               ## request-body bytes held across all streams. The
                               ## connection receive window credits buffered bodies
@@ -164,7 +171,8 @@ proc newH2Conn*(core: ptr LoopCore, maxBody, maxHeaderList,
     maxControlFrames: maxControlFrames,
     streamRecvWindow: max(streamRecvWindow, int(defaultInitialWindow)),
     connRecvWindow: max(connRecvWindow, int(defaultInitialWindow)),
-    connRecvRemaining: max(connRecvWindow, int(defaultInitialWindow)))
+    connRecvRemaining: max(connRecvWindow, int(defaultInitialWindow)),
+    encTableMax: 4096, pendingTableSizeUpdate: -1)
 
 proc sendOurSettings(c: ptr Connection) =
   var payload = ""
@@ -299,6 +307,31 @@ proc noteControlProgress(h2: H2Conn) =
 
 # --- response serialization ------------------------------------------------
 
+proc encodeExtraHeader(hb: var string, name, val: string) =
+  ## Encode one handler-supplied response header, dropping the connection-
+  ## specific fields RFC 9113 8.2.2 forbids an h2 endpoint from generating
+  ## (connection, keep-alive, transfer-encoding, upgrade, proxy-connection). A
+  ## strict client (nghttp2-based, browsers) treats a response carrying them as
+  ## malformed and cancels the stream, so h1-portable handler code would break on
+  ## h2. The inbound direction is already filtered; this closes the outbound gap
+  ## (#240.3). Names are lowercased to h2 wire form regardless.
+  let lname = name.toLowerAscii
+  case lname
+  of "connection", "proxy-connection", "keep-alive", "transfer-encoding",
+     "upgrade": discard
+  else: encodeHeader(hb, lname, val)
+
+proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
+  ## Prepend a pending HPACK dynamic-table-size-update instruction (RFC 7541
+  ## 4.2) to a response header block. Our encoder is static-only, but when the
+  ## peer lowers SETTINGS_HEADER_TABLE_SIZE the decoder still requires us to
+  ## signal the reduced maximum before the next block, or it raises
+  ## COMPRESSION_ERROR (nghttp2 does when the peer sets it to 0). Emitted once,
+  ## by whichever header block is serialized first after the change (#240.8).
+  if h2.pendingTableSizeUpdate >= 0:
+    encodeInt(hb, h2.pendingTableSizeUpdate, 5, 0x20)
+    h2.pendingTableSizeUpdate = -1
+
 proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   ## Emit a streamed response's trailer section as a trailing HEADERS frame
   ## carrying END_STREAM, then drop the stream. Called once the response body
@@ -306,8 +339,9 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   if sid notin h2.streams: return
   template st: H2Stream = h2.streams[sid]
   var hb = ""
+  h2.emitTableSizeUpdate(hb)
   for (name, val) in st.respTrailers:
-    encodeHeader(hb, name.toLowerAscii, val)
+    encodeExtraHeader(hb, name, val)
   var off = 0
   var first = true
   while first or off < hb.len:
@@ -414,17 +448,13 @@ proc h2WsAfterEmit(h2: H2Conn, c: ptr Connection, sid: uint32) =
         except Exception: discard
   else:
     w.backedUp = true
-    if w.wantClose and (st.sendWindow <= 0 or h2.connSendWindow <= 0):
-      # Closing, but the send window is exhausted so the close frame + END_STREAM
-      # can never drain gracefully. Rather than leave a zombie stream holding a
-      # slot (and, being active, stripping the connection's read deadline),
-      # RST_STREAM and tear it down.
-      c.wbuf.addRstStream(sid, errCancel)
-      try: wsStreamClosed(h2.core, c, w)
-      except Exception: discard
-      st.ws = nil
-      h2.streams.del(sid)
-      dec h2.activeStreams
+    # Do NOT RST_STREAM(CANCEL) a close just because a send window is exhausted.
+    # A later WINDOW_UPDATE resumes the drain via h2Enqueue, and connSendWindow
+    # can be drained by an entirely unrelated stream -- cancelling here dropped
+    # the queued frames and the close frame for a merely-slow peer. Leave them to
+    # drain gracefully; a genuinely stuck stream is reaped by the body deadline
+    # (a ws stream has no END_STREAM, so h2AwaitingClient arms it, #236) or the
+    # WebSocket ping/pong idle timeout (#240.9).
 
 proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
   ## Resume streamed-response producers parked on the connection write-buffer
@@ -582,6 +612,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
   if st.isHead:
     st.pendingIsLast = true            # HEAD: headers only, close the stream
   var hb = ""
+  h2.emitTableSizeUpdate(hb)
   encodeStatus(hb, code)
   if serverHeader.len > 0:
     encodeHeader(hb, "server", serverHeader)
@@ -591,7 +622,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
   if altSvc.len > 0:
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
-    encodeHeader(hb, name.toLowerAscii, val)
+    encodeExtraHeader(hb, name, val)
   var off = 0
   var first = true
   while first or off < hb.len:
@@ -748,6 +779,7 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
     st.body.setLen(0)
   w.preAcceptFin = st.endStreamSeen
   var hb = ""
+  h2.emitTableSizeUpdate(hb)
   encodeStatus(hb, 200)
   if serverHeader.len > 0: encodeHeader(hb, "server", serverHeader)
   encodeHeader(hb, "date", dateStr)
@@ -777,6 +809,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
   let skipBody = h2.streams[sid].isHead
   let bodiless = bodilessStatus(code)
   var hb = ""
+  h2.emitTableSizeUpdate(hb)
   encodeStatus(hb, code)
   if serverHeader.len > 0:
     encodeHeader(hb, "server", serverHeader)
@@ -788,7 +821,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
   if altSvc.len > 0:
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
-    encodeHeader(hb, name.toLowerAscii, val)
+    encodeExtraHeader(hb, name, val)
   let noBody = body.len == 0 or skipBody or bodiless
   # Header block fits one frame in practice; chunk defensively anyway.
   var off = 0
@@ -824,9 +857,10 @@ proc h2SendInformational*(c: ptr Connection, code: int, sid: uint32,
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or h2.streams[sid].rs.responded: return
   var hb = ""
+  h2.emitTableSizeUpdate(hb)
   encodeStatus(hb, code)
   for (name, val) in headers:
-    encodeHeader(hb, name.toLowerAscii, val)
+    encodeExtraHeader(hb, name, val)
   var off = 0
   var first = true
   while first or off < hb.len:
@@ -1018,6 +1052,16 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       of "priority":
         parsePriorityField(val, st.urgency, st.incremental)  # RFC 9218 request signal
       of "content-length":
+        # RFC 9110 8.6 content-length is 1*DIGIT. parseBiggestInt also accepts a
+        # leading '+'/'-' and Nim underscore separators (1_0 -> 10), values
+        # outside the grammar that a re-serializing proxy would read differently
+        # (parser-differential smuggling). Enforce ASCII-digits-only first (#240.6).
+        var allDigits = val.len > 0
+        for ch in val:
+          if ch notin '0'..'9': allDigits = false; break
+        if not allDigits:
+          h2.streamError(c, sid, errProtocol)
+          return
         var n: BiggestInt
         try:
           n = parseBiggestInt(val)
@@ -1093,6 +1137,11 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
   of ftData:
     let sid = fh.streamId
     if sid == 0: h2.connError(c, errProtocol); return
+    # An even stream id is server-initiated (push) space the client may never
+    # use, so it is permanently idle. A frame on it (like any frame on an idle
+    # stream) is a connection PROTOCOL_ERROR (RFC 9113 5.1) -- the `> lastStreamId`
+    # check alone misses even ids below the high-water mark (#240.1).
+    if (sid and 1'u32) == 0: h2.connError(c, errProtocol); return
     if sid > h2.lastStreamId:
       h2.connError(c, errProtocol)   # DATA on an idle stream
       return
@@ -1368,7 +1417,16 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.peerMaxFrame = int(value)
       of setEnablePush:
         if value > 1'u32: h2.connError(c, errProtocol); return
-      else: discard                  # header table size: encoder is static-only
+      of setHeaderTableSize:
+        # Our encoder is static-only (no dynamic entries), but RFC 7541 4.2 still
+        # requires signaling a reduced maximum to the peer's decoder. Cap our
+        # signalled max at the peer's value; when it drops, owe a size-update
+        # instruction on the next header block (#240.8).
+        let newMax = min(int(value), 4096)
+        if newMax != h2.encTableMax:
+          h2.encTableMax = newMax
+          h2.pendingTableSizeUpdate = newMax
+      else: discard
       i += 6
     c.wbuf.addFrameHeader(0, ftSettings, flagAck, 0)
     if initialWindowChanged:
@@ -1390,6 +1448,8 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
 
   of ftWindowUpdate:
     if fh.length != 4: h2.connError(c, errFrameSize); return
+    if fh.streamId != 0 and (fh.streamId and 1'u32) == 0:
+      h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
     let inc32 = get32(c.rbuf, payloadPos) and 0x7fffffff'u32
     if inc32 == 0:
       # A WINDOW_UPDATE referencing an idle stream (never opened) is a
@@ -1431,6 +1491,8 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
   of ftRstStream:
     if fh.streamId == 0: h2.connError(c, errProtocol); return
     if fh.length != 4: h2.connError(c, errFrameSize); return
+    if (fh.streamId and 1'u32) == 0:
+      h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
     if fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol); return   # RST on idle stream
     if fh.streamId in h2.streams:
@@ -1463,6 +1525,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
 
   of ftGoaway:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
+    # GOAWAY carries a 4-byte last-stream-id + 4-byte error code (8 octets min);
+    # a short frame is a connection FRAME_SIZE_ERROR (RFC 9113 4.2/6.8), like the
+    # ftPing/ftWindowUpdate length checks -- GOAWAY silently accepted it (#240.10).
+    if fh.length < 8: h2.connError(c, errFrameSize); return
     # A peer (client) GOAWAY is informational for a server that never pushes;
     # record it separately from our own drain flag so we do not start refusing
     # the client's own subsequent streams (which `goingAway` would do). Budget

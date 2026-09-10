@@ -1317,8 +1317,12 @@ proc processOutbox(loop: Loop) =
         if not staleConn(c, m.gen):               # unpin/resume only if alive
           # releasePin's hook covers the deferred close, and now also resumes
           # buffered input (e.g. pipelined h1 bytes after an awaitable body):
-          # previously those waited for the next socket event.
-          discard loop.releasePin(c, pkAwait)
+          # previously those waited for the next socket event. That resume can
+          # produce a synchronous response into wbuf; unlike omWsDone/omFileChunk/
+          # omHttp this branch never flushed it, so it sat with write interest
+          # disarmed until an unrelated event or the idle deadline. Flush it (#240.2).
+          if loop.releasePin(c, pkAwait) and pendingOut(c) > 0:
+            loop.flushOut(c)
       continue
     if m.fd < 0:
       when not defined(plainHttp):
