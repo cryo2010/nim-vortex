@@ -13,11 +13,27 @@ func validFieldValue*(val: string): bool =
   ## RFC 9113 8.2.1 / RFC 9114 4.1.2: no field (pseudo or regular) may carry
   ## NUL, CR, or LF in its value -- a header-injection / smuggling vector if
   ## reflected or proxied to h1. The strict h1 parser rejects these bytes
-  ## outright.
+  ## outright. A value that starts or ends with SP or HTAB is also malformed.
   for ch in val:
     let b = uint8(ch)
     if b == 0x00'u8 or b == 0x0a'u8 or b == 0x0d'u8: return false
+  if val.len > 0:
+    let f = uint8(val[0])
+    let l = uint8(val[^1])
+    if f == 0x20'u8 or f == 0x09'u8 or l == 0x20'u8 or l == 0x09'u8:
+      return false                             # leading/trailing SP/HTAB (#240.7)
   true
+
+func isKnownMethod*(m: string): bool =
+  ## An exact-match check against the HTTP methods this server can route
+  ## (std/httpcore's HttpMethod set). Unknown or mis-cased methods have no
+  ## handler and must NOT silently fall back to GET: that lets `PURGE` (or a
+  ## method carrying a space) execute the GET handler, a method-ACL-bypass
+  ## differential with the h1 parser, which 501s them (#240.4).
+  case m
+  of "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE",
+     "CONNECT": true
+  else: false
 
 func validFieldName*(name: string): bool =
   ## RFC 9113 8.2.1 / RFC 9114 4.2: a regular field name must be a valid
@@ -80,7 +96,16 @@ proc classifyRequestHead*(headers: openArray[(string, string)];
     if path.len == 0 or scheme.len == 0 or not seenAuthority: return rhInvalid
     return rhWebSocket
   if seenProtocol: return rhInvalid            # :protocol only for a ws-connect
-  if meth.len == 0 or path.len == 0 or scheme.len == 0: return rhInvalid
+  if meth == "CONNECT":
+    # RFC 9113 8.5: a plain (non-Extended) CONNECT carries :authority and MUST
+    # omit :scheme and :path. This server does not tunnel, so a well-formed plain
+    # CONNECT is unsupported; and a malformed one (carrying :scheme/:path, which
+    # 8.5 forbids) must NOT be dispatched as a normal request. Reject both -- the
+    # old generic check rejected the legal form and let the malformed one through
+    # (#240.5).
+    return rhInvalid
+  if not isKnownMethod(meth): return rhInvalid  # no silent GET fallback (#240.4)
+  if path.len == 0 or scheme.len == 0: return rhInvalid
   # RFC 9113 8.3.1 / RFC 9110 7.2: an http(s) request needs a target
   # authority, from :authority or a Host field.
   if (scheme == "http" or scheme == "https") and not seenAuthority and
