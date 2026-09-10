@@ -254,7 +254,10 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
     elif hasToken(buf, h.valStart, h.valLen, "keep-alive"):
       p.keepAlive = true
   elif ieqLit(buf, h.nameStart, h.nameLen, "expect"):
-    if ieqLit(buf, h.valStart, h.valLen, "100-continue"):
+    # RFC 9110 10.1.1: a server MUST ignore a 100-continue expectation from an
+    # HTTP/1.0 request (it has no concept of 1xx). minor is set in parseReqLine
+    # before headers, so this gate is reliable (#247).
+    if p.minor >= 1 and ieqLit(buf, h.valStart, h.valLen, "100-continue"):
       p.expectContinue = true
   elif ieqLit(buf, h.nameStart, h.nameLen, "host"):
     # RFC 9112 3.2: reject more than one Host field (smuggling guard).
