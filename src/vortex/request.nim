@@ -1284,7 +1284,15 @@ proc informational*(res: Response, code: HttpCode,
   else:
     if c.rs.responded: return
     var s = "HTTP/1.1 " & $code & "\r\n"
-    for (n, v) in headers: s.add n & ": " & v & "\r\n"
+    for (n, v) in headers:
+      # Sanitize like the final-response path (addField strips CR/LF): a 1xx head
+      # built by raw concatenation would let a user-influenced Link/hint value
+      # inject headers / split the response (#244). Drop framing fields too.
+      if h1codec.connSpecificField(n): continue
+      s.addField n
+      s.add ": "
+      s.addField v
+      s.add "\r\n"
     s.add "\r\n"
     c.wbuf.add s
   # Flush now so the hint is on the wire before the handler does its work.
