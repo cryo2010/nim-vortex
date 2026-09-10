@@ -269,7 +269,8 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  pkcs12File = settings.pkcs12File, pkcs12 = settings.pkcs12,
                  streamRecvWindow = settings.h3StreamWindow,
                  connRecvWindow = settings.h3ConnWindow,
-                 maxConnections = settings.maxConnections):
+                 maxConnections = settings.maxConnections,
+                 maxResetStreams = settings.maxResetStreams):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"

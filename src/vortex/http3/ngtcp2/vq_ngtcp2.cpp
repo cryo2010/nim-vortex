@@ -116,6 +116,8 @@ struct Conn {
   bool wantClose = false;             // emit CONNECTION_CLOSE(ccerr) then close
   bool wantGracefulClose = false;     // flush pending h3 frames (final GOAWAY)
                                       // first, THEN emit CONNECTION_CLOSE(ccerr)
+  uint64_t reset_count = 0;           // client request streams closed via reset
+                                      // (rapid-reset budget, #251)
   ngtcp2_ccerr ccerr{};               // application error for the close
 
   Stream *stream(int64_t id) {
@@ -415,7 +417,7 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   return 0;
 }
 
-int cbStreamClose(ngtcp2_conn *conn, uint32_t, int64_t stream_id,
+int cbStreamClose(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                   uint64_t app_error_code, void *user_data, void *) {
   auto *c = static_cast<Conn *>(user_data);
   if (c->h3) nghttp3_conn_close_stream(c->h3, stream_id, app_error_code);
@@ -424,6 +426,21 @@ int cbStreamClose(ngtcp2_conn *conn, uint32_t, int64_t stream_id,
   // initial budget (each request is a fresh bidi stream) and stalls after it.
   if ((stream_id & 0x03) == 0)
     ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+  // Rapid-reset budget (CVE-2023-44487, #251). Because the concurrency credit is
+  // replenished above on every close, a client can open a request stream (making
+  // us QPACK-decode HEADERS + dispatch), then RESET_STREAM it, churning work at
+  // line rate. Count reset-class closes -- an app error code was set, i.e. the
+  // stream did not complete cleanly -- on client bidi streams, and tear the
+  // connection down with H3_EXCESSIVE_LOAD (0x0107) once they exceed the budget.
+  if (c->engine->cfg.max_reset_streams > 0 && (stream_id & 0x03) == 0 &&
+      (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET)) {
+    if (++c->reset_count > c->engine->cfg.max_reset_streams &&
+        !c->wantClose && !c->closed) {
+      ngtcp2_ccerr_set_application_error(&c->ccerr, 0x0107 /*H3_EXCESSIVE_LOAD*/,
+                                         nullptr, 0);
+      c->wantClose = true;
+    }
+  }
   return 0;
 }
 

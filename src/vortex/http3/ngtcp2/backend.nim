@@ -60,6 +60,7 @@ type
     max_body: uint64
     max_concurrent_streams: uint64
     max_connections: uint64
+    max_reset_streams: uint64
     max_field_section_size: cint
     stream_recv_window: uint64
     conn_recv_window: uint64
@@ -395,7 +396,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               certPem = "", keyPem = "", keyPassword = "",
               pkcs12File = "", pkcs12 = "",
               streamRecvWindow = 0, connRecvWindow = 0,
-              maxConnections = 0): bool =
+              maxConnections = 0, maxResetStreams = 0): bool =
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
@@ -419,6 +420,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.max_body = uint64(maxBody)
   cfg.max_concurrent_streams = uint64(maxStreams)
   cfg.max_connections = uint64(max(0, maxConnections))
+  cfg.max_reset_streams = uint64(max(0, maxResetStreams))
   cfg.max_field_section_size = cint(maxFieldSection)
   cfg.stream_recv_window = uint64(streamRecvWindow)
   cfg.conn_recv_window = uint64(connRecvWindow)
