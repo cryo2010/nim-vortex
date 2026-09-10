@@ -116,6 +116,8 @@ struct Conn {
   bool wantClose = false;             // emit CONNECTION_CLOSE(ccerr) then close
   bool wantGracefulClose = false;     // flush pending h3 frames (final GOAWAY)
                                       // first, THEN emit CONNECTION_CLOSE(ccerr)
+  uint64_t reset_count = 0;           // client request streams closed via reset
+                                      // (rapid-reset budget, #251)
   ngtcp2_ccerr ccerr{};               // application error for the close
 
   Stream *stream(int64_t id) {
@@ -321,6 +323,13 @@ int setupHttpConn(Conn *c) {
   settings.qpack_blocked_streams = 0;
   settings.qpack_max_dtable_capacity = 4096;
   settings.enable_connect_protocol = 1;   // RFC 9220 WebSockets over HTTP/3
+  // Advertise the configured header-section limit (#253). Without this nghttp3
+  // leaves it unlimited, so the operator's max_field_section_size is silently
+  // ignored and a client can send an oversized header section (bounded only by
+  // the stream flow-control window).
+  if (c->engine->cfg.max_field_section_size > 0)
+    settings.max_field_section_size =
+        (uint64_t)c->engine->cfg.max_field_section_size;
 
   static const nghttp3_callbacks cbs = {
       h3AckedStreamData,   // acked_stream_data
@@ -408,7 +417,7 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   return 0;
 }
 
-int cbStreamClose(ngtcp2_conn *conn, uint32_t, int64_t stream_id,
+int cbStreamClose(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                   uint64_t app_error_code, void *user_data, void *) {
   auto *c = static_cast<Conn *>(user_data);
   if (c->h3) nghttp3_conn_close_stream(c->h3, stream_id, app_error_code);
@@ -417,6 +426,21 @@ int cbStreamClose(ngtcp2_conn *conn, uint32_t, int64_t stream_id,
   // initial budget (each request is a fresh bidi stream) and stalls after it.
   if ((stream_id & 0x03) == 0)
     ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+  // Rapid-reset budget (CVE-2023-44487, #251). Because the concurrency credit is
+  // replenished above on every close, a client can open a request stream (making
+  // us QPACK-decode HEADERS + dispatch), then RESET_STREAM it, churning work at
+  // line rate. Count reset-class closes -- an app error code was set, i.e. the
+  // stream did not complete cleanly -- on client bidi streams, and tear the
+  // connection down with H3_EXCESSIVE_LOAD (0x0107) once they exceed the budget.
+  if (c->engine->cfg.max_reset_streams > 0 && (stream_id & 0x03) == 0 &&
+      (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET)) {
+    if (++c->reset_count > c->engine->cfg.max_reset_streams &&
+        !c->wantClose && !c->closed) {
+      ngtcp2_ccerr_set_application_error(&c->ccerr, 0x0107 /*H3_EXCESSIVE_LOAD*/,
+                                         nullptr, 0);
+      c->wantClose = true;
+    }
+  }
   return 0;
 }
 
@@ -554,6 +578,17 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   if (e->cfg.cb.on_accept)
     c->conn_ud = e->cfg.cb.on_accept(e->cfg.user, reinterpret_cast<VqConn *>(c),
                                      const_cast<char *>(c->peer_ip.c_str()));
+
+  // on_accept returning NULL rejects the connection (per the header contract).
+  // Without honoring it the conn would handshake and drive callbacks with a nil
+  // conn_ud, which the Nim side dereferences (#255). Emit CONNECTION_CLOSE and do
+  // not admit it. (Latent today: cbAccept never returns nil, but the contract is
+  // now enforced for any future admission policy.)
+  if (e->cfg.cb.on_accept && c->conn_ud == nullptr) {
+    c->wantClose = true;
+    e->conns.push_back(std::move(owned));   // reaped on the next pump after CLOSE
+    return c;
+  }
 
   e->conns.push_back(std::move(owned));
   return c;
@@ -888,7 +923,13 @@ void vq_engine_pump(VqEngine *eng, uint64_t now_ns) {
   // Reap closed/draining connections.
   for (auto i = e->conns.begin(); i != e->conns.end();) {
     Conn *c = i->get();
-    bool dead = c->closed || (c->conn && ngtcp2_conn_in_closing_period(c->conn));
+    // Reap a connection in the DRAINING period too (peer sent CONNECTION_CLOSE):
+    // in_closing_period is true only when WE sent the close, so without this a
+    // peer-initiated close left the Conn/ngtcp2/nghttp3/SSL alive until the full
+    // idle timeout -- a slow leak / slot exhaustion (#252).
+    bool dead = c->closed || c->draining ||
+                (c->conn && (ngtcp2_conn_in_closing_period(c->conn) ||
+                             ngtcp2_conn_in_draining_period(c->conn)));
     if (dead) {
       if (e->cfg.cb.on_conn_close && c->conn_ud)
         e->cfg.cb.on_conn_close(e->cfg.user, c->conn_ud);

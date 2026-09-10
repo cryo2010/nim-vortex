@@ -60,6 +60,7 @@ type
     max_body: uint64
     max_concurrent_streams: uint64
     max_connections: uint64
+    max_reset_streams: uint64
     max_field_section_size: cint
     stream_recv_window: uint64
     conn_recv_window: uint64
@@ -108,8 +109,13 @@ type
     dispatched: bool
     finSeen: bool
     bodyManualAck: bool
+    contentLength: int64     ## declared content-length (-1 = absent); reconciled
+                             ## against bodyReceived at stream end (#257)
+    bodyReceived: int64      ## cumulative DATA payload bytes received
     uncredited: int          ## streaming body bytes received but not yet
                              ## credited to QUIC flow control
+    bufferedCounted: int     ## bytes this un-dispatched buffered body currently
+                             ## contributes to H3Conn.bufferedBytes (#254)
 
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore
@@ -120,6 +126,10 @@ type
     vq: ptr VqConn
     streams*: Table[uint64, H3Stream]
     closing: bool
+    bufferedBytes: int      ## total un-dispatched buffered (non-streaming) request
+                            ## -body bytes across streams; the QUIC window credits
+                            ## buffered bodies eagerly, so this independent
+                            ## aggregate is what caps per-connection memory (#254)
     lastStreamId: uint64
     goneAway: bool          ## initial GOAWAY notice sent
     finalGoaway: bool       ## final GOAWAY (nghttp3_conn_shutdown) sent
@@ -130,6 +140,7 @@ var
   gCore {.threadvar.}: ptr LoopCore
   gUdpFd {.threadvar.}: cint
   gMaxBody {.threadvar.}: uint64             # buffered request-body cap (0 = none)
+  gConnWindow {.threadvar.}: uint64          # h3 connection recv window (#254 cap)
   gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
@@ -187,7 +198,7 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   let h3c = cast[H3Conn](connUd)
   let usid = uint64(sid)
   if usid notin h3c.streams:
-    h3c.streams[usid] = H3Stream(id: usid)
+    h3c.streams[usid] = H3Stream(id: usid, contentLength: -1)
   template st: H3Stream = h3c.streams[usid]
   if st.headersDone:
     # A header block after the request head is the trailer section (RFC 9114
@@ -196,8 +207,20 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
     let tarr = cast[ptr UncheckedArray[VqHeader]](hdrs)
     for i in 0 ..< int(n):
       let name = toStr(tarr[i].name, tarr[i].name_len)
-      if name.len > 0 and name[0] != ':':
-        st.trailers.add (name, toStr(tarr[i].value, tarr[i].value_len))
+      let val = toStr(tarr[i].value, tarr[i].value_len)
+      # RFC 9114 4.1/4.2: trailers are fields, so apply the same validity rules as
+      # the head. QPACK does no byte validation, so a CR/LF/NUL value or non-token
+      # name would inject via req.trailers; a pseudo-header or connection-specific
+      # field is malformed. Reject the stream rather than store it (#257).
+      if name.len == 0 or name[0] == ':' or
+          not validFieldName(name) or not validFieldValue(val):
+        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
+      case name
+      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
+         "proxy-connection":
+        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
+      else: discard
+      st.trailers.add (name, val)
     return
   let arr = cast[ptr UncheckedArray[VqHeader]](hdrs)
   for i in 0 ..< int(n):
@@ -212,6 +235,20 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   of h3hRequest: discard
   for (name, val) in st.headers:
     if name == ":method": st.isHead = val == "HEAD"
+    elif name == "content-length":
+      # RFC 9110 8.6 grammar (1*DIGIT), non-negative, no duplicate-with-different
+      # value; the Nim side owns this (nghttp3 may reconcile length but not the
+      # digits-only grammar / duplicate rule) so a mis-parsed length can't smuggle
+      # when the request is proxied (#257).
+      var cl: int64 = 0
+      var ok = val.len > 0
+      for ch in val:
+        if ch notin '0'..'9': ok = false; break
+        if cl > (int64.high - 9) div 10: ok = false; break
+        cl = cl * 10 + int64(uint8(ch) - uint8('0'))
+      if not ok or (st.contentLength >= 0 and st.contentLength != cl):
+        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
+      st.contentLength = cl
   st.headersDone = true
   if usid > h3c.lastStreamId: h3c.lastStreamId = usid
   # Streaming route or ws-connect dispatch on headers; body flows via onBody.
@@ -233,6 +270,7 @@ proc deliverBody(h3c: H3Conn, usid: uint64, last: bool) =
     # on `st` afterwards -- re-check membership before crediting flow control.
     let cb = st.rs.onBodyCb
     let manualAck = st.bodyManualAck
+    if last: st.rs.onBodyCb = nil   # single EOF: cbStreamClose must not re-fire (#256)
     var buf: string
     swap(buf, st.body)
     cb(buf.toOpenArray(0, buf.len - 1), last)
@@ -274,12 +312,14 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     # without it a client could leak the shared window with oversized requests --
     # then STOP_SENDING+RESET the stream.
     if len > 0 and h3c.vq != nil: vqConnConsume(h3c.vq, len)
+    h3c.bufferedBytes -= st.bufferedCounted        # release its reservation (#254)
     if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
     h3c.streams.del(usid)
     return
   let old = st.body.len
   st.body.setLen(old + int(len))
   if len > 0: copyMem(addr st.body[old], data, int(len))
+  st.bodyReceived += int64(len)   # for content-length reconciliation (#257)
   if st.rs.reqStreaming:
     # Track received-but-uncredited body bytes so a stream that tears down with
     # bytes the handler never read (or a manualAck consumer stopped early)
@@ -295,6 +335,18 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     # flows and cumulative body bytes across requests do not exhaust the
     # connection's MAX_DATA window and stall the peer (QUIC code 1).
     vqStreamConsume(h3c.vq, sid, len)
+    # The eager connection-window credit above means MAX_DATA does NOT bound
+    # buffered memory; an independent per-connection aggregate does. cap >= maxBody
+    # so any single upload fits; concurrent trickled bodies that together exceed it
+    # get the offender H3_MESSAGE_ERROR reset rather than pinning maxBody x streams
+    # of memory (#254).
+    st.bufferedCounted += int(len)
+    h3c.bufferedBytes += int(len)
+    if gMaxBody > 0'u64 and
+        h3c.bufferedBytes > max(int(gConnWindow), int(gMaxBody)):
+      h3c.bufferedBytes -= st.bufferedCounted
+      vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
+      h3c.streams.del(usid)
 
 proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -304,9 +356,17 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   st.finSeen = true
   if st.ws != nil:
     wsPeerClosed(h3c.core, nil, WsConn(st.ws))
+  elif st.contentLength >= 0 and st.bodyReceived != st.contentLength:
+    # Declared content-length disagrees with the DATA received: malformed request
+    # (RFC 9110 8.6). Reset the stream; cbStreamClose delivers EOF to a suspended
+    # handler and cleans up (#257). Do not dispatch/deliver a clean completion.
+    if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
   elif st.rs.reqStreaming:
     deliverBody(h3c, usid, true)
   elif not st.dispatched and st.headersDone:
+    # Dispatched: the buffered body leaves the un-dispatched aggregate (#254).
+    h3c.bufferedBytes -= st.bufferedCounted
+    st.bufferedCounted = 0
     st.dispatched = true
     gReady.add (h3c.slot, h3c.core.h3slots[h3c.slot].gen, usid)
 
@@ -329,22 +389,37 @@ proc creditRemainder(h3c: H3Conn, st: var H3Stream) =
 proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
   let usid = uint64(sid)
-  if usid in h3c.streams:
-    template st: H3Stream = h3c.streams[usid]
-    if st.ws != nil:
-      wsStreamClosed(h3c.core, nil, WsConn(st.ws))
-      st.ws = nil
-    if st.rs.onBodyCb != nil:
-      let cb = st.rs.onBodyCb
-      st.rs.onBodyCb = nil
-      var empty: string
-      try: cb(toOpenArray(empty, 0, -1), true)
-      except CatchableError: discard
-    # The callback may have closed the stream (res.send); re-check before the
-    # raw table access, mirroring deliverBody.
-    if usid in h3c.streams:
-      creditRemainder(h3c, h3c.streams[usid])
-    h3c.streams.del(usid)
+  if usid notin h3c.streams: return
+  template st: H3Stream = h3c.streams[usid]
+  # Snapshot the WebSocket + parked callbacks and reconcile flow-control credit
+  # BEFORE removing the stream, then fire the callbacks after -- so a callback
+  # that responds (res.send/res.write) cannot invalidate the table access, and
+  # BOTH onBodyCb(last=true) AND onRespDrain fire on every teardown (RST /
+  # STOP_SENDING / abnormal close). Firing onBodyCb resumes a suspended
+  # req.read(); firing onRespDrain resumes a producer parked in res.drained()
+  # instead of stranding it forever (#232 analog, #250). Contain Exception (not
+  # just CatchableError) so an unannotated user callback cannot unwind across the
+  # C++ boundary.
+  let w = if st.ws != nil: WsConn(st.ws) else: nil
+  st.ws = nil
+  let bodyCb = st.rs.onBodyCb
+  st.rs.onBodyCb = nil
+  let drainCb = st.rs.onRespDrain
+  st.rs.onRespDrain = nil
+  h3c.bufferedBytes -= st.bufferedCounted      # release any buffered reservation (#254)
+  creditRemainder(h3c, h3c.streams[usid])
+  h3c.streams.del(usid)
+  if w != nil:
+    try: wsStreamClosed(h3c.core, nil, w)
+    except Exception: discard
+  if bodyCb != nil:
+    var empty: string
+    try: bodyCb(toOpenArray(empty, 0, -1), true)
+    except Exception: discard
+  if drainCb != nil:
+    try: drainCb(h3c.core, h3SlotFd(h3c.slot),
+                 h3c.core.h3slots[h3c.slot].gen, uint32(usid))
+    except Exception: discard
 
 proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
@@ -394,10 +469,11 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               certPem = "", keyPem = "", keyPassword = "",
               pkcs12File = "", pkcs12 = "",
               streamRecvWindow = 0, connRecvWindow = 0,
-              maxConnections = 0): bool =
+              maxConnections = 0, maxResetStreams = 0): bool =
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
+  gConnWindow = uint64(connRecvWindow)
   var cfg: VqConfig
   cfg.user = core
   cfg.cb = VqCallbacks(on_accept: cbAccept, on_headers: cbHeaders, on_body: cbBody,
@@ -418,6 +494,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.max_body = uint64(maxBody)
   cfg.max_concurrent_streams = uint64(maxStreams)
   cfg.max_connections = uint64(max(0, maxConnections))
+  cfg.max_reset_streams = uint64(max(0, maxResetStreams))
   cfg.max_field_section_size = cint(maxFieldSection)
   cfg.stream_recv_window = uint64(streamRecvWindow)
   cfg.conn_recv_window = uint64(connRecvWindow)
@@ -471,7 +548,16 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
   result.add ("date", core.dateStr)
   if contentType.len > 0 and not bodiless: result.add ("content-type", contentType)
   if not bodiless and bodyLen >= 0: result.add ("content-length", $bodyLen)
-  for (name, val) in extra: result.add (name.toLowerAscii, val)
+  for (name, val) in extra:
+    let ln = name.toLowerAscii
+    # RFC 9114 4.2: an h3 endpoint MUST NOT generate connection-specific fields;
+    # drop them (and any stray handler pseudo-header) rather than QPACK-encode a
+    # response a strict client would cancel (#257). Mirrors http2 encodeExtraHeader.
+    case ln
+    of "connection", "keep-alive", "transfer-encoding", "upgrade",
+       "proxy-connection": discard
+    else:
+      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
 
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
@@ -515,13 +601,24 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
   # Submit any trailer fields before the FIN so nghttp3 keeps the stream open for
   # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
   if trailers.len > 0:
-    var tv = newSeq[VqHeader](trailers.len)
-    var lower = newSeq[(string, string)](trailers.len)
-    for i, (name, val) in trailers:
-      lower[i] = (name.toLowerAscii, val)
-      tv[i] = VqHeader(name: lower[i][0].cstring, name_len: csize_t(lower[i][0].len),
-                       value: lower[i][1].cstring, value_len: csize_t(lower[i][1].len))
-    vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
+    # Validate handler-supplied response trailers before submission: drop a
+    # pseudo/connection-specific name or a value with CR/LF/NUL, so a handler
+    # concatenating untrusted data into a trailer can't split the response on an
+    # h1 relay (#257). Build the wire list from only the accepted entries.
+    var lower: seq[(string, string)]
+    for (name, val) in trailers:
+      let ln = name.toLowerAscii
+      if ln.len == 0 or ln[0] == ':' or not validFieldValue(val): continue
+      case ln
+      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
+         "proxy-connection": continue
+      else: lower.add (ln, val)
+    if lower.len > 0:
+      var tv = newSeq[VqHeader](lower.len)
+      for i in 0 ..< lower.len:
+        tv[i] = VqHeader(name: lower[i][0].cstring, name_len: csize_t(lower[i][0].len),
+                         value: lower[i][1].cstring, value_len: csize_t(lower[i][1].len))
+      vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
   vqStreamFinish(conn.vq, int64(sid))
 
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
@@ -586,17 +683,32 @@ proc h3GracefulClose*(conn: H3Conn) =
   vqConnCloseGraceful(conn.vq, 0)
 
 proc h3Free*(conn: H3Conn) =
-  var empty: string
+  # Snapshot ws + parked callbacks and detach them BEFORE firing any, so a
+  # callback that responds cannot invalidate the mpairs iterator; then clear the
+  # table and fire. Deliver onBodyCb(last=true) AND onRespDrain for every open
+  # stream so a suspended req.read()/res.drained() resumes instead of stranding a
+  # zombie coroutine when the whole connection dies (#250; matches h2NotifyClosed).
+  var wss: seq[WsConn]
+  var bodyCbs: seq[BodyCb]
+  var drainCbs: seq[(uint32, RespDrainCb)]
   for sid, st in conn.streams.mpairs:
-    if st.ws != nil:                  # onClose(1006) for any open ws stream
-      wsStreamClosed(conn.core, nil, WsConn(st.ws))
-      st.ws = nil
+    if st.ws != nil:
+      wss.add WsConn(st.ws); st.ws = nil
     if st.rs.onBodyCb != nil:
-      let cb = st.rs.onBodyCb
-      st.rs.onBodyCb = nil
-      try: cb(toOpenArray(empty, 0, -1), true)
-      except CatchableError: discard
+      bodyCbs.add st.rs.onBodyCb; st.rs.onBodyCb = nil
+    if st.rs.onRespDrain != nil:
+      drainCbs.add (uint32(sid), st.rs.onRespDrain); st.rs.onRespDrain = nil
   conn.streams.clear()
+  var empty: string
+  for w in wss:
+    try: wsStreamClosed(conn.core, nil, w)
+    except Exception: discard
+  for cb in bodyCbs:
+    try: cb(toOpenArray(empty, 0, -1), true)
+    except Exception: discard
+  for (sid, cb) in drainCbs:
+    try: cb(conn.core, h3SlotFd(conn.slot), conn.core.h3slots[conn.slot].gen, sid)
+    except Exception: discard
   if conn.vq != nil:
     vqConnClose(conn.vq, 0)
     conn.vq = nil

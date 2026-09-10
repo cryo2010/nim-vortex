@@ -79,6 +79,13 @@ proc findByte(buf: openArray[char], start, endPos: int, ch: char): int =
 proc toLowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
 
+proc eqLit(buf: openArray[char], start, len: int, lit: static string): bool =
+  ## Exact (case-SENSITIVE) equality against a literal, no allocation.
+  if len != lit.len: return false
+  for i in 0 ..< lit.len:
+    if buf[start + i] != lit[i]: return false
+  true
+
 proc ieqLit(buf: openArray[char], start, len: int, lit: static string): bool =
   ## Case-insensitive equality against a lowercase literal, no allocation.
   if len != lit.len: return false
@@ -135,24 +142,25 @@ proc fail(p: var RequestParser, status: HttpCode): ParseResult =
 
 proc parseMethod(p: var RequestParser, buf: openArray[char],
                  start, len: int): bool =
-  # Methods are case-sensitive per RFC, but ieqLit over the exact literal is
-  # fine because clients send them uppercase; the length check comes first.
-  if len == 3 and buf[start] == 'G': p.httpMethod = HttpGet; return true
-  if len == 4 and buf[start] == 'P' and buf[start+1] == 'O':
-    p.httpMethod = HttpPost; return true
+  # Methods are case-SENSITIVE (RFC 9110 9.1): compare exact uppercase literals so
+  # a mis-cased method (e.g. `delete`) is unknown -> 501, matching h2/h3's
+  # isKnownMethod. Case-insensitive matching here let `delete`/`put`/... dispatch
+  # the handler while h2/h3 rejected them -- a method-filter differential (#245).
   case len
   of 3:
-    if ieqLit(buf, start, len, "put"): p.httpMethod = HttpPut; return true
+    if eqLit(buf, start, len, "GET"): p.httpMethod = HttpGet; return true
+    if eqLit(buf, start, len, "PUT"): p.httpMethod = HttpPut; return true
   of 4:
-    if ieqLit(buf, start, len, "head"): p.httpMethod = HttpHead; return true
+    if eqLit(buf, start, len, "POST"): p.httpMethod = HttpPost; return true
+    if eqLit(buf, start, len, "HEAD"): p.httpMethod = HttpHead; return true
   of 5:
-    if ieqLit(buf, start, len, "patch"): p.httpMethod = HttpPatch; return true
-    if ieqLit(buf, start, len, "trace"): p.httpMethod = HttpTrace; return true
+    if eqLit(buf, start, len, "PATCH"): p.httpMethod = HttpPatch; return true
+    if eqLit(buf, start, len, "TRACE"): p.httpMethod = HttpTrace; return true
   of 6:
-    if ieqLit(buf, start, len, "delete"): p.httpMethod = HttpDelete; return true
+    if eqLit(buf, start, len, "DELETE"): p.httpMethod = HttpDelete; return true
   of 7:
-    if ieqLit(buf, start, len, "options"): p.httpMethod = HttpOptions; return true
-    if ieqLit(buf, start, len, "connect"): p.httpMethod = HttpConnect; return true
+    if eqLit(buf, start, len, "OPTIONS"): p.httpMethod = HttpOptions; return true
+    if eqLit(buf, start, len, "CONNECT"): p.httpMethod = HttpConnect; return true
   else: discard
   false
 
@@ -254,7 +262,10 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
     elif hasToken(buf, h.valStart, h.valLen, "keep-alive"):
       p.keepAlive = true
   elif ieqLit(buf, h.nameStart, h.nameLen, "expect"):
-    if ieqLit(buf, h.valStart, h.valLen, "100-continue"):
+    # RFC 9110 10.1.1: a server MUST ignore a 100-continue expectation from an
+    # HTTP/1.0 request (it has no concept of 1xx). minor is set in parseReqLine
+    # before headers, so this gate is reliable (#247).
+    if p.minor >= 1 and ieqLit(buf, h.valStart, h.valLen, "100-continue"):
       p.expectContinue = true
   elif ieqLit(buf, h.nameStart, h.nameLen, "host"):
     # RFC 9112 3.2: reject more than one Host field (smuggling guard).

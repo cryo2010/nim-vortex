@@ -107,6 +107,7 @@ typedef struct {
   uint64_t max_body;
   uint64_t max_concurrent_streams;
   uint64_t max_connections;   /* cap on concurrent QUIC conns (0 = unlimited) */
+  uint64_t max_reset_streams; /* rapid-reset budget per connection (0 = off) */
   int max_field_section_size;
   /* QUIC receive flow-control windows (0 = shim default). stream_recv_window is
    * initial_max_stream_data for client-opened bidi streams (request-body upload
