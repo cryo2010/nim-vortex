@@ -252,16 +252,34 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe.} =
     except CatchableError: discard
 
 proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
-  c.wbuf.addRstStream(sid, err)
+  # RFC 9113 5.1 forbids RST_STREAM on an idle stream id (one never opened): a
+  # peer must treat RST-on-idle as a connection PROTOCOL_ERROR. Only emit the
+  # reset for an id we have actually seen (<= lastStreamId); an idle-id caller
+  # (e.g. a self-dependency PRIORITY on stream 2^n never opened) just tears down
+  # whatever is present (nothing) without an illegal reset.
+  if sid != 0 and sid <= h2.lastStreamId:
+    c.wbuf.addRstStream(sid, err)
   h2.teardownStream(c, sid)
 
-proc noteControlFrame(h2: H2Conn, c: ptr Connection) =
-  ## Budget PING/SETTINGS/PRIORITY floods (each queues an ACK or is pure
-  ## overhead). The counter resets when a real request arrives, so only
-  ## floods with no intervening stream progress trip it.
-  inc h2.controlFrameCount
+proc noteControlFrame(h2: H2Conn, c: ptr Connection, n = 1) =
+  ## Budget control/overhead frames (PING incl. ACK, SETTINGS per entry,
+  ## WINDOW_UPDATE / PRIORITY / GOAWAY / unknown types, and every RST_STREAM we
+  ## emit in reply to a flood). `n` charges an amplifying frame per unit of work
+  ## it forces (e.g. SETTINGS charges per entry). A real request only *decays*
+  ## the counter (noteControlProgress), so a genuine few-frames-per-request ratio
+  ## never trips while a flood with negligible real progress does.
+  h2.controlFrameCount += n
   if h2.maxControlFrames > 0 and h2.controlFrameCount > h2.maxControlFrames:
     h2.connError(c, errEnhanceYourCalm)
+
+proc noteControlProgress(h2: H2Conn) =
+  ## An accepted request partially forgives the control-frame budget instead of
+  ## zeroing it. Zeroing made maxControlFrames a per-request ratio (interleaving
+  ## one minimal request per ~maxControlFrames control frames sustained a flood
+  ## forever); a bounded decay caps the sustained ratio instead (#234).
+  if h2.maxControlFrames <= 0: return
+  let forgive = max(1, h2.maxControlFrames div 10)
+  h2.controlFrameCount = max(0, h2.controlFrameCount - forgive)
 
 # --- response serialization ------------------------------------------------
 
@@ -1024,7 +1042,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     return
 
   if fh.typ > uint8(high(FrameType)):
-    return                          # unknown frame types are ignored
+    # Unknown frame types are ignored (RFC 9113 4.1) but still cost a parse and
+    # are pure overhead: budget them so a flood trips ENHANCE_YOUR_CALM (#234).
+    h2.noteControlFrame(c)
+    return
 
   case FrameType(fh.typ)
   of ftData:
@@ -1055,6 +1076,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     var streamingConnDefer = 0
     if sid notin h2.streams or h2.streams[sid].endStreamSeen or
         not h2.streams[sid].headersDone:
+      # DATA on a closed / half-closed(remote) / never-headered stream: each
+      # small frame elicits a RST_STREAM reply, so budget it as overhead (a
+      # non-reading peer would otherwise grow wbuf without bound) -- #234.
+      h2.noteControlFrame(c)
       h2.streamError(c, sid, errStreamClosed)
     else:
       var dataStart = payloadPos
@@ -1184,7 +1209,7 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
           h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
           h2.pendingPriority.del(sid)
-        h2.controlFrameCount = 0     # a real request: reset the flood budget
+        h2.noteControlProgress()     # a real request: decay the flood budget
     h2.headerBlock.setLen(fragLen)
     if fragLen > 0:
       copyMem(addr h2.headerBlock[0], addr c.rbuf[fragStart], fragLen)
@@ -1231,7 +1256,11 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       if fh.length != 0: h2.connError(c, errFrameSize)
       return
     if fh.length mod 6 != 0: h2.connError(c, errFrameSize); return
-    h2.noteControlFrame(c)
+    # Charge per setting entry, not per frame: a single 16 KiB SETTINGS carries
+    # ~2730 INITIAL_WINDOW_SIZE entries, each rewriting every open stream's send
+    # window (O(entries x streams)). One budget unit per frame let that amplify
+    # for free (#234).
+    h2.noteControlFrame(c, max(1, fh.length div 6))
     if c.state == csClosing: return
     var i = 0
     var initialWindowChanged = false
@@ -1273,9 +1302,11 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
   of ftPing:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
     if fh.length != 8: h2.connError(c, errFrameSize); return
+    # Budget PING AND its ACK: a PING-ACK flood (we never solicit one) is pure
+    # overhead that the ACK-only guard used to let through unbudgeted (#234).
+    h2.noteControlFrame(c)
+    if c.state == csClosing: return
     if (fh.flags and flagAck) == 0:
-      h2.noteControlFrame(c)
-      if c.state == csClosing: return
       c.wbuf.addPingAck(c.rbuf.toOpenArray(payloadPos, payloadPos + 7))
 
   of ftWindowUpdate:
@@ -1313,6 +1344,10 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.h2Schedule(c)
     elif fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
+    else:
+      # Closed stream (<= lastStreamId, no longer in the table): the update is
+      # ignored, but a flood of them is pure overhead -- budget it (#234).
+      h2.noteControlFrame(c)
 
   of ftRstStream:
     if fh.streamId == 0: h2.connError(c, errProtocol); return
@@ -1335,18 +1370,25 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
   of ftPriority:
     if fh.streamId == 0: h2.connError(c, errProtocol); return
     if fh.length != 5: h2.connError(c, errFrameSize); return
+    # Budget PRIORITY before any branch: a self-dependency flood used to run
+    # streamError (one RST per frame) and return *before* noteControlFrame, so it
+    # was entirely unbudgeted (#234). PRIORITY has no productive use here anyway.
+    h2.noteControlFrame(c)
+    if c.state == csClosing: return
     if (get32(c.rbuf, payloadPos) and 0x7fffffff'u32) == fh.streamId:
       # Self-dependency is a STREAM error (RFC 7540 5.3.1), not a connection
-      # teardown -- matches Go/nghttp2 (RST_STREAM, connection survives).
-      h2.streamError(c, fh.streamId, errProtocol); return   # self-dependency
-    h2.noteControlFrame(c)         # PRIORITY has no productive use here
+      # teardown -- matches Go/nghttp2 (RST_STREAM only if the stream is open;
+      # streamError skips the reset for an idle id per RFC 9113 5.1).
+      h2.streamError(c, fh.streamId, errProtocol)   # self-dependency
     # Otherwise ignored (RFC 9113 deprecates the priority tree).
 
   of ftGoaway:
     if fh.streamId != 0: h2.connError(c, errProtocol); return
     # A peer (client) GOAWAY is informational for a server that never pushes;
     # record it separately from our own drain flag so we do not start refusing
-    # the client's own subsequent streams (which `goingAway` would do).
+    # the client's own subsequent streams (which `goingAway` would do). Budget
+    # it: a GOAWAY flood was previously unbudgeted overhead (#234).
+    h2.noteControlFrame(c)
     h2.peerGoneAway = true
 
   of ftPushPromise:
