@@ -966,6 +966,16 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           loop.processInput(c)
           if c.state != csActive: returnAfterStateChange()
           if c.rlen < c.rbuf.len: continue   # compacted: read into the freed room
+        if c.ws == nil and not c.parser.inBody and
+            c.rbuf.len >= loop.settings.maxHeaderSize:
+          # Still parsing the request head at the header-size ceiling: run the
+          # parser now so its own cap trips (431/414) instead of doubling the
+          # buffer toward maxHeaderSize+maxBodySize. Otherwise a header flood (no
+          # terminating blank line) pins far more than the advertised header
+          # limit before rejection (#246). Mirrors the streaming/h2 branches.
+          loop.processInput(c)
+          if c.state != csActive: returnAfterStateChange()
+          if c.rlen < c.rbuf.len: continue
         let cap =
           if c.ws != nil: loop.settings.maxWsMessageSize + 1024
           else: loop.settings.maxHeaderSize + loop.settings.maxBodySize
