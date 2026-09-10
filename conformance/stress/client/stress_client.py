@@ -75,14 +75,27 @@ def report_line(prefix, rss, heap):
           f"RSS {rss_s} | heap {heap_s} | t={t}s", flush=True)
 
 async def reporter():
-    async with session() as s:
-        while time.monotonic() < deadline:
-            await asyncio.sleep(REPORT)
-            try:
-                rss, heap = await get_server_stats(s)
-            except Exception:
-                rss = heap = None      # a bad /stats shows as n/a, not fake 0MB
-            report_line("", rss, heap)
+    # One short-lived session per sample, with a hard timeout, and the report
+    # line prints NO MATTER WHAT. The previous shape -- one session opened
+    # eagerly up front and held for the whole run -- silently killed all
+    # reporting on h3: connect_h3's QUIC handshake (unlike httpx's lazy
+    # connect) runs in the session's __aenter__, outside the try, and under
+    # full load the 97th handshake from this pegged single-threaded process
+    # can starve or idle-timeout. The reporter then hung forever (or died as
+    # an unretrieved task exception) and a perfectly healthy run looked
+    # exactly like a server stall: zero report lines. A soak's reporting must
+    # never share fate with one connection's handshake.
+    while time.monotonic() < deadline:
+        await asyncio.sleep(REPORT)
+        rss = heap = None              # a bad /stats shows as n/a, not fake 0MB
+        try:
+            async def sample():
+                async with session() as s:
+                    return await get_server_stats(s)
+            rss, heap = await asyncio.wait_for(sample(), timeout=REPORT / 2)
+        except Exception:
+            pass
+        report_line("", rss, heap)
 
 async def loop_watchdog():
     # Distinguish a client-side stall from a server-side one. A frozen throughput
