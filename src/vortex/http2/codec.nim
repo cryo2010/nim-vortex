@@ -952,9 +952,23 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       h2.connError(c, errProtocol)
       return
     for (name, val) in fields:
-      if name.len == 0 or name[0] == ':':
+      # RFC 9113 8.2.1 applies the field-validity rules to the trailer section
+      # too, but the HPACK decoder does no byte validation. Without this a
+      # trailer value could carry CR/LF/NUL (header injection / response
+      # splitting if logged, reflected, or relayed to an h1 upstream) or a
+      # non-token / uppercase name. Apply the same checks as the initial block:
+      # no pseudo-header, valid lowercase-token name, clean value, and no
+      # connection-specific field (#238).
+      if name.len == 0 or name[0] == ':' or
+          not validFieldName(name) or not validFieldValue(val):
         h2.streamError(c, sid, errProtocol)
         return
+      case name
+      of "connection", "proxy-connection", "keep-alive",
+         "transfer-encoding", "upgrade", "te":
+        h2.streamError(c, sid, errProtocol)
+        return
+      else: discard
       st.trailers.add (name, val)
     st.endStreamSeen = true
     if st.rs.reqStreaming and st.dispatched:
