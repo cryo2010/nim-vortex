@@ -143,24 +143,38 @@ proc parsePriorityField(v: string, urgency: var uint8, incremental: var bool) =
   ## dictionary), updating `urgency`/`incremental` in place. Recognises `u`
   ## (integer 0..7) and `i` (boolean: bare or `?1` = true, `?0` = false);
   ## unknown members and malformed values are ignored (leave the current value).
-  for part in v.split(','):
-    let kv = part.strip()
-    if kv.len == 0: continue
-    let eq = kv.find('=')
-    if eq < 0:
-      if kv == "i": incremental = true          # bare boolean member = true
-    else:
-      let key = kv[0 ..< eq].strip()
-      let val = kv[eq + 1 .. ^1].strip()
-      case key
-      of "u":
-        try:
-          let n = parseInt(val)
-          if n in 0 .. 7: urgency = uint8(n)
-        except ValueError: discard
-      of "i":
-        incremental = val != "?0"               # ?1 / anything but ?0 = true
-      else: discard
+  # Index-scan the RFC 8941 dictionary in place: no split/strip/substr/parseInt
+  # allocations (this runs per request carrying a `priority` header).
+  const ows = {' ', '\t'}
+  const sep = {' ', '\t', ','}
+  var i = 0
+  let n = v.len
+  while i < n:
+    while i < n and v[i] in sep: inc i             # skip OWS and commas
+    if i >= n: break
+    let ks = i                                    # member key [ks ..< ke)
+    while i < n and v[i] notin ows and v[i] != '=' and v[i] != ',': inc i
+    let ke = i
+    let isU = ke - ks == 1 and v[ks] == 'u'
+    let isI = ke - ks == 1 and v[ks] == 'i'
+    while i < n and v[i] in ows: inc i
+    if i < n and v[i] == '=':
+      inc i
+      while i < n and v[i] in ows: inc i
+      let vs = i                                  # value [vs ..< ve)
+      while i < n and v[i] notin ows and v[i] != ',': inc i
+      let ve = i
+      if isU:                                     # sf-integer 0..7 (else ignore)
+        var num = 0
+        var ok = ve > vs
+        for k in vs ..< ve:
+          if v[k] in '0'..'9' and num <= 7: num = num * 10 + (ord(v[k]) - ord('0'))
+          else: ok = false; break
+        if ok and num in 0 .. 7: urgency = uint8(num)
+      elif isI:                                   # ?1 / anything but ?0 = true
+        incremental = not (ve - vs == 2 and v[vs] == '?' and v[vs + 1] == '0')
+    elif isI:
+      incremental = true                          # bare boolean member = true
 
 proc h2Conn*(c: ptr Connection): H2Conn {.inline.} =
   H2Conn(c.h2)
