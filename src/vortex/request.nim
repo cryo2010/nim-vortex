@@ -939,10 +939,11 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
   let key = (c.fd, c.gen, stream)
   # Skip the tuple hash + table probe unless some response actually set headers
   # (the table is empty and drained otherwise); the common no-custom-header case
-  # then pays only an O(1) len check. Mirrors the respTrailers guard in finish().
-  if core.respHeaders.len > 0 and core.respHeaders.hasKey(key):
-    let merged = core.respHeaders[key].mergedWith(headers)
-    core.respHeaders.del key
+  # then pays only an O(1) len check. When there are pending headers, `pop`
+  # fetches and removes them in a single probe (was hasKey + [] + del).
+  var pending: ResponseHeaders
+  if core.respHeaders.len > 0 and core.respHeaders.pop(key, pending):
+    let merged = pending.mergedWith(headers)
     # a Content-Type among the merged headers wins over the (auto) contentType
     let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
     emit(ct, merged)
@@ -957,9 +958,9 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
     let h3c = h3ConnOf(core, fd, gen)
     if h3c != nil:
       let key = (fd, gen, stream)
-      if core.respHeaders.len > 0 and core.respHeaders.hasKey(key):
-        let merged = core.respHeaders[key].mergedWith(headers)
-        core.respHeaders.del key
+      var pending: ResponseHeaders
+      if core.respHeaders.len > 0 and core.respHeaders.pop(key, pending):
+        let merged = pending.mergedWith(headers)
         let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
         h3Respond(core, h3c, uint64(stream), code, ct, merged, body,
                   core.secHeaders)
@@ -1778,9 +1779,9 @@ proc finish*(res: Response) {.raises: [].} =
     # Pull any pending res.trailers (loop-thread only, so no lock needed).
     var trailers: seq[(string, string)]
     let tkey = (res.fd, res.gen, res.stream)
-    if res.core.respTrailers.len > 0 and res.core.respTrailers.hasKey(tkey):
-      for pair in res.core.respTrailers[tkey].pairs: trailers.add pair
-      res.core.respTrailers.del tkey
+    var pendingTrailers: ResponseHeaders     # fetch + remove in one probe
+    if res.core.respTrailers.len > 0 and res.core.respTrailers.pop(tkey, pendingTrailers):
+      for pair in pendingTrailers.pairs: trailers.add pair
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
