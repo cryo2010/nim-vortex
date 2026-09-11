@@ -869,7 +869,8 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
 proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
                 dateStr, serverHeader, contentType: string,
                 extraHeaders: openArray[(string, string)],
-                body: openArray[char], altSvc = "") =
+                body: openArray[char], altSvc = "",
+                secHeaders: openArray[(string, string)] = []) =
   let h2 = h2Conn(c)
   if sid notin h2.streams: return
   if h2.streams[sid].rs.responded: return
@@ -890,6 +891,11 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
     encodeExtraHeader(hb, name, val)
+  for (name, val) in secHeaders:               # OWASP baseline; app header wins
+    var shadowed = false
+    for (hn, _) in extraHeaders:
+      if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
+    if not shadowed: encodeExtraHeader(hb, name, val)
   let noBody = body.len == 0 or skipBody or bodiless
   # Header block fits one frame in practice; chunk defensively anyway.
   var off = 0

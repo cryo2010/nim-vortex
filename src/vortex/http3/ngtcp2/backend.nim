@@ -542,7 +542,9 @@ proc toVq(hdrs: seq[(string, string)]): seq[VqHeader] =
 
 proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
                       extra: openArray[(string, string)], bodyLen: int,
-                      isHead, bodiless: bool): seq[(string, string)] =
+                      isHead, bodiless: bool,
+                      secHeaders: openArray[(string, string)] = []):
+                      seq[(string, string)] =
   result.add (":status", $code)
   if core.serverHeader.len > 0: result.add ("server", core.serverHeader)
   result.add ("date", core.dateStr)
@@ -558,16 +560,28 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
        "proxy-connection": discard
     else:
       if ln.len == 0 or ln[0] != ':': result.add (ln, val)
+  for (name, val) in secHeaders:               # OWASP baseline; app header wins
+    var shadowed = false
+    for (hn, _) in extra:
+      if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
+    if shadowed: continue
+    let ln = name.toLowerAscii
+    case ln
+    of "connection", "keep-alive", "transfer-encoding", "upgrade",
+       "proxy-connection": discard
+    else:
+      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
 
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
-                body: openArray[char]) =
+                body: openArray[char],
+                secHeaders: openArray[(string, string)] = []) =
   if conn.vq == nil or sid notin conn.streams or conn.streams[sid].rs.responded: return
   template st: H3Stream = conn.streams[sid]
   st.rs.responded = true
   let bodiless = bodilessStatus(code)
   let hdrs = buildRespHeaders(core, code, contentType, extraHeaders, body.len,
-                              st.isHead, bodiless)
+                              st.isHead, bodiless, secHeaders)
   var nv = toVq(hdrs)
   let sendBody = body.len > 0 and not st.isHead and not bodiless
   vqSubmitResponse(conn.vq, int64(sid), cint(code), addr nv[0], csize_t(nv.len),

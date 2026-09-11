@@ -917,10 +917,13 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                     body: openArray[char]) =
   ## Serialize a response into the connection's write buffer using the
   ## connection's protocol. Loop thread only.
+  # The OWASP baseline (empty unless securityHeaders is on) is injected during
+  # serialization, so no merged header seq is allocated per response; the
+  # emitter skips any baseline name the handler already set (app wins).
   template emit(ct: string, h: openArray[(string, string)]) =
     if stream != 0:
       h2Respond(c, code, stream, core.dateStr, core.serverHeader,
-                ct, h, body, core.altSvc)
+                ct, h, body, core.altSvc, core.secHeaders)
     else:
       if c.rs.responded: return
       c.rs.responded = true
@@ -930,7 +933,7 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                      skipBody = c.parser.httpMethod == HttpHead,
                      announceKeepAlive = c.parser.keepAlive and
                                          c.parser.minor == 0,
-                     altSvc = core.altSvc)
+                     altSvc = core.altSvc, secHeaders = core.secHeaders)
       if not c.parser.keepAlive:
         c.closeAfterFlush = true
   let key = (c.fd, c.gen, stream)
@@ -942,10 +945,8 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
     core.respHeaders.del key
     # a Content-Type among the merged headers wins over the (auto) contentType
     let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
-    if core.secHeaders.len == 0: emit(ct, merged)
-    else: emit(ct, withSecHeaders(core, merged))
-  elif core.secHeaders.len == 0: emit(contentType, headers)
-  else: emit(contentType, withSecHeaders(core, headers))
+    emit(ct, merged)
+  else: emit(contentType, headers)
 
 proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
               code: int, contentType: string,
@@ -960,16 +961,11 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
         let merged = core.respHeaders[key].mergedWith(headers)
         core.respHeaders.del key
         let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
-        if core.secHeaders.len == 0:
-          h3Respond(core, h3c, uint64(stream), code, ct, merged, body)
-        else:
-          h3Respond(core, h3c, uint64(stream), code, ct,
-                    withSecHeaders(core, merged), body)
-      elif core.secHeaders.len == 0:
-        h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
+        h3Respond(core, h3c, uint64(stream), code, ct, merged, body,
+                  core.secHeaders)
       else:
-        h3Respond(core, h3c, uint64(stream), code, contentType,
-                  withSecHeaders(core, headers), body)
+        h3Respond(core, h3c, uint64(stream), code, contentType, headers, body,
+                  core.secHeaders)
 
 var workerResponded* {.threadvar.}: bool
   ## On a worker thread, set by the worker-path `send` so blockingTrampoline can

@@ -4,6 +4,7 @@
 ## memcopies and one integer format.
 
 import std/httpcore
+from std/strutils import cmpIgnoreCase
 from ../connection import bodilessStatus
 from ../fieldrules import eqIgnoreAsciiCase
 
@@ -96,9 +97,13 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
                      body: openArray[char],
                      extraHeaders: openArray[(string, string)],
                      keepAlive: bool, skipBody: bool,
-                     announceKeepAlive = false, altSvc = "") =
+                     announceKeepAlive = false, altSvc = "",
+                     secHeaders: openArray[(string, string)] = []) =
   ## Serialize a full response. `skipBody` (HEAD) writes the head with the
-  ## real Content-Length but omits the body bytes.
+  ## real Content-Length but omits the body bytes. `secHeaders` (the OWASP
+  ## baseline) are emitted after the handler's own, skipping any name the
+  ## handler already set -- injected here so the caller need not allocate a
+  ## merged header seq per response.
   let codeInt = int(code)
   let bodiless = bodilessStatus(codeInt)
   if codeInt in 100 .. 599:
@@ -133,6 +138,16 @@ proc appendResponse*(wbuf: var string, code: HttpCode,
     wbuf.add "\r\n"
   for (name, val) in extraHeaders:
     if connSpecificField(name): continue    # never echo handler framing headers
+    wbuf.addField name
+    wbuf.add ": "
+    wbuf.addField val
+    wbuf.add "\r\n"
+  for (name, val) in secHeaders:
+    if connSpecificField(name): continue
+    var shadowed = false                     # a handler header of the same name wins
+    for (hn, _) in extraHeaders:
+      if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
+    if shadowed: continue
     wbuf.addField name
     wbuf.add ": "
     wbuf.addField val
