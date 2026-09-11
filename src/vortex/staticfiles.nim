@@ -147,7 +147,12 @@ proc parseRange(hdr: string, size: int64): (bool, int64, int64) =
   (true, s, e)
 
 const
-  fileStreamChunk = 128 * 1024      ## bytes per worker read hop
+  fileStreamChunk = 256 * 1024      ## bytes per worker read hop. Larger chunks
+                                    ## amortize the per-hop open/lseek/close
+                                    ## (readInto reopens each hop): a 1 GiB file
+                                    ## is ~4K hops, not ~8K (issue #274). MUST be
+                                    ## <= connection.fileChunkCap (the pool
+                                    ## buffer each hop fills); keep the two equal.
   fileStreamThreshold = 512 * 1024  ## stream full-file GETs larger than this
 
 proc readInto(path: string, start: int, buf: pointer, length: int): int =
