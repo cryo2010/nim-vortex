@@ -119,8 +119,22 @@ type
                                  # accept() error (EMFILE/ENFILE/...), then
                                  # re-armed in tick(). 0 = listener armed.
 
-proc monoSec(): int64 {.inline.} =
-  getMonoTime().ticks div 1_000_000_000
+when defined(linux):
+  const clockMonotonicCoarse = ClockId(6)
+    ## CLOCK_MONOTONIC_COARSE (Linux 2.6.32+, stable kernel ABI value 6): a
+    ## cheaper, vDSO-served monotonic clock. tick() only needs whole seconds, so
+    ## its coarser (~jiffy) resolution is irrelevant; this avoids the finer
+    ## CLOCK_MONOTONIC read getMonoTime() does on every loop iteration. Hardcoding
+    ## the value (vs importing the C macro) keeps it independent of feature-test
+    ## macros. Falls back to getMonoTime if the call ever fails.
+  proc monoSec(): int64 {.inline.} =
+    var ts: Timespec
+    if clock_gettime(clockMonotonicCoarse, ts) == 0:
+      return int64(clong(ts.tv_sec))
+    getMonoTime().ticks div 1_000_000_000
+else:
+  proc monoSec(): int64 {.inline.} =
+    getMonoTime().ticks div 1_000_000_000
 
 proc callHandler(loop: Loop, req: Request, res: Response) {.inline.} =
   ## Invoke the request handler from its raw (proc, env) pair. This is exactly
