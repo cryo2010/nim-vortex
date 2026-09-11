@@ -175,6 +175,9 @@ type
     onRespDrain*: RespDrainCb ## streamed-response drain callback
     reqStreaming*: bool       ## dispatched early; body flows to onBody
     onBodyCb*: BodyCb         ## inbound streaming sink (req.onBody)
+    fwdCached*: bool          ## RFC 7239 Forwarded parsed once per request
+    cachedForwarded*: seq[tuple[forr, proto, host: string]]
+                              ## its elements, reused by forwardedProto/Host/clientIp
 
   Connection* = object
     fd*: int32
@@ -616,6 +619,7 @@ proc resetRequest*(rs: var RequestState) =
   rs.onRespDrain = nil
   rs.reqStreaming = false
   rs.onBodyCb = nil
+  rs.fwdCached = false        # keep cachedForwarded storage; overwritten on next use
 
 proc resetRequestState(c: var Connection) =
   ## Clear the per-request fields shared by resetForNextRequest (keep-alive)

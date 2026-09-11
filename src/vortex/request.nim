@@ -486,6 +486,19 @@ proc parseForwarded(hdr: string): seq[ForwardedElem] =
       else: discard
     if e.forr.len > 0 or e.proto.len > 0 or e.host.len > 0: result.add e
 
+proc forwardedElems(req: Request): seq[ForwardedElem] =
+  ## parseForwarded(req.header("forwarded")), cached once per request so a
+  ## handler reading several of forwardedProto / forwardedHost / clientIp /
+  ## scheme / isSecure parses the header only once. On the worker path there is
+  ## no live cache to reuse (the same rule as url/query), so parse directly.
+  if req.snap != nil: return parseForwarded(req.header("forwarded"))
+  let rs = reqState(req)
+  if rs == nil: return parseForwarded(req.header("forwarded"))
+  if not rs.fwdCached:
+    rs.cachedForwarded = parseForwarded(req.header("forwarded"))
+    rs.fwdCached = true
+  rs.cachedForwarded
+
 proc fwdIp(s: string): string =
   ## Extract the bare IP from an RFC 7239 for= node (`ip`, `ip:port`,
   ## `"[v6]:port"`, `_obfuscated`); returns the token unchanged if it isn't one.
@@ -502,7 +515,7 @@ proc forwardedProto*(req: Request): string =
   ## trusted proxy or unset. Prefer `req.scheme` / `req.isSecure`, which fold it
   ## in.
   if not req.fromTrustedProxy: return ""
-  let fwd = parseForwarded(req.header("forwarded"))
+  let fwd = req.forwardedElems
   if fwd.len > 0 and fwd[0].proto.len > 0: return fwd[0].proto.toLowerAscii
   let xfp = req.header("x-forwarded-proto")
   if xfp.len > 0: return xfp.split(',')[0].strip.toLowerAscii
@@ -512,7 +525,7 @@ proc forwardedHost*(req: Request): string =
   ## (host=) or X-Forwarded-Host; "" when not behind a trusted proxy or unset.
   ## Folded into `req.host`.
   if not req.fromTrustedProxy: return ""
-  let fwd = parseForwarded(req.header("forwarded"))
+  let fwd = req.forwardedElems
   if fwd.len > 0 and fwd[0].host.len > 0: return fwd[0].host
   let xfh = req.header("x-forwarded-host")
   if xfh.len > 0: return xfh.split(',')[0].strip
@@ -526,7 +539,7 @@ proc clientIp*(req: Request): string =
   ## `remoteAddress` when not behind a trusted proxy.
   if not req.fromTrustedProxy: return req.remoteAddress
   var chain: seq[string]
-  let fwd = parseForwarded(req.header("forwarded"))
+  let fwd = req.forwardedElems
   if fwd.len > 0:
     for e in fwd:
       if e.forr.len > 0: chain.add fwdIp(e.forr)   # left = client-most
