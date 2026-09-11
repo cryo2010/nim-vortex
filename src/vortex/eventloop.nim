@@ -496,7 +496,14 @@ proc flushOut(loop: Loop, c: ptr Connection) =
   elif c.rs.respStreaming and c.respBackedUp:
     c.respBackedUp = false
     if c.rs.onRespDrain != nil:
-      c.rs.onRespDrain(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
+      # Fire once, then clear -- the producer re-registers if it wants the next
+      # drain (matches the h2/h3 codecs). One-shot is required by the file
+      # streamer's read-ahead: it may prefetch the next chunk while still backed
+      # up (no fresh onDrain registered), and a persistent callback would then
+      # re-fire spuriously on the next full drain (issue #273).
+      let cb = c.rs.onRespDrain
+      c.rs.onRespDrain = nil
+      cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
   else:
     # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it and
     # resume producers parked on the cap (no-op for non-h2 connections). It may

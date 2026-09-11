@@ -2562,9 +2562,20 @@ proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
     res.core.chunkPool.chunkReturn(buf)
     res.abort()
 
-proc pullNext(res: Response, room: bool, nextRead: string, reader: pointer) =
-  ## Pull the next chunk now if the write backlog has room, else after it drains.
-  if room:
+const fileReadAhead = 2 * fileChunkCap
+  ## Read-ahead budget for streamed downloads: keep at most this much response
+  ## backlog buffered before pausing the next disk read. Two chunks lets the
+  ## next read overlap the current chunk's socket write (disk I/O and network
+  ## I/O pipeline instead of alternating), while a slow client still throttles
+  ## us -- the backlog reaches the budget and reads wait for a drain (issue
+  ## #273). Costs one extra pooled buffer of in-flight backlog per active stream.
+
+proc pullNext(res: Response, nextRead: string, reader: pointer) =
+  ## Prefetch the next chunk to overlap its disk read with the current chunk's
+  ## socket write. If the response backlog is already at the read-ahead budget,
+  ## wait for it to drain first so a slow reader cannot make us buffer without
+  ## bound (bufferedAmount covers the h1 wbuf and the h2/h3 per-stream backlog).
+  if res.bufferedAmount() < fileReadAhead:
     dispatchNextRead(res, nextRead, reader)
   else:
     let held = nextRead
@@ -2577,13 +2588,12 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## Loop-side: copy a filled pool buffer into the response; finish on the last,
   ## else pull the next read. `buf` is returned to the pool by processOutbox
   ## after the batch (whether or not the connection is still alive).
-  var room = true
   if buf != nil and n > 0:
-    room = res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
+    discard res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
   if last:
     res.finish()
     return
-  pullNext(res, room, nextRead, reader)
+  pullNext(res, nextRead, reader)
 
 proc applyFileStart*(res: Response, status: int, contentType: string,
                      headers: openArray[(string, string)], totalLen: int64,
@@ -2594,11 +2604,11 @@ proc applyFileStart*(res: Response, status: int, contentType: string,
   ## the buffer pool.
   res.sendHead(HttpCode(status), contentType, headers,
                contentLength = int(totalLen))
-  let room = res.write(firstChunk)
+  discard res.write(firstChunk)
   if last:
     res.finish()
     return
-  pullNext(res, room, nextRead, reader)
+  pullNext(res, nextRead, reader)
 
 macro blocking*(request: Request, args: varargs[untyped]): untyped =
   ## Run a block on the worker pool, where blocking calls (sync DB drivers, file
