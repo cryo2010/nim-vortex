@@ -353,11 +353,18 @@ proc encodeExtraHeader(hb: var string, name, val: string) =
   ## malformed and cancels the stream, so h1-portable handler code would break on
   ## h2. The inbound direction is already filtered; this closes the outbound gap
   ## (#240.3). Names are lowercased to h2 wire form regardless.
-  let lname = name.toLowerAscii
-  case lname
-  of "connection", "proxy-connection", "keep-alive", "transfer-encoding",
-     "upgrade": discard
-  else: encodeHeader(hb, lname, val)
+  ##
+  ## The forbidden-set check is allocation-free (eqIgnoreAsciiCase), and the
+  ## `toLowerAscii` copy is taken only when the name is not already lowercase --
+  ## an h2-aware handler using lowercase names then pays no per-header alloc.
+  if eqIgnoreAsciiCase(name, "connection") or
+     eqIgnoreAsciiCase(name, "proxy-connection") or
+     eqIgnoreAsciiCase(name, "keep-alive") or
+     eqIgnoreAsciiCase(name, "transfer-encoding") or
+     eqIgnoreAsciiCase(name, "upgrade"):
+    return
+  if isLowerAscii(name): encodeHeader(hb, name, val)
+  else: encodeHeader(hb, name.toLowerAscii, val)
 
 proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
   ## Prepend a pending HPACK dynamic-table-size-update instruction (RFC 7541

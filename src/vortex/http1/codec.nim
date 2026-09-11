@@ -4,8 +4,8 @@
 ## memcopies and one integer format.
 
 import std/httpcore
-from std/strutils import toLowerAscii
 from ../connection import bodilessStatus
+from ../fieldrules import eqIgnoreAsciiCase
 
 proc addField*(wbuf: var string, s: string) =
   ## Append a handler-supplied header name or value with CR and LF removed,
@@ -31,10 +31,13 @@ proc connSpecificField*(name: string): bool =
   ## framing (a second Content-Length, or Transfer-Encoding alongside it) that a
   ## downstream intermediary reads as request/response smuggling. Content-Type is
   ## NOT in this set (it is carried separately). Mirrors http2 encodeExtraHeader.
-  case name.toLowerAscii
-  of "connection", "proxy-connection", "keep-alive", "transfer-encoding",
-     "upgrade", "content-length": true
-  else: false
+  ## Case-insensitive compare without allocating a lowercased copy per header.
+  eqIgnoreAsciiCase(name, "connection") or
+  eqIgnoreAsciiCase(name, "proxy-connection") or
+  eqIgnoreAsciiCase(name, "keep-alive") or
+  eqIgnoreAsciiCase(name, "transfer-encoding") or
+  eqIgnoreAsciiCase(name, "upgrade") or
+  eqIgnoreAsciiCase(name, "content-length")
 
 const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
