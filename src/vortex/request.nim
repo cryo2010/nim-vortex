@@ -2283,37 +2283,52 @@ proc fileChunkTrampoline(user, core: pointer, fd: int32, gen: uint32,
 
 proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
                              data: sink string,
-                             pin: PinKind) {.raises: [].} =
+                             pin: PinKind): bool {.discardable, raises: [].} =
   ## Internal: dispatchBlockingData with the pin kind named by the caller --
   ## pkBlocking for handler bodies (incl. the sendFile INITIAL read, which
   ## reads request headers/preconditions and must pause input), pkFileChunk
   ## for dispatchNextRead's chunk reads (file-only workers that must not).
   ## A refusal releases the same kind, and the matching trampoline stamps the
   ## same kind as its message's release, so the counters cannot diverge.
+  ##
+  ## Returns true once the task is owned downstream -- a worker took it, or it
+  ## ran inline (no pool). Returns false when the dispatch did NOT happen: a
+  ## dead connection, or a saturated pool. The caller still owns anything it
+  ## embedded in `data` (e.g. a borrowed chunk-pool buffer) and must reclaim it.
+  ## The synchronous pkBlocking path sheds load with a 503 on refusal; the
+  ## pkFileChunk continuation path returns false WITHOUT a 503 -- the response
+  ## is already mid-stream, so a 503 would be a silent no-op (rs.responded).
+  ## Its caller (dispatchNextRead) truncates the stream and reclaims the buffer.
   let tramp = if pin == pkFileChunk: fileChunkTrampoline
               else: blockingDataTrampoline
   try:
     if req.core.pool == nil:
       tramp(cast[pointer](fn), cast[pointer](req.core),
             req.fd, req.gen, req.stream, data)  # no pool: inline
-      return
+      return true
     if req.fd < 0:
       let idx = h3SlotOf(req.fd)
       if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return
+        return false
       acquirePin(req.core, addr req.core.h3slots[idx], pin)
     else:
       let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return
+      if c == nil: return false
       acquirePin(req.core, c, pin)
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: tramp, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
                        gen: req.gen, stream: req.stream, data: data,
                        snap: snapshotRequest(req))):
-      undoPinAnd503(req, pin)        # pool saturated: shed load with 503
+      # Pool saturated: release the pin we just took. Shed load with a 503 for
+      # the synchronous path; the file-chunk continuation only releases the pin
+      # and reports failure so its caller can truncate + reclaim the buffer.
+      if pin == pkFileChunk: undoPin(req, pin)
+      else: undoPinAnd503(req, pin)
+      return false
+    return true
   except Exception:
-    discard
+    return false
 
 proc dispatchBlockingData*(req: Request, fn: BlockingDataProc,
                            data: sink string) {.raises: [].} =
@@ -2531,16 +2546,36 @@ proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
   ## (sendFile -> serveResolved) is dispatched separately and reads req
   ## headers, so it is pkBlocking and correctly pauses input. One acquisition,
   ## one kind: a saturated-pool refusal (undoPin) releases the same
-  ## pkFileChunk, so the counters stay balanced by construction.
+  ## pkFileChunk, so the counters stay balanced by construction. A refused or
+  ## dead-connection dispatch returns false; we then reclaim the borrowed buffer
+  ## and abort the stream (issue #272) instead of leaking it and stalling.
   let buf = res.core.chunkPool.chunkTake()
-  dispatchBlockingDataPin(
-    Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
-    cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf),
-    pkFileChunk)
+  if not dispatchBlockingDataPin(
+      Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
+      cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf),
+      pkFileChunk):
+    # No worker took the read (saturated pool, or a dead connection). The buffer
+    # whose pointer we embedded in the task will never come back via an
+    # omFileChunk, so reclaim it here, and truncate the response (abort) so the
+    # client sees a cut-short transfer rather than a silent stall until timeout.
+    # abort() no-ops on a dead connection (nothing to truncate) -- see abort().
+    res.core.chunkPool.chunkReturn(buf)
+    res.abort()
 
-proc pullNext(res: Response, room: bool, nextRead: string, reader: pointer) =
-  ## Pull the next chunk now if the write backlog has room, else after it drains.
-  if room:
+const fileReadAhead = 2 * fileChunkCap
+  ## Read-ahead budget for streamed downloads: keep at most this much response
+  ## backlog buffered before pausing the next disk read. Two chunks lets the
+  ## next read overlap the current chunk's socket write (disk I/O and network
+  ## I/O pipeline instead of alternating), while a slow client still throttles
+  ## us -- the backlog reaches the budget and reads wait for a drain (issue
+  ## #273). Costs one extra pooled buffer of in-flight backlog per active stream.
+
+proc pullNext(res: Response, nextRead: string, reader: pointer) =
+  ## Prefetch the next chunk to overlap its disk read with the current chunk's
+  ## socket write. If the response backlog is already at the read-ahead budget,
+  ## wait for it to drain first so a slow reader cannot make us buffer without
+  ## bound (bufferedAmount covers the h1 wbuf and the h2/h3 per-stream backlog).
+  if res.bufferedAmount() < fileReadAhead:
     dispatchNextRead(res, nextRead, reader)
   else:
     let held = nextRead
@@ -2553,13 +2588,12 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## Loop-side: copy a filled pool buffer into the response; finish on the last,
   ## else pull the next read. `buf` is returned to the pool by processOutbox
   ## after the batch (whether or not the connection is still alive).
-  var room = true
   if buf != nil and n > 0:
-    room = res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
+    discard res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
   if last:
     res.finish()
     return
-  pullNext(res, room, nextRead, reader)
+  pullNext(res, nextRead, reader)
 
 proc applyFileStart*(res: Response, status: int, contentType: string,
                      headers: openArray[(string, string)], totalLen: int64,
@@ -2570,11 +2604,11 @@ proc applyFileStart*(res: Response, status: int, contentType: string,
   ## the buffer pool.
   res.sendHead(HttpCode(status), contentType, headers,
                contentLength = int(totalLen))
-  let room = res.write(firstChunk)
+  discard res.write(firstChunk)
   if last:
     res.finish()
     return
-  pullNext(res, room, nextRead, reader)
+  pullNext(res, nextRead, reader)
 
 macro blocking*(request: Request, args: varargs[untyped]): untyped =
   ## Run a block on the worker pool, where blocking calls (sync DB drivers, file

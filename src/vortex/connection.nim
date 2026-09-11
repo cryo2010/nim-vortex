@@ -508,8 +508,10 @@ proc releasePin*(s: ptr H3SlotEntry, k: PinKind) {.inline.} =
   doAssert s.pins[k] > 0, "pin release without a matching acquire"
   dec s.pins[k]
 
-const fileChunkCap* = 128 * 1024
-  ## Size of a pooled sendFile read buffer (one worker read hop).
+const fileChunkCap* = 256 * 1024
+  ## Size of a pooled sendFile read buffer (one worker read hop). MUST stay >=
+  ## staticfiles.fileStreamChunk (the bytes a hop reads into it); the two are
+  ## kept equal. Larger chunks cut the per-hop reopen overhead (issue #274).
 
 proc chunkTake*(p: var ChunkPool): pointer =
   ## Borrow a buffer for a file-read worker to fill (loop thread only).
@@ -518,7 +520,7 @@ proc chunkTake*(p: var ChunkPool): pointer =
   p.all.add result
 
 const chunkPoolMaxFree* = 16
-  ## Cap on idle pooled buffers kept per loop (16 x 128KiB = 2MiB). Without a cap
+  ## Cap on idle pooled buffers kept per loop (16 x 256KiB = 4MiB). Without a cap
   ## the free-list floats to peak-ever concurrency and pins that memory for the
   ## loop's life after a burst subsides; buffers returned past the cap are freed.
 
