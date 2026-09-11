@@ -125,6 +125,10 @@ type
     sendQ*: array[8, Deque[uint32]]
     scheduling*: bool         ## reentrancy guard for h2Schedule
     resuming*: bool           ## reentrancy guard for h2ResumeProducers
+    backedUpProducers*: int   ## streams with respBackedUp set: lets
+                              ## h2ResumeProducers skip the full stream-table
+                              ## scan when nothing is parked (the common case).
+                              ## Maintained only via setBackedUp/clearBackedUp.
     # RFC 9218 PRIORITY_UPDATE that arrived before a stream's HEADERS: the raw
     # Priority field value, applied when the stream opens. Capped to bound a flood.
     pendingPriority*: Table[uint32, string]
@@ -251,6 +255,20 @@ proc recordEarlyClosed(h2: H2Conn, sid: uint32) {.raises: [].} =
   if h2.earlyClosedQ.len > maxEarlyClosed:
     h2.earlyClosed.excl h2.earlyClosedQ.popFirst()
 
+proc setBackedUp(h2: H2Conn, st: var H2Stream) {.inline.} =
+  ## Mark a stream's producer parked and keep h2.backedUpProducers exact.
+  ## Idempotent: a re-mark does not double-count.
+  if not st.respBackedUp:
+    st.respBackedUp = true
+    inc h2.backedUpProducers
+
+proc clearBackedUp(h2: H2Conn, st: var H2Stream) {.inline.} =
+  ## Clear the parked flag (resume, finish, or teardown) and keep the counter
+  ## exact. Idempotent, so every teardown path can call it unconditionally.
+  if st.respBackedUp:
+    st.respBackedUp = false
+    dec h2.backedUpProducers
+
 proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises: [].} =
   ## The single stream-removal primitive for every teardown path (normal
   ## completion, RST_STREAM in either direction, stream error, connection
@@ -293,6 +311,7 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises
     st.rs.onBodyCb = nil
     drainCb = st.rs.onRespDrain
     st.rs.onRespDrain = nil
+    clearBackedUp(h2, st[])               # drop from the parked-producer count
   do:
     return                                # not present (already gone)
   h2.streams.del(sid)
@@ -509,6 +528,7 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
   ## ids first (an onRespDrain callback may res.write and mutate the table) and
   ## stop early if a resumed producer refills the buffer.
   if h2.resuming: return
+  if h2.backedUpProducers == 0: return   # nothing parked: skip the table scan
   if pendingOut(c) >= respHighWater: return
   h2.resuming = true
   var resumable: seq[uint32]
@@ -522,7 +542,7 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
     if sid notin h2.streams: continue
     template st: H2Stream = h2.streams[sid]
     if not st.respBackedUp or st.rs.onRespDrain == nil: continue
-    st.respBackedUp = false
+    clearBackedUp(h2, st)
     let cb = st.rs.onRespDrain
     st.rs.onRespDrain = nil            # fire once; the producer re-registers if it
     # backs up again (res.write -> enqueue+schedule). Contain a raising producer
@@ -633,7 +653,7 @@ proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
   ## even though this stream's send window still has room.
   let h2 = h2Conn(c)
   if h2 != nil and sid in h2.streams:
-    h2.streams[sid].respBackedUp = true
+    setBackedUp(h2, h2.streams[sid])
 
 proc h2DrainResume*(c: ptr Connection, core: ptr LoopCore) =
   ## The connection write buffer drained to the socket: run a scheduler pass to
@@ -715,7 +735,7 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   template st: H2Stream = h2.streams[sid]
   st.rs.respStreaming = false
   st.rs.onRespDrain = nil
-  st.respBackedUp = false          # finished: never let a drain path resume it
+  clearBackedUp(h2, st)            # finished: never let a drain path resume it
   if st.isHead:
     return                               # HEAD stream already closed at head
   st.pendingIsLast = true
