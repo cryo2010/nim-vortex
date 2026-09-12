@@ -198,14 +198,21 @@ proc match(node: RouteNode, path: string, start: int,
     return cast[ptr RouteNodeObj](child)
   nil
 
-proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
-  ## Look up and invoke the handler for a request; captured route
-  ## parameters become req.params.
+proc matchPath(router: Router, req: Request,
+               params: var PathParams): ptr RouteNodeObj =
+  ## Strip the query string off the request path and match it against the trie,
+  ## filling `params`. Shared by `route` and `streamPredicate` so their path
+  ## normalization cannot drift apart. Returns a ptr into the pinned trie, or nil.
   var path = req.path
   let q = path.find('?')
   if q >= 0: path.setLen(q)
+  router.root.match(path, 0, params)
+
+proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =
+  ## Look up and invoke the handler for a request; captured route
+  ## parameters become req.params.
   var params: PathParams
-  let node = router.root.match(path, 0, params)   # ptr into the pinned trie
+  let node = router.matchPath(req, params)   # ptr into the pinned trie
   if node == nil:
     router.notFound(req, res)
     return
@@ -275,10 +282,7 @@ proc streamPredicate*(router: Router): StreamRouteCb =
         stream: uint32): bool {.gcsafe.} =
     {.gcsafe.}:
       let req = Request(core: core, fd: fd, gen: gen, stream: stream)
-      var path = req.path
-      let q = path.find('?')
-      if q >= 0: path.setLen(q)
       var params: PathParams
-      let node = r.root.match(path, 0, params)   # ptr into the pinned trie
+      let node = r.matchPath(req, params)   # ptr into the pinned trie
       if node == nil: return false
       node.streaming[req.method]
