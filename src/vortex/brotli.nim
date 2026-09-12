@@ -95,7 +95,7 @@ proc newBrotliStream*(): BrotliStream =
                                     uint32(brModeText))
 
 method compress*(s: BrotliStream, data: openArray[char], last: bool): string
-    {.gcsafe.} =
+    {.gcsafe, raises: [].} =
   ## Feed one chunk; returns the compressed bytes to emit (may be ""). `last`
   ## finishes the stream. On error the encoder is dropped and returns "".
   if s == nil or s.state == nil: return ""

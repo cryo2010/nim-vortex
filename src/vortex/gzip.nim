@@ -65,7 +65,7 @@ proc newGzipStream*(): GzipStream =
     result = nil
 
 method compress*(s: GzipStream, data: openArray[char], last: bool): string
-    {.gcsafe.} =
+    {.gcsafe, raises: [].} =
   ## Feed one chunk; returns the compressed bytes to emit. `last` emits the
   ## gzip trailer. "" is a valid result (nothing to emit yet). On a hard error
   ## the stream is marked dead and returns "".

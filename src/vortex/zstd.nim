@@ -84,7 +84,7 @@ proc newZstdStream*(): ZstdStream =
   discard zstdCCtxSetParameter(result.cctx, zstdCLevelParam, zstdLevel)
 
 method compress*(s: ZstdStream, data: openArray[char], last: bool): string
-    {.gcsafe.} =
+    {.gcsafe, raises: [].} =
   ## Feed one chunk; returns the compressed bytes to emit (may be ""). `last`
   ## ends the frame. On error the encoder is dropped and returns "".
   if s == nil or s.cctx == nil: return ""

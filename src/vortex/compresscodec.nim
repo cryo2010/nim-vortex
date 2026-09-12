@@ -21,7 +21,7 @@ type
     ## inflated bytes when `ok`.
 
 method compress*(s: CompressStream, data: openArray[char], last: bool): string
-    {.base, gcsafe.} =
+    {.base, gcsafe, raises: [].} =
   ## Feed one chunk; return the compressed bytes to emit (may be ""). `last`
   ## finishes the stream. The base is never reached in practice (every stored
   ## encoder is a concrete subtype); it yields identity "" defensively.

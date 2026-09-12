@@ -29,7 +29,8 @@ export wscodec
 when not defined(plainHttp):
   import ./http3/ngtcp2/backend as h3codec   # HTTP/3 over ngtcp2 + nghttp3
   import ./transport/tls as tlscodec
-import ./compresscodec   # CompressStream Strategy + DecodeResult (leaf, always safe)
+when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
+  import ./compresscodec   # CompressStream Strategy + DecodeResult (used only here)
 when defined(httpGzip):
   import ./gzip
 when defined(httpBrotli):
@@ -766,7 +767,8 @@ proc parseAcceptHeader(h: string): seq[tuple[tok: string, q: float]] =
     result.add (tok.toLowerAscii, q)
 
 proc negotiate(header: string, offered: openArray[string],
-               match: proc(entry, offered: string): int {.nimcall, gcsafe.}): string =
+               match: proc(entry, offered: string): int
+                       {.nimcall, gcsafe, raises: [].}): string =
   ## Pick the value from `offered` (in server-preference order) that the client
   ## most prefers. The most specific matching range determines an offer's q; the
   ## highest q wins, ties broken by offer order. No header -> the first offer.
