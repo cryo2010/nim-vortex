@@ -670,6 +670,26 @@ proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [
   ## Forward declaration: sendFrame closes the connection if permessage-deflate
   ## compression fails (see below).
 
+template withWsConn(ws: WebSocket; c, w, body: untyped) =
+  ## Loop-thread contract for the WsConn-resolving entry points. Off the loop
+  ## thread these cannot touch the ref (mutating/reading it would race the loop's
+  ## non-atomic ORC refcount), so bail with the proc's default result; on-loop,
+  ## resolve the (Connection, WsConn) pair into `c`/`w`, nil-guard, then run body.
+  if currentThreadId() != ws.core.threadId: return
+  let (c, w) = wsConnOf(ws)
+  if w == nil: return
+  body
+
+template withWsConn(ws: WebSocket; c, w, offThread, body: untyped) =
+  ## As above, but the entry point must still deliver off the loop thread: run
+  ## `offThread` (route the frame through the outbox) before bailing.
+  if currentThreadId() != ws.core.threadId:
+    offThread
+    return
+  let (c, w) = wsConnOf(ws)
+  if w == nil: return
+  body
+
 proc sendFrame(ws: WebSocket, op: WsOpcode,
                data: openArray[char]) {.raises: [].} =
   # Declared {.raises: [].} (the flushHook proc pointer otherwise gives an
@@ -677,38 +697,36 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
   # bodies, which only permit CatchableError. A send is best-effort: a
   # failure just means the connection is going away.
   try:
-    if currentThreadId() != ws.core.threadId:
-      var frame = ""
-      frame.appendFrame(op, data)
-      push(ws.core.outbox, OutMsg(kind: omWs, fd: ws.fd, gen: ws.gen,
-                                  stream: ws.stream, data: frame))
-      return
-    let (c, w) = wsConnOf(ws)
-    if w == nil or w.closeSent: return   # nothing may follow a sent close frame
-    when defined(wsDeflate):
-      # Compress data messages when permessage-deflate is negotiated; control
-      # frames and empty messages go out uncompressed. (Off-loop sends above
-      # are always uncompressed: the deflate stream is loop-thread state.)
-      if w.pmd and (op == opText or op == opBinary) and data.len > 0:
-        var comp: string
-        try:
-          comp = w.deflate.compress(data)
-        except CatchableError:
-          # A deflate failure corrupts the stateful pmd stream (context takeover
-          # carries state across messages), so every later message would be
-          # undecodable. Close with 1011 rather than dropping silently or
-          # emitting a frame the peer can't decode (R13).
-          ws.close(1011)
+    withWsConn(ws, c, w,
+      (var frame = "";
+       frame.appendFrame(op, data);
+       push(ws.core.outbox, OutMsg(kind: omWs, fd: ws.fd, gen: ws.gen,
+                                   stream: ws.stream, data: frame)))):
+      if w.closeSent: return   # nothing may follow a sent close frame
+      when defined(wsDeflate):
+        # Compress data messages when permessage-deflate is negotiated; control
+        # frames and empty messages go out uncompressed. (Off-loop sends above
+        # are always uncompressed: the deflate stream is loop-thread state.)
+        if w.pmd and (op == opText or op == opBinary) and data.len > 0:
+          var comp: string
+          try:
+            comp = w.deflate.compress(data)
+          except CatchableError:
+            # A deflate failure corrupts the stateful pmd stream (context
+            # takeover carries state across messages), so every later message
+            # would be undecodable. Close with 1011 rather than dropping
+            # silently or emitting a frame the peer can't decode (R13).
+            ws.close(1011)
+            return
+          w.outBuf.appendFrame(op, comp, rsv1 = true)
+          w.flush(ws.core, c, w)
+          if ws.core.flushHook != nil:
+            ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
           return
-        w.outBuf.appendFrame(op, comp, rsv1 = true)
-        w.flush(ws.core, c, w)
-        if ws.core.flushHook != nil:
-          ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
-        return
-    w.outBuf.appendFrame(op, data)
-    w.flush(ws.core, c, w)
-    if ws.core.flushHook != nil:
-      ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
+      w.outBuf.appendFrame(op, data)
+      w.flush(ws.core, c, w)
+      if ws.core.flushHook != nil:
+        ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
   except Exception:
     discard
 
@@ -728,20 +746,18 @@ proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [
   ## (the connection for HTTP/1.1, the stream for HTTP/2) once it flushes.
   ## Safe from any thread.
   try:
-    if currentThreadId() != ws.core.threadId:
-      var frame = ""
-      frame.appendClose(code, reason)
-      push(ws.core.outbox, OutMsg(kind: omWsClose, fd: ws.fd, gen: ws.gen,
-                                  stream: ws.stream, data: frame))
-      return
-    let (c, w) = wsConnOf(ws)
-    if w == nil or w.closeSent: return
-    w.closeSent = true
-    w.outBuf.appendClose(code, reason)
-    w.wantClose = true
-    w.flush(ws.core, c, w)
-    if ws.core.flushHook != nil:
-      ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
+    withWsConn(ws, c, w,
+      (var frame = "";
+       frame.appendClose(code, reason);
+       push(ws.core.outbox, OutMsg(kind: omWsClose, fd: ws.fd, gen: ws.gen,
+                                   stream: ws.stream, data: frame)))):
+      if w.closeSent: return
+      w.closeSent = true
+      w.outBuf.appendClose(code, reason)
+      w.wantClose = true
+      w.flush(ws.core, c, w)
+      if ws.core.flushHook != nil:
+        ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
   except Exception:
     discard
 
@@ -750,15 +766,13 @@ proc `onMessage=`*(ws: WebSocket, cb: WsMessageCb) =
   ## resolving and mutating the WsConn ref from a worker would race the loop's
   ## non-atomic ORC refcount. Cross-thread output uses send/close, which route
   ## through the outbox.
-  if currentThreadId() != ws.core.threadId: return
-  let (_, w) = wsConnOf(ws)
-  if w != nil: w.onMessage = cb
+  withWsConn(ws, _, w):
+    w.onMessage = cb
 
 proc `onClose=`*(ws: WebSocket, cb: WsCloseCb) =
   ## Loop-thread only (see onMessage=).
-  if currentThreadId() != ws.core.threadId: return
-  let (_, w) = wsConnOf(ws)
-  if w != nil: w.onClose = cb
+  withWsConn(ws, _, w):
+    w.onClose = cb
 
 proc `onDrain=`*(ws: WebSocket, cb: WsDrainCb) =
   ## Set a callback fired (on the loop thread) when the write backlog drains
@@ -766,9 +780,8 @@ proc `onDrain=`*(ws: WebSocket, cb: WsDrainCb) =
   ## `bufferedAmount` to stop sending while the backlog is high and resume
   ## from here. No-op if the connection is gone. Loop-thread only (see
   ## onMessage=).
-  if currentThreadId() != ws.core.threadId: return
-  let (_, w) = wsConnOf(ws)
-  if w != nil: w.onDrain = cb
+  withWsConn(ws, _, w):
+    w.onDrain = cb
 
 proc bufferedAmount*(ws: WebSocket): int =
   ## Bytes queued by send() but not yet written to the peer. Grows when the
@@ -778,17 +791,14 @@ proc bufferedAmount*(ws: WebSocket): int =
   ## snapshot: read it from a handler callback (onMessage/onDrain), not
   ## another thread; off-loop sends queue on the outbox and are not counted
   ## until the loop picks them up.
-  if currentThreadId() != ws.core.threadId: return 0   # loop-thread only
-  let (c, w) = wsConnOf(ws)
-  if w == nil: return 0
-  if ws.fd >= 0 and ws.stream == 0: c.pendingOut else: w.h2Pending
+  withWsConn(ws, c, w):
+    result = if ws.fd >= 0 and ws.stream == 0: c.pendingOut else: w.h2Pending
 
 proc isAlive*(ws: WebSocket): bool =
   ## Loop-thread only; off-loop it conservatively reports false rather than
   ## resolving the WsConn ref across threads.
-  if currentThreadId() != ws.core.threadId: return false
-  let (_, w) = wsConnOf(ws)
-  w != nil
+  withWsConn(ws, _, w):
+    result = true
 
 proc subprotocol*(ws: WebSocket): string =
   ## The negotiated subprotocol, or "" if none was agreed.
