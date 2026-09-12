@@ -377,6 +377,19 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   c.closeRequested = false
   dec loop.connCount
 
+proc setInterest(loop: Loop, c: ptr Connection, events: set[Event]) =
+  ## Point the selector at exactly `events` for c's fd: register the fd if it was
+  ## unregistered (e.g. re-arming a connection parked half-closed for a deferred
+  ## response), else update it, keeping c.registered / c.writeArmed in sync. The
+  ## caller owns deadlines; dropping the fd entirely is disarmForResponse's job,
+  ## not an empty event set here.
+  if not c.registered:
+    loop.selector.registerHandle(int(c.fd), events, fkClient)
+    c.registered = true
+  else:
+    loop.selector.updateHandle(int(c.fd), events)
+  c.writeArmed = Event.Write in events
+
 proc armWrite(loop: Loop, c: ptr Connection) =
   # The socket could not take all pending output: arm a write-stall deadline so a
   # slow-reading client that never drains the response is closed (writeTimeout).
@@ -386,21 +399,20 @@ proc armWrite(loop: Loop, c: ptr Connection) =
   if loop.settings.writeTimeout > 0:
     c.writeDeadline = loop.core.nowSec + int64(loop.settings.writeTimeout)
   if not c.registered:
-    # Re-arm a connection unregistered while it waited half-closed for a
-    # deferred response (see disarmForResponse): there is output to flush now.
-    loop.selector.registerHandle(int(c.fd), {Event.Write}, fkClient)
-    c.registered = true
-    c.writeArmed = true
+    # Re-arm a connection unregistered while it waited half-closed for a deferred
+    # response (see disarmForResponse): there is output to flush now. Read
+    # interest is added once the write drains (disarmWrite).
+    loop.setInterest(c, {Event.Write})
   elif not c.writeArmed:
-    c.writeArmed = true
-    loop.selector.updateHandle(int(c.fd), {Event.Read, Event.Write})
+    loop.setInterest(c, {Event.Read, Event.Write})
 
 proc disarmWrite(loop: Loop, c: ptr Connection) =
   c.writeDeadline = 0            # output fully flushed: the write is not stalled
   if c.writeArmed:
-    c.writeArmed = false
     if c.registered:
-      loop.selector.updateHandle(int(c.fd), {Event.Read})
+      loop.setInterest(c, {Event.Read})
+    else:
+      c.writeArmed = false
 
 proc disarmForResponse(loop: Loop, c: ptr Connection) =
   ## The peer half-closed and we are waiting for a deferred/worker response.
@@ -429,13 +441,8 @@ proc beginLingerClose(loop: Loop, c: ptr Connection) =
   # response before this close) or write-armed; without read interest the
   # connection would strand in csDraining until the drain deadline (5s), holding
   # an fd + connCount slot for every such close.
-  if not c.registered:
-    loop.selector.registerHandle(int(c.fd), {Event.Read}, fkClient)
-    c.registered = true
-    c.writeArmed = false
-  elif c.writeArmed:
-    c.writeArmed = false
-    loop.selector.updateHandle(int(c.fd), {Event.Read})
+  if not c.registered or c.writeArmed:
+    loop.setInterest(c, {Event.Read})
   c.setDeadline(loop, dkDrain)
 
 proc handleDrain(loop: Loop, c: ptr Connection) =
@@ -538,6 +545,27 @@ proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   c.lingerClose = true       # drain the peer so the error is delivered, no RST
   c.state = csClosing
 
+proc h2Deadline(c: ptr Connection): DeadlineKind =
+  ## Classify an active h2 connection's timeout policy for this pass:
+  ##  - dkIdle: no streams open -- (re)arm keep-alive. This must refresh on every
+  ##    pass that leaves zero active streams, not just the first: a fully
+  ##    synchronous request opens and closes its stream within one processInput,
+  ##    so activeStreams is 0 at both ends; freezing it at first-arm would let
+  ##    sweepTimeouts close a busy connection keepAliveTimeout after it opened
+  ##    (e.g. a client streaming SSE batches, one stream at a time).
+  ##  - dkBody: a stream still awaits the client's request head/body (a slowloris
+  ##    hold-open, bounded by bodyTimeout), OR every request has finished but the
+  ##    server still owes response bytes parked on an exhausted send window -- the
+  ##    client must send WINDOW_UPDATE, so its silence is a stall, not a legit
+  ##    silent SSE/download (#236). A stream the client finished while the server
+  ##    streams a long response back (endStreamSeen) is excluded by
+  ##    h2AwaitingClient, so a legitimately-silent client is never wrongly reaped.
+  ##  - dkNone: nothing to time.
+  if h2ActiveStreams(c) == 0: dkIdle
+  elif h2AwaitingClient(c): dkBody
+  elif h2BlockedOnPeerWindow(c): dkBody
+  else: dkNone
+
 proc h2Input(loop: Loop, c: ptr Connection) =
   ## Feed buffered bytes to the HTTP/2 codec and dispatch ready streams.
   if c.inputPausePins > 0:
@@ -579,40 +607,12 @@ proc h2Input(loop: Loop, c: ptr Connection) =
           wsPeerClosed(addr loop.core, c, w)
         loop.flushOut(c)
   if c.state == csActive:
-    if h2ActiveStreams(c) == 0:
-      # Idle: (re)arm the keep-alive deadline. This must refresh on every pass
-      # that leaves the connection with no active streams, not just the first
-      # (the h1 path re-arms unconditionally after each request too). A fully
-      # synchronous h2 request opens and closes its stream within a single
-      # processInput, so activeStreams is 0 at both ends and the `else` branch
-      # never runs -- guarding this with `dlKind != dkIdle` would freeze the
-      # deadline at the first request's arming time, so sweepTimeouts would
-      # close a busy connection keepAliveTimeout seconds after it opened
-      # regardless of ongoing traffic (e.g. a client streaming SSE batches, one
-      # stream at a time).
-      c.setDeadline(loop, dkIdle)
-    elif h2AwaitingClient(c):
-      # At least one open stream is still awaiting the client's request head or
-      # body (no END_STREAM yet): arm a read-idle deadline so a client that opens
-      # HEADERS/DATA and then goes silent (a slowloris hold-open) is closed. This
-      # re-arms on every pass that made progress, so an actively-transferring
-      # upload is never cut off. A stream the client has finished while the server
-      # streams a long response back (endStreamSeen) is excluded by
-      # h2AwaitingClient -- read-timing that would kill a legitimate silent-client
-      # SSE/download. bodyTimeout is the natural bound for in-flight request bytes.
-      c.setDeadline(loop, dkBody)
-    elif h2BlockedOnPeerWindow(c):
-      # Every open stream has finished its request (so h2AwaitingClient is false),
-      # but the server still owes response bytes parked on an exhausted send
-      # window. That is NOT a legitimately-silent SSE/download: the client must
-      # send WINDOW_UPDATE to receive more, so treat its silence as a stall and
-      # arm the body deadline. Otherwise the else below clears the deadline and
-      # nothing (no read deadline, no write deadline -- the bytes are in
-      # pendingBody, not wbuf) ever reaps the connection (#236).
-      c.setDeadline(loop, dkBody)
-    else:
+    let dk = h2Deadline(c)
+    if dk == dkNone:
       c.deadline = 0
       c.dlKind = dkNone
+    else:
+      c.setDeadline(loop, dk)
 
 proc initH2(loop: Loop, c: ptr Connection) =
   c.h2 = newH2Conn(addr loop.core,
@@ -953,6 +953,16 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     if c.state != csFree and (c.pendingOut > 0 or c.closeAfterFlush):
       loop.flushOut(c)
     return
+  template compactThenRetry() =
+    ## rbuf is full at a soft compaction threshold (the streaming-body or
+    ## header-size ceiling handled below): let the parser consume + compact the
+    ## buffered bytes instead of doubling toward the whole-body cap (a fast upload
+    ## or header flood would otherwise pin far more than advertised). Bail if that
+    ## closed/transitioned the connection; re-read into any room it freed;
+    ## otherwise fall through to the grow-or-close below.
+    loop.processInput(c)
+    if c.state != csActive: returnAfterStateChange()
+    if c.rlen < c.rbuf.len: continue
   while true:
     if c.rlen == c.rbuf.len:
       if c.h2 != nil:
@@ -988,9 +998,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           # toward the whole-body cap. A fast h1 upload would otherwise pin
           # ~maxBodySize per connection; across many concurrent uploads that is
           # gigabytes -> OOM. Mirrors the h2 process-and-compact path above.
-          loop.processInput(c)
-          if c.state != csActive: returnAfterStateChange()
-          if c.rlen < c.rbuf.len: continue   # compacted: read into the freed room
+          compactThenRetry()
         if c.ws == nil and not c.parser.inBody and
             c.rbuf.len >= loop.settings.maxHeaderSize:
           # Still parsing the request head at the header-size ceiling: run the
@@ -998,9 +1006,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           # buffer toward maxHeaderSize+maxBodySize. Otherwise a header flood (no
           # terminating blank line) pins far more than the advertised header
           # limit before rejection (#246). Mirrors the streaming/h2 branches.
-          loop.processInput(c)
-          if c.state != csActive: returnAfterStateChange()
-          if c.rlen < c.rbuf.len: continue
+          compactThenRetry()
         let cap =
           if c.ws != nil: loop.settings.maxWsMessageSize + 1024
           else: loop.settings.maxHeaderSize + loop.settings.maxBodySize
