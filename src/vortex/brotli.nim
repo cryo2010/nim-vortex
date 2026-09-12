@@ -7,6 +7,8 @@
 when not defined(httpBrotli):
   {.error: "vortex/brotli requires -d:httpBrotli (and --passL:\"-lbrotlienc -lbrotlicommon\")".}
 
+import ./boundedinflate
+
 {.passL: "-lbrotlienc -lbrotlicommon".}
 
 const
@@ -146,21 +148,15 @@ proc brotliDecode*(data: openArray[char], maxOut: int):
   var availIn = csize_t(data.len)
   var nextIn =
     if data.len > 0: cast[ptr uint8](unsafeAddr data[0]) else: nil
-  var res = newString(min(maxOut, max(1024, data.len * 4)))
-  var total = 0
-  while true:
-    if total == res.len:
-      if res.len >= maxOut: return (false, true, "")   # over the cap (bomb)
-      res.setLen(min(maxOut, res.len * 2))
-    var availOut = csize_t(res.len - total)
-    var nextOut = cast[ptr uint8](addr res[total])
-    let rc = brotliDecoderDecompressStream(s, addr availIn, addr nextIn,
-                                           addr availOut, addr nextOut, nil)
-    total = res.len - int(availOut)
-    case rc
-    of brDecoderSuccess: break
-    of brDecoderNeedOutput: continue                   # grow at the loop top
-    of brDecoderNeedInput: return (false, false, "")   # truncated
-    else: return (false, false, "")                    # brDecoderError
-  res.setLen(total)
-  (true, false, res)
+  boundedInflate(data.len, maxOut,
+    proc(dst: ptr uint8, cap: int): tuple[produced: int, state: InflateState] =
+      var availOut = csize_t(cap)
+      var nextOut = dst
+      let rc = brotliDecoderDecompressStream(s, addr availIn, addr nextIn,
+                                             addr availOut, addr nextOut, nil)
+      let produced = cap - int(availOut)
+      case rc
+      of brDecoderSuccess: (produced, infDone)
+      of brDecoderNeedOutput: (produced, infMore)       # grow at the loop top
+      of brDecoderNeedInput: (produced, infError)        # truncated
+      else: (produced, infError))                        # brDecoderError

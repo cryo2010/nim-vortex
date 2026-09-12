@@ -6,7 +6,7 @@
 when not defined(httpGzip):
   {.error: "vortex/gzip requires -d:httpGzip (and --passL:-lz)".}
 
-import ./zlibffi
+import ./zlibffi, ./boundedinflate
 
 const
   gzipWindowBits = cint(15 + 16)   # 15-bit window + 16 = gzip header/trailer
@@ -108,17 +108,12 @@ proc gunzip*(data: openArray[char], maxOut: int):
   if data.len > 0:
     strm.nextIn = cast[ptr uint8](unsafeAddr data[0])
   strm.availIn = cuint(data.len)
-  var res = newString(min(maxOut, max(1024, data.len * 4)))
-  var total = 0
-  while true:
-    if total == res.len:
-      if res.len >= maxOut: return (false, true, "")   # exceeds the cap (bomb)
-      res.setLen(min(maxOut, res.len * 2))
-    strm.nextOut = cast[ptr uint8](addr res[total])
-    strm.availOut = cuint(res.len - total)
-    let rc = inflate(addr strm, zNoFlush)
-    total = res.len - int(strm.availOut)
-    if rc == zStreamEnd: break
-    if rc != zOk: return (false, false, "")            # corrupt/truncated
-  res.setLen(total)
-  (true, false, res)
+  boundedInflate(data.len, maxOut,
+    proc(dst: ptr uint8, cap: int): tuple[produced: int, state: InflateState] =
+      strm.nextOut = dst
+      strm.availOut = cuint(cap)
+      let rc = inflate(addr strm, zNoFlush)
+      let produced = cap - int(strm.availOut)
+      if rc == zStreamEnd: (produced, infDone)
+      elif rc != zOk: (produced, infError)               # corrupt/truncated
+      else: (produced, infMore))
