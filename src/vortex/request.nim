@@ -2185,6 +2185,25 @@ proc workerResponse(req: Request, rel: PinRelease): Response =
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
            relKind: rel)
 
+template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
+  ## The shared invariant of the synchronous worker trampolines: on the pool path
+  ## (a worker thread holding the connection pin) reset the first-send-wins latch,
+  ## run `body`, turn any exception into a 500 rather than let the worker abort,
+  ## and -- if the body answered nothing -- emit a default 500 so the task's
+  ## outbox message always fires and releases the pin (otherwise the connection
+  ## stays pinned forever). The inline no-pool path runs on the loop thread with
+  ## no pin, so it skips the latch and the fallback. The "always respond / release
+  ## the pin" contract thus lives in one place. Does NOT cover the awaitable
+  ## (err-box) or WebSocket (no-500) trampolines, whose completion differs.
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: workerResponded = false
+  try:
+    body
+  except Exception:
+    res.send(Http500, "500 Internal Server Error")
+  if onWorker and not workerResponded:
+    res.send(Http500, "500 Internal Server Error")
+
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, data: string) {.nimcall, gcsafe.} =
   discard data                 # HTTP bodies read the request via `req`
@@ -2192,23 +2211,8 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = workerResponse(req, prBlocking)   # sync task: first send releases
-  # On the pool path this runs on a worker thread and holds the connection pin;
-  # the inline no-pool path runs on the loop thread with no pin. Only the worker
-  # path needs the "always respond" guard (and its send routes via the outbox).
-  let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
-  try:
+  runWorkerBody(lc, res):
     fn(req, res)
-  except Exception:
-    # Exception (incl. a catchable Defect): answer 500 rather than let the
-    # worker thread abort. The trailing guard still releases the pin.
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    # The body finished without a response (forgot res.send, or used the
-    # loop-thread-only streaming API from a worker, which no-ops here). Emit a
-    # default 500 so the client is answered and the outbox push releases the
-    # pin this task holds -- otherwise the connection stays pinned forever.
-    res.send(Http500, "500 Internal Server Error")
 
 proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   ## Pin the connection and hand `fn` to the worker pool. Must be called
@@ -2256,14 +2260,8 @@ proc blockingDataImpl(user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = workerResponse(req, rel)
-  let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
-  try:
+  runWorkerBody(lc, res):
     fn(req, res, data)
-  except Exception:
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    res.send(Http500, "500 Internal Server Error")
 
 proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
                             stream: uint32, data: string) {.nimcall, gcsafe.} =
@@ -2349,14 +2347,8 @@ proc blockingArgsTrampoline[T](user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = workerResponse(req, prBlocking)   # sync task: first send releases
-  let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
-  try:
+  runWorkerBody(lc, res):
     box.body(req, res, box.data)
-  except Exception:
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    res.send(Http500, "500 Internal Server Error")
   GC_unref(box)
 
 proc dispatchBlockingArgs[T](req: Request,
