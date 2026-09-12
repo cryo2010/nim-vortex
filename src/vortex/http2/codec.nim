@@ -11,6 +11,18 @@ import ../fieldrules   # token delimiters + pseudo-header machine shared with
 import ../websocket/codec as wscodec
 
 type
+  RespPhase* = enum
+    ## Explicit state machine for the streamed-response send path
+    ## (h2SendHead -> h2StreamWrite* -> h2StreamFinish / h2StreamAbort). Makes
+    ## the legal transition order a single guarded field instead of being spread
+    ## across booleans; mirrors http1/parser.nim's ParsePhase. A buffered
+    ## (non-streamed) response never leaves rpNone -- it does not use this path.
+    rpNone       ## no streamed response opened (initial; also buffered responses)
+    rpHeadSent   ## HEADERS emitted for a HEAD request -- headers only, stream closed
+    rpStreaming  ## HEADERS sent, body open: h2StreamWrite / h2StreamFinish allowed
+    rpFinished   ## h2StreamFinish ran: END_STREAM (or trailers) emitted
+    rpAborted    ## h2StreamAbort ran: RST_STREAM(INTERNAL_ERROR) sent
+
   H2Stream* = object
     headers*: seq[(string, string)]  ## request fields incl. pseudo-headers
     trailers*: seq[(string, string)] ## request trailer fields (after the body)
@@ -31,6 +43,9 @@ type
     rs*: RequestState                ## per-request state shared with h1/h3
                                      ## (responded, lazy caches, pathParams,
                                      ## streaming flags/callbacks)
+    respPhase*: RespPhase            ## streamed-response send state machine
+                                     ## (h2-local; replaces the old rs.respStreaming
+                                     ## flag for this path)
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool
@@ -690,7 +705,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
   if sid notin h2.streams or h2.streams[sid].rs.responded: return
   template st: H2Stream = h2.streams[sid]
   st.rs.responded = true
-  st.rs.respStreaming = true
+  st.respPhase = if st.isHead: rpHeadSent else: rpStreaming
   if st.isHead:
     st.pendingIsLast = true            # HEAD: headers only, close the stream
   var hb = ""
@@ -714,7 +729,8 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   ## Append a body chunk to a streamed response and push it bounded by flow
   ## control. Returns the unsent backlog (pending body bytes) for backpressure.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
     return 0
   template st: H2Stream = h2.streams[sid]
   if st.isHead: return 0
@@ -736,10 +752,11 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   ## DATA frame carries END_STREAM (or, when `trailers` are given, a trailing
   ## HEADERS frame does), then push.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
     return
   template st: H2Stream = h2.streams[sid]
-  st.rs.respStreaming = false
+  st.respPhase = rpFinished
   st.rs.onRespDrain = nil
   clearBackedUp(h2, st)            # finished: never let a drain path resume it
   if st.isHead:
@@ -766,9 +783,10 @@ proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
   ## sees the transfer was cut short, not cleanly completed. No-op unless the
   ## stream is an open streamed response.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
     return
-  h2.streams[sid].rs.respStreaming = false
+  h2.streams[sid].respPhase = rpAborted
   h2.streams[sid].rs.onRespDrain = nil
   h2.streamError(c, sid, errInternal)
 
