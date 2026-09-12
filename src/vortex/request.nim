@@ -802,6 +802,13 @@ proc matchCharset(entry, offered: string): int {.nimcall, gcsafe.} =
   if entry == offered: return 1
   -1
 
+proc matchEncoding(entry, offered: string): int {.nimcall, gcsafe.} =
+  ## Accept-Encoding tokens have no wildcard sub-structure, so this mirrors
+  ## matchCharset: exact = 1, "*" = 0, none = -1.
+  if entry == "*": return 0
+  if entry == offered: return 1
+  -1
+
 proc accepts*(req: Request, offered: varargs[string]): string =
   ## The media type from `offered` (server-preference order) the client accepts
   ## best per the Accept header, honoring q-values and `type/*` / `*/*` wildcards
@@ -1031,39 +1038,20 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
 
   proc chooseEncoding(req: Request): string =
     ## Pick the best Content-Encoding we can produce from the client's
-    ## Accept-Encoding, honoring q-values (q=0 disables an encoding). On a q tie
-    ## the server prefers br, then zstd, then gzip (widest support / best text
-    ## ratio first). Returns "br", "zstd", "gzip", or "" (send identity).
-    var brQ, zsQ, gzQ = -1.0
-    for part in req.header("accept-encoding").split(','):
-      let tok = part.strip
-      if tok.len == 0: continue
-      var name = tok
-      var q = 1.0
-      let semi = tok.find(';')
-      if semi >= 0:
-        name = tok[0 ..< semi].strip
-        let low = tok.toLowerAscii
-        let qpos = low.find("q=")
-        if qpos >= 0:
-          try: q = parseFloat(low[qpos + 2 .. ^1].strip)
-          except ValueError: q = 0.0
-      case name.toLowerAscii
-      of "br": brQ = q
-      of "zstd": zsQ = q
-      of "gzip": gzQ = q
-      of "*":
-        if brQ < 0: brQ = q
-        if zsQ < 0: zsQ = q
-        if gzQ < 0: gzQ = q
-      else: discard
-    when not defined(httpBrotli): brQ = -1.0     # can't produce it
-    when not defined(httpZstd): zsQ = -1.0
-    when not defined(httpGzip): gzQ = -1.0
-    if brQ > 0 and brQ >= zsQ and brQ >= gzQ: "br"
-    elif zsQ > 0 and zsQ >= gzQ: "zstd"
-    elif gzQ > 0: "gzip"
-    else: ""
+    ## Accept-Encoding, honoring q-values (q=0 disables an encoding) and `*`. On
+    ## a q tie the server prefers br, then zstd, then gzip (widest support / best
+    ## text ratio first). Returns "br", "zstd", "gzip", or "" (send identity).
+    ## Reuses the shared negotiate() q-value machinery (accepts/acceptsLanguage/
+    ## acceptsCharset), with the offer list limited to encoders this build can
+    ## produce. No Accept-Encoding header -> identity (unlike accepts(), which
+    ## falls back to the first offer, an encoding is only added on explicit ask).
+    let ae = req.header("accept-encoding")
+    if ae.strip.len == 0: return ""
+    var offered: seq[string]                       # server-preference order,
+    when defined(httpBrotli): offered.add "br"     # restricted to encoders this
+    when defined(httpZstd): offered.add "zstd"     # build can actually produce
+    when defined(httpGzip): offered.add "gzip"
+    negotiate(ae, offered, matchEncoding)
 
   # --- streaming compression (res.sendHead/write/finish, SSE, file streaming) --
   proc negotiateStreamEnc(res: Response, contentType: string,
