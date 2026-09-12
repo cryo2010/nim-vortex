@@ -2214,6 +2214,24 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   runWorkerBody(lc, res):
     fn(req, res)
 
+proc acquireDispatchPin(req: Request, kind: PinKind): bool =
+  ## Resolve the request's carrier and take a `kind` pin on it: an H3 slot when
+  ## `fd < 0` (verifying the slot's generation still matches), else the Connection
+  ## for `fd`/`gen`. Returns false WITHOUT pinning if the carrier is gone (a
+  ## stale / closed connection), so each dispatcher can bail and run its own
+  ## cleanup. Centralizes the `fd < 0 == h3 slot` encoding the four
+  ## dispatchBlocking* variants otherwise each repeat verbatim.
+  if req.fd < 0:
+    let idx = h3SlotOf(req.fd)
+    if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+      return false
+    acquirePin(req.core, addr req.core.h3slots[idx], kind)
+  else:
+    let c = conn(req.core, req.fd, req.gen)
+    if c == nil: return false
+    acquirePin(req.core, c, kind)
+  true
+
 proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   ## Pin the connection and hand `fn` to the worker pool. Must be called
   ## from the owning loop thread (i.e. inside a handler). Prefer the
@@ -2229,15 +2247,7 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
       blockingTrampoline(cast[pointer](fn), cast[pointer](req.core),
                          req.fd, req.gen, req.stream, "")  # no pool: inline
       return
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return
-      acquirePin(req.core, addr req.core.h3slots[idx], pkBlocking)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return
-      acquirePin(req.core, c, pkBlocking)
+    if not acquireDispatchPin(req, pkBlocking): return
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
@@ -2302,15 +2312,7 @@ proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
       tramp(cast[pointer](fn), cast[pointer](req.core),
             req.fd, req.gen, req.stream, data)  # no pool: inline
       return true
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return false
-      acquirePin(req.core, addr req.core.h3slots[idx], pin)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return false
-      acquirePin(req.core, c, pin)
+    if not acquireDispatchPin(req, pin): return false
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: tramp, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
@@ -2375,15 +2377,7 @@ proc dispatchBlockingArgs[T](req: Request,
     # incref -- a genuine data race and the ASan use-after-free in the
     # blocking(args) path). An early return below (dead conn) still decs the
     # local here, but only on the loop thread, which is safe.
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return
-      acquirePin(req.core, addr req.core.h3slots[idx], pkBlocking)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return
-      acquirePin(req.core, c, pkBlocking)
+    if not acquireDispatchPin(req, pkBlocking): return
     let raw = cast[pointer](box)
     wasMoved(box)                                 # transfer ownership; no loop dec
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
@@ -2468,15 +2462,9 @@ proc dispatchBlockingResult*[A, R](req: Request,
       blockingResultTrampoline[A, R](cast[pointer](box), cast[pointer](req.core),
                                      req.fd, req.gen, req.stream, "")   # inline
       return
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        GC_unref(box); dec req.core.pendingBlockingResults; return
-      acquirePin(req.core, addr req.core.h3slots[idx], pkAwait)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: (GC_unref(box); dec req.core.pendingBlockingResults; return)
-      acquirePin(req.core, c, pkAwait)
+    if not acquireDispatchPin(req, pkAwait):
+      # Dead connection: balance the GC_ref and the pending count taken above.
+      GC_unref(box); dec req.core.pendingBlockingResults; return
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingResultTrampoline[A, R],
                        user: cast[pointer](box), core: cast[pointer](req.core),
