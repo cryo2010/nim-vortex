@@ -117,9 +117,9 @@ proc armWsPing*(core: ptr LoopCore, c: ptr Connection) =
   ## (Re)start the WebSocket idle timer: after wsPingInterval seconds with
   ## no inbound frame the loop sends a keepalive ping (see the event loop's
   ## sweep). 0 disables it, leaving the connection without a read deadline.
-  if core.wsPingInterval > 0:
+  if core.config.wsPingInterval > 0:
     c.dlKind = dkWsPing
-    c.deadline = core.nowSec + int64(core.wsPingInterval)
+    c.deadline = core.nowSec + int64(core.config.wsPingInterval)
   else:
     c.dlKind = dkNone
     c.deadline = 0
@@ -220,7 +220,7 @@ proc wsSetup*(core: ptr LoopCore, fd: int32, gen: uint32, maxMessage: int,
     w.subprotocol = chosen
     result.protocol = chosen
   when defined(wsDeflate):
-    if core.wsCompression and extensionsOffer.len > 0:
+    if core.config.wsCompression and extensionsOffer.len > 0:
       let neg = negotiatePmd(extensionsOffer)
       if neg.accept:
         w.deflate = initDeflator(neg.serverWindow, neg.serverNoCtx)
@@ -577,13 +577,13 @@ proc wsSweepIdle*(core: ptr LoopCore, c: ptr Connection, w: WsConn): bool =
   ## stop tracking this ws (it timed out, or already closed). h1 uses the
   ## connection deadline wheel instead. `c` is the h2 connection, nil for h3.
   if w.closeNotified: return true            # already closed: reap
-  if core.wsPingInterval <= 0: return false  # keepalive disabled
+  if core.config.wsPingInterval <= 0: return false  # keepalive disabled
   if w.pingSent:
-    if core.nowSec - w.pingAt >= int64(core.wsPongTimeout):
+    if core.nowSec - w.pingAt >= int64(core.config.wsPongTimeout):
       failClose(core, c, w, 1011)            # no reply: peer is gone
       if w.flush != nil: w.flush(core, c, w) # push the close / conclude the stream
       return true
-  elif core.nowSec - w.lastRx >= int64(core.wsPingInterval):
+  elif core.nowSec - w.lastRx >= int64(core.config.wsPingInterval):
     w.outBuf.appendFrame(opPing, "")
     w.pingSent = true
     w.pingAt = core.nowSec
@@ -620,16 +620,16 @@ proc wsConnOf*(ws: WebSocket): (ptr Connection, WsConn) =
   ## the returned connection is nil and the flush reaches the stream through
   ## the WsConn.
   if ws.fd < 0:
-    if ws.core.wsH3Lookup != nil:
-      return (nil, WsConn(ws.core.wsH3Lookup(cast[pointer](ws.core), ws.fd,
+    if ws.core.hooks.wsH3Lookup != nil:
+      return (nil, WsConn(ws.core.hooks.wsH3Lookup(cast[pointer](ws.core), ws.fd,
                                              ws.gen, ws.stream)))
     return (nil, nil)
   let c = conn(ws.core, ws.fd, ws.gen)
   if c == nil: return (nil, nil)
   if ws.stream == 0:
     return (c, WsConn(c.ws))
-  if ws.core.wsStreamLookup != nil:
-    return (c, WsConn(ws.core.wsStreamLookup(cast[pointer](c), ws.stream)))
+  if ws.core.hooks.wsStreamLookup != nil:
+    return (c, WsConn(ws.core.hooks.wsStreamLookup(cast[pointer](c), ws.stream)))
   (c, nil)
 
 proc wsConnForStream*(core: ptr LoopCore, c: ptr Connection,
@@ -637,16 +637,16 @@ proc wsConnForStream*(core: ptr LoopCore, c: ptr Connection,
   ## Resolve the WsConn for a connection + stream (h1 `c.ws` or the h2 stream
   ## via the lookup hook). Used by the event loop's outbox routing.
   if stream == 0: return WsConn(c.ws)
-  if core.wsStreamLookup != nil:
-    return WsConn(core.wsStreamLookup(cast[pointer](c), stream))
+  if core.hooks.wsStreamLookup != nil:
+    return WsConn(core.hooks.wsStreamLookup(cast[pointer](c), stream))
   nil
 
 proc wsConnForH3*(core: ptr LoopCore, fd: int32, gen: uint32,
                   stream: uint32): WsConn =
   ## Resolve an h3 stream's WsConn from a handle (`fd < 0`). Used by the event
   ## loop's outbox routing for HTTP/3 WebSockets.
-  if core.wsH3Lookup != nil:
-    return WsConn(core.wsH3Lookup(cast[pointer](core), fd, gen, stream))
+  if core.hooks.wsH3Lookup != nil:
+    return WsConn(core.hooks.wsH3Lookup(cast[pointer](core), fd, gen, stream))
   nil
 
 proc wsFlushRaw*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
@@ -720,13 +720,13 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
             return
           w.outBuf.appendFrame(op, comp, rsv1 = true)
           w.flush(ws.core, c, w)
-          if ws.core.flushHook != nil:
-            ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
+          if ws.core.hooks.flushHook != nil:
+            ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
           return
       w.outBuf.appendFrame(op, data)
       w.flush(ws.core, c, w)
-      if ws.core.flushHook != nil:
-        ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
+      if ws.core.hooks.flushHook != nil:
+        ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
   except Exception:
     discard
 
@@ -756,8 +756,8 @@ proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [
       w.outBuf.appendClose(code, reason)
       w.wantClose = true
       w.flush(ws.core, c, w)
-      if ws.core.flushHook != nil:
-        ws.core.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
+      if ws.core.hooks.flushHook != nil:
+        ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
   except Exception:
     discard
 

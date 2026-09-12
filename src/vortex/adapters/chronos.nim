@@ -41,7 +41,7 @@
 ## this bounds completion latency instead). chronos's `poll()` would
 ## otherwise block until its next timer, so the pump keeps a pending
 ## callback queued to force a zero-timeout backend poll. When the future
-## finishes, the deferred respond is flushed via LoopCore.kick. An
+## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
 ## uncaught exception in the body responds 500.
 
 import pkg/chronos

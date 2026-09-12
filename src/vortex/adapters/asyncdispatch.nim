@@ -36,7 +36,7 @@
 ## run ready callbacks, capping its selector timeout at a few ms while
 ## async operations are pending (asyncdispatch's own fds cannot wake our
 ## selector; this bounds completion latency instead). When the future
-## finishes, the deferred respond is flushed via LoopCore.kick. An
+## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
 ## uncaught exception in the body responds 500.
 
 import std/[asyncdispatch, httpcore, tables, deques, macros, selectors]

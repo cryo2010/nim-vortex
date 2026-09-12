@@ -769,4 +769,4 @@ proc h3WsLookup(corep: pointer, fd: int32, gen: uint32,
   nil
 
 proc installH3WsHooks*(core: ptr LoopCore) =
-  core.wsH3Lookup = h3WsLookup
+  core.hooks.wsH3Lookup = h3WsLookup

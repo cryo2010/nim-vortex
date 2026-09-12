@@ -251,14 +251,14 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
     if settings.hasTls:
       result.core.secHeaders.add ("Strict-Transport-Security",
                                   "max-age=63072000; includeSubDomains")
-  result.core.maxWsMessage = settings.maxWsMessageSize
-  result.core.wsPingInterval = settings.wsPingInterval
-  result.core.wsPongTimeout = settings.wsPongTimeout
-  result.core.wsCompression = settings.wsCompression
-  result.core.compress = settings.compress
-  result.core.decompressRequest = settings.decompressRequest
-  result.core.trustedProxies = settings.trustedProxies
-  result.core.maxDecompressedBody = settings.maxBodySize
+  result.core.config.maxWsMessage = settings.maxWsMessageSize
+  result.core.config.wsPingInterval = settings.wsPingInterval
+  result.core.config.wsPongTimeout = settings.wsPongTimeout
+  result.core.config.wsCompression = settings.wsCompression
+  result.core.config.compress = settings.compress
+  result.core.config.decompressRequest = settings.decompressRequest
+  result.core.config.trustedProxies = settings.trustedProxies
+  result.core.config.maxDecompressedBody = settings.maxBodySize
   result.core.nowSec = monoSec()
   result.core.pool = pool
   result.core.outbox = outbox
@@ -903,7 +903,7 @@ proc releasePin(loop: Loop, slot: ptr H3SlotEntry, k: PinKind) =
 
 proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
               stream: uint32) {.nimcall, gcsafe.} =
-  ## LoopCore.kick: adapters call this on the loop thread after a
+  ## LoopCore.hooks.kick: adapters call this on the loop thread after a
   ## deferred respond. Redundant calls are harmless.
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
@@ -916,7 +916,7 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
     loop.resumeAfterRespond(c, stream)
 
 proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
-  ## LoopCore.flushHook: write a connection's pending output now. Used by a
+  ## LoopCore.hooks.flushHook: write a connection's pending output now. Used by a
   ## loop-thread WebSocket send outside the read path.
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
@@ -1775,8 +1775,8 @@ proc drainComplete(loop: Loop): bool =
 
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
-  loop.core.kick = kickImpl
-  loop.core.flushHook = flushImpl
+  loop.core.hooks.kick = kickImpl
+  loop.core.hooks.flushHook = flushImpl
   installWsHooks(addr loop.core)   # h2 WebSocket (RFC 8441) stream lookup
   when not defined(plainHttp):
     installH3WsHooks(addr loop.core)   # h3 WebSocket (RFC 9220) stream lookup
@@ -1859,11 +1859,11 @@ proc run*(loop: Loop) =
         discard quicWork
         try: loop.h3Drive()
         except Exception: discard
-    if loop.core.pumpHook != nil:
+    if loop.core.hooks.pumpHook != nil:
       # Pump at the end of the iteration so callbacks scheduled while
       # handling this batch (e.g. an await that completed immediately)
       # finish in the same pass instead of after a selector timeout.
-      loop.pumpCap = loop.core.pumpHook()
+      loop.pumpCap = loop.core.hooks.pumpHook()
     loop.tick()
     if loop.draining:
       loop.drainSweep()               # close connections that just finished
@@ -1894,7 +1894,7 @@ proc run*(loop: Loop) =
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
-        for k in PinKind: loop.core.h3slots[i].pins[k] = 0
+        loop.core.h3slots[i].pins.reset()
         loop.h3FreeSlot(i)
       ngEngineFree()              # frees the shim engine (all conns + TLS ctx)
       discard posix.close(cint(loop.udpFd))
@@ -1902,8 +1902,8 @@ proc run*(loop: Loop) =
   loop.core.chunkPool.chunkPoolFree()    # free pooled sendFile buffers (workers joined)
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
     discard posix.close(cint(loop.listenFd))
-  if loop.core.teardownHook != nil:      # release the async adapter's dispatcher
-    loop.core.teardownHook()
+  if loop.core.hooks.teardownHook != nil:      # release the async adapter's dispatcher
+    loop.core.hooks.teardownHook()
 
 type LoopThreadArg* = tuple
   ## Plain-data bundle for starting a loop on its own thread; the Loop

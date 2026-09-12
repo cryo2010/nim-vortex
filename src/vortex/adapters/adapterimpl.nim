@@ -21,17 +21,17 @@ when not declared(onCompleted):
 
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
   ## Idempotent; called automatically by the entry points below.
-  if core.pumpHook == nil:
-    core.pumpHook = pump
-    core.teardownHook = teardown
+  if core.hooks.pumpHook == nil:
+    core.hooks.pumpHook = pump
+    core.hooks.teardownHook = teardown
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
   ## if the body already answered).
   if failed:
     response(req).send(Http500, "500 Internal Server Error")
-  if req.core.kick != nil:
-    req.core.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
+  if req.core.hooks.kick != nil:
+    req.core.hooks.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
 
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling to a running future: 500 on failure,

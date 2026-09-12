@@ -464,8 +464,8 @@ proc fromTrustedProxy*(req: Request): bool =
   ## non-empty). Forwarding headers (X-Forwarded-*, RFC 7239 Forwarded) are
   ## believed only from such a peer -- a request straight from a client can forge
   ## them, so with no trustedProxies configured this is always false (fail safe).
-  req.core != nil and req.core.trustedProxies.len > 0 and
-    isTrustedProxy(req.remoteAddress, req.core.trustedProxies)
+  req.core != nil and req.core.config.trustedProxies.len > 0 and
+    isTrustedProxy(req.remoteAddress, req.core.config.trustedProxies)
 
 type ForwardedElem = tuple[forr, proto, host: string]
 
@@ -547,7 +547,7 @@ proc clientIp*(req: Request): string =
   else:
     chain = req.forwardedFor
   for i in countdown(chain.high, 0):
-    if not isTrustedProxy(chain[i], req.core.trustedProxies): return chain[i]
+    if not isTrustedProxy(chain[i], req.core.config.trustedProxies): return chain[i]
   if chain.len > 0: return chain[0]
   req.remoteAddress
 
@@ -1059,7 +1059,7 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
                           headers: openArray[(string, string)]): string =
     ## The encoding to stream a sendHead body with, or "" for identity. Same
     ## eligibility as send() minus the size threshold (the length is unknown).
-    if not res.core.compress or not compressibleType(contentType) or
+    if not res.core.config.compress or not compressibleType(contentType) or
         hasContentEncoding(headers):
       return ""
     chooseEncoding(Request(core: res.core, fd: res.fd, gen: res.gen,
@@ -1103,7 +1103,7 @@ proc sendBody(res: Response, code: HttpCode, body: openArray[char],
   let effCt = if ctHdr.len > 0: ctHdr else: defaultCt   # for compressibility
   let writeCt = if ctHdr.len > 0: "" else: defaultCt    # skip if headers have it
   when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-    if res.core.compress and body.len >= compressMinSize and
+    if res.core.config.compress and body.len >= compressMinSize and
         compressibleType(effCt) and not hasContentEncoding(headers):
       let enc = chooseEncoding(Request(core: res.core, fd: res.fd,
                                        gen: res.gen, stream: res.stream))
@@ -1219,7 +1219,7 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     ## for an over-cap body or 400 for a corrupt one) to skip the handler; true
     ## otherwise (including the no-op cases: feature off, no/other encoding,
     ## empty body). Called once at dispatch (loop thread) before the handler.
-    if not req.core.decompressRequest: return true
+    if not req.core.config.decompressRequest: return true
     let enc = req.header("content-encoding").strip.toLowerAscii
     var isGzip, isBr, isZstd = false
     when defined(httpGzip):
@@ -1231,7 +1231,7 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if not (isGzip or isBr or isZstd): return true
     let raw = req.body
     if raw.len == 0: return true
-    let cap = if req.core.maxDecompressedBody > 0: req.core.maxDecompressedBody
+    let cap = if req.core.config.maxDecompressedBody > 0: req.core.config.maxDecompressedBody
               else: 512 * 1024 * 1024      # hard ceiling when maxBodySize=0
     var r: DecodeResult
     when defined(httpGzip):
@@ -1292,7 +1292,7 @@ proc informational*(res: Response, code: HttpCode,
     s.add "\r\n"
     c.wbuf.add s
   # Flush now so the hint is on the wire before the handler does its work.
-  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  try: res.core.hooks.flushHook(res.core.loopPtr, res.fd, res.gen)
   except Exception: discard
 
 proc earlyHints*(res: Response, links: openArray[string],
@@ -1541,7 +1541,7 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
       currentThreadId() == req.core.threadId:
     c.sent100 = true
     c.wbuf.add continue100
-    try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+    try: req.core.hooks.flushHook(req.core.loopPtr, req.fd, req.gen)
     except Exception: discard
 
 proc ackBody*(req: Request, n: int) =
@@ -1563,7 +1563,7 @@ proc ackBody*(req: Request, n: int) =
   let c = conn(req.core, req.fd, req.gen)
   if c == nil or req.stream == 0: return
   h2AckBody(c, req.stream, n)
-  try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+  try: req.core.hooks.flushHook(req.core.loopPtr, req.fd, req.gen)
   except Exception: discard
 
 # --- streaming responses ----------------------------------------------------
@@ -1572,11 +1572,11 @@ proc flushConn(res: Response) {.raises: [].} =
   ## Call the loop's flush hook, containing its untyped effect so the streaming
   ## API stays callable from a strict-effect async body (chronos infers the
   ## hook as raising Exception, which `{.async.}` forbids).
-  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  try: res.core.hooks.flushHook(res.core.loopPtr, res.fd, res.gen)
   except Exception: discard
 
 proc kickConn(res: Response) {.raises: [].} =
-  try: res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+  try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0)
   except Exception: discard
 
 proc h2Writable(res: Response, backlog: int): bool =
@@ -2700,7 +2700,7 @@ proc acceptWebSocket*(req: Request,
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
       if h3c != nil:
         discard h3WsAccept(req.core, h3c, uint64(req.stream), req.fd, req.gen,
-                           req.core.maxWsMessage,
+                           req.core.config.maxWsMessage,
                            req.header("sec-websocket-extensions"),
                            req.header("sec-websocket-protocol"), protocols)
     return
@@ -2708,14 +2708,14 @@ proc acceptWebSocket*(req: Request,
   if c == nil: return
   if req.stream != 0:
     # HTTP/2 (RFC 8441): reply 200 on the stream and attach a WsConn.
-    discard h2WsAccept(c, req.stream, req.core.maxWsMessage,
+    discard h2WsAccept(c, req.stream, req.core.config.maxWsMessage,
                        req.header("sec-websocket-extensions"),
                        req.header("sec-websocket-protocol"), protocols,
                        req.core.dateStr, req.core.serverHeader)
     return
   if c.rs.responded or c.ws != nil: return
   discard wsAccept(req.core, c, req.header("sec-websocket-key"),
-                   req.core.maxWsMessage,
+                   req.core.config.maxWsMessage,
                    req.header("sec-websocket-extensions"),
                    req.header("sec-websocket-protocol"), protocols)
 

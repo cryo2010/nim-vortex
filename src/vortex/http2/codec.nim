@@ -791,7 +791,7 @@ proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
   h2.streamError(c, sid, errInternal)
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
-  ## LoopCore.wsStreamLookup: resolve a stream's WsConn for the public API.
+  ## LoopCore.hooks.wsStreamLookup: resolve a stream's WsConn for the public API.
   let c = cast[ptr Connection](cp)
   if c.h2 != nil:
     let h2 = H2Conn(c.h2)
@@ -801,7 +801,7 @@ proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
 proc installWsHooks*(core: ptr LoopCore) =
   ## Register the WebSocket-over-HTTP/2 lookup so the WebSocket layer can
   ## reach per-stream state without importing the h2 codec.
-  core.wsStreamLookup = h2WsLookup
+  core.hooks.wsStreamLookup = h2WsLookup
 
 proc h2WsTeardownAll*(c: ptr Connection) =
   ## Deliver onClose (1006) for every WebSocket stream when the connection
