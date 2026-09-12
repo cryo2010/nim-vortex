@@ -390,11 +390,7 @@ proc encodeExtraHeader(hb: var string, name, val: string) =
   ## The forbidden-set check is allocation-free (eqIgnoreAsciiCase), and the
   ## `toLowerAscii` copy is taken only when the name is not already lowercase --
   ## an h2-aware handler using lowercase names then pays no per-header alloc.
-  if eqIgnoreAsciiCase(name, "connection") or
-     eqIgnoreAsciiCase(name, "proxy-connection") or
-     eqIgnoreAsciiCase(name, "keep-alive") or
-     eqIgnoreAsciiCase(name, "transfer-encoding") or
-     eqIgnoreAsciiCase(name, "upgrade"):
+  if isForbiddenResponseField(name):             # shared set (fieldrules), also h1/h3
     return
   if isLowerAscii(name): encodeHeader(hb, name, val)
   else: encodeHeader(hb, name.toLowerAscii, val)

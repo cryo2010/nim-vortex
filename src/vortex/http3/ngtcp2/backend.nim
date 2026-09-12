@@ -550,23 +550,17 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
     let ln = name.toLowerAscii
     # RFC 9114 4.2: an h3 endpoint MUST NOT generate connection-specific fields;
     # drop them (and any stray handler pseudo-header) rather than QPACK-encode a
-    # response a strict client would cancel (#257). Mirrors http2 encodeExtraHeader.
-    case ln
-    of "connection", "keep-alive", "transfer-encoding", "upgrade",
-       "proxy-connection": discard
-    else:
-      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
+    # response a strict client would cancel (#257). Shared set (fieldrules), also h1/h2.
+    if isForbiddenResponseField(ln): continue
+    if ln.len == 0 or ln[0] != ':': result.add (ln, val)
   for (name, val) in secHeaders:               # OWASP baseline; app header wins
     var shadowed = false
     for (hn, _) in extra:
       if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
     if shadowed: continue
     let ln = name.toLowerAscii
-    case ln
-    of "connection", "keep-alive", "transfer-encoding", "upgrade",
-       "proxy-connection": discard
-    else:
-      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
+    if isForbiddenResponseField(ln): continue
+    if ln.len == 0 or ln[0] != ':': result.add (ln, val)
 
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
@@ -619,10 +613,8 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
     for (name, val) in trailers:
       let ln = name.toLowerAscii
       if ln.len == 0 or ln[0] == ':' or not validFieldValue(val): continue
-      case ln
-      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
-         "proxy-connection": continue
-      else: lower.add (ln, val)
+      if isForbiddenResponseField(ln, trailer = true): continue  # trailers also ban te
+      lower.add (ln, val)
     if lower.len > 0:
       var tv = newSeq[VqHeader](lower.len)
       for i in 0 ..< lower.len:

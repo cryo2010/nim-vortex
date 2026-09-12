@@ -93,6 +93,23 @@ func parseContentLength*(val: openArray[char], prev: int64,
   value = v
   clOk
 
+func isForbiddenResponseField*(name: string, trailer = false): bool =
+  ## The connection-specific / hop-by-hop field names an h2 or h3 endpoint MUST
+  ## NOT generate on a response (RFC 9113 8.2.2 / RFC 9114 4.2): a strict client
+  ## treats a response carrying one as malformed and cancels the stream, so
+  ## h1-portable handler code would break on h2/h3. In a trailer section `te` is
+  ## additionally forbidden. Case-insensitive and allocation-free, so callers may
+  ## pass an original- or lower-cased name. Deliberately excludes content-length:
+  ## the h1 codec forbids that separately as a framing concern, because h1
+  ## (unlike h2/h3) generates Content-Length itself. Shared by the h1/h2/h3
+  ## codecs so this smuggling-relevant set cannot drift between them.
+  eqIgnoreAsciiCase(name, "connection") or
+  eqIgnoreAsciiCase(name, "proxy-connection") or
+  eqIgnoreAsciiCase(name, "keep-alive") or
+  eqIgnoreAsciiCase(name, "transfer-encoding") or
+  eqIgnoreAsciiCase(name, "upgrade") or
+  (trailer and eqIgnoreAsciiCase(name, "te"))
+
 type RequestHeadClass* = enum
   rhInvalid    ## malformed: reject the request / reset the stream
   rhRequest    ## a normal request (:method/:path/:scheme present, authority ok)

@@ -6,7 +6,7 @@
 import std/httpcore
 from std/strutils import cmpIgnoreCase
 from ../connection import bodilessStatus
-from ../fieldrules import eqIgnoreAsciiCase
+from ../fieldrules import eqIgnoreAsciiCase, isForbiddenResponseField
 
 proc addField*(wbuf: var string, s: string) =
   ## Append a handler-supplied header name or value with CR and LF removed,
@@ -31,14 +31,11 @@ proc connSpecificField*(name: string): bool =
   ## Connection itself, so echoing a handler-supplied one produces conflicting
   ## framing (a second Content-Length, or Transfer-Encoding alongside it) that a
   ## downstream intermediary reads as request/response smuggling. Content-Type is
-  ## NOT in this set (it is carried separately). Mirrors http2 encodeExtraHeader.
+  ## NOT in this set (it is carried separately). The connection-specific set is
+  ## shared with h2/h3 (fieldrules.isForbiddenResponseField); h1 adds
+  ## content-length, which it (unlike h2/h3) generates itself.
   ## Case-insensitive compare without allocating a lowercased copy per header.
-  eqIgnoreAsciiCase(name, "connection") or
-  eqIgnoreAsciiCase(name, "proxy-connection") or
-  eqIgnoreAsciiCase(name, "keep-alive") or
-  eqIgnoreAsciiCase(name, "transfer-encoding") or
-  eqIgnoreAsciiCase(name, "upgrade") or
-  eqIgnoreAsciiCase(name, "content-length")
+  isForbiddenResponseField(name) or eqIgnoreAsciiCase(name, "content-length")
 
 const weekdayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
