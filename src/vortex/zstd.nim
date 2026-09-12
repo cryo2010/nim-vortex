@@ -8,6 +8,8 @@
 when not defined(httpZstd):
   {.error: "vortex/zstd requires -d:httpZstd (and --passL:-lzstd)".}
 
+import ./boundedinflate
+
 {.passL: "-lzstd".}
 
 const
@@ -118,21 +120,14 @@ proc zstdDecode*(data: openArray[char], maxOut: int):
   var input = ZstdInBuffer(
     src: (if data.len > 0: unsafeAddr data[0] else: nil),
     size: csize_t(data.len), pos: 0)
-  var res = newString(min(maxOut, max(1024, data.len * 4)))
-  var total = 0
-  while true:
-    if total == res.len:
-      if res.len >= maxOut: return (false, true, "")   # over the cap (bomb)
-      res.setLen(min(maxOut, res.len * 2))
-    var output = ZstdOutBuffer(dst: addr res[0], size: csize_t(res.len),
-                               pos: csize_t(total))
-    let rc = zstdDecompressStream(dctx, addr output, addr input)
-    if zstdIsError(rc) != 0: return (false, false, "")  # corrupt
-    total = int(output.pos)
-    if rc == 0: break                                   # frame complete
-    # rc != 0 with output space left means it wants more input; if the input is
-    # already drained the stream is truncated.
-    if total < res.len and input.pos == input.size:
-      return (false, false, "")
-  res.setLen(total)
-  (true, false, res)
+  boundedInflate(data.len, maxOut,
+    proc(dst: ptr uint8, cap: int): tuple[produced: int, state: InflateState] =
+      var output = ZstdOutBuffer(dst: dst, size: csize_t(cap), pos: 0)
+      let rc = zstdDecompressStream(dctx, addr output, addr input)
+      let produced = int(output.pos)
+      if zstdIsError(rc) != 0: (produced, infError)       # corrupt
+      elif rc == 0: (produced, infDone)                   # frame complete
+      # rc != 0 with output space left means it wants more input; if the input is
+      # already drained the stream is truncated.
+      elif produced < cap and input.pos == input.size: (produced, infError)
+      else: (produced, infMore))

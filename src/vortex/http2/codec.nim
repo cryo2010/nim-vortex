@@ -390,11 +390,7 @@ proc encodeExtraHeader(hb: var string, name, val: string) =
   ## The forbidden-set check is allocation-free (eqIgnoreAsciiCase), and the
   ## `toLowerAscii` copy is taken only when the name is not already lowercase --
   ## an h2-aware handler using lowercase names then pays no per-header alloc.
-  if eqIgnoreAsciiCase(name, "connection") or
-     eqIgnoreAsciiCase(name, "proxy-connection") or
-     eqIgnoreAsciiCase(name, "keep-alive") or
-     eqIgnoreAsciiCase(name, "transfer-encoding") or
-     eqIgnoreAsciiCase(name, "upgrade"):
+  if isForbiddenResponseField(name):             # shared set (fieldrules), also h1/h3
     return
   if isLowerAscii(name): encodeHeader(hb, name, val)
   else: encodeHeader(hb, name.toLowerAscii, val)
@@ -1140,30 +1136,16 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       of "priority":
         parsePriorityField(val, st.urgency, st.incremental)  # RFC 9218 request signal
       of "content-length":
-        # RFC 9110 8.6 content-length is 1*DIGIT. parseBiggestInt also accepts a
-        # leading '+'/'-' and Nim underscore separators (1_0 -> 10), values
-        # outside the grammar that a re-serializing proxy would read differently
-        # (parser-differential smuggling). Enforce ASCII-digits-only first (#240.6).
-        var allDigits = val.len > 0
-        for ch in val:
-          if ch notin '0'..'9': allDigits = false; break
-        if not allDigits:
+        # RFC 9110 8.6 (1*DIGIT, digits-only so a '+'/'-' or Nim underscore a
+        # re-serializing proxy reads differently can't smuggle) + RFC 9113 8.1.1
+        # (non-negative, no duplicate-with-different value). st.contentLength
+        # starts at -1 (unset). Shared grammar (fieldrules, also h1/h3) (#240.6).
+        var n: int64
+        case parseContentLength(val, st.contentLength, n)
+        of clOk: st.contentLength = n
+        else:
           h2.streamError(c, sid, errProtocol)
           return
-        var n: BiggestInt
-        try:
-          n = parseBiggestInt(val)
-        except ValueError:
-          h2.streamError(c, sid, errProtocol)
-          return
-        # RFC 9113 8.1.1: a negative length, or a second content-length whose
-        # value differs from the first, is malformed. A negative value would
-        # also disable the body-length reconciliation below (a smuggling
-        # vector when proxied to h1). st.contentLength starts at -1 (unset).
-        if n < 0 or (st.contentLength >= 0 and st.contentLength != n):
-          h2.streamError(c, sid, errProtocol)
-          return
-        st.contentLength = n
       else: discard
     if listSize > h2.maxHeaderList:
       h2.streamError(c, sid, errEnhanceYourCalm)

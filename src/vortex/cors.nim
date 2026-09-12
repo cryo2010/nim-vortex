@@ -38,23 +38,33 @@ proc initCorsOptions*(origins = @["*"],
               exposeHeaders: exposeHeaders, allowCredentials: allowCredentials,
               maxAge: maxAge)
 
-proc isAllowed(opts: CorsOptions, origin: string): bool =
+proc originAllowed(opts: CorsOptions, origin: string): bool =
+  ## Exact-match the request Origin against the allowlist. The any-origin case
+  ## is handled by the precomputed `anyOrigin` flag, so no "*" check here.
   for o in opts.origins:
-    if o == "*" or o == origin: return true
+    if o == origin: return true
   false
 
 proc cors*(opts = initCorsOptions()): Middleware =
   ## A middleware applying `opts`. Register with `router.use(cors(...))`.
   let opts = opts
+  # Derive the per-config flags and joined header strings once here, not on
+  # every request: the originals reallocated `@["*"]` for a comparison and
+  # re-joined the methods/headers lists for each CORS request.
+  let anyOrigin = "*" in opts.origins
+  # Only anonymous any-origin may emit the literal "*"; a credentialed or
+  # allowlisted config must echo the request Origin (and Vary on it).
+  let emitWildcard = anyOrigin and not opts.allowCredentials
+  let methodsJoined = opts.methods.join(", ")
+  let exposeJoined = opts.exposeHeaders.join(", ")
+  let headersJoined = opts.headers.join(", ")
   proc (next: RequestHandler): RequestHandler {.gcsafe.} =
     let inner = next
     proc (req: Request, res: Response) {.gcsafe.} =
       let origin = req.origin
-      let allowed = origin.len > 0 and opts.isAllowed(origin)
+      let allowed = origin.len > 0 and (anyOrigin or opts.originAllowed(origin))
       if allowed:
-        # A specific allowlist or credentials must echo the Origin (and Vary on
-        # it); only anonymous any-origin may use the literal "*".
-        if opts.origins == @["*"] and not opts.allowCredentials:
+        if emitWildcard:
           res.headers["Access-Control-Allow-Origin"] = "*"
         else:
           res.headers["Access-Control-Allow-Origin"] = origin
@@ -62,15 +72,15 @@ proc cors*(opts = initCorsOptions()): Middleware =
         if opts.allowCredentials:
           res.headers["Access-Control-Allow-Credentials"] = "true"
         if opts.exposeHeaders.len > 0:
-          res.headers["Access-Control-Expose-Headers"] = opts.exposeHeaders.join(", ")
+          res.headers["Access-Control-Expose-Headers"] = exposeJoined
 
       # Preflight: an OPTIONS carrying Access-Control-Request-Method. Answer it
       # here (terminal) so it never falls through to a route or the auto-OPTIONS.
       if req.method == HttpOptions and
          req.header("access-control-request-method").len > 0:
         if allowed:
-          res.headers["Access-Control-Allow-Methods"] = opts.methods.join(", ")
-          let ah = if opts.headers.len > 0: opts.headers.join(", ")
+          res.headers["Access-Control-Allow-Methods"] = methodsJoined
+          let ah = if opts.headers.len > 0: headersJoined
                    else: req.header("access-control-request-headers")
           if ah.len > 0:
             res.headers["Access-Control-Allow-Headers"] = ah

@@ -239,16 +239,12 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
       # RFC 9110 8.6 grammar (1*DIGIT), non-negative, no duplicate-with-different
       # value; the Nim side owns this (nghttp3 may reconcile length but not the
       # digits-only grammar / duplicate rule) so a mis-parsed length can't smuggle
-      # when the request is proxied (#257).
-      var cl: int64 = 0
-      var ok = val.len > 0
-      for ch in val:
-        if ch notin '0'..'9': ok = false; break
-        if cl > (int64.high - 9) div 10: ok = false; break
-        cl = cl * 10 + int64(uint8(ch) - uint8('0'))
-      if not ok or (st.contentLength >= 0 and st.contentLength != cl):
+      # when the request is proxied (#257). Shared grammar (fieldrules, also h1/h2).
+      var cl: int64
+      case parseContentLength(val, st.contentLength, cl)
+      of clOk: st.contentLength = cl
+      else:
         vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
-      st.contentLength = cl
   st.headersDone = true
   if usid > h3c.lastStreamId: h3c.lastStreamId = usid
   # Streaming route or ws-connect dispatch on headers; body flows via onBody.
@@ -554,23 +550,17 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
     let ln = name.toLowerAscii
     # RFC 9114 4.2: an h3 endpoint MUST NOT generate connection-specific fields;
     # drop them (and any stray handler pseudo-header) rather than QPACK-encode a
-    # response a strict client would cancel (#257). Mirrors http2 encodeExtraHeader.
-    case ln
-    of "connection", "keep-alive", "transfer-encoding", "upgrade",
-       "proxy-connection": discard
-    else:
-      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
+    # response a strict client would cancel (#257). Shared set (fieldrules), also h1/h2.
+    if isForbiddenResponseField(ln): continue
+    if ln.len == 0 or ln[0] != ':': result.add (ln, val)
   for (name, val) in secHeaders:               # OWASP baseline; app header wins
     var shadowed = false
     for (hn, _) in extra:
       if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
     if shadowed: continue
     let ln = name.toLowerAscii
-    case ln
-    of "connection", "keep-alive", "transfer-encoding", "upgrade",
-       "proxy-connection": discard
-    else:
-      if ln.len == 0 or ln[0] != ':': result.add (ln, val)
+    if isForbiddenResponseField(ln): continue
+    if ln.len == 0 or ln[0] != ':': result.add (ln, val)
 
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
@@ -623,10 +613,8 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
     for (name, val) in trailers:
       let ln = name.toLowerAscii
       if ln.len == 0 or ln[0] == ':' or not validFieldValue(val): continue
-      case ln
-      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
-         "proxy-connection": continue
-      else: lower.add (ln, val)
+      if isForbiddenResponseField(ln, trailer = true): continue  # trailers also ban te
+      lower.add (ln, val)
     if lower.len > 0:
       var tv = newSeq[VqHeader](lower.len)
       for i in 0 ..< lower.len:

@@ -12,52 +12,11 @@
 when not defined(wsDeflate):
   {.error: "websocket/deflate requires -d:wsDeflate".}
 
-{.passL: "-lz".}
-
-type
-  ZStream {.bycopy.} = object
-    nextIn: ptr uint8
-    availIn: cuint
-    totalIn: culong
-    nextOut: ptr uint8
-    availOut: cuint
-    totalOut: culong
-    msg: cstring
-    state: pointer
-    zalloc: pointer
-    zfree: pointer
-    opaque: pointer
-    dataType: cint
-    adler: culong
-    reserved: culong
+import ../zlibffi
 
 const
-  zNoFlush = cint(0)
-  zSyncFlush = cint(2)
-  zStreamEnd = cint(1)
-  zStreamError = cint(-2)
-  zDataError = cint(-3)
-  zMemError = cint(-4)
-  zNeedDict = cint(2)
-  zDeflated = cint(8)
-  zDefaultStrategy = cint(0)
-  zDefaultCompression = cint(-1)
-  zMemLevel = cint(8)
   # RFC 7692 7.2.1/7.2.2: the sync-flush trailer stripped/appended per message.
   deflateTail = "\x00\x00\xff\xff"
-
-proc zlibVersion(): cstring {.importc, cdecl.}
-proc deflateInit2(strm: ptr ZStream, level, meth, windowBits, memLevel,
-                  strategy: cint, version: cstring,
-                  streamSize: cint): cint {.importc: "deflateInit2_", cdecl.}
-proc deflate(strm: ptr ZStream, flush: cint): cint {.importc, cdecl.}
-proc deflateReset(strm: ptr ZStream): cint {.importc, cdecl.}
-proc deflateEnd(strm: ptr ZStream): cint {.importc, cdecl.}
-proc inflateInit2(strm: ptr ZStream, windowBits: cint, version: cstring,
-                  streamSize: cint): cint {.importc: "inflateInit2_", cdecl.}
-proc inflate(strm: ptr ZStream, flush: cint): cint {.importc, cdecl.}
-proc inflateReset(strm: ptr ZStream): cint {.importc, cdecl.}
-proc inflateEnd(strm: ptr ZStream): cint {.importc, cdecl.}
 
 type
   Deflator* = object

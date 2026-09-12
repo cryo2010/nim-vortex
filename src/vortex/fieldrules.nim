@@ -65,6 +65,51 @@ func validFieldName*(name: string): bool =
       return false
   true
 
+type ContentLengthResult* = enum
+  clOk          ## parsed into the out-param
+  clMalformed   ## empty, or not 1*DIGIT (-> 400 / stream error)
+  clOverflow    ## in-grammar but exceeds int64 (h1 maps this to 413)
+  clConflict    ## valid but differs from a previously-seen content-length
+
+func parseContentLength*(val: openArray[char], prev: int64,
+                         value: var int64): ContentLengthResult =
+  ## RFC 9110 8.6: Content-Length is 1*DIGIT. Rejects an empty value and any
+  ## non-ASCII-digit byte, so a leading '+'/'-' or a Nim-style underscore (which
+  ## `parseBiggestInt` would accept, 1_0 -> 10) cannot parse to a value a
+  ## re-serializing proxy would read differently (parser-differential smuggling).
+  ## `prev` is the previously-seen content-length (-1 when none); a valid value
+  ## that differs from a non-negative `prev` is clConflict (RFC 9113 8.1.1 /
+  ## RFC 9114 duplicate rule). digits-only makes the result non-negative. Takes
+  ## an openArray so the h1 parser can validate a read-buffer slice without
+  ## allocating a string. Shared by the h1, h2 and h3 parsers so the
+  ## smuggling-sensitive grammar lives in one place.
+  if val.len == 0: return clMalformed
+  var v: int64 = 0
+  for ch in val:
+    if ch notin '0'..'9': return clMalformed
+    if v > (int64.high - 9) div 10: return clOverflow
+    v = v * 10 + int64(uint8(ch) - uint8('0'))
+  if prev >= 0 and prev != v: return clConflict
+  value = v
+  clOk
+
+func isForbiddenResponseField*(name: string, trailer = false): bool =
+  ## The connection-specific / hop-by-hop field names an h2 or h3 endpoint MUST
+  ## NOT generate on a response (RFC 9113 8.2.2 / RFC 9114 4.2): a strict client
+  ## treats a response carrying one as malformed and cancels the stream, so
+  ## h1-portable handler code would break on h2/h3. In a trailer section `te` is
+  ## additionally forbidden. Case-insensitive and allocation-free, so callers may
+  ## pass an original- or lower-cased name. Deliberately excludes content-length:
+  ## the h1 codec forbids that separately as a framing concern, because h1
+  ## (unlike h2/h3) generates Content-Length itself. Shared by the h1/h2/h3
+  ## codecs so this smuggling-relevant set cannot drift between them.
+  eqIgnoreAsciiCase(name, "connection") or
+  eqIgnoreAsciiCase(name, "proxy-connection") or
+  eqIgnoreAsciiCase(name, "keep-alive") or
+  eqIgnoreAsciiCase(name, "transfer-encoding") or
+  eqIgnoreAsciiCase(name, "upgrade") or
+  (trailer and eqIgnoreAsciiCase(name, "te"))
+
 type RequestHeadClass* = enum
   rhInvalid    ## malformed: reject the request / reset the stream
   rhRequest    ## a normal request (:method/:path/:scheme present, authority ok)
