@@ -225,8 +225,17 @@ proc waitFor*(server: var Server) =
   ## mirrors Go's `Server.Shutdown(ctx)` returning on the ctx deadline and tokio's
   ## `Runtime::shutdown_timeout` abandoning blocking threads: the leaked threads
   ## keep running against still-valid shared state until the process exits.
+  # Block until this server is actually asked to stop. waitFor doubles as the
+  # blocking body of serve(): until a signal / requestShutdown sets stopFlag the
+  # loops keep serving, so we must NOT touch the pool yet -- signalStop here would
+  # set pool.stopping and make every subsequent `blocking:` dispatch shed a 503.
+  # Poll the stop flag (10ms granularity), never timing out: a healthy server may
+  # serve for days before its first stop request.
+  while server.stopFlag != nil and not server.stopFlag[].load(moAcquire):
+    sleep(10)
   if server.pool != nil: server.pool.signalStop()   # wake idle workers to exit
-  # Poll the live-thread counter (10ms granularity) up to the hard timeout.
+  # Now bound the wait for loops + workers to drain, and detach any that are stuck
+  # in a never-returning body once the hard timeout elapses (below).
   var live = if server.alive != nil: server.alive[].load(moAcquire) else: 0
   var waited = 0
   let maxWait = max(1, server.hardShutdownSec) * 100        # * 10ms
