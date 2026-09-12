@@ -154,10 +154,45 @@ when not defined(plainHttp):
       for (n, v) in st.headers:
         if n == name: return v
 
+  proc h3FieldIn(h3c: H3Conn, stream: uint32, name: string): string =
+    ## A single request field from an already-resolved H3Conn + stream ("" if the
+    ## stream is gone or the field is absent). The by-carrier twin of h3FieldOf,
+    ## for use inside withCarrier's onH3 (which has already resolved h3c).
+    let st = h3StreamPtr(h3c, uint64(stream))
+    if st != nil:
+      for (n, v) in st.headers:
+        if n == name: return v
+
 template withConn(req: Request, c, body: untyped) =
   let c = conn(req.core, req.fd, req.gen)
   if c != nil:
     body
+
+template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
+  ## Discriminate the request carrier exactly once, the way ~20 read-accessors
+  ## each did inline: a worker-thread snapshot (req.snap), else an HTTP/3 slot
+  ## (fd < 0), else an HTTP/2 stream (stream != 0), else the HTTP/1 connection.
+  ## Compile-time Template Method: every branch inlines (no per-call indirection
+  ## on this hot path; NOT a runtime dispatch object). `c` / `h3c` are
+  ## caller-supplied identifiers (like withConn's `c`): onH2/onH1 see the resolved
+  ## non-nil Connection `c`, onH3 the resolved non-nil H3Conn `h3c`, onSnap uses
+  ## req.snap. The h3 branch is compiled out under -d:plainHttp.
+  if req.snap != nil:
+    onSnap
+  elif req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        onH3
+    else:
+      discard
+  else:
+    let c = conn(req.core, req.fd, req.gen)
+    if c != nil:
+      if req.stream != 0:
+        onH2
+      else:
+        onH1
 
 proc lowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
@@ -220,61 +255,51 @@ proc `method`*(req: Request): HttpMethod =
   ## valid after a dot, so plain `req.method` works at call sites; only
   ## this declaration (and UFCS/standalone uses) needs backticks.
   result = HttpGet
-  if req.snap != nil: return req.snap.httpMethod
-  if req.fd < 0:
-    when not defined(plainHttp):
-      result = parseMethodStr(h3FieldOf(req, ":method"))
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      result = parseMethodStr(h2Field(c, req.stream, ":method"))
-    else:
-      result = c.parser.httpMethod
+  withCarrier(req, c, h3c):
+    result = req.snap.httpMethod
+  do:
+    result = parseMethodStr(h3FieldIn(h3c, req.stream, ":method"))
+  do:
+    result = parseMethodStr(h2Field(c, req.stream, ":method"))
+  do:
+    result = c.parser.httpMethod
 
 proc path*(req: Request): string =
-  if req.snap != nil: return req.snap.target
-  if req.fd < 0:
-    when not defined(plainHttp):
-      result = h3FieldOf(req, ":path")
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      result = h2Field(c, req.stream, ":path")
-    else:
-      result = c.rbuf.substr(int(c.parser.pathStart),
-                             int(c.parser.pathStart + c.parser.pathLen) - 1)
+  withCarrier(req, c, h3c):
+    result = req.snap.target
+  do:
+    result = h3FieldIn(h3c, req.stream, ":path")
+  do:
+    result = h2Field(c, req.stream, ":path")
+  do:
+    result = c.rbuf.substr(int(c.parser.pathStart),
+                           int(c.parser.pathStart + c.parser.pathLen) - 1)
 
 iterator items*(h: RequestHeaders): (string, string) =
   ## Yields (name, value) pairs (`for (n, v) in req.headers`). HTTP/2 and /3
   ## names are lowercase on the wire; pseudo-headers are skipped.
   let req = h.req
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     for (n, v) in req.snap.headers:
       if n.len > 0 and n[0] != ':': yield (n, v)
-  elif req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
-        if st != nil:
-          for (n, v) in st.headers:
-            if n.len > 0 and n[0] != ':':
-              yield (n, v)
-  else:
-    let c = conn(req.core, req.fd, req.gen)
-    if c != nil:
-      if req.stream != 0:
-        let st = h2Stream(c, req.stream)
-        if st != nil:
-          for (n, v) in st.headers:
-            if n.len > 0 and n[0] != ':':
-              yield (n, v)
-      else:
-        for hs in c.parser.headers:
-          yield (c.rbuf.substr(int(hs.nameStart),
-                               int(hs.nameStart + hs.nameLen) - 1),
-                 c.rbuf.substr(int(hs.valStart),
-                               int(hs.valStart + hs.valLen) - 1))
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil:
+      for (n, v) in st.headers:
+        if n.len > 0 and n[0] != ':':
+          yield (n, v)
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil:
+      for (n, v) in st.headers:
+        if n.len > 0 and n[0] != ':':
+          yield (n, v)
+  do:
+    for hs in c.parser.headers:
+      yield (c.rbuf.substr(int(hs.nameStart),
+                           int(hs.nameStart + hs.nameLen) - 1),
+             c.rbuf.substr(int(hs.valStart),
+                           int(hs.valStart + hs.valLen) - 1))
 
 proc h1NameMatches(c: ptr Connection, hs: HeaderSlice,
                    name: string): bool {.inline.} =
@@ -288,18 +313,15 @@ proc h1NameMatches(c: ptr Connection, hs: HeaderSlice,
 
 proc header*(req: Request, name: string): string =
   ## Case-insensitive single-header lookup; "" when absent.
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     let want = name.toLowerAscii
     for (n, v) in req.snap.headers:
       if n.toLowerAscii == want: return v
-    return ""
-  if req.fd < 0:
-    when not defined(plainHttp):
-      result = h3FieldOf(req, name.toLowerAscii)
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      return h2Field(c, req.stream, name.toLowerAscii)
+  do:
+    result = h3FieldIn(h3c, req.stream, name.toLowerAscii)
+  do:
+    return h2Field(c, req.stream, name.toLowerAscii)
+  do:
     for h in c.parser.headers:
       if h1NameMatches(c, h, name):
         return c.rbuf.substr(int(h.valStart),
@@ -326,23 +348,17 @@ proc contains*(h: RequestHeaders, name: string): bool =
       if pair[0].len > 0 and pair[0][0] != ':' and cmpIgnoreCase(pair[0], name) == 0:
         found = true; break
     found
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     return scanSeq(req.snap.headers)
-  if req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
-        if st != nil: return scanSeq(st.headers)
-    return false
-  let c = conn(req.core, req.fd, req.gen)
-  if c == nil: return false
-  if req.stream != 0:
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil: return scanSeq(st.headers)
+  do:
     let st = h2Stream(c, req.stream)
     return st != nil and scanSeq(st.headers)
-  for hs in c.parser.headers:                 # HTTP/1: compare against the read buffer
-    if h1NameMatches(c, hs, name): return true
-  false
+  do:
+    for hs in c.parser.headers:               # HTTP/1: compare against the read buffer
+      if h1NameMatches(c, hs, name): return true
 
 # --- request trailers -------------------------------------------------------
 
@@ -350,28 +366,22 @@ iterator items*(h: RequestTrailers): (string, string) =
   ## Yields (name, value) trailer pairs (`for (n, v) in req.trailers`). Names are
   ## lowercase on h2/h3; empty until the request body has fully arrived.
   let req = h.req
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     for (n, v) in req.snap.trailers: yield (n, v)
-  elif req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
-        if st != nil:
-          for (n, v) in st.trailers: yield (n, v)
-  else:
-    let c = conn(req.core, req.fd, req.gen)
-    if c != nil:
-      if req.stream != 0:
-        let st = h2Stream(c, req.stream)
-        if st != nil:
-          for (n, v) in st.trailers: yield (n, v)
-      else:
-        for hs in c.parser.trailers:
-          yield (c.rbuf.substr(int(hs.nameStart),
-                               int(hs.nameStart + hs.nameLen) - 1),
-                 c.rbuf.substr(int(hs.valStart),
-                               int(hs.valStart + hs.valLen) - 1))
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil:
+      for (n, v) in st.trailers: yield (n, v)
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil:
+      for (n, v) in st.trailers: yield (n, v)
+  do:
+    for hs in c.parser.trailers:
+      yield (c.rbuf.substr(int(hs.nameStart),
+                           int(hs.nameStart + hs.nameLen) - 1),
+             c.rbuf.substr(int(hs.valStart),
+                           int(hs.valStart + hs.valLen) - 1))
 
 proc trailers*(req: Request): RequestTrailers {.inline.} =
   ## A read-only, case-insensitive view of the request *trailers* (the header
@@ -397,17 +407,16 @@ proc len*(h: RequestTrailers): int =
   for _ in h: inc result
 
 proc body*(req: Request): string =
-  if req.snap != nil: return req.snap.body
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = st.body
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: result = st.body
-    elif c.bodyDecodedSet:
+  withCarrier(req, c, h3c):
+    result = req.snap.body
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil: result = st.body
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil: result = st.body
+  do:
+    if c.bodyDecodedSet:
       result = c.bodyDecoded          # decompressed request body (see decodeRequestBody)
     elif c.parser.chunked:
       result = c.chunkBody
@@ -423,14 +432,14 @@ proc remoteAddress*(req: Request): string =
   ## listener has `settings.proxyProtocol` enabled and the connection came from a
   ## trusted proxy, this is already the real client IP from the PROXY header.
   ## Empty for a stale handle.
-  if req.snap != nil: return req.snap.remoteAddr
-  if req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil: return h3c.remoteAddr
-    return ""
-  let c = conn(req.core, req.fd, req.gen)
-  if c != nil: c.remoteAddr else: ""
+  withCarrier(req, c, h3c):
+    result = req.snap.remoteAddr
+  do:
+    result = h3c.remoteAddr
+  do:
+    result = c.remoteAddr
+  do:
+    result = c.remoteAddr
 
 proc clientCertSubject*(req: Request): string =
   ## The client certificate's subject DN for an mTLS connection, or "" if none
@@ -633,18 +642,16 @@ proc host*(req: Request): string =
   if result.len == 0: result = req.header("host")
 
 proc contentLength*(req: Request): int =
-  if req.snap != nil: return req.snap.body.len
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = st.body.len
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: result = st.body.len
-    else:
-      result = if c.parser.chunked: c.chunkBody.len else: c.parser.bodyLen
+  withCarrier(req, c, h3c):
+    result = req.snap.body.len
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil: result = st.body.len
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil: result = st.body.len
+  do:
+    result = if c.parser.chunked: c.chunkBody.len else: c.parser.bodyLen
 
 template lazyUrl(store: untyped, target: string): Uri =
   if not store.urlCached:
