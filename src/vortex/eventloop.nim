@@ -1300,225 +1300,217 @@ when not defined(plainHttp):
           loop.core.h3slots[idx].totalPins == 0:
         loop.h3FreeSlot(idx)
 
+proc staleConn(c: ptr Connection, msgGen: uint32): bool {.inline.} =
+  ## h1/h2: the message's connection died or its fd slot was reused. Every outbox
+  ## branch checks the endpoint's generation BEFORE touching its pin -- a stale
+  ## message must never dec a pin the *current* occupant took for an in-flight
+  ## task, which would let the loop free the endpoint under a worker.
+  c.gen != msgGen or c.state == csFree
+
+when not defined(plainHttp):
+  proc staleH3(slot: ptr H3SlotEntry, msgGen: uint32): bool {.inline.} =
+    ## h3 twin of staleConn: the message's slot was freed (gen bumped) or holds
+    ## no connection.
+    slot.gen != msgGen or slot.conn == nil
+
+  proc unpinH3ThenSkip(loop: Loop, slot: ptr H3SlotEntry, idx: int,
+                       rel: PinRelease): bool =
+    ## Release the pin the message names (prNone releases nothing -- e.g. an
+    ## awaitable body's own response, whose pkAwait rides its later
+    ## omBlockingDone) and honor a close deferred while pinned. Returns true when
+    ## the caller should skip the payload: the slot is condemned (freed once the
+    ## last pin drops), so there is nothing left to respond to.
+    if rel != prNone: loop.releasePin(slot, pinKindOf(rel))
+    if slot.closeReq:
+      if slot.totalPins == 0: loop.h3FreeSlot(idx)
+      return true
+    false
+
+proc applyFileMessage(loop: Loop, m: OutMsg) =
+  ## Emit an omFileStart (head + first chunk) or omFileChunk (a later chunk) into
+  ## its response. The apply is identical for h1/h2 and h3 (the pin release and
+  ## post-apply resume differ and stay with each caller).
+  let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen, stream: m.stream)
+  if m.kind == omFileStart:
+    let bodyStart = unpackResponseInto(m.data, loop.unpackCt, loop.unpackHeaders)
+    applyFileStart(res, int(m.code), loop.unpackCt, loop.unpackHeaders, m.n64,
+                   m.data.toOpenArray(bodyStart, m.data.len - 1),
+                   m.aux, m.user, m.last)
+  else:
+    applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
+
+proc applyBlockingDone(loop: Loop, m: OutMsg, h3Touched: var bool) =
+  ## An awaitable req.blocking worker finished. Release the boxed result and
+  ## complete the future *regardless of connection state* -- on shutdown or after
+  ## a client drop the connection may be gone, and a dead-conn skip would leak the
+  ## box + future.
+  let base = cast[BlockingResultBase](m.user)
+  if base.onDone != nil: base.onDone(base)   # complete/fail the future (loop)
+  GC_unref(base)                             # release the box
+  if loop.core.pendingBlockingResults > 0:   # this task is no longer outstanding
+    dec loop.core.pendingBlockingResults
+  # The mapping is fixed: omBlockingDone is the one and only carrier of an
+  # awaitable task's release (blockingResultTrampoline stamps it).
+  doAssert m.release == prAwait, "omBlockingDone must release prAwait"
+  if m.fd < 0:
+    when not defined(plainHttp):
+      let idx = h3SlotOf(m.fd)
+      if idx < loop.core.h3slots.len and loop.core.h3slots[idx].gen == m.gen:
+        let slot = addr loop.core.h3slots[idx]
+        loop.releasePin(slot, pkAwait)
+        if slot.closeReq and slot.totalPins == 0: loop.h3FreeSlot(idx)
+        h3Touched = true
+  elif int(m.fd) < loop.core.conns.len:
+    let c = addr loop.core.conns[int(m.fd)]
+    if not staleConn(c, m.gen):               # unpin/resume only if alive
+      # releasePin's hook covers the deferred close, and also resumes buffered
+      # input (e.g. pipelined h1 bytes after an awaitable body). That resume can
+      # produce a synchronous response into wbuf; unlike omWsDone/omFileChunk/
+      # omHttp this branch never flushed it, so it sat with write interest
+      # disarmed until an unrelated event or the idle deadline. Flush it (#240.2).
+      if loop.releasePin(c, pkAwait) and pendingOut(c) > 0:
+        loop.flushOut(c)
+
+when not defined(plainHttp):
+  proc applyOutboxH3(loop: Loop, m: OutMsg, h3Touched: var bool) =
+    ## Apply one non-blockingDone message on an h3 slot (m.fd < 0).
+    let idx = h3SlotOf(m.fd)
+    if idx >= loop.core.h3slots.len: return
+    let slot = addr loop.core.h3slots[idx]
+    # RFC 9220 WebSocket messages use per-stream pinning, not the slot pin.
+    # Handle (or, when stale, drop) them entirely before the omHttp pin
+    # bookkeeping: a stale ws message must never fall through to unpinH3ThenSkip
+    # and steal a pin the slot's *current* occupant took for an in-flight
+    # blocking: task (which would let the loop free the slot under that worker).
+    if m.kind in {omWs, omWsClose, omWsDone}:
+      if not staleH3(slot, m.gen):
+        if m.kind == omWsDone:
+          # An h3 ws.blocking worker finished: release the per-stream pin and pump
+          # the frames buffered while it ran (h3 ws never carries a slot-pin
+          # release -- per-stream pinnedByWorker instead).
+          doAssert m.release == prNone
+          let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
+          if w != nil: wsResume(addr loop.core, nil, w)
+        else:
+          let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
+          if w != nil: wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
+        h3Touched = true
+      return
+    if staleH3(slot, m.gen): return
+    if m.kind in {omFileStart, omFileChunk}:
+      # The initial read (omFileStart <- serveResolved) holds pkBlocking (it reads
+      # request headers -- risk R3: a file-classified release would let input
+      # mutate state under it); chunk reads are pkFileChunk.
+      doAssert (if m.kind == omFileStart: m.release != prFileChunk
+                else: m.release in {prFileChunk, prNone})
+      if loop.unpinH3ThenSkip(slot, idx, m.release): return
+      loop.applyFileMessage(m)
+      h3Touched = true
+      return
+    # omHttp releases what its task held: prBlocking, prFileChunk, or prNone (an
+    # awaitable body's response; its pkAwait rides omBlockingDone). Never
+    # prAwait/prWsBlocking, which have their own dedicated carrier messages.
+    doAssert m.release notin {prAwait, prWsBlocking}
+    if loop.unpinH3ThenSkip(slot, idx, m.release): return
+    let bodyStart = unpackResponseInto(m.data, loop.unpackCt, loop.unpackHeaders)
+    h3Apply(addr loop.core, m.fd, m.gen, m.stream, int(m.code),
+            loop.unpackCt, loop.unpackHeaders,
+            m.data.toOpenArray(bodyStart, m.data.len - 1))
+    h3Touched = true
+
+proc applyOutboxConn(loop: Loop, m: OutMsg) =
+  ## Apply one non-blockingDone message on an h1/h2 connection (m.fd >= 0).
+  if int(m.fd) >= loop.core.conns.len: return
+  let c = addr loop.core.conns[int(m.fd)]
+  if staleConn(c, m.gen): return
+  if m.kind == omWs or m.kind == omWsClose:
+    # A WebSocket frame from an off-loop sender (already serialized): route to the
+    # h1 connection or the h2 stream, then flush.
+    let w = wsConnForStream(addr loop.core, c, m.stream)
+    if w != nil:
+      wsFlushRaw(addr loop.core, c, w, m.data, m.kind == omWsClose)
+      loop.flushOut(c)
+    return
+  if m.kind == omWsDone:
+    # A ws.blocking worker finished: release its pin and resume dispatching frames
+    # held back while it ran. stream 0 (h1) holds a pkWsBlocking connection pin;
+    # an h2 stream holds the per-stream pin, released by wsResume.
+    if m.stream == 0:
+      # releasePin's hook covers the deferred close and, when frames are buffered,
+      # dispatches the next message; only the flush of what that queued stays here.
+      doAssert m.release == prWsBlocking
+      if not loop.releasePin(c, pkWsBlocking): return
+      if c.state != csFree and c.pendingOut > 0:
+        loop.flushOut(c)
+    else:
+      doAssert m.release == prNone
+      let w = wsConnForStream(addr loop.core, c, m.stream)
+      if w != nil:
+        wsResume(addr loop.core, c, w)
+        if c.state != csFree and c.pendingOut > 0:
+          loop.flushOut(c)
+    return
+  if m.kind in {omFileStart, omFileChunk}:
+    # Only chunk reads (dispatchNextRead -> omFileChunk) release prFileChunk. The
+    # initial read (omFileStart -> serveResolved) reads req headers, so it releases
+    # the pkBlocking pin it held (risk R3: never classify it as a file pin).
+    # releasePin's hook covers the deferred close and the input resume (draining
+    # buffered HTTP/2 frames -- chiefly the peer's WINDOW_UPDATEs a streamed
+    # sendFile needs) the moment only file pins, if any, remain.
+    doAssert (if m.kind == omFileStart: m.release != prFileChunk
+              else: m.release in {prFileChunk, prNone})
+    if m.release != prNone:
+      if not loop.releasePin(c, pinKindOf(m.release)): return
+    elif c.closeRequested:
+      loop.closeConn(c)          # re-defers while other pins remain
+      return
+    if c.state != csActive: return
+    loop.applyFileMessage(m)
+    # The final chunk finished the response: reset and resume the pipeline (the
+    # blocking-dispatch path doesn't set awaitingResponse, so finish()'s kick is a
+    # no-op here -- mirror the buffered omHttp path explicitly).
+    if m.last and not staleConn(c, m.gen):
+      loop.resumeAfterRespond(c, m.stream)
+    elif not staleConn(c, m.gen) and c.pendingOut > 0:
+      # The write scheduler fills c.wbuf up to respHighWater and stops; push it to
+      # the socket now. On a fast socket flushOut never hits EAGAIN, so write
+      # interest is never armed and no later Write event would drain it.
+      loop.flushOut(c)
+    return
+  # omHttp releases what its task held: prBlocking, prFileChunk, or prNone (an
+  # awaitable body's response -- its pkAwait rides omBlockingDone -- or a send from
+  # a non-task thread). Hook as above; the resume may run just before the apply
+  # instead of just after -- one message earlier.
+  doAssert m.release notin {prAwait, prWsBlocking}
+  if m.release != prNone:
+    if not loop.releasePin(c, pinKindOf(m.release)): return
+  elif c.closeRequested:
+    loop.closeConn(c)          # connection died while the task ran
+    return
+  let bodyStart = unpackResponseInto(m.data, loop.unpackCt, loop.unpackHeaders)
+  applyResponse(addr loop.core, c, m.stream, int(m.code), loop.unpackCt,
+                loop.unpackHeaders,
+                m.data.toOpenArray(bodyStart, m.data.len - 1))
+  loop.resumeAfterRespond(c, m.stream)
+
 proc processOutbox(loop: Loop) =
-  ## Apply worker-produced responses: unpin, write out, resume parsing.
-  ##
-  ## Invariant for every outbox message: check the endpoint's generation BEFORE
-  ## touching its pin. A stale message (its request's connection/slot was freed
-  ## and possibly reused) must never dec a pin the *current* occupant took for
-  ## an in-flight task -- that would let the loop free the endpoint under a
-  ## worker. The stale* guards below name that check; every branch runs one
-  ## before any pin bookkeeping.
-  template staleConn(c: ptr Connection, msgGen: uint32): bool =
-    ## h1/h2: the message's connection died or its fd slot was reused.
-    c.gen != msgGen or c.state == csFree
-  when not defined(plainHttp):
-    template staleH3(slot: ptr H3SlotEntry, msgGen: uint32): bool =
-      ## h3: the message's slot was freed (gen bumped) or holds no connection.
-      slot.gen != msgGen or slot.conn == nil
-    template unpinH3AndSkipIfClosing(slot: ptr H3SlotEntry, idx: int,
-                                     rel: PinRelease) =
-      ## Release the pin the message names (prNone releases nothing -- e.g. an
-      ## awaitable body's own response, whose pkAwait rides its later
-      ## omBlockingDone) and honor a close deferred while pinned: free the
-      ## slot once the last pin drops and skip the payload -- the slot is
-      ## condemned, so there is nothing left to respond to. (`continue`s the
-      ## message loop.)
-      if rel != prNone: loop.releasePin(slot, pinKindOf(rel))
-      if slot.closeReq:
-        if slot.totalPins == 0: loop.h3FreeSlot(idx)
-        continue
+  ## Apply worker-produced responses: unpin, write out, resume parsing. Each
+  ## message is dispatched to a per-transport handler (see applyBlockingDone /
+  ## applyOutboxH3 / applyOutboxConn), which enforces the stale-generation
+  ## invariant before any pin bookkeeping.
   loop.outboxScratch.setLen(0)
   drain(loop.core.outbox, loop.outboxScratch)
   var h3Touched = false
   for m in loop.outboxScratch.mitems:
     if m.kind == omBlockingDone:
-      # An awaitable req.blocking worker finished. Release the boxed result and
-      # complete the future *regardless of connection state* -- on shutdown or
-      # after a client drop the connection may be gone, and the dead-conn
-      # `continue`s below would otherwise skip this and leak the box + future.
-      let base = cast[BlockingResultBase](m.user)
-      if base.onDone != nil: base.onDone(base)   # complete/fail the future (loop)
-      GC_unref(base)                             # release the box
-      if loop.core.pendingBlockingResults > 0:   # this task is no longer outstanding
-        dec loop.core.pendingBlockingResults
-      # The mapping is fixed: omBlockingDone is the one and only carrier of an
-      # awaitable task's release (blockingResultTrampoline stamps it).
-      doAssert m.release == prAwait, "omBlockingDone must release prAwait"
-      if m.fd < 0:
-        when not defined(plainHttp):
-          let idx = h3SlotOf(m.fd)
-          if idx < loop.core.h3slots.len and loop.core.h3slots[idx].gen == m.gen:
-            let slot = addr loop.core.h3slots[idx]
-            loop.releasePin(slot, pkAwait)
-            if slot.closeReq and slot.totalPins == 0: loop.h3FreeSlot(idx)
-            h3Touched = true
-      elif int(m.fd) < loop.core.conns.len:
-        let c = addr loop.core.conns[int(m.fd)]
-        if not staleConn(c, m.gen):               # unpin/resume only if alive
-          # releasePin's hook covers the deferred close, and now also resumes
-          # buffered input (e.g. pipelined h1 bytes after an awaitable body):
-          # previously those waited for the next socket event. That resume can
-          # produce a synchronous response into wbuf; unlike omWsDone/omFileChunk/
-          # omHttp this branch never flushed it, so it sat with write interest
-          # disarmed until an unrelated event or the idle deadline. Flush it (#240.2).
-          if loop.releasePin(c, pkAwait) and pendingOut(c) > 0:
-            loop.flushOut(c)
-      continue
-    if m.fd < 0:
+      loop.applyBlockingDone(m, h3Touched)
+    elif m.fd < 0:
       when not defined(plainHttp):
-        let idx = h3SlotOf(m.fd)
-        if idx >= loop.core.h3slots.len: continue
-        let slot = addr loop.core.h3slots[idx]
-        # RFC 9220 WebSocket messages use per-stream pinning, not the slot
-        # pin. Handle (or, when stale, drop) them entirely before the omHttp
-        # pin bookkeeping: a stale ws message must never fall through to the
-        # unpinH3AndSkipIfClosing below and steal a pin the slot's *current*
-        # occupant took for an in-flight blocking: task (which would let the
-        # loop free the slot under that worker). Mirrors the h1 branch (see
-        # the staleConn/staleH3 invariant above).
-        if m.kind in {omWs, omWsClose, omWsDone}:
-          if not staleH3(slot, m.gen):
-            if m.kind == omWsDone:
-              # An h3 ws.blocking worker finished. Same dispatch as the h2
-              # stream case below: release the per-stream pin and pump the
-              # frames buffered while it ran. h3 ws messages never carry a
-              # slot-pin release (per-stream pinnedByWorker instead).
-              doAssert m.release == prNone
-              let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
-              if w != nil:
-                wsResume(addr loop.core, nil, w)
-            else:
-              let w = wsConnForH3(addr loop.core, m.fd, m.gen, m.stream)
-              if w != nil:
-                wsFlushRaw(addr loop.core, nil, w, m.data, m.kind == omWsClose)
-            h3Touched = true
-          continue
-        if staleH3(slot, m.gen): continue
-        if m.kind in {omFileStart, omFileChunk}:
-          # The initial read (omFileStart <- serveResolved) holds pkBlocking (it
-          # reads request headers -- risk R3: a file-classified release here
-          # would let input mutate state under it); chunk reads are pkFileChunk.
-          doAssert (if m.kind == omFileStart: m.release != prFileChunk
-                    else: m.release in {prFileChunk, prNone})
-          unpinH3AndSkipIfClosing(slot, idx, m.release)
-          let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
-                             stream: m.stream)
-          if m.kind == omFileStart:
-            let bodyStart = unpackResponseInto(m.data, loop.unpackCt,
-                                               loop.unpackHeaders)
-            applyFileStart(res, int(m.code), loop.unpackCt, loop.unpackHeaders,
-                           m.n64,
-                           m.data.toOpenArray(bodyStart, m.data.len - 1),
-                           m.aux, m.user, m.last)
-          else:
-            applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
-          h3Touched = true
-          continue
-        # omHttp releases what its task held: prBlocking (a sync task's first
-        # response), prFileChunk (a chunk reader's error-fallback 500), or
-        # prNone (an awaitable body's response; its pkAwait rides
-        # omBlockingDone). Never prAwait/prWsBlocking, which have their own
-        # dedicated carrier messages.
-        doAssert m.release notin {prAwait, prWsBlocking}
-        unpinH3AndSkipIfClosing(slot, idx, m.release)
-        let bodyStart = unpackResponseInto(m.data, loop.unpackCt,
-                                           loop.unpackHeaders)
-        h3Apply(addr loop.core, m.fd, m.gen, m.stream, int(m.code),
-                loop.unpackCt, loop.unpackHeaders,
-                m.data.toOpenArray(bodyStart, m.data.len - 1))
-        h3Touched = true
-      continue
-    if int(m.fd) >= loop.core.conns.len: continue
-    let c = addr loop.core.conns[int(m.fd)]
-    if staleConn(c, m.gen): continue
-    if m.kind == omWs or m.kind == omWsClose:
-      # A WebSocket frame from an off-loop sender (already serialized): route
-      # to the h1 connection or the h2 stream, then flush.
-      let w = wsConnForStream(addr loop.core, c, m.stream)
-      if w != nil:
-        wsFlushRaw(addr loop.core, c, w, m.data, m.kind == omWsClose)
-        loop.flushOut(c)
-      continue
-    if m.kind == omWsDone:
-      # A ws.blocking worker finished: release its pin and resume dispatching
-      # the frames held back while it ran. One dispatch on the stream id,
-      # mirrored by the h3 branch above: stream 0 (h1) holds a pkWsBlocking
-      # connection pin; an h2 stream holds the per-stream pin, released by
-      # wsResume via wsReleaseStreamPin.
-      if m.stream == 0:
-        # releasePin's hook covers the deferred close and, when frames are
-        # buffered (rlen > 0), dispatches the next message via processInput ->
-        # wsInput; only the flush of anything that dispatch queued stays here.
-        doAssert m.release == prWsBlocking
-        if not loop.releasePin(c, pkWsBlocking): continue
-        if c.state != csFree and c.pendingOut > 0:
-          loop.flushOut(c)
+        loop.applyOutboxH3(m, h3Touched)
       else:
-        doAssert m.release == prNone
-        let w = wsConnForStream(addr loop.core, c, m.stream)
-        if w != nil:
-          wsResume(addr loop.core, c, w)
-          if c.state != csFree and c.pendingOut > 0:
-            loop.flushOut(c)
-      continue
-    if m.kind in {omFileStart, omFileChunk}:
-      # Only chunk reads (dispatchNextRead -> omFileChunk) release prFileChunk.
-      # The initial read (omFileStart -> serveResolved) reads req headers, so
-      # its message releases the pkBlocking pin it held (risk R3: never
-      # classify it as a file pin). releasePin's hook covers the deferred
-      # close and the input resume that lived here -- draining buffered HTTP/2
-      # frames (chiefly the peer's WINDOW_UPDATEs, which a streamed sendFile
-      # response needs) the moment only file pins, if any, remain.
-      doAssert (if m.kind == omFileStart: m.release != prFileChunk
-                else: m.release in {prFileChunk, prNone})
-      if m.release != prNone:
-        if not loop.releasePin(c, pinKindOf(m.release)):
-          continue
-      elif c.closeRequested:
-        loop.closeConn(c)          # re-defers while other pins remain
-        continue
-      if c.state != csActive: continue
-      let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
-                         stream: m.stream)
-      if m.kind == omFileStart:
-        let bodyStart = unpackResponseInto(m.data, loop.unpackCt,
-                                           loop.unpackHeaders)
-        applyFileStart(res, int(m.code), loop.unpackCt, loop.unpackHeaders,
-                       m.n64,
-                       m.data.toOpenArray(bodyStart, m.data.len - 1),
-                       m.aux, m.user, m.last)
-      else:
-        applyFileChunk(res, m.buf, int(m.code), m.aux, m.user, m.last)
-      # The final chunk finished the response: reset and resume the pipeline
-      # (the blocking-dispatch path doesn't set awaitingResponse, so finish()'s
-      # kick is a no-op here -- mirror the buffered omHttp path explicitly).
-      if m.last and not staleConn(c, m.gen):
-        loop.resumeAfterRespond(c, m.stream)
-      elif not staleConn(c, m.gen) and c.pendingOut > 0:
-        # The write scheduler fills c.wbuf up to respHighWater and stops; push it
-        # to the socket now. On a fast socket flushOut never hits EAGAIN, so write
-        # interest is never armed and no later Write event would drain it.
-        loop.flushOut(c)
-      continue
-    # omHttp releases what its task held: prBlocking (a sync task's first
-    # response), prFileChunk (a chunk reader's error-fallback 500), or prNone
-    # (an awaitable body's response -- its pkAwait rides omBlockingDone -- or
-    # a send from a non-task thread). Hook as above; the resume may now run
-    # just before the apply instead of just after (resumeAfterRespond) -- one
-    # message earlier.
-    doAssert m.release notin {prAwait, prWsBlocking}
-    if m.release != prNone:
-      if not loop.releasePin(c, pinKindOf(m.release)): continue
-    elif c.closeRequested:
-      loop.closeConn(c)          # connection died while the task ran
-      continue
-    let bodyStart = unpackResponseInto(m.data, loop.unpackCt,
-                                       loop.unpackHeaders)
-    applyResponse(addr loop.core, c, m.stream, int(m.code), loop.unpackCt,
-                  loop.unpackHeaders,
-                  m.data.toOpenArray(bodyStart, m.data.len - 1))
-    loop.resumeAfterRespond(c, m.stream)
+        discard
+    else:
+      loop.applyOutboxConn(m)
   # Recycle every sendFile read buffer from this batch back to the pool -- once,
   # here, so a buffer is returned exactly once whether its stream was alive (the
   # data was copied above) or the connection had died (the data is discarded).
