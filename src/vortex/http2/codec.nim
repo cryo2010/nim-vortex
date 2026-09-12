@@ -406,6 +406,24 @@ proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
     encodeInt(hb, h2.pendingTableSizeUpdate, 5, 0x20)
     h2.pendingTableSizeUpdate = -1
 
+proc emitHeaderBlock(h2: H2Conn, c: ptr Connection, sid: uint32,
+                     hb: string, firstFrameFlags: uint8 = 0) =
+  ## Chunk an encoded header block into a HEADERS frame followed by CONTINUATION
+  ## frames, each <= peerMaxFrame, with END_HEADERS on the last fragment (RFC
+  ## 9113 6.2 / 6.10). `firstFrameFlags` (e.g. flagEndStream) rides the first
+  ## frame only. One home for the easy-to-get-wrong CONTINUATION-splitting rule.
+  var off = 0
+  var first = true
+  while first or off < hb.len:
+    let chunk = min(hb.len - off, h2.peerMaxFrame)
+    var flags = if off + chunk >= hb.len: flagEndHeaders else: 0'u8
+    if first: flags = flags or firstFrameFlags
+    c.wbuf.addFrameHeader(chunk,
+      (if first: ftHeaders else: ftContinuation), flags, sid)
+    c.wbuf.add hb[off ..< off + chunk]
+    off += chunk
+    first = false
+
 proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   ## Emit a streamed response's trailer section as a trailing HEADERS frame
   ## carrying END_STREAM, then drop the stream. Called once the response body
@@ -416,18 +434,7 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   h2.emitTableSizeUpdate(hb)
   for (name, val) in st.respTrailers:
     encodeExtraHeader(hb, name, val)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    var flags = if lastFrag: flagEndHeaders else: 0'u8
-    if first: flags = flags or flagEndStream   # END_STREAM rides the HEADERS
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb, flagEndStream)
   h2.teardownStream(c, sid)
 
 proc h2Sendable(h2: H2Conn, st: H2Stream): bool =
@@ -698,18 +705,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
     encodeExtraHeader(hb, name, val)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    var flags = if lastFrag: flagEndHeaders else: 0'u8
-    if first and st.isHead: flags = flags or flagEndStream
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb, if st.isHead: flagEndStream else: 0'u8)
   if st.isHead:
     h2.teardownStream(c, sid)
 
@@ -863,17 +859,7 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
   encodeHeader(hb, "date", dateStr)
   if proto.len > 0: encodeHeader(hb, "sec-websocket-protocol", proto)
   if ext.len > 0: encodeHeader(hb, "sec-websocket-extensions", ext)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    let flags = if lastFrag: flagEndHeaders else: 0'u8   # never END_STREAM
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb)                        # never END_STREAM
   true
 
 proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
@@ -907,19 +893,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
       if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
     if not shadowed: encodeExtraHeader(hb, name, val)
   let noBody = body.len == 0 or skipBody or bodiless
-  # Header block fits one frame in practice; chunk defensively anyway.
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    var flags = if lastFrag: flagEndHeaders else: 0'u8
-    if first and noBody: flags = flags or flagEndStream
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb, if noBody: flagEndStream else: 0'u8)
   if noBody:
     h2.teardownStream(c, sid)
   else:
@@ -945,16 +919,7 @@ proc h2SendInformational*(c: ptr Connection, code: int, sid: uint32,
   encodeStatus(hb, code)
   for (name, val) in headers:
     encodeExtraHeader(hb, name, val)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let flags = if off + chunk >= hb.len: flagEndHeaders else: 0'u8  # no END_STREAM
-    c.wbuf.addFrameHeader(chunk, (if first: ftHeaders else: ftContinuation),
-                          flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb)                        # no END_STREAM (1xx)
 
 # --- receive-window replenishment (batched WINDOW_UPDATE) -------------------
 
