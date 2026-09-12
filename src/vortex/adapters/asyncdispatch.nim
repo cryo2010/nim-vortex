@@ -81,8 +81,11 @@ proc teardown() {.nimcall, gcsafe.} =
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
 template onCompleted(fut, body: untyped) =
-  ## Run `body` when `fut` completes (asyncdispatch callback signature:
-  ## a plain nullary closure).
+  ## Contract shared with the chronos backend: run `body` when `fut` completes
+  ## (asyncdispatch callback signature: a plain nullary closure). Unlike chronos,
+  ## this backend does NO pending-op accounting -- the asyncdispatch dispatcher's
+  ## hasPendingOperations already tells the pump when to run, so there is no
+  ## per-future trackPending/untrackPending to keep. See chronos.nim's onCompleted.
   fut.addCallback proc () {.gcsafe.} =
     body
 
