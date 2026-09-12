@@ -10,7 +10,8 @@
 ## bytes arrive. On `prError`, `errorStatus` holds the HTTP status to send.
 
 import std/httpcore
-from ../fieldrules import tokenDelims
+from ../fieldrules import tokenDelims, ContentLengthResult, parseContentLength,
+  clOk, clOverflow, clMalformed, clConflict
   # RFC 9110 5.6.2 token separators (shared with the h2 codec and h3 backend
   # so the parsers cannot drift apart on what a field name may contain).
 
@@ -205,14 +206,11 @@ proc processHeader(p: var RequestParser, buf: openArray[char],
   if ieqLit(buf, h.nameStart, h.nameLen, "content-length"):
     if p.seenContentLength or p.chunked: return p.fail(Http400)
     var v: int64 = 0
-    if h.valLen == 0: return p.fail(Http400)
-    for i in h.valStart ..< h.valStart + h.valLen:
-      let c = buf[i]
-      if c notin '0'..'9': return p.fail(Http400)
-      if v > (int64.high - 9) div 10: return p.fail(Http413)
-      v = v * 10 + int64(uint8(c) - uint8('0'))
-    p.contentLength = v
-    p.seenContentLength = true
+    case parseContentLength(
+        buf.toOpenArray(int(h.valStart), int(h.valStart + h.valLen) - 1), -1, v)
+    of clOk: p.contentLength = v; p.seenContentLength = true
+    of clOverflow: return p.fail(Http413)
+    else: return p.fail(Http400)               # clMalformed (empty or non-digit)
   elif ieqLit(buf, h.nameStart, h.nameLen, "transfer-encoding"):
     if p.seenContentLength: return p.fail(Http400)
     # More than one Transfer-Encoding field line is faulty framing: the fields
