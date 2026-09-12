@@ -7,6 +7,8 @@ when not defined(httpGzip):
   {.error: "vortex/gzip requires -d:httpGzip (and --passL:-lz)".}
 
 import ./zlibffi, ./boundedinflate
+import ./compresscodec
+export compresscodec.DecodeResult, compresscodec.compress
 
 const
   gzipWindowBits = cint(15 + 16)   # 15-bit window + 16 = gzip header/trailer
@@ -42,7 +44,7 @@ proc gzip*(data: openArray[char]): string =
 # stream is torn down (normal finish or abandonment) -- no manual cleanup.
 
 type
-  GzipStreamObj = object of RootObj
+  GzipStreamObj = object of CompressStreamObj
     strm: ZStream
     inited: bool
   GzipStream* = ref GzipStreamObj
@@ -62,7 +64,8 @@ proc newGzipStream*(): GzipStream =
   else:
     result = nil
 
-proc compress*(s: GzipStream, data: openArray[char], last: bool): string =
+method compress*(s: GzipStream, data: openArray[char], last: bool): string
+    {.gcsafe.} =
   ## Feed one chunk; returns the compressed bytes to emit. `last` emits the
   ## gzip trailer. "" is a valid result (nothing to emit yet). On a hard error
   ## the stream is marked dead and returns "".
@@ -96,8 +99,7 @@ proc compress*(s: GzipStream, data: openArray[char], last: bool): string =
 
 const inflateAutoWindowBits = cint(15 + 32)   # auto-detect gzip/zlib headers
 
-proc gunzip*(data: openArray[char], maxOut: int):
-    tuple[ok: bool, tooLarge: bool, data: string] =
+proc gunzip*(data: openArray[char], maxOut: int): DecodeResult =
   ## `tooLarge` distinguishes an over-cap body (-> 413) from a corrupt one.
   if maxOut <= 0: return (false, false, "")
   var strm: ZStream

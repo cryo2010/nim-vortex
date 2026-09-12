@@ -29,6 +29,7 @@ export wscodec
 when not defined(plainHttp):
   import ./http3/ngtcp2/backend as h3codec   # HTTP/3 over ngtcp2 + nghttp3
   import ./transport/tls as tlscodec
+import ./compresscodec   # CompressStream Strategy + DecodeResult (leaf, always safe)
 when defined(httpGzip):
   import ./gzip
 when defined(httpBrotli):
@@ -1065,7 +1066,8 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
                            stream: res.stream))
 
   proc makeStreamComp(enc: string): RootRef =
-    ## A streaming compressor for `enc` (upcast to RootRef), or nil.
+    ## A streaming compressor for `enc` (a CompressStream, stored type-erased as
+    ## RootRef), or nil. The one place the algorithm name selects a backend.
     when defined(httpBrotli):
       if enc == "br": return newBrotliStream()
     when defined(httpZstd):
@@ -1074,16 +1076,12 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc == "gzip": return newGzipStream()
     nil
 
-  proc compChunk(comp: RootRef, enc: string, data: openArray[char],
-                 last: bool): string =
-    ## Feed a chunk to `comp` and return the bytes to emit (may be "").
-    when defined(httpBrotli):
-      if enc == "br": return BrotliStream(comp).compress(data, last)
-    when defined(httpZstd):
-      if enc == "zstd": return ZstdStream(comp).compress(data, last)
-    when defined(httpGzip):
-      if enc == "gzip": return GzipStream(comp).compress(data, last)
-    ""
+  proc compChunk(comp: RootRef, data: openArray[char], last: bool): string =
+    ## Feed a chunk to `comp` and return the bytes to emit (may be ""). Dispatches
+    ## polymorphically on the concrete encoder (CompressStream.compress) -- no
+    ## per-call `case` over the algorithm.
+    if comp == nil: return ""
+    CompressStream(comp).compress(data, last)
 
 proc contentTypeOf(headers: openArray[(string, string)]): string =
   ## The Content-Type already present in `headers` ("" if none, case-insensitive).
@@ -1235,7 +1233,7 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if raw.len == 0: return true
     let cap = if req.core.maxDecompressedBody > 0: req.core.maxDecompressedBody
               else: 512 * 1024 * 1024      # hard ceiling when maxBodySize=0
-    var r: tuple[ok: bool, tooLarge: bool, data: string]
+    var r: DecodeResult
     when defined(httpGzip):
       if isGzip: r = gunzip(raw, cap)
     when defined(httpBrotli):
@@ -1714,8 +1712,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
-              let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)),
-                                data, false)
+              let z = compChunk(comp, data, false)
               if z.len == 0: return true      # buffered; still writable
               return h3StreamWrite(h3c, uint64(res.stream), z) < respHighWater
           return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
@@ -1726,7 +1723,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
-          let z = compChunk(st.rs.respComp, st.rs.respEnc, data, false)
+          let z = compChunk(st.rs.respComp, data, false)
           if z.len == 0: return true
           let backlog = h2StreamWrite(c, res.stream, z)
           flushConn(res)
@@ -1739,7 +1736,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
     c.respBodyWritten += data.len   # reconciled vs respContentLength at finish() (#248)
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.rs.respComp != nil:
-        let z = compChunk(c.rs.respComp, c.rs.respEnc, data, false)
+        let z = compChunk(c.rs.respComp, data, false)
         if z.len > 0:
           if c.respFraming == rfChunked: appendChunk(c.wbuf, z)
           else:
@@ -1790,7 +1787,7 @@ proc finish*(res: Response) {.raises: [].} =
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
-              let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)), "", true)
+              let z = compChunk(comp, "", true)
               if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
           h3StreamFinish(h3c, uint64(res.stream), trailers)
@@ -1801,7 +1798,7 @@ proc finish*(res: Response) {.raises: [].} =
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         var st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
-          let z = compChunk(st.rs.respComp, st.rs.respEnc, "", true)
+          let z = compChunk(st.rs.respComp, "", true)
           if z.len > 0: discard h2StreamWrite(c, res.stream, z)
           # h2StreamWrite runs the scheduler, which may del OTHER streams on
           # completion and backshift the table, invalidating the captured `st`
@@ -1823,7 +1820,7 @@ proc finish*(res: Response) {.raises: [].} =
     c.respFraming = rfNone
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.rs.respComp != nil:
-        let z = compChunk(c.rs.respComp, c.rs.respEnc, "", true)   # trailer/finish
+        let z = compChunk(c.rs.respComp, "", true)   # trailer/finish
         if z.len > 0 and c.parser.httpMethod != HttpHead:
           if framing == rfChunked: appendChunk(c.wbuf, z)
           else:

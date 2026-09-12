@@ -9,6 +9,8 @@ when not defined(httpZstd):
   {.error: "vortex/zstd requires -d:httpZstd (and --passL:-lzstd)".}
 
 import ./boundedinflate
+import ./compresscodec
+export compresscodec.DecodeResult, compresscodec.compress
 
 {.passL: "-lzstd".}
 
@@ -64,7 +66,7 @@ proc zstd*(data: openArray[char]): string =
 # when that stream is torn down. Mirrors gzip.GzipStream / brotli.BrotliStream.
 
 type
-  ZstdStreamObj = object of RootObj
+  ZstdStreamObj = object of CompressStreamObj
     cctx: pointer            # ZSTD_CCtx*
   ZstdStream* = ref ZstdStreamObj
 
@@ -81,7 +83,8 @@ proc newZstdStream*(): ZstdStream =
     return nil
   discard zstdCCtxSetParameter(result.cctx, zstdCLevelParam, zstdLevel)
 
-proc compress*(s: ZstdStream, data: openArray[char], last: bool): string =
+method compress*(s: ZstdStream, data: openArray[char], last: bool): string
+    {.gcsafe.} =
   ## Feed one chunk; returns the compressed bytes to emit (may be ""). `last`
   ## ends the frame. On error the encoder is dropped and returns "".
   if s == nil or s.cctx == nil: return ""
@@ -110,8 +113,7 @@ proc compress*(s: ZstdStream, data: openArray[char], last: bool): string =
 # exceed the cap. Returns (false, "") on a corrupt/truncated stream or an
 # over-cap body; the caller rejects it. Mirrors gzip.gunzip / brotli.brotliDecode.
 
-proc zstdDecode*(data: openArray[char], maxOut: int):
-    tuple[ok: bool, tooLarge: bool, data: string] =
+proc zstdDecode*(data: openArray[char], maxOut: int): DecodeResult =
   ## `tooLarge` distinguishes an over-cap body (-> 413) from a corrupt one.
   if maxOut <= 0: return (false, false, "")
   let dctx = zstdCreateDCtx()
