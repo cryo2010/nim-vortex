@@ -6,46 +6,10 @@
 when not defined(httpGzip):
   {.error: "vortex/gzip requires -d:httpGzip (and --passL:-lz)".}
 
-{.passL: "-lz".}
-
-type
-  ZStream {.bycopy.} = object
-    nextIn: ptr uint8
-    availIn: cuint
-    totalIn: culong
-    nextOut: ptr uint8
-    availOut: cuint
-    totalOut: culong
-    msg: cstring
-    state: pointer
-    zalloc: pointer
-    zfree: pointer
-    opaque: pointer
-    dataType: cint
-    adler: culong
-    reserved: culong
+import ./zlibffi
 
 const
-  zOk = cint(0)
-  zStreamEnd = cint(1)
-  zNoFlush = cint(0)
-  zFinish = cint(4)
-  zDeflated = cint(8)
-  zDefaultStrategy = cint(0)
-  zDefaultCompression = cint(-1)
-  zMemLevel = cint(8)
   gzipWindowBits = cint(15 + 16)   # 15-bit window + 16 = gzip header/trailer
-
-proc zlibVersion(): cstring {.importc, cdecl.}
-proc deflateInit2(strm: ptr ZStream, level, meth, windowBits, memLevel,
-                  strategy: cint, version: cstring,
-                  streamSize: cint): cint {.importc: "deflateInit2_", cdecl.}
-proc deflate(strm: ptr ZStream, flush: cint): cint {.importc, cdecl.}
-proc deflateEnd(strm: ptr ZStream): cint {.importc, cdecl.}
-proc inflateInit2(strm: ptr ZStream, windowBits: cint, version: cstring,
-                  streamSize: cint): cint {.importc: "inflateInit2_", cdecl.}
-proc inflate(strm: ptr ZStream, flush: cint): cint {.importc, cdecl.}
-proc inflateEnd(strm: ptr ZStream): cint {.importc, cdecl.}
 
 proc gzip*(data: openArray[char]): string =
   ## gzip-compress `data` in one shot; "" on failure (caller sends uncompressed).
@@ -76,10 +40,6 @@ proc gzip*(data: openArray[char]): string =
 # (Z_FINISH). It is a `ref object of RootObj` so a Connection / h2 / h3 stream
 # can hold it as a RootRef, and its =destroy frees the zlib state when that
 # stream is torn down (normal finish or abandonment) -- no manual cleanup.
-
-const
-  zSyncFlush = cint(2)
-  zBufError = cint(-5)
 
 type
   GzipStreamObj = object of RootObj
