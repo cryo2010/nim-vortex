@@ -89,11 +89,48 @@ proc validateConfig(s: VortexConfig) =
   if s.minTlsVersion == TlsVersion.V13 and s.maxTlsVersion == TlsVersion.V12:
     raise newException(CatchableError,
       "maxTlsVersion (TLS 1.2) is below minTlsVersion (TLS 1.3).")
-  if s.maxHeaderSize < 0 or s.maxBodySize < 0 or s.maxWsMessageSize < 0 or
-     s.headerTimeout < 0 or s.bodyTimeout < 0 or s.keepAliveTimeout < 0 or
-     s.responseTimeout < 0 or s.shutdownGrace < 0 or s.maxConnections < 0 or
-     s.numThreads < 0 or s.workerThreads < 0:
-    raise newException(CatchableError, "settings must not be negative")
+  # Report the first offending field by name rather than a bare "a setting is
+  # negative", and add new numeric settings here as they appear.
+  for (name, val) in [
+      ("maxHeaderSize", s.maxHeaderSize), ("maxBodySize", s.maxBodySize),
+      ("maxWsMessageSize", s.maxWsMessageSize), ("headerTimeout", s.headerTimeout),
+      ("bodyTimeout", s.bodyTimeout), ("keepAliveTimeout", s.keepAliveTimeout),
+      ("responseTimeout", s.responseTimeout), ("shutdownGrace", s.shutdownGrace),
+      ("maxConnections", s.maxConnections), ("numThreads", s.numThreads),
+      ("workerThreads", s.workerThreads)]:
+    if val < 0:
+      raise newException(CatchableError,
+        "setting '" & name & "' must not be negative (got " & $val & ")")
+
+proc teardownResources(server: var Server) =
+  ## Free every shared resource a Server owns, in one place, and null the handles
+  ## so a repeat close/waitFor is a no-op. The caller must have already joined (or
+  ## detached) the loop/worker threads; this does not touch the listen fds (the
+  ## loops own and close those on exit). Used by both the startServer unwind path
+  ## and the clean waitFor path so the resource list lives once.
+  for ob in server.outboxes:
+    if ob != nil: freeOutbox ob
+  server.outboxes.setLen(0)
+  server.threads.setLen(0)
+  if server.pool != nil:
+    server.pool.shutdown()
+    deallocShared server.pool
+    server.pool = nil
+  if server.alive != nil:
+    deallocShared server.alive
+    server.alive = nil
+  when not defined(plainHttp):
+    if server.tls != nil:
+      freeTlsConfig(cast[ptr TlsConfig](server.tls))
+      server.tls = nil
+    if server.quicReload != nil:
+      deinitCertReload(cast[ptr CertReload](server.quicReload))
+      deallocShared server.quicReload
+      server.quicReload = nil
+  if server.stopFlag != nil:
+    unregisterServerFlag(server.stopFlag)
+    deallocShared server.stopFlag
+    server.stopFlag = nil
 
 proc startServer(handler: RequestHandler, settings: VortexConfig,
                  streamRoute: StreamRouteCb = nil): Server =
@@ -200,20 +237,7 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
     for i in madeThreads ..< numLoops:      # fds of loops that never started
       if fds[i] != osInvalidSocket: discard posix.close(cint(fds[i]))
       if udpFds[i] != osInvalidSocket: discard posix.close(cint(udpFds[i]))
-    for ob in result.outboxes:
-      if ob != nil: freeOutbox ob
-    result.outboxes.setLen(0)
-    result.threads.setLen(0)
-    result.pool.shutdown()
-    deallocShared result.pool
-    if result.alive != nil: deallocShared result.alive
-    when not defined(plainHttp):
-      if result.tls != nil: freeTlsConfig(cast[ptr TlsConfig](result.tls))
-      if result.quicReload != nil:
-        deinitCertReload(cast[ptr CertReload](result.quicReload))
-        deallocShared result.quicReload
-    unregisterServerFlag(result.stopFlag)
-    deallocShared result.stopFlag
+    teardownResources(result)
     raise
 
 proc waitFor*(server: var Server) =
@@ -263,28 +287,7 @@ proc waitFor*(server: var Server) =
   # Clean path: every thread exited, so the joins below return immediately.
   for t in server.threads.mitems:
     joinThread t
-  server.threads.setLen(0)
-  server.pool.shutdown()       # workers already exited; this joins + frees
-  deallocShared server.pool
-  server.pool = nil
-  if server.alive != nil:
-    deallocShared server.alive
-    server.alive = nil
-  for ob in server.outboxes:
-    freeOutbox ob
-  server.outboxes.setLen(0)
-  when not defined(plainHttp):
-    if server.tls != nil:
-      freeTlsConfig(cast[ptr TlsConfig](server.tls))
-      server.tls = nil
-    if server.quicReload != nil:
-      deinitCertReload(cast[ptr CertReload](server.quicReload))
-      deallocShared(server.quicReload)
-      server.quicReload = nil
-  if server.stopFlag != nil:
-    unregisterServerFlag(server.stopFlag)
-    deallocShared(server.stopFlag)
-    server.stopFlag = nil
+  teardownResources(server)   # workers already exited; frees pool/outboxes/etc.
 
 proc close*(server: var Server) =
   ## Stop and tear down. Stops only this server, not others in the process.
