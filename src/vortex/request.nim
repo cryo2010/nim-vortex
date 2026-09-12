@@ -486,6 +486,19 @@ proc parseForwarded(hdr: string): seq[ForwardedElem] =
       else: discard
     if e.forr.len > 0 or e.proto.len > 0 or e.host.len > 0: result.add e
 
+proc forwardedElems(req: Request): seq[ForwardedElem] =
+  ## parseForwarded(req.header("forwarded")), cached once per request so a
+  ## handler reading several of forwardedProto / forwardedHost / clientIp /
+  ## scheme / isSecure parses the header only once. On the worker path there is
+  ## no live cache to reuse (the same rule as url/query), so parse directly.
+  if req.snap != nil: return parseForwarded(req.header("forwarded"))
+  let rs = reqState(req)
+  if rs == nil: return parseForwarded(req.header("forwarded"))
+  if not rs.fwdCached:
+    rs.cachedForwarded = parseForwarded(req.header("forwarded"))
+    rs.fwdCached = true
+  rs.cachedForwarded
+
 proc fwdIp(s: string): string =
   ## Extract the bare IP from an RFC 7239 for= node (`ip`, `ip:port`,
   ## `"[v6]:port"`, `_obfuscated`); returns the token unchanged if it isn't one.
@@ -502,7 +515,7 @@ proc forwardedProto*(req: Request): string =
   ## trusted proxy or unset. Prefer `req.scheme` / `req.isSecure`, which fold it
   ## in.
   if not req.fromTrustedProxy: return ""
-  let fwd = parseForwarded(req.header("forwarded"))
+  let fwd = req.forwardedElems
   if fwd.len > 0 and fwd[0].proto.len > 0: return fwd[0].proto.toLowerAscii
   let xfp = req.header("x-forwarded-proto")
   if xfp.len > 0: return xfp.split(',')[0].strip.toLowerAscii
@@ -512,7 +525,7 @@ proc forwardedHost*(req: Request): string =
   ## (host=) or X-Forwarded-Host; "" when not behind a trusted proxy or unset.
   ## Folded into `req.host`.
   if not req.fromTrustedProxy: return ""
-  let fwd = parseForwarded(req.header("forwarded"))
+  let fwd = req.forwardedElems
   if fwd.len > 0 and fwd[0].host.len > 0: return fwd[0].host
   let xfh = req.header("x-forwarded-host")
   if xfh.len > 0: return xfh.split(',')[0].strip
@@ -526,7 +539,7 @@ proc clientIp*(req: Request): string =
   ## `remoteAddress` when not behind a trusted proxy.
   if not req.fromTrustedProxy: return req.remoteAddress
   var chain: seq[string]
-  let fwd = parseForwarded(req.header("forwarded"))
+  let fwd = req.forwardedElems
   if fwd.len > 0:
     for e in fwd:
       if e.forr.len > 0: chain.add fwdIp(e.forr)   # left = client-most
@@ -917,10 +930,13 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                     body: openArray[char]) =
   ## Serialize a response into the connection's write buffer using the
   ## connection's protocol. Loop thread only.
+  # The OWASP baseline (empty unless securityHeaders is on) is injected during
+  # serialization, so no merged header seq is allocated per response; the
+  # emitter skips any baseline name the handler already set (app wins).
   template emit(ct: string, h: openArray[(string, string)]) =
     if stream != 0:
       h2Respond(c, code, stream, core.dateStr, core.serverHeader,
-                ct, h, body, core.altSvc)
+                ct, h, body, core.altSvc, core.secHeaders)
     else:
       if c.rs.responded: return
       c.rs.responded = true
@@ -930,22 +946,21 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                      skipBody = c.parser.httpMethod == HttpHead,
                      announceKeepAlive = c.parser.keepAlive and
                                          c.parser.minor == 0,
-                     altSvc = core.altSvc)
+                     altSvc = core.altSvc, secHeaders = core.secHeaders)
       if not c.parser.keepAlive:
         c.closeAfterFlush = true
   let key = (c.fd, c.gen, stream)
   # Skip the tuple hash + table probe unless some response actually set headers
   # (the table is empty and drained otherwise); the common no-custom-header case
-  # then pays only an O(1) len check. Mirrors the respTrailers guard in finish().
-  if core.respHeaders.len > 0 and core.respHeaders.hasKey(key):
-    let merged = core.respHeaders[key].mergedWith(headers)
-    core.respHeaders.del key
+  # then pays only an O(1) len check. When there are pending headers, `pop`
+  # fetches and removes them in a single probe (was hasKey + [] + del).
+  var pending: ResponseHeaders
+  if core.respHeaders.len > 0 and core.respHeaders.pop(key, pending):
+    let merged = pending.mergedWith(headers)
     # a Content-Type among the merged headers wins over the (auto) contentType
     let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
-    if core.secHeaders.len == 0: emit(ct, merged)
-    else: emit(ct, withSecHeaders(core, merged))
-  elif core.secHeaders.len == 0: emit(contentType, headers)
-  else: emit(contentType, withSecHeaders(core, headers))
+    emit(ct, merged)
+  else: emit(contentType, headers)
 
 proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
               code: int, contentType: string,
@@ -956,20 +971,15 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
     let h3c = h3ConnOf(core, fd, gen)
     if h3c != nil:
       let key = (fd, gen, stream)
-      if core.respHeaders.len > 0 and core.respHeaders.hasKey(key):
-        let merged = core.respHeaders[key].mergedWith(headers)
-        core.respHeaders.del key
+      var pending: ResponseHeaders
+      if core.respHeaders.len > 0 and core.respHeaders.pop(key, pending):
+        let merged = pending.mergedWith(headers)
         let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
-        if core.secHeaders.len == 0:
-          h3Respond(core, h3c, uint64(stream), code, ct, merged, body)
-        else:
-          h3Respond(core, h3c, uint64(stream), code, ct,
-                    withSecHeaders(core, merged), body)
-      elif core.secHeaders.len == 0:
-        h3Respond(core, h3c, uint64(stream), code, contentType, headers, body)
+        h3Respond(core, h3c, uint64(stream), code, ct, merged, body,
+                  core.secHeaders)
       else:
-        h3Respond(core, h3c, uint64(stream), code, contentType,
-                  withSecHeaders(core, headers), body)
+        h3Respond(core, h3c, uint64(stream), code, contentType, headers, body,
+                  core.secHeaders)
 
 var workerResponded* {.threadvar.}: bool
   ## On a worker thread, set by the worker-path `send` so blockingTrampoline can
@@ -1782,9 +1792,9 @@ proc finish*(res: Response) {.raises: [].} =
     # Pull any pending res.trailers (loop-thread only, so no lock needed).
     var trailers: seq[(string, string)]
     let tkey = (res.fd, res.gen, res.stream)
-    if res.core.respTrailers.len > 0 and res.core.respTrailers.hasKey(tkey):
-      for pair in res.core.respTrailers[tkey].pairs: trailers.add pair
-      res.core.respTrailers.del tkey
+    var pendingTrailers: ResponseHeaders     # fetch + remove in one probe
+    if res.core.respTrailers.len > 0 and res.core.respTrailers.pop(tkey, pendingTrailers):
+      for pair in pendingTrailers.pairs: trailers.add pair
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)

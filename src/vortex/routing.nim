@@ -22,7 +22,14 @@ type
     segment: string           ## literal, or param name when isParam
     isParam: bool
     isWild: bool              ## trailing "*": matches the rest
-    children: seq[RouteNode]
+    children: seq[RouteNode]  ## every child, in registration order (build + walk)
+    # Children pre-partitioned by kind so match() checks each bucket directly
+    # instead of scanning `children` three times per path segment (exact, then
+    # param, then wildcard). Populated as children are added; the trie is frozen
+    # before serving, so these stay consistent with `children`.
+    exactChildren: seq[RouteNode]
+    paramChildren: seq[RouteNode]
+    wildChild: RouteNode      ## the single trailing-"*" child, or nil
     handlers: array[HttpMethod, RequestHandler]
     streaming: array[HttpMethod, bool]  ## route registered via `stream`
   RouteNode = ref RouteNodeObj
@@ -78,6 +85,9 @@ proc addRouteNode(router: Router, path: string): RouteNode =
     if next == nil:
       next = RouteNode(segment: seg, isParam: isParam, isWild: isWild)
       node.children.add next
+      if isWild: node.wildChild = next
+      elif isParam: node.paramChildren.add next
+      else: node.exactChildren.add next
     node = next
     if isWild: break
   node
@@ -167,25 +177,25 @@ proc match(node: RouteNode, path: string, start: int,
   # alloc) and substr only when a param actually captures -- so a clean route like
   # /plaintext or /echo allocates no per-segment substring.
   let decoded = if hasPct: decodeSegment(path.substr(i, j - 1)) else: ""
-  # Exact matches first.
-  for k in 0 ..< node.children.len:
-    let child {.cursor.} = node.children[k]
-    if not child.isParam and not child.isWild and
-        (if hasPct: child.segment == decoded else: segEq(path, i, j, child.segment)):
+  # Exact matches first, then params, then the wildcard -- each bucket is a
+  # pre-partitioned child list (see RouteNodeObj), so no per-segment rescan of
+  # the full child set. `{.cursor.}` locals keep the concurrent lookup off the
+  # shared nodes' ORC refcounts (see RouteNode).
+  for k in 0 ..< node.exactChildren.len:
+    let child {.cursor.} = node.exactChildren[k]
+    if (if hasPct: child.segment == decoded else: segEq(path, i, j, child.segment)):
       let found = match(child, path, j, params)
       if found != nil: return found
-  for k in 0 ..< node.children.len:
-    let child {.cursor.} = node.children[k]
-    if child.isParam:
-      params.add (child.segment, if hasPct: decoded else: path.substr(i, j - 1))
-      let found = match(child, path, j, params)
-      if found != nil: return found
-      params.setLen(params.len - 1)
-  for k in 0 ..< node.children.len:
-    let child {.cursor.} = node.children[k]
-    if child.isWild:
-      params.add ("*", path.substr(i))   # raw remainder (see decodeSegment)
-      return cast[ptr RouteNodeObj](child)
+  for k in 0 ..< node.paramChildren.len:
+    let child {.cursor.} = node.paramChildren[k]
+    params.add (child.segment, if hasPct: decoded else: path.substr(i, j - 1))
+    let found = match(child, path, j, params)
+    if found != nil: return found
+    params.setLen(params.len - 1)
+  if node.wildChild != nil:
+    let child {.cursor.} = node.wildChild
+    params.add ("*", path.substr(i))     # raw remainder (see decodeSegment)
+    return cast[ptr RouteNodeObj](child)
   nil
 
 proc route*(router: Router, req: Request, res: Response) {.gcsafe.} =

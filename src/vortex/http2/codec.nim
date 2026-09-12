@@ -125,6 +125,10 @@ type
     sendQ*: array[8, Deque[uint32]]
     scheduling*: bool         ## reentrancy guard for h2Schedule
     resuming*: bool           ## reentrancy guard for h2ResumeProducers
+    backedUpProducers*: int   ## streams with respBackedUp set: lets
+                              ## h2ResumeProducers skip the full stream-table
+                              ## scan when nothing is parked (the common case).
+                              ## Maintained only via setBackedUp/clearBackedUp.
     # RFC 9218 PRIORITY_UPDATE that arrived before a stream's HEADERS: the raw
     # Priority field value, applied when the stream opens. Capped to bound a flood.
     pendingPriority*: Table[uint32, string]
@@ -139,24 +143,38 @@ proc parsePriorityField(v: string, urgency: var uint8, incremental: var bool) =
   ## dictionary), updating `urgency`/`incremental` in place. Recognises `u`
   ## (integer 0..7) and `i` (boolean: bare or `?1` = true, `?0` = false);
   ## unknown members and malformed values are ignored (leave the current value).
-  for part in v.split(','):
-    let kv = part.strip()
-    if kv.len == 0: continue
-    let eq = kv.find('=')
-    if eq < 0:
-      if kv == "i": incremental = true          # bare boolean member = true
-    else:
-      let key = kv[0 ..< eq].strip()
-      let val = kv[eq + 1 .. ^1].strip()
-      case key
-      of "u":
-        try:
-          let n = parseInt(val)
-          if n in 0 .. 7: urgency = uint8(n)
-        except ValueError: discard
-      of "i":
-        incremental = val != "?0"               # ?1 / anything but ?0 = true
-      else: discard
+  # Index-scan the RFC 8941 dictionary in place: no split/strip/substr/parseInt
+  # allocations (this runs per request carrying a `priority` header).
+  const ows = {' ', '\t'}
+  const sep = {' ', '\t', ','}
+  var i = 0
+  let n = v.len
+  while i < n:
+    while i < n and v[i] in sep: inc i             # skip OWS and commas
+    if i >= n: break
+    let ks = i                                    # member key [ks ..< ke)
+    while i < n and v[i] notin ows and v[i] != '=' and v[i] != ',': inc i
+    let ke = i
+    let isU = ke - ks == 1 and v[ks] == 'u'
+    let isI = ke - ks == 1 and v[ks] == 'i'
+    while i < n and v[i] in ows: inc i
+    if i < n and v[i] == '=':
+      inc i
+      while i < n and v[i] in ows: inc i
+      let vs = i                                  # value [vs ..< ve)
+      while i < n and v[i] notin ows and v[i] != ',': inc i
+      let ve = i
+      if isU:                                     # sf-integer 0..7 (else ignore)
+        var num = 0
+        var ok = ve > vs
+        for k in vs ..< ve:
+          if v[k] in '0'..'9' and num <= 7: num = num * 10 + (ord(v[k]) - ord('0'))
+          else: ok = false; break
+        if ok and num in 0 .. 7: urgency = uint8(num)
+      elif isI:                                   # ?1 / anything but ?0 = true
+        incremental = not (ve - vs == 2 and v[vs] == '?' and v[vs + 1] == '0')
+    elif isI:
+      incremental = true                          # bare boolean member = true
 
 proc h2Conn*(c: ptr Connection): H2Conn {.inline.} =
   H2Conn(c.h2)
@@ -251,6 +269,20 @@ proc recordEarlyClosed(h2: H2Conn, sid: uint32) {.raises: [].} =
   if h2.earlyClosedQ.len > maxEarlyClosed:
     h2.earlyClosed.excl h2.earlyClosedQ.popFirst()
 
+proc setBackedUp(h2: H2Conn, st: var H2Stream) {.inline.} =
+  ## Mark a stream's producer parked and keep h2.backedUpProducers exact.
+  ## Idempotent: a re-mark does not double-count.
+  if not st.respBackedUp:
+    st.respBackedUp = true
+    inc h2.backedUpProducers
+
+proc clearBackedUp(h2: H2Conn, st: var H2Stream) {.inline.} =
+  ## Clear the parked flag (resume, finish, or teardown) and keep the counter
+  ## exact. Idempotent, so every teardown path can call it unconditionally.
+  if st.respBackedUp:
+    st.respBackedUp = false
+    dec h2.backedUpProducers
+
 proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises: [].} =
   ## The single stream-removal primitive for every teardown path (normal
   ## completion, RST_STREAM in either direction, stream error, connection
@@ -293,6 +325,7 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises
     st.rs.onBodyCb = nil
     drainCb = st.rs.onRespDrain
     st.rs.onRespDrain = nil
+    clearBackedUp(h2, st[])               # drop from the parked-producer count
   do:
     return                                # not present (already gone)
   h2.streams.del(sid)
@@ -353,11 +386,18 @@ proc encodeExtraHeader(hb: var string, name, val: string) =
   ## malformed and cancels the stream, so h1-portable handler code would break on
   ## h2. The inbound direction is already filtered; this closes the outbound gap
   ## (#240.3). Names are lowercased to h2 wire form regardless.
-  let lname = name.toLowerAscii
-  case lname
-  of "connection", "proxy-connection", "keep-alive", "transfer-encoding",
-     "upgrade": discard
-  else: encodeHeader(hb, lname, val)
+  ##
+  ## The forbidden-set check is allocation-free (eqIgnoreAsciiCase), and the
+  ## `toLowerAscii` copy is taken only when the name is not already lowercase --
+  ## an h2-aware handler using lowercase names then pays no per-header alloc.
+  if eqIgnoreAsciiCase(name, "connection") or
+     eqIgnoreAsciiCase(name, "proxy-connection") or
+     eqIgnoreAsciiCase(name, "keep-alive") or
+     eqIgnoreAsciiCase(name, "transfer-encoding") or
+     eqIgnoreAsciiCase(name, "upgrade"):
+    return
+  if isLowerAscii(name): encodeHeader(hb, name, val)
+  else: encodeHeader(hb, name.toLowerAscii, val)
 
 proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
   ## Prepend a pending HPACK dynamic-table-size-update instruction (RFC 7541
@@ -502,6 +542,7 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
   ## ids first (an onRespDrain callback may res.write and mutate the table) and
   ## stop early if a resumed producer refills the buffer.
   if h2.resuming: return
+  if h2.backedUpProducers == 0: return   # nothing parked: skip the table scan
   if pendingOut(c) >= respHighWater: return
   h2.resuming = true
   var resumable: seq[uint32]
@@ -515,7 +556,7 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
     if sid notin h2.streams: continue
     template st: H2Stream = h2.streams[sid]
     if not st.respBackedUp or st.rs.onRespDrain == nil: continue
-    st.respBackedUp = false
+    clearBackedUp(h2, st)
     let cb = st.rs.onRespDrain
     st.rs.onRespDrain = nil            # fire once; the producer re-registers if it
     # backs up again (res.write -> enqueue+schedule). Contain a raising producer
@@ -626,7 +667,7 @@ proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
   ## even though this stream's send window still has room.
   let h2 = h2Conn(c)
   if h2 != nil and sid in h2.streams:
-    h2.streams[sid].respBackedUp = true
+    setBackedUp(h2, h2.streams[sid])
 
 proc h2DrainResume*(c: ptr Connection, core: ptr LoopCore) =
   ## The connection write buffer drained to the socket: run a scheduler pass to
@@ -708,7 +749,7 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   template st: H2Stream = h2.streams[sid]
   st.rs.respStreaming = false
   st.rs.onRespDrain = nil
-  st.respBackedUp = false          # finished: never let a drain path resume it
+  clearBackedUp(h2, st)            # finished: never let a drain path resume it
   if st.isHead:
     return                               # HEAD stream already closed at head
   st.pendingIsLast = true
@@ -842,7 +883,8 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
 proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
                 dateStr, serverHeader, contentType: string,
                 extraHeaders: openArray[(string, string)],
-                body: openArray[char], altSvc = "") =
+                body: openArray[char], altSvc = "",
+                secHeaders: openArray[(string, string)] = []) =
   let h2 = h2Conn(c)
   if sid notin h2.streams: return
   if h2.streams[sid].rs.responded: return
@@ -863,6 +905,11 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
     encodeExtraHeader(hb, name, val)
+  for (name, val) in secHeaders:               # OWASP baseline; app header wins
+    var shadowed = false
+    for (hn, _) in extraHeaders:
+      if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
+    if not shadowed: encodeExtraHeader(hb, name, val)
   let noBody = body.len == 0 or skipBody or bodiless
   # Header block fits one frame in practice; chunk defensively anyway.
   var off = 0

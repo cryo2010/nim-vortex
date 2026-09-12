@@ -109,9 +109,11 @@ proc decodeStr*(buf: openArray[char], pos: var int, endPos: int,
     raise newException(HpackError, "truncated string data")
   if huffman:
     huffmanDecode(buf, pos, len, output)
-  else:
-    for i in pos ..< pos + len:
-      output.add buf[i]
+  elif len > 0:
+    # Literal (non-Huffman) octets: bulk-copy instead of appending byte-by-byte.
+    let old = output.len
+    output.setLen(old + len)
+    copyMem(addr output[old], unsafeAddr buf[pos], len)
   pos += len
 
 proc decodeString(buf: openArray[char], pos: var int, endPos: int,

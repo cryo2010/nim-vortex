@@ -175,6 +175,9 @@ type
     onRespDrain*: RespDrainCb ## streamed-response drain callback
     reqStreaming*: bool       ## dispatched early; body flows to onBody
     onBodyCb*: BodyCb         ## inbound streaming sink (req.onBody)
+    fwdCached*: bool          ## RFC 7239 Forwarded parsed once per request
+    cachedForwarded*: seq[tuple[forr, proto, host: string]]
+                              ## its elements, reused by forwardedProto/Host/clientIp
 
   Connection* = object
     fd*: int32
@@ -433,6 +436,35 @@ proc unpackResponse*(data: string):
     result.headers.add (name, val)
   result.bodyStart = pos
 
+proc setSlice(dst: var string, src: string, start, n: int) {.inline.} =
+  ## Overwrite `dst` with src[start ..< start+n], reusing dst's existing buffer
+  ## (no allocation once it is large enough).
+  dst.setLen(n)
+  if n > 0: copyMem(addr dst[0], unsafeAddr src[start], n)
+
+proc unpackResponseInto*(data: string, contentType: var string,
+                         headers: var seq[(string, string)]): int =
+  ## Decode a packed response (see packResponse) into caller-owned, reusable
+  ## buffers instead of freshly-allocated strings + seq, and return bodyStart.
+  ## The loop drains many worker responses per wakeup; reusing one `contentType`
+  ## string and one `headers` seq (whose slot strings are overwritten in place)
+  ## makes that path allocation-free after warmup -- the former unpackResponse
+  ## allocated the seq plus a substr per header name and value every time. The
+  ## buffers are only valid until the next call, which is fine: the loop copies
+  ## them into the write buffer / header block before draining the next message.
+  ## Loop-thread only.
+  var pos = 0
+  let ctLen = int(getU32(data, pos)); pos += 4
+  contentType.setSlice(data, pos, ctLen); pos += ctLen
+  let n = int(getU32(data, pos)); pos += 4
+  headers.setLen(n)                 # keeps the seq buffer + surviving slot strings
+  for i in 0 ..< n:
+    let nl = int(getU32(data, pos)); pos += 4
+    headers[i][0].setSlice(data, pos, nl); pos += nl
+    let vl = int(getU32(data, pos)); pos += 4
+    headers[i][1].setSlice(data, pos, vl); pos += vl
+  result = pos
+
 proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
   ## Resolve a (fd, gen) handle; nil if the connection is gone.
   if fd < 0 or int(fd) >= core.conns.len: return nil
@@ -587,6 +619,7 @@ proc resetRequest*(rs: var RequestState) =
   rs.onRespDrain = nil
   rs.reqStreaming = false
   rs.onBodyCb = nil
+  rs.fwdCached = false        # keep cachedForwarded storage; overwritten on next use
 
 proc resetRequestState(c: var Connection) =
   ## Clear the per-request fields shared by resetForNextRequest (keep-alive)

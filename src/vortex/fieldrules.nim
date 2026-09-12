@@ -9,6 +9,25 @@ const tokenDelims* = {'"', '(', ')', ',', '/', ':', ';', '<', '=', '>',
   ## RFC 9110 5.6.2 token separators: bytes that may not appear in a field
   ## name (VCHARs outside this set are valid token characters).
 
+func eqIgnoreAsciiCase*(s: string, lit: static string): bool =
+  ## Case-insensitive ASCII equality against a lowercase literal, allocating
+  ## nothing (unlike `s.toLowerAscii == lit`). The length guard short-circuits
+  ## the common non-match on the response header hot path. `lit` must already be
+  ## lowercase (a compile-time literal).
+  if s.len != lit.len: return false
+  for i in 0 ..< lit.len:
+    var c = s[i]
+    if c in 'A'..'Z': c = char(uint8(c) or 0x20'u8)
+    if c != lit[i]: return false
+  true
+
+func isLowerAscii*(s: string): bool =
+  ## True when `s` contains no ASCII uppercase letter, i.e. it is already in
+  ## HTTP/2 lowercase wire form and needs no `toLowerAscii` copy.
+  for c in s:
+    if c in 'A'..'Z': return false
+  true
+
 func validFieldValue*(val: string): bool =
   ## RFC 9113 8.2.1 / RFC 9114 4.1.2: no field (pseudo or regular) may carry
   ## NUL, CR, or LF in its value -- a header-injection / smuggling vector if
