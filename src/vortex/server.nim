@@ -105,13 +105,14 @@ proc validateConfig(s: VortexConfig) =
 proc teardownResources(server: var Server) =
   ## Free every shared resource a Server owns, in one place, and null the handles
   ## so a repeat close/waitFor is a no-op. The caller must have already joined (or
-  ## detached) the loop/worker threads; this does not touch the listen fds (the
-  ## loops own and close those on exit). Used by both the startServer unwind path
-  ## and the clean waitFor path so the resource list lives once.
-  for ob in server.outboxes:
-    if ob != nil: freeOutbox ob
-  server.outboxes.setLen(0)
+  ## detached) the loop threads; this does not touch the listen fds (the loops own
+  ## and close those on exit). Used by both the startServer unwind path and the
+  ## clean waitFor path so the resource list lives once.
   server.threads.setLen(0)
+  # Order matters: shut the worker pool down (joining the worker threads) BEFORE
+  # freeing the outboxes, because workers post blocking: results into the outboxes
+  # and hold their locks -- freeing an outbox lock under a live worker is a race
+  # (helgrind caught this). Loop threads were already joined by the caller.
   if server.pool != nil:
     server.pool.shutdown()
     deallocShared server.pool
@@ -119,6 +120,9 @@ proc teardownResources(server: var Server) =
   if server.alive != nil:
     deallocShared server.alive
     server.alive = nil
+  for ob in server.outboxes:
+    if ob != nil: freeOutbox ob
+  server.outboxes.setLen(0)
   when not defined(plainHttp):
     if server.tls != nil:
       freeTlsConfig(cast[ptr TlsConfig](server.tls))
