@@ -21,17 +21,17 @@ when not declared(onCompleted):
 
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
   ## Idempotent; called automatically by the entry points below.
-  if core.pumpHook == nil:
-    core.pumpHook = pump
-    core.teardownHook = teardown
+  if core.hooks.pumpHook == nil:
+    core.hooks.pumpHook = pump
+    core.hooks.teardownHook = teardown
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
   ## if the body already answered).
   if failed:
     response(req).send(Http500, "500 Internal Server Error")
-  if req.core.kick != nil:
-    req.core.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
+  if req.core.hooks.kick != nil:
+    req.core.hooks.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
 
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling to a running future: 500 on failure,
@@ -124,65 +124,104 @@ proc write*(res: Response, data: string) {.async.} =
 # a per-request reader and feeds it from onBody; the handler pulls chunks with
 # `await req.read()`, getting "" at end of body.
 
-type
-  BodyReader = ref object
-    req: Request
-    chunks: Deque[string]
-    eof: bool
-    waiter: Future[string]         ## a read() suspended on an empty queue
+# --- generic single-consumer awaitable reader ------------------------------
+# A queue with at most one parked waiter, shared by the request-body reader
+# (T = a body chunk string) and the WebSocket message reader (T = WsMessage):
+# feed hands an item to a parked take, else enqueues; markEof records the
+# terminal value; take drains the queue then returns that eof value, rejecting a
+# concurrent second waiter. Every item handed to the consumer passes through
+# dequeue, so onConsume (nil unless set) fires exactly once per item -- the body
+# reader grants manualAck flow-control credit there.
 
-var bodyReaders {.threadvar.}: Table[(int32, uint32, uint32), BodyReader]
+type
+  AwaitableReader[T] = ref object
+    queue: Deque[T]
+    closed: bool
+    eofVal: T                      ## value handed out on/after end of stream
+    waiter: Future[T]              ## a take() suspended on an empty queue
+    onConsume: proc (item: T) {.gcsafe, raises: [].}
+
+proc dequeue[T](r: AwaitableReader[T]): T =
+  result = r.queue.popFirst()
+  if r.onConsume != nil: r.onConsume(result)
+
+proc feed[T](r: AwaitableReader[T], item: T) =
+  ## Deliver an item: hand it to a parked take (via dequeue, so onConsume fires),
+  ## else enqueue it.
+  r.queue.addLast item
+  if r.waiter != nil and not r.waiter.finished:
+    let w = r.waiter
+    r.waiter = nil
+    w.complete(r.dequeue())
+
+proc markEof[T](r: AwaitableReader[T], eofVal: T) =
+  ## End of stream: record the terminal value and hand it to a parked take (a
+  ## waiter is only parked on an empty queue, so nothing queued is skipped).
+  r.closed = true
+  r.eofVal = eofVal
+  if r.waiter != nil and not r.waiter.finished:
+    let w = r.waiter
+    r.waiter = nil
+    w.complete(eofVal)
+
+proc drained[T](r: AwaitableReader[T]): bool {.inline.} =
+  ## Closed with the queue empty: nothing more will ever be handed out, so the
+  ## owner may reap the reader's table entry.
+  r.closed and r.queue.len == 0
+
+proc take[T](r: AwaitableReader[T]): Future[T] =
+  ## One pull: a queued item, the terminal eof value once drained, or park a
+  ## single waiter (a concurrent second reader is rejected -- it would leak the
+  ## first future). raises-safe under chronos's strict async effect tracking.
+  result = newFuture[T]("AwaitableReader.take")
+  if r.queue.len > 0:
+    result.complete(r.dequeue())
+  elif r.closed:
+    result.complete(r.eofVal)
+  elif r.waiter != nil and not r.waiter.finished:
+    result.fail(newException(ValueError, "concurrent read on one reader is unsupported"))
+  else:
+    r.waiter = result
+
+# --- pull-based request-body reading (await req.read) -----------------------
+
+var bodyReaders {.threadvar.}: Table[(int32, uint32, uint32), AwaitableReader[string]]
 
 proc toStr(a: openArray[char]): string =
   result = newString(a.len)
   if a.len > 0: copyMem(addr result[0], unsafeAddr a[0], a.len)
 
-proc take(r: BodyReader): string =
-  ## Dequeue a chunk and grant flow-control credit for it (manualAck): the peer
-  ## is only allowed to send more once the consumer has pulled this much.
-  ## ackBody reaches a loop hook (untyped effect); contain it so read() stays
-  ## raises-safe under chronos's strict async effect tracking.
-  result = r.chunks.popFirst()
-  try: r.req.ackBody(result.len)
-  except Exception: discard
-
-proc feed(r: BodyReader, chunk: openArray[char], last: bool) =
-  if chunk.len > 0: r.chunks.addLast(toStr(chunk))
-  if last: r.eof = true
-  if r.waiter != nil and not r.waiter.finished:
-    let w = r.waiter
-    r.waiter = nil
-    if r.chunks.len > 0: w.complete(r.take())
-    else: w.complete("")           # eof (a waiter is only set on an empty queue)
+proc newBodyReader(req: Request): AwaitableReader[string] =
+  ## A body reader whose onConsume grants manualAck flow-control credit for each
+  ## consumed chunk: the peer may send more only once the handler has pulled it.
+  ## ackBody reaches a loop hook (untyped effect); contain it.
+  result = AwaitableReader[string](queue: initDeque[string]())
+  let rq = req
+  result.onConsume = proc (chunk: string) {.gcsafe, raises: [].} =
+    try: rq.ackBody(chunk.len)
+    except Exception: discard
 
 proc read*(req: Request): Future[string] =
   ## Await the next request-body chunk in an async streaming handler; resolves
   ## to "" at end of body. Only meaningful on a route registered with the async
   ## `stream` below (or a `streamRoute` predicate); otherwise resolves to "".
-  result = newFuture[string]("request.read")
   let r = bodyReaders.getOrDefault((req.fd, req.gen, req.stream))
   if r == nil:
+    result = newFuture[string]("request.read")
     result.complete("")
-  elif r.chunks.len > 0:
-    result.complete(r.take())
-  elif r.eof:
-    result.complete("")
-  elif r.waiter != nil and not r.waiter.finished:
-    # A read() is already pending: don't overwrite it (that would leak the first
-    # future forever). Concurrent reads of one body are unsupported.
-    result.fail(newException(ValueError, "concurrent req.read() not supported"))
   else:
-    r.waiter = result
+    result = r.take()
 
 proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
   let h = inner
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
-      let r = BodyReader(req: req, chunks: initDeque[string]())
+      let r = newBodyReader(req)
       let k = (req.fd, req.gen, req.stream)
       bodyReaders[k] = r
       req.onBody(proc (chunk: openArray[char], last: bool) {.gcsafe.} =
-        r.feed(chunk, last), manualAck = true)
+        if chunk.len > 0: r.feed(toStr(chunk))
+        if last: r.markEof(""), manualAck = true)
       let fut = h(req, res)
       onCompleted(fut):
         bodyReaders.del(k)
@@ -306,21 +345,7 @@ type
     code*: uint16
     reason*: string
 
-  WsReader = ref object
-    msgs: Deque[(string, WsKind)]
-    eof: bool
-    code: uint16
-    reason: string
-    waiter: Future[WsMessage]
-
-var wsReaders {.threadvar.}: Table[(int32, uint32, uint32), WsReader]
-
-proc feedMsg(r: WsReader, data: string, kind: WsKind) =
-  if r.waiter != nil and not r.waiter.finished:
-    let w = r.waiter; r.waiter = nil
-    w.complete(WsMessage(data: data, kind: kind))
-  else:
-    r.msgs.addLast((data, kind))
+var wsReaders {.threadvar.}: Table[(int32, uint32, uint32), AwaitableReader[WsMessage]]
 
 proc installWsReader*(ws: WebSocket) {.raises: [].} =
   ## Install ws.onMessage/onClose feeding a per-handle reader, so `receive` can
@@ -329,21 +354,16 @@ proc installWsReader*(ws: WebSocket) {.raises: [].} =
   try:
     let key = (ws.fd, ws.gen, ws.stream)
     if wsReaders.hasKey(key): return
-    let r = WsReader(msgs: initDeque[(string, WsKind)]())
+    let r = AwaitableReader[WsMessage](queue: initDeque[WsMessage]())
     wsReaders[key] = r
     ws.onMessage = proc(s: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
-      r.feedMsg(data, kind)
+      r.feed(WsMessage(data: data, kind: kind))
     ws.onClose = proc(s: WebSocket, code: uint16, reason: string) {.gcsafe.} =
-      r.eof = true; r.code = code; r.reason = reason
-      if r.waiter != nil and not r.waiter.finished:
-        let w = r.waiter; r.waiter = nil
-        w.complete(WsMessage(closed: true, code: code, reason: reason))
-        wsReaders.del(key)
-      elif r.msgs.len == 0:
-        # Close with no parked receive() and nothing left to drain: drop the
-        # reader now so its per-handle entry can't leak in wsReaders (R12). A
-        # non-empty queue is left for receive() to drain, which deletes on eof.
-        wsReaders.del(key)
+      r.markEof(WsMessage(closed: true, code: code, reason: reason))
+      # Nothing left to hand out (no parked receive and no queued messages): drop
+      # the reader now so its per-handle entry can't leak (R12). A non-empty queue
+      # is left for receive() to drain, which reaps the entry once it hits eof.
+      if r.drained: wsReaders.del(key)
   except Exception:
     discard
 
@@ -360,21 +380,19 @@ proc receive*(ws: WebSocket): Future[WsMessage] =
   ## Await the next WebSocket message; the result's `closed` is true (carrying
   ## the peer's `code`/`reason`) once the socket closes. The reader must be
   ## installed first (via `messages`, or `installWsReader`). Loop-thread only.
-  result = newFuture[WsMessage]("ws.receive")
   let key = (ws.fd, ws.gen, ws.stream)
   let r = wsReaders.getOrDefault(key)
   if r == nil:
+    result = newFuture[WsMessage]("ws.receive")
     result.complete(WsMessage(closed: true))
-  elif r.msgs.len > 0:
-    let (d, k) = r.msgs.popFirst()
-    result.complete(WsMessage(data: d, kind: k))
-  elif r.eof:
-    wsReaders.del(key)
-    result.complete(WsMessage(closed: true, code: r.code, reason: r.reason))
-  elif r.waiter != nil and not r.waiter.finished:
-    result.fail(newException(ValueError, "concurrent ws.receive() not supported"))
   else:
-    r.waiter = result
+    # Reap the entry once the terminal (closed) message is the thing being handed
+    # out -- i.e. the queue was already drained and the reader closed. A pull that
+    # merely dequeues the last data message must NOT delete yet: the next receive
+    # still owes the closed message (with code/reason).
+    let handingOutEof = r.drained
+    result = r.take()
+    if handingOutEof: wsReaders.del(key)
 
 template messages*(ws: WebSocket, msg, body: untyped) =
   ## Async loop over incoming WebSocket messages: `body` runs per text/binary

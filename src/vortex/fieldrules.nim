@@ -110,6 +110,21 @@ func isForbiddenResponseField*(name: string, trailer = false): bool =
   eqIgnoreAsciiCase(name, "upgrade") or
   (trailer and eqIgnoreAsciiCase(name, "te"))
 
+func validTrailerField*(name, val: string): bool =
+  ## Whether a decoded h2/h3 request trailer field may be stored in req.trailers.
+  ## RFC 9113 8.1 / RFC 9114 4.1-4.2: a trailer is a field, so it must be a valid
+  ## lowercase-token name (never a pseudo-header) with a clean value, and must not
+  ## be a connection-specific / hop-by-hop field. HPACK/QPACK do no byte
+  ## validation, so without this a trailer could smuggle a CR/LF/NUL value or a
+  ## non-token name into req.trailers (#238 / #257). h2 and h3 reset the stream
+  ## when this returns false. The h1 parser deliberately does NOT use this: it
+  ## drops a wider RFC 9110 6.5.1 superset (framing / routing / auth / control
+  ## fields) from the trailer section rather than rejecting the message, a
+  ## stricter but lenient model, so it keeps its own list.
+  name.len > 0 and name[0] != ':' and
+    validFieldName(name) and validFieldValue(val) and
+    not isForbiddenResponseField(name, trailer = true)
+
 type RequestHeadClass* = enum
   rhInvalid    ## malformed: reject the request / reset the stream
   rhRequest    ## a normal request (:method/:path/:scheme present, authority ok)

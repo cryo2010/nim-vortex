@@ -8,6 +8,8 @@ when not defined(httpBrotli):
   {.error: "vortex/brotli requires -d:httpBrotli (and --passL:\"-lbrotlienc -lbrotlicommon\")".}
 
 import ./boundedinflate
+import ./compresscodec
+export compresscodec.DecodeResult, compresscodec.compress
 
 {.passL: "-lbrotlienc -lbrotlicommon".}
 
@@ -70,7 +72,7 @@ proc brotliEncoderHasMoreOutput(s: pointer): cint
   {.importc: "BrotliEncoderHasMoreOutput", cdecl.}
 
 type
-  BrotliStreamObj = object of RootObj
+  BrotliStreamObj = object of CompressStreamObj
     state: pointer            # BrotliEncoderState*
   BrotliStream* = ref BrotliStreamObj
 
@@ -92,7 +94,8 @@ proc newBrotliStream*(): BrotliStream =
   discard brotliEncoderSetParameter(result.state, brParamMode,
                                     uint32(brModeText))
 
-proc compress*(s: BrotliStream, data: openArray[char], last: bool): string =
+method compress*(s: BrotliStream, data: openArray[char], last: bool): string
+    {.gcsafe, raises: [].} =
   ## Feed one chunk; returns the compressed bytes to emit (may be ""). `last`
   ## finishes the stream. On error the encoder is dropped and returns "".
   if s == nil or s.state == nil: return ""
@@ -138,8 +141,7 @@ proc brotliDecoderDecompressStream(s: pointer, availIn: ptr csize_t,
                                    totalOut: ptr csize_t): cint
   {.importc: "BrotliDecoderDecompressStream", cdecl.}
 
-proc brotliDecode*(data: openArray[char], maxOut: int):
-    tuple[ok: bool, tooLarge: bool, data: string] =
+proc brotliDecode*(data: openArray[char], maxOut: int): DecodeResult =
   ## `tooLarge` distinguishes an over-cap body (-> 413) from a corrupt one.
   if maxOut <= 0: return (false, false, "")
   let s = brotliDecoderCreateInstance(nil, nil, nil)

@@ -41,7 +41,7 @@
 ## this bounds completion latency instead). chronos's `poll()` would
 ## otherwise block until its next timer, so the pump keeps a pending
 ## callback queued to force a zero-timeout backend poll. When the future
-## finishes, the deferred respond is flushed via LoopCore.kick. An
+## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
 ## uncaught exception in the body responds 500.
 
 import pkg/chronos
@@ -99,13 +99,25 @@ proc teardown() {.nimcall, gcsafe.} =
 
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
+proc trackPending() {.inline.} = inc pendingOps
+  ## Count one future as outstanding so the pump keeps running (and keeps capping
+  ## the loop timeout) until it completes. Paired with untrackPending.
+proc untrackPending() {.inline.} = dec pendingOps
+  ## The completion half of trackPending.
+
 template onCompleted(fut, body: untyped) =
-  ## Run `body` when `fut` completes, absorbing chronos's callback
-  ## signature (pointer argument, `raises: []`) and keeping the
-  ## pendingOps count that tells the pump when to run.
-  inc pendingOps
+  ## Contract shared with the asyncdispatch backend: run `body` when `fut`
+  ## completes (absorbing chronos's callback signature: pointer argument,
+  ## `raises: []`). This backend ADDITIONALLY owns the pump's pending-op
+  ## accounting -- chronos's own fds cannot wake our selector, so it tracks each
+  ## awaited future as outstanding (trackPending) until completion
+  ## (untrackPending) to tell the pump when to run. asyncdispatch needs none of
+  ## this (its dispatcher's hasPendingOperations already reports pending work), so
+  ## its onCompleted only runs body. Callers in adapterimpl rely only on the
+  ## "run body on completion" half; this pump-scheduling side is the backend's.
+  trackPending()
   fut.addCallback proc (arg: pointer) {.gcsafe, raises: [].} =
-    dec pendingOps
+    untrackPending()
     try:
       body
     except Exception:

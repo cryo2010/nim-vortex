@@ -29,6 +29,8 @@ export wscodec
 when not defined(plainHttp):
   import ./http3/ngtcp2/backend as h3codec   # HTTP/3 over ngtcp2 + nghttp3
   import ./transport/tls as tlscodec
+when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
+  import ./compresscodec   # CompressStream Strategy + DecodeResult (used only here)
 when defined(httpGzip):
   import ./gzip
 when defined(httpBrotli):
@@ -153,10 +155,45 @@ when not defined(plainHttp):
       for (n, v) in st.headers:
         if n == name: return v
 
+  proc h3FieldIn(h3c: H3Conn, stream: uint32, name: string): string =
+    ## A single request field from an already-resolved H3Conn + stream ("" if the
+    ## stream is gone or the field is absent). The by-carrier twin of h3FieldOf,
+    ## for use inside withCarrier's onH3 (which has already resolved h3c).
+    let st = h3StreamPtr(h3c, uint64(stream))
+    if st != nil:
+      for (n, v) in st.headers:
+        if n == name: return v
+
 template withConn(req: Request, c, body: untyped) =
   let c = conn(req.core, req.fd, req.gen)
   if c != nil:
     body
+
+template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
+  ## Discriminate the request carrier exactly once, the way ~20 read-accessors
+  ## each did inline: a worker-thread snapshot (req.snap), else an HTTP/3 slot
+  ## (fd < 0), else an HTTP/2 stream (stream != 0), else the HTTP/1 connection.
+  ## Compile-time Template Method: every branch inlines (no per-call indirection
+  ## on this hot path; NOT a runtime dispatch object). `c` / `h3c` are
+  ## caller-supplied identifiers (like withConn's `c`): onH2/onH1 see the resolved
+  ## non-nil Connection `c`, onH3 the resolved non-nil H3Conn `h3c`, onSnap uses
+  ## req.snap. The h3 branch is compiled out under -d:plainHttp.
+  if req.snap != nil:
+    onSnap
+  elif req.fd < 0:
+    when not defined(plainHttp):
+      let h3c = h3ConnOf(req.core, req.fd, req.gen)
+      if h3c != nil:
+        onH3
+    else:
+      discard
+  else:
+    let c = conn(req.core, req.fd, req.gen)
+    if c != nil:
+      if req.stream != 0:
+        onH2
+      else:
+        onH1
 
 proc lowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
@@ -219,61 +256,51 @@ proc `method`*(req: Request): HttpMethod =
   ## valid after a dot, so plain `req.method` works at call sites; only
   ## this declaration (and UFCS/standalone uses) needs backticks.
   result = HttpGet
-  if req.snap != nil: return req.snap.httpMethod
-  if req.fd < 0:
-    when not defined(plainHttp):
-      result = parseMethodStr(h3FieldOf(req, ":method"))
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      result = parseMethodStr(h2Field(c, req.stream, ":method"))
-    else:
-      result = c.parser.httpMethod
+  withCarrier(req, c, h3c):
+    result = req.snap.httpMethod
+  do:
+    result = parseMethodStr(h3FieldIn(h3c, req.stream, ":method"))
+  do:
+    result = parseMethodStr(h2Field(c, req.stream, ":method"))
+  do:
+    result = c.parser.httpMethod
 
 proc path*(req: Request): string =
-  if req.snap != nil: return req.snap.target
-  if req.fd < 0:
-    when not defined(plainHttp):
-      result = h3FieldOf(req, ":path")
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      result = h2Field(c, req.stream, ":path")
-    else:
-      result = c.rbuf.substr(int(c.parser.pathStart),
-                             int(c.parser.pathStart + c.parser.pathLen) - 1)
+  withCarrier(req, c, h3c):
+    result = req.snap.target
+  do:
+    result = h3FieldIn(h3c, req.stream, ":path")
+  do:
+    result = h2Field(c, req.stream, ":path")
+  do:
+    result = c.rbuf.substr(int(c.parser.pathStart),
+                           int(c.parser.pathStart + c.parser.pathLen) - 1)
 
 iterator items*(h: RequestHeaders): (string, string) =
   ## Yields (name, value) pairs (`for (n, v) in req.headers`). HTTP/2 and /3
   ## names are lowercase on the wire; pseudo-headers are skipped.
   let req = h.req
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     for (n, v) in req.snap.headers:
       if n.len > 0 and n[0] != ':': yield (n, v)
-  elif req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
-        if st != nil:
-          for (n, v) in st.headers:
-            if n.len > 0 and n[0] != ':':
-              yield (n, v)
-  else:
-    let c = conn(req.core, req.fd, req.gen)
-    if c != nil:
-      if req.stream != 0:
-        let st = h2Stream(c, req.stream)
-        if st != nil:
-          for (n, v) in st.headers:
-            if n.len > 0 and n[0] != ':':
-              yield (n, v)
-      else:
-        for hs in c.parser.headers:
-          yield (c.rbuf.substr(int(hs.nameStart),
-                               int(hs.nameStart + hs.nameLen) - 1),
-                 c.rbuf.substr(int(hs.valStart),
-                               int(hs.valStart + hs.valLen) - 1))
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil:
+      for (n, v) in st.headers:
+        if n.len > 0 and n[0] != ':':
+          yield (n, v)
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil:
+      for (n, v) in st.headers:
+        if n.len > 0 and n[0] != ':':
+          yield (n, v)
+  do:
+    for hs in c.parser.headers:
+      yield (c.rbuf.substr(int(hs.nameStart),
+                           int(hs.nameStart + hs.nameLen) - 1),
+             c.rbuf.substr(int(hs.valStart),
+                           int(hs.valStart + hs.valLen) - 1))
 
 proc h1NameMatches(c: ptr Connection, hs: HeaderSlice,
                    name: string): bool {.inline.} =
@@ -287,18 +314,15 @@ proc h1NameMatches(c: ptr Connection, hs: HeaderSlice,
 
 proc header*(req: Request, name: string): string =
   ## Case-insensitive single-header lookup; "" when absent.
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     let want = name.toLowerAscii
     for (n, v) in req.snap.headers:
       if n.toLowerAscii == want: return v
-    return ""
-  if req.fd < 0:
-    when not defined(plainHttp):
-      result = h3FieldOf(req, name.toLowerAscii)
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      return h2Field(c, req.stream, name.toLowerAscii)
+  do:
+    result = h3FieldIn(h3c, req.stream, name.toLowerAscii)
+  do:
+    return h2Field(c, req.stream, name.toLowerAscii)
+  do:
     for h in c.parser.headers:
       if h1NameMatches(c, h, name):
         return c.rbuf.substr(int(h.valStart),
@@ -325,23 +349,17 @@ proc contains*(h: RequestHeaders, name: string): bool =
       if pair[0].len > 0 and pair[0][0] != ':' and cmpIgnoreCase(pair[0], name) == 0:
         found = true; break
     found
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     return scanSeq(req.snap.headers)
-  if req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
-        if st != nil: return scanSeq(st.headers)
-    return false
-  let c = conn(req.core, req.fd, req.gen)
-  if c == nil: return false
-  if req.stream != 0:
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil: return scanSeq(st.headers)
+  do:
     let st = h2Stream(c, req.stream)
     return st != nil and scanSeq(st.headers)
-  for hs in c.parser.headers:                 # HTTP/1: compare against the read buffer
-    if h1NameMatches(c, hs, name): return true
-  false
+  do:
+    for hs in c.parser.headers:               # HTTP/1: compare against the read buffer
+      if h1NameMatches(c, hs, name): return true
 
 # --- request trailers -------------------------------------------------------
 
@@ -349,28 +367,22 @@ iterator items*(h: RequestTrailers): (string, string) =
   ## Yields (name, value) trailer pairs (`for (n, v) in req.trailers`). Names are
   ## lowercase on h2/h3; empty until the request body has fully arrived.
   let req = h.req
-  if req.snap != nil:
+  withCarrier(req, c, h3c):
     for (n, v) in req.snap.trailers: yield (n, v)
-  elif req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil:
-        let st = h3StreamPtr(h3c, uint64(req.stream))
-        if st != nil:
-          for (n, v) in st.trailers: yield (n, v)
-  else:
-    let c = conn(req.core, req.fd, req.gen)
-    if c != nil:
-      if req.stream != 0:
-        let st = h2Stream(c, req.stream)
-        if st != nil:
-          for (n, v) in st.trailers: yield (n, v)
-      else:
-        for hs in c.parser.trailers:
-          yield (c.rbuf.substr(int(hs.nameStart),
-                               int(hs.nameStart + hs.nameLen) - 1),
-                 c.rbuf.substr(int(hs.valStart),
-                               int(hs.valStart + hs.valLen) - 1))
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil:
+      for (n, v) in st.trailers: yield (n, v)
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil:
+      for (n, v) in st.trailers: yield (n, v)
+  do:
+    for hs in c.parser.trailers:
+      yield (c.rbuf.substr(int(hs.nameStart),
+                           int(hs.nameStart + hs.nameLen) - 1),
+             c.rbuf.substr(int(hs.valStart),
+                           int(hs.valStart + hs.valLen) - 1))
 
 proc trailers*(req: Request): RequestTrailers {.inline.} =
   ## A read-only, case-insensitive view of the request *trailers* (the header
@@ -396,17 +408,16 @@ proc len*(h: RequestTrailers): int =
   for _ in h: inc result
 
 proc body*(req: Request): string =
-  if req.snap != nil: return req.snap.body
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = st.body
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: result = st.body
-    elif c.bodyDecodedSet:
+  withCarrier(req, c, h3c):
+    result = req.snap.body
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil: result = st.body
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil: result = st.body
+  do:
+    if c.bodyDecodedSet:
       result = c.bodyDecoded          # decompressed request body (see decodeRequestBody)
     elif c.parser.chunked:
       result = c.chunkBody
@@ -422,14 +433,14 @@ proc remoteAddress*(req: Request): string =
   ## listener has `settings.proxyProtocol` enabled and the connection came from a
   ## trusted proxy, this is already the real client IP from the PROXY header.
   ## Empty for a stale handle.
-  if req.snap != nil: return req.snap.remoteAddr
-  if req.fd < 0:
-    when not defined(plainHttp):
-      let h3c = h3ConnOf(req.core, req.fd, req.gen)
-      if h3c != nil: return h3c.remoteAddr
-    return ""
-  let c = conn(req.core, req.fd, req.gen)
-  if c != nil: c.remoteAddr else: ""
+  withCarrier(req, c, h3c):
+    result = req.snap.remoteAddr
+  do:
+    result = h3c.remoteAddr
+  do:
+    result = c.remoteAddr
+  do:
+    result = c.remoteAddr
 
 proc clientCertSubject*(req: Request): string =
   ## The client certificate's subject DN for an mTLS connection, or "" if none
@@ -463,8 +474,8 @@ proc fromTrustedProxy*(req: Request): bool =
   ## non-empty). Forwarding headers (X-Forwarded-*, RFC 7239 Forwarded) are
   ## believed only from such a peer -- a request straight from a client can forge
   ## them, so with no trustedProxies configured this is always false (fail safe).
-  req.core != nil and req.core.trustedProxies.len > 0 and
-    isTrustedProxy(req.remoteAddress, req.core.trustedProxies)
+  req.core != nil and req.core.config.trustedProxies.len > 0 and
+    isTrustedProxy(req.remoteAddress, req.core.config.trustedProxies)
 
 type ForwardedElem = tuple[forr, proto, host: string]
 
@@ -546,7 +557,7 @@ proc clientIp*(req: Request): string =
   else:
     chain = req.forwardedFor
   for i in countdown(chain.high, 0):
-    if not isTrustedProxy(chain[i], req.core.trustedProxies): return chain[i]
+    if not isTrustedProxy(chain[i], req.core.config.trustedProxies): return chain[i]
   if chain.len > 0: return chain[0]
   req.remoteAddress
 
@@ -632,18 +643,16 @@ proc host*(req: Request): string =
   if result.len == 0: result = req.header("host")
 
 proc contentLength*(req: Request): int =
-  if req.snap != nil: return req.snap.body.len
-  if req.fd < 0:
-    when not defined(plainHttp):
-      withH3(req, st):
-        result = st.body.len
-    return
-  withConn(req, c):
-    if req.stream != 0:
-      let st = h2Stream(c, req.stream)
-      if st != nil: result = st.body.len
-    else:
-      result = if c.parser.chunked: c.chunkBody.len else: c.parser.bodyLen
+  withCarrier(req, c, h3c):
+    result = req.snap.body.len
+  do:
+    let st = h3StreamPtr(h3c, uint64(req.stream))
+    if st != nil: result = st.body.len
+  do:
+    let st = h2Stream(c, req.stream)
+    if st != nil: result = st.body.len
+  do:
+    result = if c.parser.chunked: c.chunkBody.len else: c.parser.bodyLen
 
 template lazyUrl(store: untyped, target: string): Uri =
   if not store.urlCached:
@@ -758,7 +767,8 @@ proc parseAcceptHeader(h: string): seq[tuple[tok: string, q: float]] =
     result.add (tok.toLowerAscii, q)
 
 proc negotiate(header: string, offered: openArray[string],
-               match: proc(entry, offered: string): int {.nimcall, gcsafe.}): string =
+               match: proc(entry, offered: string): int
+                       {.nimcall, gcsafe, raises: [].}): string =
   ## Pick the value from `offered` (in server-preference order) that the client
   ## most prefers. The most specific matching range determines an offer's q; the
   ## highest q wins, ties broken by offer order. No header -> the first offer.
@@ -798,6 +808,13 @@ proc matchLang(entry, offered: string): int {.nimcall, gcsafe.} =
 
 proc matchCharset(entry, offered: string): int {.nimcall, gcsafe.} =
   ## exact = 1, "*" = 0, none = -1.
+  if entry == "*": return 0
+  if entry == offered: return 1
+  -1
+
+proc matchEncoding(entry, offered: string): int {.nimcall, gcsafe.} =
+  ## Accept-Encoding tokens have no wildcard sub-structure, so this mirrors
+  ## matchCharset: exact = 1, "*" = 0, none = -1.
   if entry == "*": return 0
   if entry == offered: return 1
   -1
@@ -1031,53 +1048,35 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
 
   proc chooseEncoding(req: Request): string =
     ## Pick the best Content-Encoding we can produce from the client's
-    ## Accept-Encoding, honoring q-values (q=0 disables an encoding). On a q tie
-    ## the server prefers br, then zstd, then gzip (widest support / best text
-    ## ratio first). Returns "br", "zstd", "gzip", or "" (send identity).
-    var brQ, zsQ, gzQ = -1.0
-    for part in req.header("accept-encoding").split(','):
-      let tok = part.strip
-      if tok.len == 0: continue
-      var name = tok
-      var q = 1.0
-      let semi = tok.find(';')
-      if semi >= 0:
-        name = tok[0 ..< semi].strip
-        let low = tok.toLowerAscii
-        let qpos = low.find("q=")
-        if qpos >= 0:
-          try: q = parseFloat(low[qpos + 2 .. ^1].strip)
-          except ValueError: q = 0.0
-      case name.toLowerAscii
-      of "br": brQ = q
-      of "zstd": zsQ = q
-      of "gzip": gzQ = q
-      of "*":
-        if brQ < 0: brQ = q
-        if zsQ < 0: zsQ = q
-        if gzQ < 0: gzQ = q
-      else: discard
-    when not defined(httpBrotli): brQ = -1.0     # can't produce it
-    when not defined(httpZstd): zsQ = -1.0
-    when not defined(httpGzip): gzQ = -1.0
-    if brQ > 0 and brQ >= zsQ and brQ >= gzQ: "br"
-    elif zsQ > 0 and zsQ >= gzQ: "zstd"
-    elif gzQ > 0: "gzip"
-    else: ""
+    ## Accept-Encoding, honoring q-values (q=0 disables an encoding) and `*`. On
+    ## a q tie the server prefers br, then zstd, then gzip (widest support / best
+    ## text ratio first). Returns "br", "zstd", "gzip", or "" (send identity).
+    ## Reuses the shared negotiate() q-value machinery (accepts/acceptsLanguage/
+    ## acceptsCharset), with the offer list limited to encoders this build can
+    ## produce. No Accept-Encoding header -> identity (unlike accepts(), which
+    ## falls back to the first offer, an encoding is only added on explicit ask).
+    let ae = req.header("accept-encoding")
+    if ae.strip.len == 0: return ""
+    var offered: seq[string]                       # server-preference order,
+    when defined(httpBrotli): offered.add "br"     # restricted to encoders this
+    when defined(httpZstd): offered.add "zstd"     # build can actually produce
+    when defined(httpGzip): offered.add "gzip"
+    negotiate(ae, offered, matchEncoding)
 
   # --- streaming compression (res.sendHead/write/finish, SSE, file streaming) --
   proc negotiateStreamEnc(res: Response, contentType: string,
                           headers: openArray[(string, string)]): string =
     ## The encoding to stream a sendHead body with, or "" for identity. Same
     ## eligibility as send() minus the size threshold (the length is unknown).
-    if not res.core.compress or not compressibleType(contentType) or
+    if not res.core.config.compress or not compressibleType(contentType) or
         hasContentEncoding(headers):
       return ""
     chooseEncoding(Request(core: res.core, fd: res.fd, gen: res.gen,
                            stream: res.stream))
 
   proc makeStreamComp(enc: string): RootRef =
-    ## A streaming compressor for `enc` (upcast to RootRef), or nil.
+    ## A streaming compressor for `enc` (a CompressStream, stored type-erased as
+    ## RootRef), or nil. The one place the algorithm name selects a backend.
     when defined(httpBrotli):
       if enc == "br": return newBrotliStream()
     when defined(httpZstd):
@@ -1086,16 +1085,12 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if enc == "gzip": return newGzipStream()
     nil
 
-  proc compChunk(comp: RootRef, enc: string, data: openArray[char],
-                 last: bool): string =
-    ## Feed a chunk to `comp` and return the bytes to emit (may be "").
-    when defined(httpBrotli):
-      if enc == "br": return BrotliStream(comp).compress(data, last)
-    when defined(httpZstd):
-      if enc == "zstd": return ZstdStream(comp).compress(data, last)
-    when defined(httpGzip):
-      if enc == "gzip": return GzipStream(comp).compress(data, last)
-    ""
+  proc compChunk(comp: RootRef, data: openArray[char], last: bool): string =
+    ## Feed a chunk to `comp` and return the bytes to emit (may be ""). Dispatches
+    ## polymorphically on the concrete encoder (CompressStream.compress) -- no
+    ## per-call `case` over the algorithm.
+    if comp == nil: return ""
+    CompressStream(comp).compress(data, last)
 
 proc contentTypeOf(headers: openArray[(string, string)]): string =
   ## The Content-Type already present in `headers` ("" if none, case-insensitive).
@@ -1117,7 +1112,7 @@ proc sendBody(res: Response, code: HttpCode, body: openArray[char],
   let effCt = if ctHdr.len > 0: ctHdr else: defaultCt   # for compressibility
   let writeCt = if ctHdr.len > 0: "" else: defaultCt    # skip if headers have it
   when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-    if res.core.compress and body.len >= compressMinSize and
+    if res.core.config.compress and body.len >= compressMinSize and
         compressibleType(effCt) and not hasContentEncoding(headers):
       let enc = chooseEncoding(Request(core: res.core, fd: res.fd,
                                        gen: res.gen, stream: res.stream))
@@ -1233,7 +1228,7 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     ## for an over-cap body or 400 for a corrupt one) to skip the handler; true
     ## otherwise (including the no-op cases: feature off, no/other encoding,
     ## empty body). Called once at dispatch (loop thread) before the handler.
-    if not req.core.decompressRequest: return true
+    if not req.core.config.decompressRequest: return true
     let enc = req.header("content-encoding").strip.toLowerAscii
     var isGzip, isBr, isZstd = false
     when defined(httpGzip):
@@ -1245,9 +1240,9 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if not (isGzip or isBr or isZstd): return true
     let raw = req.body
     if raw.len == 0: return true
-    let cap = if req.core.maxDecompressedBody > 0: req.core.maxDecompressedBody
+    let cap = if req.core.config.maxDecompressedBody > 0: req.core.config.maxDecompressedBody
               else: 512 * 1024 * 1024      # hard ceiling when maxBodySize=0
-    var r: tuple[ok: bool, tooLarge: bool, data: string]
+    var r: DecodeResult
     when defined(httpGzip):
       if isGzip: r = gunzip(raw, cap)
     when defined(httpBrotli):
@@ -1306,7 +1301,7 @@ proc informational*(res: Response, code: HttpCode,
     s.add "\r\n"
     c.wbuf.add s
   # Flush now so the hint is on the wire before the handler does its work.
-  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  try: res.core.hooks.flushHook(res.core.loopPtr, res.fd, res.gen)
   except Exception: discard
 
 proc earlyHints*(res: Response, links: openArray[string],
@@ -1555,7 +1550,7 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
       currentThreadId() == req.core.threadId:
     c.sent100 = true
     c.wbuf.add continue100
-    try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+    try: req.core.hooks.flushHook(req.core.loopPtr, req.fd, req.gen)
     except Exception: discard
 
 proc ackBody*(req: Request, n: int) =
@@ -1577,7 +1572,7 @@ proc ackBody*(req: Request, n: int) =
   let c = conn(req.core, req.fd, req.gen)
   if c == nil or req.stream == 0: return
   h2AckBody(c, req.stream, n)
-  try: req.core.flushHook(req.core.loopPtr, req.fd, req.gen)
+  try: req.core.hooks.flushHook(req.core.loopPtr, req.fd, req.gen)
   except Exception: discard
 
 # --- streaming responses ----------------------------------------------------
@@ -1586,11 +1581,11 @@ proc flushConn(res: Response) {.raises: [].} =
   ## Call the loop's flush hook, containing its untyped effect so the streaming
   ## API stays callable from a strict-effect async body (chronos infers the
   ## hook as raising Exception, which `{.async.}` forbids).
-  try: res.core.flushHook(res.core.loopPtr, res.fd, res.gen)
+  try: res.core.hooks.flushHook(res.core.loopPtr, res.fd, res.gen)
   except Exception: discard
 
 proc kickConn(res: Response) {.raises: [].} =
-  try: res.core.kick(res.core.loopPtr, res.fd, res.gen, 0)
+  try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0)
   except Exception: discard
 
 proc h2Writable(res: Response, backlog: int): bool =
@@ -1726,8 +1721,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
-              let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)),
-                                data, false)
+              let z = compChunk(comp, data, false)
               if z.len == 0: return true      # buffered; still writable
               return h3StreamWrite(h3c, uint64(res.stream), z) < respHighWater
           return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
@@ -1738,7 +1732,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
-          let z = compChunk(st.rs.respComp, st.rs.respEnc, data, false)
+          let z = compChunk(st.rs.respComp, data, false)
           if z.len == 0: return true
           let backlog = h2StreamWrite(c, res.stream, z)
           flushConn(res)
@@ -1751,7 +1745,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
     c.respBodyWritten += data.len   # reconciled vs respContentLength at finish() (#248)
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.rs.respComp != nil:
-        let z = compChunk(c.rs.respComp, c.rs.respEnc, data, false)
+        let z = compChunk(c.rs.respComp, data, false)
         if z.len > 0:
           if c.respFraming == rfChunked: appendChunk(c.wbuf, z)
           else:
@@ -1802,7 +1796,7 @@ proc finish*(res: Response) {.raises: [].} =
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
-              let z = compChunk(comp, h3RespEnc(h3c, uint64(res.stream)), "", true)
+              let z = compChunk(comp, "", true)
               if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
           h3StreamFinish(h3c, uint64(res.stream), trailers)
@@ -1813,7 +1807,7 @@ proc finish*(res: Response) {.raises: [].} =
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         var st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
-          let z = compChunk(st.rs.respComp, st.rs.respEnc, "", true)
+          let z = compChunk(st.rs.respComp, "", true)
           if z.len > 0: discard h2StreamWrite(c, res.stream, z)
           # h2StreamWrite runs the scheduler, which may del OTHER streams on
           # completion and backshift the table, invalidating the captured `st`
@@ -1835,7 +1829,7 @@ proc finish*(res: Response) {.raises: [].} =
     c.respFraming = rfNone
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
       if c.rs.respComp != nil:
-        let z = compChunk(c.rs.respComp, c.rs.respEnc, "", true)   # trailer/finish
+        let z = compChunk(c.rs.respComp, "", true)   # trailer/finish
         if z.len > 0 and c.parser.httpMethod != HttpHead:
           if framing == rfChunked: appendChunk(c.wbuf, z)
           else:
@@ -2197,6 +2191,25 @@ proc workerResponse(req: Request, rel: PinRelease): Response =
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
            relKind: rel)
 
+template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
+  ## The shared invariant of the synchronous worker trampolines: on the pool path
+  ## (a worker thread holding the connection pin) reset the first-send-wins latch,
+  ## run `body`, turn any exception into a 500 rather than let the worker abort,
+  ## and -- if the body answered nothing -- emit a default 500 so the task's
+  ## outbox message always fires and releases the pin (otherwise the connection
+  ## stays pinned forever). The inline no-pool path runs on the loop thread with
+  ## no pin, so it skips the latch and the fallback. The "always respond / release
+  ## the pin" contract thus lives in one place. Does NOT cover the awaitable
+  ## (err-box) or WebSocket (no-500) trampolines, whose completion differs.
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: workerResponded = false
+  try:
+    body
+  except Exception:
+    res.send(Http500, "500 Internal Server Error")
+  if onWorker and not workerResponded:
+    res.send(Http500, "500 Internal Server Error")
+
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, data: string) {.nimcall, gcsafe.} =
   discard data                 # HTTP bodies read the request via `req`
@@ -2204,23 +2217,26 @@ proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = workerResponse(req, prBlocking)   # sync task: first send releases
-  # On the pool path this runs on a worker thread and holds the connection pin;
-  # the inline no-pool path runs on the loop thread with no pin. Only the worker
-  # path needs the "always respond" guard (and its send routes via the outbox).
-  let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
-  try:
+  runWorkerBody(lc, res):
     fn(req, res)
-  except Exception:
-    # Exception (incl. a catchable Defect): answer 500 rather than let the
-    # worker thread abort. The trailing guard still releases the pin.
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    # The body finished without a response (forgot res.send, or used the
-    # loop-thread-only streaming API from a worker, which no-ops here). Emit a
-    # default 500 so the client is answered and the outbox push releases the
-    # pin this task holds -- otherwise the connection stays pinned forever.
-    res.send(Http500, "500 Internal Server Error")
+
+proc acquireDispatchPin(req: Request, kind: PinKind): bool =
+  ## Resolve the request's carrier and take a `kind` pin on it: an H3 slot when
+  ## `fd < 0` (verifying the slot's generation still matches), else the Connection
+  ## for `fd`/`gen`. Returns false WITHOUT pinning if the carrier is gone (a
+  ## stale / closed connection), so each dispatcher can bail and run its own
+  ## cleanup. Centralizes the `fd < 0 == h3 slot` encoding the four
+  ## dispatchBlocking* variants otherwise each repeat verbatim.
+  if req.fd < 0:
+    let idx = h3SlotOf(req.fd)
+    if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
+      return false
+    acquirePin(req.core, addr req.core.h3slots[idx], kind)
+  else:
+    let c = conn(req.core, req.fd, req.gen)
+    if c == nil: return false
+    acquirePin(req.core, c, kind)
+  true
 
 proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   ## Pin the connection and hand `fn` to the worker pool. Must be called
@@ -2237,15 +2253,7 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
       blockingTrampoline(cast[pointer](fn), cast[pointer](req.core),
                          req.fd, req.gen, req.stream, "")  # no pool: inline
       return
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return
-      acquirePin(req.core, addr req.core.h3slots[idx], pkBlocking)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return
-      acquirePin(req.core, c, pkBlocking)
+    if not acquireDispatchPin(req, pkBlocking): return
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
@@ -2268,14 +2276,8 @@ proc blockingDataImpl(user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = workerResponse(req, rel)
-  let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
-  try:
+  runWorkerBody(lc, res):
     fn(req, res, data)
-  except Exception:
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    res.send(Http500, "500 Internal Server Error")
 
 proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
                             stream: uint32, data: string) {.nimcall, gcsafe.} =
@@ -2316,15 +2318,7 @@ proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
       tramp(cast[pointer](fn), cast[pointer](req.core),
             req.fd, req.gen, req.stream, data)  # no pool: inline
       return true
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return false
-      acquirePin(req.core, addr req.core.h3slots[idx], pin)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return false
-      acquirePin(req.core, c, pin)
+    if not acquireDispatchPin(req, pin): return false
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: tramp, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
@@ -2361,14 +2355,8 @@ proc blockingArgsTrampoline[T](user, core: pointer, fd: int32, gen: uint32,
   let lc = cast[ptr LoopCore](core)
   let req = workerReq(lc, fd, gen, stream)
   let res = workerResponse(req, prBlocking)   # sync task: first send releases
-  let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
-  try:
+  runWorkerBody(lc, res):
     box.body(req, res, box.data)
-  except Exception:
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    res.send(Http500, "500 Internal Server Error")
   GC_unref(box)
 
 proc dispatchBlockingArgs[T](req: Request,
@@ -2395,15 +2383,7 @@ proc dispatchBlockingArgs[T](req: Request,
     # incref -- a genuine data race and the ASan use-after-free in the
     # blocking(args) path). An early return below (dead conn) still decs the
     # local here, but only on the loop thread, which is safe.
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        return
-      acquirePin(req.core, addr req.core.h3slots[idx], pkBlocking)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: return
-      acquirePin(req.core, c, pkBlocking)
+    if not acquireDispatchPin(req, pkBlocking): return
     let raw = cast[pointer](box)
     wasMoved(box)                                 # transfer ownership; no loop dec
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
@@ -2488,15 +2468,9 @@ proc dispatchBlockingResult*[A, R](req: Request,
       blockingResultTrampoline[A, R](cast[pointer](box), cast[pointer](req.core),
                                      req.fd, req.gen, req.stream, "")   # inline
       return
-    if req.fd < 0:
-      let idx = h3SlotOf(req.fd)
-      if idx >= req.core.h3slots.len or req.core.h3slots[idx].gen != req.gen:
-        GC_unref(box); dec req.core.pendingBlockingResults; return
-      acquirePin(req.core, addr req.core.h3slots[idx], pkAwait)
-    else:
-      let c = conn(req.core, req.fd, req.gen)
-      if c == nil: (GC_unref(box); dec req.core.pendingBlockingResults; return)
-      acquirePin(req.core, c, pkAwait)
+    if not acquireDispatchPin(req, pkAwait):
+      # Dead connection: balance the GC_ref and the pending count taken above.
+      GC_unref(box); dec req.core.pendingBlockingResults; return
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingResultTrampoline[A, R],
                        user: cast[pointer](box), core: cast[pointer](req.core),
@@ -2735,7 +2709,7 @@ proc acceptWebSocket*(req: Request,
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
       if h3c != nil:
         discard h3WsAccept(req.core, h3c, uint64(req.stream), req.fd, req.gen,
-                           req.core.maxWsMessage,
+                           req.core.config.maxWsMessage,
                            req.header("sec-websocket-extensions"),
                            req.header("sec-websocket-protocol"), protocols)
     return
@@ -2743,14 +2717,14 @@ proc acceptWebSocket*(req: Request,
   if c == nil: return
   if req.stream != 0:
     # HTTP/2 (RFC 8441): reply 200 on the stream and attach a WsConn.
-    discard h2WsAccept(c, req.stream, req.core.maxWsMessage,
+    discard h2WsAccept(c, req.stream, req.core.config.maxWsMessage,
                        req.header("sec-websocket-extensions"),
                        req.header("sec-websocket-protocol"), protocols,
                        req.core.dateStr, req.core.serverHeader)
     return
   if c.rs.responded or c.ws != nil: return
   discard wsAccept(req.core, c, req.header("sec-websocket-key"),
-                   req.core.maxWsMessage,
+                   req.core.config.maxWsMessage,
                    req.header("sec-websocket-extensions"),
                    req.header("sec-websocket-protocol"), protocols)
 

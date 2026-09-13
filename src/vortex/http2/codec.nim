@@ -11,6 +11,18 @@ import ../fieldrules   # token delimiters + pseudo-header machine shared with
 import ../websocket/codec as wscodec
 
 type
+  RespPhase* = enum
+    ## Explicit state machine for the streamed-response send path
+    ## (h2SendHead -> h2StreamWrite* -> h2StreamFinish / h2StreamAbort). Makes
+    ## the legal transition order a single guarded field instead of being spread
+    ## across booleans; mirrors http1/parser.nim's ParsePhase. A buffered
+    ## (non-streamed) response never leaves rpNone -- it does not use this path.
+    rpNone       ## no streamed response opened (initial; also buffered responses)
+    rpHeadSent   ## HEADERS emitted for a HEAD request -- headers only, stream closed
+    rpStreaming  ## HEADERS sent, body open: h2StreamWrite / h2StreamFinish allowed
+    rpFinished   ## h2StreamFinish ran: END_STREAM (or trailers) emitted
+    rpAborted    ## h2StreamAbort ran: RST_STREAM(INTERNAL_ERROR) sent
+
   H2Stream* = object
     headers*: seq[(string, string)]  ## request fields incl. pseudo-headers
     trailers*: seq[(string, string)] ## request trailer fields (after the body)
@@ -31,6 +43,9 @@ type
     rs*: RequestState                ## per-request state shared with h1/h3
                                      ## (responded, lazy caches, pathParams,
                                      ## streaming flags/callbacks)
+    respPhase*: RespPhase            ## streamed-response send state machine
+                                     ## (h2-local; replaces the old rs.respStreaming
+                                     ## flag for this path)
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool
@@ -406,6 +421,24 @@ proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
     encodeInt(hb, h2.pendingTableSizeUpdate, 5, 0x20)
     h2.pendingTableSizeUpdate = -1
 
+proc emitHeaderBlock(h2: H2Conn, c: ptr Connection, sid: uint32,
+                     hb: string, firstFrameFlags: uint8 = 0) =
+  ## Chunk an encoded header block into a HEADERS frame followed by CONTINUATION
+  ## frames, each <= peerMaxFrame, with END_HEADERS on the last fragment (RFC
+  ## 9113 6.2 / 6.10). `firstFrameFlags` (e.g. flagEndStream) rides the first
+  ## frame only. One home for the easy-to-get-wrong CONTINUATION-splitting rule.
+  var off = 0
+  var first = true
+  while first or off < hb.len:
+    let chunk = min(hb.len - off, h2.peerMaxFrame)
+    var flags = if off + chunk >= hb.len: flagEndHeaders else: 0'u8
+    if first: flags = flags or firstFrameFlags
+    c.wbuf.addFrameHeader(chunk,
+      (if first: ftHeaders else: ftContinuation), flags, sid)
+    c.wbuf.add hb[off ..< off + chunk]
+    off += chunk
+    first = false
+
 proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   ## Emit a streamed response's trailer section as a trailing HEADERS frame
   ## carrying END_STREAM, then drop the stream. Called once the response body
@@ -416,18 +449,7 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   h2.emitTableSizeUpdate(hb)
   for (name, val) in st.respTrailers:
     encodeExtraHeader(hb, name, val)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    var flags = if lastFrag: flagEndHeaders else: 0'u8
-    if first: flags = flags or flagEndStream   # END_STREAM rides the HEADERS
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb, flagEndStream)
   h2.teardownStream(c, sid)
 
 proc h2Sendable(h2: H2Conn, st: H2Stream): bool =
@@ -683,7 +705,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
   if sid notin h2.streams or h2.streams[sid].rs.responded: return
   template st: H2Stream = h2.streams[sid]
   st.rs.responded = true
-  st.rs.respStreaming = true
+  st.respPhase = if st.isHead: rpHeadSent else: rpStreaming
   if st.isHead:
     st.pendingIsLast = true            # HEAD: headers only, close the stream
   var hb = ""
@@ -698,18 +720,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
     encodeHeader(hb, "alt-svc", altSvc)
   for (name, val) in extraHeaders:
     encodeExtraHeader(hb, name, val)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    var flags = if lastFrag: flagEndHeaders else: 0'u8
-    if first and st.isHead: flags = flags or flagEndStream
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb, if st.isHead: flagEndStream else: 0'u8)
   if st.isHead:
     h2.teardownStream(c, sid)
 
@@ -718,7 +729,8 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   ## Append a body chunk to a streamed response and push it bounded by flow
   ## control. Returns the unsent backlog (pending body bytes) for backpressure.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
     return 0
   template st: H2Stream = h2.streams[sid]
   if st.isHead: return 0
@@ -740,10 +752,11 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   ## DATA frame carries END_STREAM (or, when `trailers` are given, a trailing
   ## HEADERS frame does), then push.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
     return
   template st: H2Stream = h2.streams[sid]
-  st.rs.respStreaming = false
+  st.respPhase = rpFinished
   st.rs.onRespDrain = nil
   clearBackedUp(h2, st)            # finished: never let a drain path resume it
   if st.isHead:
@@ -770,14 +783,15 @@ proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
   ## sees the transfer was cut short, not cleanly completed. No-op unless the
   ## stream is an open streamed response.
   let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or not h2.streams[sid].rs.respStreaming:
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
     return
-  h2.streams[sid].rs.respStreaming = false
+  h2.streams[sid].respPhase = rpAborted
   h2.streams[sid].rs.onRespDrain = nil
   h2.streamError(c, sid, errInternal)
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
-  ## LoopCore.wsStreamLookup: resolve a stream's WsConn for the public API.
+  ## LoopCore.hooks.wsStreamLookup: resolve a stream's WsConn for the public API.
   let c = cast[ptr Connection](cp)
   if c.h2 != nil:
     let h2 = H2Conn(c.h2)
@@ -787,7 +801,7 @@ proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
 proc installWsHooks*(core: ptr LoopCore) =
   ## Register the WebSocket-over-HTTP/2 lookup so the WebSocket layer can
   ## reach per-stream state without importing the h2 codec.
-  core.wsStreamLookup = h2WsLookup
+  core.hooks.wsStreamLookup = h2WsLookup
 
 proc h2WsTeardownAll*(c: ptr Connection) =
   ## Deliver onClose (1006) for every WebSocket stream when the connection
@@ -863,17 +877,7 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
   encodeHeader(hb, "date", dateStr)
   if proto.len > 0: encodeHeader(hb, "sec-websocket-protocol", proto)
   if ext.len > 0: encodeHeader(hb, "sec-websocket-extensions", ext)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    let flags = if lastFrag: flagEndHeaders else: 0'u8   # never END_STREAM
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb)                        # never END_STREAM
   true
 
 proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
@@ -907,19 +911,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
       if cmpIgnoreCase(hn, name) == 0: shadowed = true; break
     if not shadowed: encodeExtraHeader(hb, name, val)
   let noBody = body.len == 0 or skipBody or bodiless
-  # Header block fits one frame in practice; chunk defensively anyway.
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let lastFrag = off + chunk >= hb.len
-    var flags = if lastFrag: flagEndHeaders else: 0'u8
-    if first and noBody: flags = flags or flagEndStream
-    c.wbuf.addFrameHeader(chunk,
-      (if first: ftHeaders else: ftContinuation), flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb, if noBody: flagEndStream else: 0'u8)
   if noBody:
     h2.teardownStream(c, sid)
   else:
@@ -945,16 +937,7 @@ proc h2SendInformational*(c: ptr Connection, code: int, sid: uint32,
   encodeStatus(hb, code)
   for (name, val) in headers:
     encodeExtraHeader(hb, name, val)
-  var off = 0
-  var first = true
-  while first or off < hb.len:
-    let chunk = min(hb.len - off, h2.peerMaxFrame)
-    let flags = if off + chunk >= hb.len: flagEndHeaders else: 0'u8  # no END_STREAM
-    c.wbuf.addFrameHeader(chunk, (if first: ftHeaders else: ftContinuation),
-                          flags, sid)
-    c.wbuf.add hb[off ..< off + chunk]
-    off += chunk
-    first = false
+  emitHeaderBlock(h2, c, sid, hb)                        # no END_STREAM (1xx)
 
 # --- receive-window replenishment (batched WINDOW_UPDATE) -------------------
 
@@ -1077,19 +1060,11 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
       # too, but the HPACK decoder does no byte validation. Without this a
       # trailer value could carry CR/LF/NUL (header injection / response
       # splitting if logged, reflected, or relayed to an h1 upstream) or a
-      # non-token / uppercase name. Apply the same checks as the initial block:
-      # no pseudo-header, valid lowercase-token name, clean value, and no
-      # connection-specific field (#238).
-      if name.len == 0 or name[0] == ':' or
-          not validFieldName(name) or not validFieldValue(val):
+      # non-token / uppercase name, or a connection-specific field (#238).
+      # Shared rule (fieldrules.validTrailerField, also the h3 backend's).
+      if not validTrailerField(name, val):
         h2.streamError(c, sid, errProtocol)
         return
-      case name
-      of "connection", "proxy-connection", "keep-alive",
-         "transfer-encoding", "upgrade", "te":
-        h2.streamError(c, sid, errProtocol)
-        return
-      else: discard
       st.trailers.add (name, val)
     st.endStreamSeen = true
     if st.rs.reqStreaming and st.dispatched:
@@ -1184,10 +1159,430 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
 
 # --- frame ingestion --------------------------------------------------------
 
+proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                payloadPos: int, ready: var seq[uint32]) =
+  template payload(i: int): char = c.rbuf[payloadPos + i]
+  let sid = fh.streamId
+  if sid == 0: h2.connError(c, errProtocol); return
+  # An even stream id is server-initiated (push) space the client may never
+  # use, so it is permanently idle. A frame on it (like any frame on an idle
+  # stream) is a connection PROTOCOL_ERROR (RFC 9113 5.1) -- the `> lastStreamId`
+  # check alone misses even ids below the high-water mark (#240.1).
+  if (sid and 1'u32) == 0: h2.connError(c, errProtocol); return
+  if sid > h2.lastStreamId:
+    h2.connError(c, errProtocol)   # DATA on an idle stream
+    return
+  # Enforce the RECEIVE flow-control window we advertised (RFC 9113 6.9): the
+  # entire DATA payload counts against both windows, even on a stream in error.
+  # A peer that overruns the window is a FLOW_CONTROL_ERROR -- connection-level
+  # for the connection window, stream-level for the stream (matching Go's
+  # inflow.take / nghttp2). Credit is returned by creditStream/creditConn.
+  if fh.length > 0:
+    h2.connRecvRemaining -= fh.length
+    if h2.connRecvRemaining < 0: h2.connError(c, errFlowControl); return
+    if sid in h2.streams:
+      h2.streams[sid].recvRemaining -= fh.length
+      if h2.streams[sid].recvRemaining < 0:
+        # Stream-window overrun: RST this stream but return its connection-window
+        # bytes (this branch returns before the eager credit below, so record
+        # them as deferred and let teardownStream reclaim them -- #231).
+        h2.streams[sid].connDeferred += fh.length
+        h2.streamError(c, sid, errFlowControl); return
+  # Flow control applies to the whole payload regardless of validity.
+  # A streaming body's DATA payload has its connection-window credit deferred
+  # to consumption (set below); 0 means credit the whole frame eagerly.
+  var streamingConnDefer = 0
+  if sid notin h2.streams or h2.streams[sid].endStreamSeen or
+      not h2.streams[sid].headersDone:
+    # DATA on a closed / half-closed(remote) / never-headered stream: each
+    # small frame elicits a RST_STREAM reply, so budget it as overhead (a
+    # non-reading peer would otherwise grow wbuf without bound) -- #234.
+    h2.noteControlFrame(c)
+    h2.streamError(c, sid, errStreamClosed)
+  else:
+    var dataStart = payloadPos
+    var dataLen = fh.length
+    if (fh.flags and flagPadded) != 0:
+      if dataLen < 1: h2.connError(c, errFrameSize); return
+      let padLen = int(uint8(payload(0)))
+      if padLen >= dataLen: h2.connError(c, errProtocol); return
+      dataStart += 1
+      dataLen -= 1 + padLen
+    template st: H2Stream = h2.streams[sid]
+    if st.ws != nil:
+      # RFC 8441 WebSocket stream: DATA payload is WebSocket framing.
+      wsFeed(h2.core, c, WsConn(st.ws),
+               c.rbuf.toOpenArray(dataStart, dataStart + dataLen - 1))
+      if (fh.flags and flagEndStream) != 0 and sid in h2.streams and
+          h2.streams[sid].ws != nil:
+        wsPeerClosed(h2.core, c, WsConn(h2.streams[sid].ws))
+    elif st.body.len + dataLen > h2.maxBody:
+      h2.streamError(c, sid, errRefusedStream)
+    elif st.isWsConnect:
+      # WebSocket frames can arrive in the same read batch as the Extended
+      # CONNECT HEADERS, before the handler runs acceptWebSocket. Buffer them
+      # in st.body (bounded by the maxBody check above); h2WsAccept moves them
+      # into the WsConn's inBuf, pumped once the handler installs onMessage.
+      if dataLen > 0:
+        let old = st.body.len
+        st.body.setLen(old + dataLen)
+        copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+      if (fh.flags and flagEndStream) != 0:
+        st.endStreamSeen = true
+    elif st.rs.reqStreaming:
+      # Inbound streaming: hand DATA to onBody and clear (bounded memory);
+      # no content-length reconciliation since the body is not retained. The
+      # stream AND connection flow-control windows are replenished on consume
+      # (h2DeliverBody / ackBody), not here, so a slow consumer throttles the
+      # peer and the connection window caps total un-consumed buffer; padding
+      # is discarded now, so credit its flow-control bytes now.
+      if fh.length > dataLen:
+        h2.creditStream(c, sid, fh.length - dataLen)
+      streamingConnDefer = dataLen    # connection credit deferred to consume
+      st.connDeferred += dataLen      # owed back on consume / at teardown (#231)
+      st.bodyReceived += dataLen      # for content-length reconciliation (#237)
+      if dataLen > 0:
+        let old = st.body.len
+        st.body.setLen(old + dataLen)
+        copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+      let endS = (fh.flags and flagEndStream) != 0
+      if endS:
+        st.endStreamSeen = true
+        # A streaming route does not retain the body, but the declared
+        # content-length must still match the DATA received (RFC 9113 8.1.1):
+        # a mismatch desynchronizes an h1 upstream if the request is forwarded
+        # (smuggling). Fail the stream instead of delivering a clean last=true.
+        if st.contentLength >= 0 and st.bodyReceived != st.contentLength:
+          h2.streamError(c, sid, errProtocol)
+        else:
+          h2.h2DeliverBody(c, sid, true)
+      else:
+        h2.h2DeliverBody(c, sid, false)
+    else:
+      let old = st.body.len
+      st.body.setLen(old + dataLen)
+      if dataLen > 0:
+        copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+      # A buffered body is retained (not consumed on receipt) until END_STREAM
+      # dispatch, and its connection-window bytes are credited eagerly (a body
+      # larger than the window must be, or it could never arrive). So the
+      # window does NOT bound buffered memory; an independent per-connection
+      # aggregate does. cap >= maxBody, so any single upload fits; concurrent
+      # trickled bodies that together exceed it get the offender REFUSED_STREAM
+      # (retryable) instead of pinning ~2 GiB (#235).
+      st.bufferedCounted += dataLen
+      h2.bufferedBytes += dataLen
+      if h2.bufferedBytes > max(h2.connRecvWindow, h2.maxBody):
+        h2.streamError(c, sid, errRefusedStream)
+      elif (fh.flags and flagEndStream) != 0:
+        st.endStreamSeen = true
+        # Dispatched now: it leaves the un-dispatched aggregate (the handler
+        # will consume st.body and complete). Release its reservation.
+        h2.bufferedBytes -= st.bufferedCounted
+        st.bufferedCounted = 0
+        if st.contentLength >= 0 and
+            int64(st.body.len) != st.contentLength:
+          h2.streamError(c, sid, errProtocol)
+        elif not st.dispatched:
+          st.dispatched = true
+          ready.add sid
+  # Replenish the connection window eagerly (so a slow stream can't starve
+  # the others), EXCEPT a streaming body's DATA payload, which is credited on
+  # consumption (h2DeliverBody / ackBody) so the connection window bounds the
+  # total un-consumed upload buffer across all streams. The stream window is
+  # eager too, except a streaming request defers it to consumption likewise.
+  if fh.length > 0:
+    let connNow = fh.length - streamingConnDefer
+    if connNow > 0:
+      h2.creditConn(c, connNow)
+    if fh.streamId in h2.streams and
+        not h2.streams[fh.streamId].endStreamSeen and
+        not h2.streams[fh.streamId].rs.reqStreaming:
+      h2.creditStream(c, fh.streamId, fh.length)
+
+proc handleHeaders(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                   payloadPos: int, ready: var seq[uint32]) =
+  template payload(i: int): char = c.rbuf[payloadPos + i]
+  let sid = fh.streamId
+  if sid == 0 or (sid mod 2) == 0: h2.connError(c, errProtocol); return
+  var fragStart = payloadPos
+  var fragLen = fh.length
+  if (fh.flags and flagPadded) != 0:
+    if fragLen < 1: h2.connError(c, errFrameSize); return
+    let padLen = int(uint8(payload(0)))
+    fragStart += 1
+    fragLen -= 1
+    if padLen > fragLen: h2.connError(c, errProtocol); return
+    fragLen -= padLen
+  var selfDep = false
+  if (fh.flags and flagPriority) != 0:
+    if fragLen < 5: h2.connError(c, errFrameSize); return
+    selfDep = (get32(c.rbuf, fragStart) and 0x7fffffff'u32) == sid
+    fragStart += 5
+    fragLen -= 5
+  # A stream can be REFUSED (self-dependency, graceful drain, or the
+  # concurrency cap) without tearing the connection down. RFC 9113 4.3 still
+  # requires the field block to be HPACK-decoded even when discarded, or the
+  # server's dynamic table desyncs from the client's encoder; and the refused
+  # id must advance lastStreamId and track CONTINUATION so legally-pipelined
+  # frames behind it are not mistaken for idle-stream connection errors (#233).
+  # So: buffer + decode the block as usual, then RST with this code instead of
+  # dispatching -- never create the stream or reset the flood budget for it.
+  var refuseErr = 0'u32
+  if sid in h2.streams:
+    if not h2.streams[sid].headersDone:
+      h2.connError(c, errProtocol); return   # HEADERS while mid-request
+    if h2.streams[sid].endStreamSeen:
+      # HEADERS on a half-closed(remote) stream: RFC 9113 5.1 mandates a
+      # STREAM error STREAM_CLOSED, not a connection teardown (#239).
+      h2.streamError(c, sid, errStreamClosed); return
+    # else: trailers (allowed); the deprecated priority flag is ignored
+  elif sid <= h2.lastStreamId:
+    if sid in h2.earlyClosed:
+      # The server closed this stream early (final response before the client
+      # finished) and the client's legally in-flight HEADERS raced the
+      # deletion. Decode the block (keep HPACK in sync for the client's other
+      # streams) and answer RST_STREAM(STREAM_CLOSED) rather than GOAWAY-ing
+      # every concurrent request for correct client behavior (#239). Do NOT
+      # advance lastStreamId.
+      h2.earlyClosed.excl sid
+      refuseErr = errStreamClosed
+    else:
+      # A stream the client itself finished (END_STREAM), or an id below the
+      # high-water mark that was never opened: a HEADERS here is a genuine
+      # violation -> connection error STREAM_CLOSED (RFC 9113 5.1, h2spec 5.1).
+      h2.connError(c, errStreamClosed); return
+  else:
+    if selfDep:
+      # RFC 7540 5.3.1: self-dependency is a stream error PROTOCOL_ERROR.
+      refuseErr = errProtocol
+    elif h2.goingAway:
+      refuseErr = errRefusedStream
+    elif h2.maxConcurrentStreams > 0 and
+        h2.activeStreams >= h2.maxConcurrentStreams:
+      refuseErr = errRefusedStream
+    h2.lastStreamId = sid
+    if refuseErr == 0:
+      h2.streams[sid] = H2Stream(
+        sendWindow: h2.peerInitialWindow, contentLength: -1,
+        recvRemaining: h2.streamRecvWindow, urgency: defaultUrgency)
+      inc h2.activeStreams
+      if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
+        h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
+        h2.pendingPriority.del(sid)
+      h2.noteControlProgress()     # a real request: decay the flood budget
+  h2.headerBlock.setLen(fragLen)
+  if fragLen > 0:
+    copyMem(addr h2.headerBlock[0], addr c.rbuf[fragStart], fragLen)
+  if (fh.flags and flagEndHeaders) != 0:
+    h2.finishHeaders(c, sid, (fh.flags and flagEndStream) != 0, ready)
+    # finishHeaders decoded the block; a refused stream is not in the table so
+    # it returned without dispatching. Budget the refusal (overhead) then RST
+    # it. Skip if decoding or the budget already tore the connection down.
+    if refuseErr != 0 and c.state != csClosing:
+      h2.noteControlFrame(c)
+      if c.state != csClosing: h2.streamError(c, sid, refuseErr)
+  else:
+    h2.contStream = sid
+    h2.contEndStream = (fh.flags and flagEndStream) != 0
+    h2.contRefuse = refuseErr
+
+proc handleContinuation(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                        payloadPos: int, ready: var seq[uint32]) =
+  if h2.contStream == 0 or fh.streamId != h2.contStream:
+    h2.connError(c, errProtocol)
+    return
+  # Budget CONTINUATION fragments (CVE-2024-27316 class): a flood of
+  # zero-length CONTINUATION frames never grows headerBlock past the byte cap
+  # below, so count them against the control-frame budget, which resets only on
+  # real stream progress.
+  h2.noteControlFrame(c)
+  if c.state == csClosing: return
+  if h2.headerBlock.len + fh.length > h2.maxHeaderList * 2:
+    h2.connError(c, errEnhanceYourCalm)
+    return
+  let hbOld = h2.headerBlock.len
+  h2.headerBlock.setLen(hbOld + fh.length)
+  if fh.length > 0:
+    copyMem(addr h2.headerBlock[hbOld], addr c.rbuf[payloadPos], fh.length)
+  if (fh.flags and flagEndHeaders) != 0:
+    let sid = h2.contStream
+    h2.contStream = 0
+    let refuse = h2.contRefuse
+    h2.contRefuse = 0
+    h2.finishHeaders(c, sid, h2.contEndStream, ready)
+    if refuse != 0 and c.state != csClosing:   # decoded above; now refuse (#233/#239)
+      h2.noteControlFrame(c)
+      if c.state != csClosing: h2.streamError(c, sid, refuse)
+
+proc handleSettings(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                    payloadPos: int) =
+  if fh.streamId != 0: h2.connError(c, errProtocol); return
+  if (fh.flags and flagAck) != 0:
+    if fh.length != 0: h2.connError(c, errFrameSize)
+    return
+  if fh.length mod 6 != 0: h2.connError(c, errFrameSize); return
+  # Charge per setting entry, not per frame: a single 16 KiB SETTINGS carries
+  # ~2730 INITIAL_WINDOW_SIZE entries, each rewriting every open stream's send
+  # window (O(entries x streams)). One budget unit per frame let that amplify
+  # for free (#234).
+  h2.noteControlFrame(c, max(1, fh.length div 6))
+  if c.state == csClosing: return
+  var i = 0
+  var initialWindowChanged = false
+  while i < fh.length:
+    let id = get16(c.rbuf, payloadPos + i)
+    let value = get32(c.rbuf, payloadPos + i + 2)
+    case id
+    of setInitialWindowSize:
+      if value > 0x7fffffff'u32:
+        h2.connError(c, errFlowControl); return
+      let delta = int32(value) - h2.peerInitialWindow
+      h2.peerInitialWindow = int32(value)
+      for sid, st in h2.streams.mpairs:
+        # A stream's send window may already be near 2^31-1 (raised by
+        # WINDOW_UPDATE); a positive delta must not push it past the signed
+        # 31-bit ceiling, and the accounting must not wrap int32 either.
+        # RFC 9113 6.9.2 makes an out-of-range result a FLOW_CONTROL_ERROR.
+        let nw = int64(st.sendWindow) + int64(delta)
+        if nw > 0x7fffffff'i64 or nw < -0x80000000'i64:
+          h2.connError(c, errFlowControl); return
+        st.sendWindow = int32(nw)
+      initialWindowChanged = true
+    of setMaxFrameSize:
+      if value < 16384'u32 or value > 16777215'u32:
+        h2.connError(c, errProtocol); return
+      h2.peerMaxFrame = int(value)
+    of setEnablePush:
+      if value > 1'u32: h2.connError(c, errProtocol); return
+    of setHeaderTableSize:
+      # Our encoder is static-only (no dynamic entries), but RFC 7541 4.2 still
+      # requires signaling a reduced maximum to the peer's decoder. Cap our
+      # signalled max at the peer's value; when it drops, owe a size-update
+      # instruction on the next header block (#240.8).
+      let newMax = min(int(value), 4096)
+      if newMax != h2.encTableMax:
+        h2.encTableMax = newMax
+        h2.pendingTableSizeUpdate = newMax
+    else: discard
+    i += 6
+  c.wbuf.addFrameHeader(0, ftSettings, flagAck, 0)
+  if initialWindowChanged:
+    # Raising SETTINGS_INITIAL_WINDOW_SIZE grows every stream's send window
+    # (RFC 7540 6.9.2): re-enqueue any stream with a backlog and run a pass.
+    for sid, st in h2.streams:
+      if st.pendingBody.len - st.pendingPos > 0: h2.h2Enqueue(sid)
+    h2.h2Schedule(c)
+
+proc handlePing(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                payloadPos: int) =
+  if fh.streamId != 0: h2.connError(c, errProtocol); return
+  if fh.length != 8: h2.connError(c, errFrameSize); return
+  # Budget PING AND its ACK: a PING-ACK flood (we never solicit one) is pure
+  # overhead that the ACK-only guard used to let through unbudgeted (#234).
+  h2.noteControlFrame(c)
+  if c.state == csClosing: return
+  if (fh.flags and flagAck) == 0:
+    c.wbuf.addPingAck(c.rbuf.toOpenArray(payloadPos, payloadPos + 7))
+
+proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                        payloadPos: int) =
+  if fh.length != 4: h2.connError(c, errFrameSize); return
+  if fh.streamId != 0 and (fh.streamId and 1'u32) == 0:
+    h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
+  let inc32 = get32(c.rbuf, payloadPos) and 0x7fffffff'u32
+  if inc32 == 0:
+    # A WINDOW_UPDATE referencing an idle stream (never opened) is a
+    # connection-level PROTOCOL_ERROR (RFC 9113 5.1), like any frame on an
+    # idle stream -- check that before the stream-scoped 0-increment error, so
+    # id > lastStreamId GOAWAYs instead of RST-ing a stream that never existed.
+    if fh.streamId == 0 or fh.streamId > h2.lastStreamId:
+      h2.connError(c, errProtocol)
+    else: h2.streamError(c, fh.streamId, errProtocol)
+    return
+  if fh.streamId == 0:
+    if int64(h2.connSendWindow) + int64(inc32) > 0x7fffffff'i64:
+      h2.connError(c, errFlowControl); return
+    let wasBlocked = h2.connSendWindow <= 0
+    h2.connSendWindow += int32(inc32)
+    if h2.h2NextUrgency() >= 0 or (wasBlocked and h2.connSendWindow > 0):
+      # The connection window moved: run a scheduler pass. The ready-queue
+      # already holds the stream-sendable streams, so no scan is needed.
+      h2.h2Schedule(c)
+    else:
+      # A WINDOW_UPDATE that unblocked nothing is pure overhead; budget it so a
+      # flood trips ENHANCE_YOUR_CALM (the counter resets on real progress).
+      h2.noteControlFrame(c)
+      if c.state == csClosing: return
+  elif fh.streamId in h2.streams:
+    template st: H2Stream = h2.streams[fh.streamId]
+    if int64(st.sendWindow) + int64(inc32) > 0x7fffffff'i64:
+      h2.streamError(c, fh.streamId, errFlowControl); return
+    st.sendWindow += int32(inc32)
+    h2.h2Enqueue(fh.streamId)
+    h2.h2Schedule(c)
+  elif fh.streamId > h2.lastStreamId:
+    h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
+  else:
+    # Closed stream (<= lastStreamId, no longer in the table): the update is
+    # ignored, but a flood of them is pure overhead -- budget it (#234).
+    h2.noteControlFrame(c)
+
+proc handleRstStream(h2: H2Conn, c: ptr Connection, fh: FrameHeader) =
+  if fh.streamId == 0: h2.connError(c, errProtocol); return
+  if fh.length != 4: h2.connError(c, errFrameSize); return
+  if (fh.streamId and 1'u32) == 0:
+    h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
+  if fh.streamId > h2.lastStreamId:
+    h2.connError(c, errProtocol); return   # RST on idle stream
+  if fh.streamId in h2.streams:
+    # Unified teardown: reclaim deferred connection-window credit (#231),
+    # deliver onClose to a WebSocket, and fire onBodyCb(last=true) /
+    # onRespDrain so a handler suspended in await req.read()/res.drained()
+    # resumes instead of leaking a zombie coroutine (#232).
+    h2.teardownStream(c, fh.streamId)
+  # Rapid Reset (CVE-2023-44487): a peer that opens then immediately
+  # resets streams costs handler work while never holding concurrency.
+  # Cap cumulative resets per connection.
+  inc h2.rstStreamCount
+  if h2.maxResetStreams > 0 and h2.rstStreamCount > h2.maxResetStreams:
+    h2.connError(c, errEnhanceYourCalm)
+
+proc handlePriority(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
+                    payloadPos: int) =
+  if fh.streamId == 0: h2.connError(c, errProtocol); return
+  if fh.length != 5: h2.connError(c, errFrameSize); return
+  # Budget PRIORITY before any branch: a self-dependency flood used to run
+  # streamError (one RST per frame) and return *before* noteControlFrame, so it
+  # was entirely unbudgeted (#234). PRIORITY has no productive use here anyway.
+  h2.noteControlFrame(c)
+  if c.state == csClosing: return
+  if (get32(c.rbuf, payloadPos) and 0x7fffffff'u32) == fh.streamId:
+    # Self-dependency is a PROTOCOL_ERROR (RFC 7540 5.3.1). On an opened stream
+    # it is a STREAM error (RST_STREAM, connection survives -- Go/nghttp2). On
+    # an idle stream RST_STREAM is forbidden (RFC 9113 5.1), so the only legal
+    # signal is a connection error (h2spec expects GOAWAY here).
+    if fh.streamId > h2.lastStreamId:
+      h2.connError(c, errProtocol)
+    else:
+      h2.streamError(c, fh.streamId, errProtocol)
+  # Otherwise ignored (RFC 9113 deprecates the priority tree).
+
+proc handleGoaway(h2: H2Conn, c: ptr Connection, fh: FrameHeader) =
+  if fh.streamId != 0: h2.connError(c, errProtocol); return
+  # GOAWAY carries a 4-byte last-stream-id + 4-byte error code (8 octets min);
+  # a short frame is a connection FRAME_SIZE_ERROR (RFC 9113 4.2/6.8), like the
+  # ftPing/ftWindowUpdate length checks -- GOAWAY silently accepted it (#240.10).
+  if fh.length < 8: h2.connError(c, errFrameSize); return
+  # A peer (client) GOAWAY is informational for a server that never pushes;
+  # record it separately from our own drain flag so we do not start refusing
+  # the client's own subsequent streams (which `goingAway` would do). Budget
+  # it: a GOAWAY flood was previously unbudgeted overhead (#234).
+  h2.noteControlFrame(c)
+  h2.peerGoneAway = true
+
 proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
                  payloadPos: int, ready: var seq[uint32]) =
-  template payload(i: int): char = c.rbuf[payloadPos + i]
-
   if h2.contStream != 0 and
       (fh.typ != uint8(ftContinuation) or fh.streamId != h2.contStream):
     h2.connError(c, errProtocol)
@@ -1204,421 +1599,16 @@ proc handleFrame(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     return
 
   case FrameType(fh.typ)
-  of ftData:
-    let sid = fh.streamId
-    if sid == 0: h2.connError(c, errProtocol); return
-    # An even stream id is server-initiated (push) space the client may never
-    # use, so it is permanently idle. A frame on it (like any frame on an idle
-    # stream) is a connection PROTOCOL_ERROR (RFC 9113 5.1) -- the `> lastStreamId`
-    # check alone misses even ids below the high-water mark (#240.1).
-    if (sid and 1'u32) == 0: h2.connError(c, errProtocol); return
-    if sid > h2.lastStreamId:
-      h2.connError(c, errProtocol)   # DATA on an idle stream
-      return
-    # Enforce the RECEIVE flow-control window we advertised (RFC 9113 6.9): the
-    # entire DATA payload counts against both windows, even on a stream in error.
-    # A peer that overruns the window is a FLOW_CONTROL_ERROR -- connection-level
-    # for the connection window, stream-level for the stream (matching Go's
-    # inflow.take / nghttp2). Credit is returned by creditStream/creditConn.
-    if fh.length > 0:
-      h2.connRecvRemaining -= fh.length
-      if h2.connRecvRemaining < 0: h2.connError(c, errFlowControl); return
-      if sid in h2.streams:
-        h2.streams[sid].recvRemaining -= fh.length
-        if h2.streams[sid].recvRemaining < 0:
-          # Stream-window overrun: RST this stream but return its connection-window
-          # bytes (this branch returns before the eager credit below, so record
-          # them as deferred and let teardownStream reclaim them -- #231).
-          h2.streams[sid].connDeferred += fh.length
-          h2.streamError(c, sid, errFlowControl); return
-    # Flow control applies to the whole payload regardless of validity.
-    # A streaming body's DATA payload has its connection-window credit deferred
-    # to consumption (set below); 0 means credit the whole frame eagerly.
-    var streamingConnDefer = 0
-    if sid notin h2.streams or h2.streams[sid].endStreamSeen or
-        not h2.streams[sid].headersDone:
-      # DATA on a closed / half-closed(remote) / never-headered stream: each
-      # small frame elicits a RST_STREAM reply, so budget it as overhead (a
-      # non-reading peer would otherwise grow wbuf without bound) -- #234.
-      h2.noteControlFrame(c)
-      h2.streamError(c, sid, errStreamClosed)
-    else:
-      var dataStart = payloadPos
-      var dataLen = fh.length
-      if (fh.flags and flagPadded) != 0:
-        if dataLen < 1: h2.connError(c, errFrameSize); return
-        let padLen = int(uint8(payload(0)))
-        if padLen >= dataLen: h2.connError(c, errProtocol); return
-        dataStart += 1
-        dataLen -= 1 + padLen
-      template st: H2Stream = h2.streams[sid]
-      if st.ws != nil:
-        # RFC 8441 WebSocket stream: DATA payload is WebSocket framing.
-        wsFeed(h2.core, c, WsConn(st.ws),
-                 c.rbuf.toOpenArray(dataStart, dataStart + dataLen - 1))
-        if (fh.flags and flagEndStream) != 0 and sid in h2.streams and
-            h2.streams[sid].ws != nil:
-          wsPeerClosed(h2.core, c, WsConn(h2.streams[sid].ws))
-      elif st.body.len + dataLen > h2.maxBody:
-        h2.streamError(c, sid, errRefusedStream)
-      elif st.isWsConnect:
-        # WebSocket frames can arrive in the same read batch as the Extended
-        # CONNECT HEADERS, before the handler runs acceptWebSocket. Buffer them
-        # in st.body (bounded by the maxBody check above); h2WsAccept moves them
-        # into the WsConn's inBuf, pumped once the handler installs onMessage.
-        if dataLen > 0:
-          let old = st.body.len
-          st.body.setLen(old + dataLen)
-          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
-        if (fh.flags and flagEndStream) != 0:
-          st.endStreamSeen = true
-      elif st.rs.reqStreaming:
-        # Inbound streaming: hand DATA to onBody and clear (bounded memory);
-        # no content-length reconciliation since the body is not retained. The
-        # stream AND connection flow-control windows are replenished on consume
-        # (h2DeliverBody / ackBody), not here, so a slow consumer throttles the
-        # peer and the connection window caps total un-consumed buffer; padding
-        # is discarded now, so credit its flow-control bytes now.
-        if fh.length > dataLen:
-          h2.creditStream(c, sid, fh.length - dataLen)
-        streamingConnDefer = dataLen    # connection credit deferred to consume
-        st.connDeferred += dataLen      # owed back on consume / at teardown (#231)
-        st.bodyReceived += dataLen      # for content-length reconciliation (#237)
-        if dataLen > 0:
-          let old = st.body.len
-          st.body.setLen(old + dataLen)
-          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
-        let endS = (fh.flags and flagEndStream) != 0
-        if endS:
-          st.endStreamSeen = true
-          # A streaming route does not retain the body, but the declared
-          # content-length must still match the DATA received (RFC 9113 8.1.1):
-          # a mismatch desynchronizes an h1 upstream if the request is forwarded
-          # (smuggling). Fail the stream instead of delivering a clean last=true.
-          if st.contentLength >= 0 and st.bodyReceived != st.contentLength:
-            h2.streamError(c, sid, errProtocol)
-          else:
-            h2.h2DeliverBody(c, sid, true)
-        else:
-          h2.h2DeliverBody(c, sid, false)
-      else:
-        let old = st.body.len
-        st.body.setLen(old + dataLen)
-        if dataLen > 0:
-          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
-        # A buffered body is retained (not consumed on receipt) until END_STREAM
-        # dispatch, and its connection-window bytes are credited eagerly (a body
-        # larger than the window must be, or it could never arrive). So the
-        # window does NOT bound buffered memory; an independent per-connection
-        # aggregate does. cap >= maxBody, so any single upload fits; concurrent
-        # trickled bodies that together exceed it get the offender REFUSED_STREAM
-        # (retryable) instead of pinning ~2 GiB (#235).
-        st.bufferedCounted += dataLen
-        h2.bufferedBytes += dataLen
-        if h2.bufferedBytes > max(h2.connRecvWindow, h2.maxBody):
-          h2.streamError(c, sid, errRefusedStream)
-        elif (fh.flags and flagEndStream) != 0:
-          st.endStreamSeen = true
-          # Dispatched now: it leaves the un-dispatched aggregate (the handler
-          # will consume st.body and complete). Release its reservation.
-          h2.bufferedBytes -= st.bufferedCounted
-          st.bufferedCounted = 0
-          if st.contentLength >= 0 and
-              int64(st.body.len) != st.contentLength:
-            h2.streamError(c, sid, errProtocol)
-          elif not st.dispatched:
-            st.dispatched = true
-            ready.add sid
-    # Replenish the connection window eagerly (so a slow stream can't starve
-    # the others), EXCEPT a streaming body's DATA payload, which is credited on
-    # consumption (h2DeliverBody / ackBody) so the connection window bounds the
-    # total un-consumed upload buffer across all streams. The stream window is
-    # eager too, except a streaming request defers it to consumption likewise.
-    if fh.length > 0:
-      let connNow = fh.length - streamingConnDefer
-      if connNow > 0:
-        h2.creditConn(c, connNow)
-      if fh.streamId in h2.streams and
-          not h2.streams[fh.streamId].endStreamSeen and
-          not h2.streams[fh.streamId].rs.reqStreaming:
-        h2.creditStream(c, fh.streamId, fh.length)
-
-  of ftHeaders:
-    let sid = fh.streamId
-    if sid == 0 or (sid mod 2) == 0: h2.connError(c, errProtocol); return
-    var fragStart = payloadPos
-    var fragLen = fh.length
-    if (fh.flags and flagPadded) != 0:
-      if fragLen < 1: h2.connError(c, errFrameSize); return
-      let padLen = int(uint8(payload(0)))
-      fragStart += 1
-      fragLen -= 1
-      if padLen > fragLen: h2.connError(c, errProtocol); return
-      fragLen -= padLen
-    var selfDep = false
-    if (fh.flags and flagPriority) != 0:
-      if fragLen < 5: h2.connError(c, errFrameSize); return
-      selfDep = (get32(c.rbuf, fragStart) and 0x7fffffff'u32) == sid
-      fragStart += 5
-      fragLen -= 5
-    # A stream can be REFUSED (self-dependency, graceful drain, or the
-    # concurrency cap) without tearing the connection down. RFC 9113 4.3 still
-    # requires the field block to be HPACK-decoded even when discarded, or the
-    # server's dynamic table desyncs from the client's encoder; and the refused
-    # id must advance lastStreamId and track CONTINUATION so legally-pipelined
-    # frames behind it are not mistaken for idle-stream connection errors (#233).
-    # So: buffer + decode the block as usual, then RST with this code instead of
-    # dispatching -- never create the stream or reset the flood budget for it.
-    var refuseErr = 0'u32
-    if sid in h2.streams:
-      if not h2.streams[sid].headersDone:
-        h2.connError(c, errProtocol); return   # HEADERS while mid-request
-      if h2.streams[sid].endStreamSeen:
-        # HEADERS on a half-closed(remote) stream: RFC 9113 5.1 mandates a
-        # STREAM error STREAM_CLOSED, not a connection teardown (#239).
-        h2.streamError(c, sid, errStreamClosed); return
-      # else: trailers (allowed); the deprecated priority flag is ignored
-    elif sid <= h2.lastStreamId:
-      if sid in h2.earlyClosed:
-        # The server closed this stream early (final response before the client
-        # finished) and the client's legally in-flight HEADERS raced the
-        # deletion. Decode the block (keep HPACK in sync for the client's other
-        # streams) and answer RST_STREAM(STREAM_CLOSED) rather than GOAWAY-ing
-        # every concurrent request for correct client behavior (#239). Do NOT
-        # advance lastStreamId.
-        h2.earlyClosed.excl sid
-        refuseErr = errStreamClosed
-      else:
-        # A stream the client itself finished (END_STREAM), or an id below the
-        # high-water mark that was never opened: a HEADERS here is a genuine
-        # violation -> connection error STREAM_CLOSED (RFC 9113 5.1, h2spec 5.1).
-        h2.connError(c, errStreamClosed); return
-    else:
-      if selfDep:
-        # RFC 7540 5.3.1: self-dependency is a stream error PROTOCOL_ERROR.
-        refuseErr = errProtocol
-      elif h2.goingAway:
-        refuseErr = errRefusedStream
-      elif h2.maxConcurrentStreams > 0 and
-          h2.activeStreams >= h2.maxConcurrentStreams:
-        refuseErr = errRefusedStream
-      h2.lastStreamId = sid
-      if refuseErr == 0:
-        h2.streams[sid] = H2Stream(
-          sendWindow: h2.peerInitialWindow, contentLength: -1,
-          recvRemaining: h2.streamRecvWindow, urgency: defaultUrgency)
-        inc h2.activeStreams
-        if h2.pendingPriority.len > 0 and sid in h2.pendingPriority:
-          h2.h2Reprioritize(sid, h2.pendingPriority[sid])   # buffered PRIORITY_UPDATE
-          h2.pendingPriority.del(sid)
-        h2.noteControlProgress()     # a real request: decay the flood budget
-    h2.headerBlock.setLen(fragLen)
-    if fragLen > 0:
-      copyMem(addr h2.headerBlock[0], addr c.rbuf[fragStart], fragLen)
-    if (fh.flags and flagEndHeaders) != 0:
-      h2.finishHeaders(c, sid, (fh.flags and flagEndStream) != 0, ready)
-      # finishHeaders decoded the block; a refused stream is not in the table so
-      # it returned without dispatching. Budget the refusal (overhead) then RST
-      # it. Skip if decoding or the budget already tore the connection down.
-      if refuseErr != 0 and c.state != csClosing:
-        h2.noteControlFrame(c)
-        if c.state != csClosing: h2.streamError(c, sid, refuseErr)
-    else:
-      h2.contStream = sid
-      h2.contEndStream = (fh.flags and flagEndStream) != 0
-      h2.contRefuse = refuseErr
-
-  of ftContinuation:
-    if h2.contStream == 0 or fh.streamId != h2.contStream:
-      h2.connError(c, errProtocol)
-      return
-    # Budget CONTINUATION fragments (CVE-2024-27316 class): a flood of
-    # zero-length CONTINUATION frames never grows headerBlock past the byte cap
-    # below, so count them against the control-frame budget, which resets only on
-    # real stream progress.
-    h2.noteControlFrame(c)
-    if c.state == csClosing: return
-    if h2.headerBlock.len + fh.length > h2.maxHeaderList * 2:
-      h2.connError(c, errEnhanceYourCalm)
-      return
-    let hbOld = h2.headerBlock.len
-    h2.headerBlock.setLen(hbOld + fh.length)
-    if fh.length > 0:
-      copyMem(addr h2.headerBlock[hbOld], addr c.rbuf[payloadPos], fh.length)
-    if (fh.flags and flagEndHeaders) != 0:
-      let sid = h2.contStream
-      h2.contStream = 0
-      let refuse = h2.contRefuse
-      h2.contRefuse = 0
-      h2.finishHeaders(c, sid, h2.contEndStream, ready)
-      if refuse != 0 and c.state != csClosing:   # decoded above; now refuse (#233/#239)
-        h2.noteControlFrame(c)
-        if c.state != csClosing: h2.streamError(c, sid, refuse)
-
-  of ftSettings:
-    if fh.streamId != 0: h2.connError(c, errProtocol); return
-    if (fh.flags and flagAck) != 0:
-      if fh.length != 0: h2.connError(c, errFrameSize)
-      return
-    if fh.length mod 6 != 0: h2.connError(c, errFrameSize); return
-    # Charge per setting entry, not per frame: a single 16 KiB SETTINGS carries
-    # ~2730 INITIAL_WINDOW_SIZE entries, each rewriting every open stream's send
-    # window (O(entries x streams)). One budget unit per frame let that amplify
-    # for free (#234).
-    h2.noteControlFrame(c, max(1, fh.length div 6))
-    if c.state == csClosing: return
-    var i = 0
-    var initialWindowChanged = false
-    while i < fh.length:
-      let id = get16(c.rbuf, payloadPos + i)
-      let value = get32(c.rbuf, payloadPos + i + 2)
-      case id
-      of setInitialWindowSize:
-        if value > 0x7fffffff'u32:
-          h2.connError(c, errFlowControl); return
-        let delta = int32(value) - h2.peerInitialWindow
-        h2.peerInitialWindow = int32(value)
-        for sid, st in h2.streams.mpairs:
-          # A stream's send window may already be near 2^31-1 (raised by
-          # WINDOW_UPDATE); a positive delta must not push it past the signed
-          # 31-bit ceiling, and the accounting must not wrap int32 either.
-          # RFC 9113 6.9.2 makes an out-of-range result a FLOW_CONTROL_ERROR.
-          let nw = int64(st.sendWindow) + int64(delta)
-          if nw > 0x7fffffff'i64 or nw < -0x80000000'i64:
-            h2.connError(c, errFlowControl); return
-          st.sendWindow = int32(nw)
-        initialWindowChanged = true
-      of setMaxFrameSize:
-        if value < 16384'u32 or value > 16777215'u32:
-          h2.connError(c, errProtocol); return
-        h2.peerMaxFrame = int(value)
-      of setEnablePush:
-        if value > 1'u32: h2.connError(c, errProtocol); return
-      of setHeaderTableSize:
-        # Our encoder is static-only (no dynamic entries), but RFC 7541 4.2 still
-        # requires signaling a reduced maximum to the peer's decoder. Cap our
-        # signalled max at the peer's value; when it drops, owe a size-update
-        # instruction on the next header block (#240.8).
-        let newMax = min(int(value), 4096)
-        if newMax != h2.encTableMax:
-          h2.encTableMax = newMax
-          h2.pendingTableSizeUpdate = newMax
-      else: discard
-      i += 6
-    c.wbuf.addFrameHeader(0, ftSettings, flagAck, 0)
-    if initialWindowChanged:
-      # Raising SETTINGS_INITIAL_WINDOW_SIZE grows every stream's send window
-      # (RFC 7540 6.9.2): re-enqueue any stream with a backlog and run a pass.
-      for sid, st in h2.streams:
-        if st.pendingBody.len - st.pendingPos > 0: h2.h2Enqueue(sid)
-      h2.h2Schedule(c)
-
-  of ftPing:
-    if fh.streamId != 0: h2.connError(c, errProtocol); return
-    if fh.length != 8: h2.connError(c, errFrameSize); return
-    # Budget PING AND its ACK: a PING-ACK flood (we never solicit one) is pure
-    # overhead that the ACK-only guard used to let through unbudgeted (#234).
-    h2.noteControlFrame(c)
-    if c.state == csClosing: return
-    if (fh.flags and flagAck) == 0:
-      c.wbuf.addPingAck(c.rbuf.toOpenArray(payloadPos, payloadPos + 7))
-
-  of ftWindowUpdate:
-    if fh.length != 4: h2.connError(c, errFrameSize); return
-    if fh.streamId != 0 and (fh.streamId and 1'u32) == 0:
-      h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
-    let inc32 = get32(c.rbuf, payloadPos) and 0x7fffffff'u32
-    if inc32 == 0:
-      # A WINDOW_UPDATE referencing an idle stream (never opened) is a
-      # connection-level PROTOCOL_ERROR (RFC 9113 5.1), like any frame on an
-      # idle stream -- check that before the stream-scoped 0-increment error, so
-      # id > lastStreamId GOAWAYs instead of RST-ing a stream that never existed.
-      if fh.streamId == 0 or fh.streamId > h2.lastStreamId:
-        h2.connError(c, errProtocol)
-      else: h2.streamError(c, fh.streamId, errProtocol)
-      return
-    if fh.streamId == 0:
-      if int64(h2.connSendWindow) + int64(inc32) > 0x7fffffff'i64:
-        h2.connError(c, errFlowControl); return
-      let wasBlocked = h2.connSendWindow <= 0
-      h2.connSendWindow += int32(inc32)
-      if h2.h2NextUrgency() >= 0 or (wasBlocked and h2.connSendWindow > 0):
-        # The connection window moved: run a scheduler pass. The ready-queue
-        # already holds the stream-sendable streams, so no scan is needed.
-        h2.h2Schedule(c)
-      else:
-        # A WINDOW_UPDATE that unblocked nothing is pure overhead; budget it so a
-        # flood trips ENHANCE_YOUR_CALM (the counter resets on real progress).
-        h2.noteControlFrame(c)
-        if c.state == csClosing: return
-    elif fh.streamId in h2.streams:
-      template st: H2Stream = h2.streams[fh.streamId]
-      if int64(st.sendWindow) + int64(inc32) > 0x7fffffff'i64:
-        h2.streamError(c, fh.streamId, errFlowControl); return
-      st.sendWindow += int32(inc32)
-      h2.h2Enqueue(fh.streamId)
-      h2.h2Schedule(c)
-    elif fh.streamId > h2.lastStreamId:
-      h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
-    else:
-      # Closed stream (<= lastStreamId, no longer in the table): the update is
-      # ignored, but a flood of them is pure overhead -- budget it (#234).
-      h2.noteControlFrame(c)
-
-  of ftRstStream:
-    if fh.streamId == 0: h2.connError(c, errProtocol); return
-    if fh.length != 4: h2.connError(c, errFrameSize); return
-    if (fh.streamId and 1'u32) == 0:
-      h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
-    if fh.streamId > h2.lastStreamId:
-      h2.connError(c, errProtocol); return   # RST on idle stream
-    if fh.streamId in h2.streams:
-      # Unified teardown: reclaim deferred connection-window credit (#231),
-      # deliver onClose to a WebSocket, and fire onBodyCb(last=true) /
-      # onRespDrain so a handler suspended in await req.read()/res.drained()
-      # resumes instead of leaking a zombie coroutine (#232).
-      h2.teardownStream(c, fh.streamId)
-    # Rapid Reset (CVE-2023-44487): a peer that opens then immediately
-    # resets streams costs handler work while never holding concurrency.
-    # Cap cumulative resets per connection.
-    inc h2.rstStreamCount
-    if h2.maxResetStreams > 0 and h2.rstStreamCount > h2.maxResetStreams:
-      h2.connError(c, errEnhanceYourCalm)
-
-  of ftPriority:
-    if fh.streamId == 0: h2.connError(c, errProtocol); return
-    if fh.length != 5: h2.connError(c, errFrameSize); return
-    # Budget PRIORITY before any branch: a self-dependency flood used to run
-    # streamError (one RST per frame) and return *before* noteControlFrame, so it
-    # was entirely unbudgeted (#234). PRIORITY has no productive use here anyway.
-    h2.noteControlFrame(c)
-    if c.state == csClosing: return
-    if (get32(c.rbuf, payloadPos) and 0x7fffffff'u32) == fh.streamId:
-      # Self-dependency is a PROTOCOL_ERROR (RFC 7540 5.3.1). On an opened stream
-      # it is a STREAM error (RST_STREAM, connection survives -- Go/nghttp2). On
-      # an idle stream RST_STREAM is forbidden (RFC 9113 5.1), so the only legal
-      # signal is a connection error (h2spec expects GOAWAY here).
-      if fh.streamId > h2.lastStreamId:
-        h2.connError(c, errProtocol)
-      else:
-        h2.streamError(c, fh.streamId, errProtocol)
-    # Otherwise ignored (RFC 9113 deprecates the priority tree).
-
-  of ftGoaway:
-    if fh.streamId != 0: h2.connError(c, errProtocol); return
-    # GOAWAY carries a 4-byte last-stream-id + 4-byte error code (8 octets min);
-    # a short frame is a connection FRAME_SIZE_ERROR (RFC 9113 4.2/6.8), like the
-    # ftPing/ftWindowUpdate length checks -- GOAWAY silently accepted it (#240.10).
-    if fh.length < 8: h2.connError(c, errFrameSize); return
-    # A peer (client) GOAWAY is informational for a server that never pushes;
-    # record it separately from our own drain flag so we do not start refusing
-    # the client's own subsequent streams (which `goingAway` would do). Budget
-    # it: a GOAWAY flood was previously unbudgeted overhead (#234).
-    h2.noteControlFrame(c)
-    h2.peerGoneAway = true
-
-  of ftPushPromise:
-    h2.connError(c, errProtocol)     # clients cannot push
+  of ftData: h2.handleData(c, fh, payloadPos, ready)
+  of ftHeaders: h2.handleHeaders(c, fh, payloadPos, ready)
+  of ftContinuation: h2.handleContinuation(c, fh, payloadPos, ready)
+  of ftSettings: h2.handleSettings(c, fh, payloadPos)
+  of ftPing: h2.handlePing(c, fh, payloadPos)
+  of ftWindowUpdate: h2.handleWindowUpdate(c, fh, payloadPos)
+  of ftRstStream: h2.handleRstStream(c, fh)
+  of ftPriority: h2.handlePriority(c, fh, payloadPos)
+  of ftGoaway: h2.handleGoaway(c, fh)
+  of ftPushPromise: h2.connError(c, errProtocol)     # clients cannot push
 
 proc h2Feed*(c: ptr Connection, ready: var seq[uint32]) =
   ## Consume the connection preface and all complete frames from the

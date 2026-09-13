@@ -36,7 +36,7 @@
 ## run ready callbacks, capping its selector timeout at a few ms while
 ## async operations are pending (asyncdispatch's own fds cannot wake our
 ## selector; this bounds completion latency instead). When the future
-## finishes, the deferred respond is flushed via LoopCore.kick. An
+## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
 ## uncaught exception in the body responds 500.
 
 import std/[asyncdispatch, httpcore, tables, deques, macros, selectors]
@@ -81,8 +81,11 @@ proc teardown() {.nimcall, gcsafe.} =
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
 template onCompleted(fut, body: untyped) =
-  ## Run `body` when `fut` completes (asyncdispatch callback signature:
-  ## a plain nullary closure).
+  ## Contract shared with the chronos backend: run `body` when `fut` completes
+  ## (asyncdispatch callback signature: a plain nullary closure). Unlike chronos,
+  ## this backend does NO pending-op accounting -- the asyncdispatch dispatcher's
+  ## hasPendingOperations already tells the pump when to run, so there is no
+  ## per-future trackPending/untrackPending to keep. See chronos.nim's onCompleted.
   fut.addCallback proc () {.gcsafe.} =
     body
 

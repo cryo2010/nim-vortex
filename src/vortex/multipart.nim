@@ -21,36 +21,44 @@ type
     fields*: seq[(string, string)]
     files*: seq[UploadedFile]
 
-  FormFields* = object
+  MultiMap*[T] = object
+    ## Insertion-ordered, first-match multi-map backed by a flat seq. `FormFields`
+    ## and `UploadedFiles` are instantiations; each element's key is derived by the
+    ## `keyOf` overload for `T`, so `contains`/`items`/`len` are shared and only the
+    ## `[]` return type / missing-key policy differ per instantiation below.
+    s*: seq[T]
+
+  FormFields* = MultiMap[(string, string)]
     ## Submitted form fields (application/x-www-form-urlencoded, or the text
     ## parts of multipart/form-data). Same shape as req.headers:
     ## `req.form["name"]` is the first value ("" if absent), `"name" in req.form`
     ## tests presence, `for (k, v) in req.form` iterates all. Field names are
     ## case-sensitive (unlike headers).
-    s*: seq[(string, string)]
 
-  UploadedFiles* = object
+  UploadedFiles* = MultiMap[UploadedFile]
     ## Uploaded files of a multipart/form-data body, keyed by the form field
     ## name (the <input name>, not the filename). `req.files["avatar"]` is the
     ## first file for that field and RAISES KeyError if absent (check
     ## `"avatar" in req.files` or catch); `for f in req.files` iterates all.
-    s*: seq[UploadedFile]
 
 # --- req.form / req.files accessors (req.headers-shaped) ---------------------
+
+func keyOf(e: (string, string)): string {.inline.} = e[0]
+func keyOf(e: UploadedFile): string {.inline.} = e.name
+
+proc contains*[T](m: MultiMap[T], name: string): bool =
+  for e in m.s:
+    if keyOf(e) == name: return true
+
+iterator items*[T](m: MultiMap[T]): T =
+  for e in m.s: yield e
+
+proc len*[T](m: MultiMap[T]): int {.inline.} = m.s.len
 
 proc `[]`*(f: FormFields, name: string): string =
   ## First value for `name`, or "" if absent (like req.headers[name]).
   for (n, v) in f.s:
     if n == name: return v
-
-proc contains*(f: FormFields, name: string): bool =
-  for (n, _) in f.s:
-    if n == name: return true
-
-iterator items*(f: FormFields): (string, string) =
-  for p in f.s: yield p
-
-proc len*(f: FormFields): int {.inline.} = f.s.len
 
 proc `[]`*(u: UploadedFiles, name: string): UploadedFile =
   ## First uploaded file for form field `name`. Raises KeyError if there is
@@ -58,15 +66,6 @@ proc `[]`*(u: UploadedFiles, name: string): UploadedFile =
   for f in u.s:
     if f.name == name: return f
   raise newException(KeyError, "no uploaded file for form field: " & name)
-
-proc contains*(u: UploadedFiles, name: string): bool =
-  for f in u.s:
-    if f.name == name: return true
-
-iterator items*(u: UploadedFiles): UploadedFile =
-  for f in u.s: yield f
-
-proc len*(u: UploadedFiles): int {.inline.} = u.s.len
 
 # --- parsing ----------------------------------------------------------------
 

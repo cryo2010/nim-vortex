@@ -51,6 +51,13 @@ type
     prFileChunk,  ## releases one pkFileChunk (a chunk-read task's message)
     prWsBlocking  ## releases one pkWsBlocking (omWsDone, h1 stream 0)
 
+  PinSet* = object
+    ## Typed pin counts for one carrier (Connection / H3SlotEntry). A value
+    ## embedded in both, so the `for k in PinKind` accounting lives once instead
+    ## of being re-implemented per carrier. Loop-thread only; the counts are
+    ## non-atomic int32.
+    counts: array[PinKind, int32]
+
   OutMsgKind* = enum
     omHttp,                   ## data is a packed HTTP response (see packResponse)
     omWs,                     ## data is a ready-to-write WebSocket frame
@@ -207,7 +214,7 @@ type
                               ## without clobbering the request/idle deadline.
     writeArmed*: bool         ## selector currently watching writability
     registered*: bool         ## fd registered with the selector
-    pins*: array[PinKind, int32]
+    pins*: PinSet
                               ## outstanding worker tasks by pin kind; the slot
                               ## can't recycle while any is held (totalPins).
                               ## pkFileChunk workers only read a file -- never
@@ -241,9 +248,9 @@ type
     ## A Request handle encodes slot i as fd = -(i+2); see h3SlotFd/h3SlotOf.
     conn*: RootRef            ## http3.codec.H3Conn; nil = free slot
     gen*: uint32
-    pins*: array[PinKind, int32]
+    pins*: PinSet
                               ## outstanding worker tasks by pin kind. Same
-                              ## array as Connection for one code path; the h3
+                              ## type as Connection for one code path; the h3
                               ## shim is driven by h3Drive (no input pause), so
                               ## only totalPins is ever consulted here.
     closeReq*: bool           ## free deferred until unpinned
@@ -258,24 +265,14 @@ type
     free*: seq[pointer]       ## available buffers (loop thread only)
     all*: seq[pointer]        ## every buffer created, for teardown
 
-  LoopCore* = object
-    ## The part of an event loop's state that `Request` handles must reach:
-    ## connection slots plus per-loop cached strings. Lives inside the Loop
-    ## object (stable address for the server's lifetime).
-    conns*: seq[Connection]
-    h3slots*: seq[H3SlotEntry]
-    altSvc*: string           ## advertised on h1/h2 responses when h3 is on
-    dateStr*: string          ## cached RFC 7231 date, refreshed once/second
-    serverHeader*: string
-    secHeaders*: seq[(string, string)]  ## OWASP baseline injected on responses
-                                        ## when settings.securityHeaders is set
-                                        ## (loop-thread only, precomputed once)
-    nowSec*: int64            ## coarse monotonic seconds, updated per tick
+  LoopConfig* = object
+    ## Read-only per-loop policy, populated once from `settings` when the loop
+    ## starts. Grouped out of LoopCore's mutable/per-tick fields so the static
+    ## knobs a Request consults live together. Loop-thread only (never mutated
+    ## after start).
     maxWsMessage*: int        ## largest inbound WebSocket message (bytes)
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
     wsPongTimeout*: int       ## after a keepalive ping, seconds to wait for a reply
-    wsIdle*: seq[RootRef]     ## h2/h3 WebSocket streams tracked for idle keepalive
-                              ## (WsConn upcast; h1 uses the connection deadline wheel)
     wsCompression*: bool      ## negotiate permessage-deflate (only with -d:wsDeflate)
     compress*: bool           ## gzip/brotli eligible responses (needs the flags)
     decompressRequest*: bool  ## decode gzip/br/zstd request bodies into req.body
@@ -283,20 +280,11 @@ type
     trustedProxies*: seq[string]  ## CIDR/IP allowlist; forwarded headers
                                   ## (X-Forwarded-*, RFC 7239) are honored only
                                   ## from a peer in this list (empty = none)
-    threadId*: int            ## owning thread; respond() routes on this
-    pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
-    outbox*: ptr Outbox
-    chunkPool*: ChunkPool     ## recycled sendFile read buffers (loop-owned)
-    respHeaders*: Table[ReqKey, ResponseHeaders]
-      ## Pending `res.headers` per in-flight request, merged in at send and
-      ## dropped once the response is emitted (loop-thread only). Empty for the
-      ## common case, so a non-user pays only one failed lookup per response.
-    respTrailers*: Table[ReqKey, ResponseHeaders]
-      ## Pending `res.trailers` per in-flight streamed response, emitted by
-      ## `res.finish` after the body (loop-thread only). Empty for the common
-      ## case, so a response that sets no trailers pays only one failed lookup.
-    # Async-adapter integration (see adapters/). All loop-thread only.
-    loopPtr*: pointer         ## the owning Loop, for kick
+
+  AdapterHooks* = object
+    ## The proc-pointer vtable an async adapter / the event loop registers on a
+    ## LoopCore (all loop-thread only). Grouped so the hand-rolled hooks live in
+    ## one place instead of loose fields on LoopCore.
     pumpHook*: proc (): int {.nimcall, gcsafe.}
       ## Registered by an adapter; called once per loop iteration to run
       ## ready async callbacks. Returns a max selector timeout in ms, or
@@ -324,6 +312,38 @@ type
       ## Resolve an HTTP/3 (RFC 9220) WebSocket stream's WsConn. Set by the h3
       ## codec. h3 handles have `fd < 0` (an h3 slot, not a `ptr Connection`),
       ## so this takes the whole handle rather than a connection pointer.
+
+  LoopCore* = object
+    ## The part of an event loop's state that `Request` handles must reach:
+    ## connection slots plus per-loop cached strings. Lives inside the Loop
+    ## object (stable address for the server's lifetime).
+    conns*: seq[Connection]
+    h3slots*: seq[H3SlotEntry]
+    altSvc*: string           ## advertised on h1/h2 responses when h3 is on
+    dateStr*: string          ## cached RFC 7231 date, refreshed once/second
+    serverHeader*: string
+    secHeaders*: seq[(string, string)]  ## OWASP baseline injected on responses
+                                        ## when settings.securityHeaders is set
+                                        ## (loop-thread only, precomputed once)
+    nowSec*: int64            ## coarse monotonic seconds, updated per tick
+    config*: LoopConfig       ## read-only per-loop policy derived from settings
+    wsIdle*: seq[RootRef]     ## h2/h3 WebSocket streams tracked for idle keepalive
+                              ## (WsConn upcast; h1 uses the connection deadline wheel)
+    threadId*: int            ## owning thread; respond() routes on this
+    pool*: pointer            ## ptr WorkerPool (untyped to avoid a cycle)
+    outbox*: ptr Outbox
+    chunkPool*: ChunkPool     ## recycled sendFile read buffers (loop-owned)
+    respHeaders*: Table[ReqKey, ResponseHeaders]
+      ## Pending `res.headers` per in-flight request, merged in at send and
+      ## dropped once the response is emitted (loop-thread only). Empty for the
+      ## common case, so a non-user pays only one failed lookup per response.
+    respTrailers*: Table[ReqKey, ResponseHeaders]
+      ## Pending `res.trailers` per in-flight streamed response, emitted by
+      ## `res.finish` after the body (loop-thread only). Empty for the common
+      ## case, so a response that sets no trailers pays only one failed lookup.
+    # Async-adapter integration (see adapters/). All loop-thread only.
+    loopPtr*: pointer         ## the owning Loop, for kick
+    hooks*: AdapterHooks      ## adapter/event-loop proc-pointer vtable (below)
     streamRouteRaw*: RawClosure
       ## Opt-in inbound-streaming predicate (see StreamRouteCb), stored as a
       ## raw closure (see RawClosure) so it doesn't refcount across loop
@@ -473,16 +493,25 @@ proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
 
 # --- typed pin accounting ---------------------------------------------------
 
-func totalPins*(c: Connection): int32 =
+func total*(ps: PinSet): int32 {.inline.} =
+  ## Sum across every pin kind (the loop that used to be repeated per carrier).
+  for k in PinKind: result += ps.counts[k]
+
+func `[]`*(ps: PinSet, k: PinKind): int32 {.inline.} = ps.counts[k]
+proc inc*(ps: var PinSet, k: PinKind) {.inline.} = inc ps.counts[k]
+proc dec*(ps: var PinSet, k: PinKind) {.inline.} = dec ps.counts[k]
+proc reset*(ps: var PinSet) {.inline.} =
+  for k in PinKind: ps.counts[k] = 0
+
+func totalPins*(c: Connection): int32 {.inline.} =
   ## Any outstanding worker task: the slot must not recycle, `conns` must not
   ## realloc, and the loop must not touch the carrier's ORC-counted protocol
   ## refs. Replaces every former `pinned > 0` gate.
-  for k in PinKind: result += c.pins[k]
+  c.pins.total
 
 func totalPins*(c: ptr Connection): int32 {.inline.} = totalPins(c[])
 
-func totalPins*(s: H3SlotEntry): int32 =
-  for k in PinKind: result += s.pins[k]
+func totalPins*(s: H3SlotEntry): int32 {.inline.} = s.pins.total
 
 func totalPins*(s: ptr H3SlotEntry): int32 {.inline.} = totalPins(s[])
 
@@ -520,13 +549,13 @@ proc acquirePin*(core: ptr LoopCore, c: ptr Connection, k: PinKind) {.inline.} =
   ## int32 inc racing the loop -- from silent UB into a caught defect.
   doAssert onOwnLoopThread(core),
     "pins may only be acquired on the owning loop thread"
-  inc c.pins[k]
+  c.pins.inc k
 
 proc acquirePin*(core: ptr LoopCore, s: ptr H3SlotEntry,
                  k: PinKind) {.inline.} =
   doAssert onOwnLoopThread(core),
     "pins may only be acquired on the owning loop thread"
-  inc s.pins[k]
+  s.pins.inc k
 
 proc releasePin*(c: ptr Connection, k: PinKind) {.inline.} =
   ## Bare counter release (loop thread). Outbox message application must go
@@ -534,11 +563,11 @@ proc releasePin*(c: ptr Connection, k: PinKind) {.inline.} =
   ## (deferred close, input resume); this primitive backs that wrapper and the
   ## same-stretch refusal path (request.undoPin), where no message applies.
   doAssert c.pins[k] > 0, "pin release without a matching acquire"
-  dec c.pins[k]
+  c.pins.dec k
 
 proc releasePin*(s: ptr H3SlotEntry, k: PinKind) {.inline.} =
   doAssert s.pins[k] > 0, "pin release without a matching acquire"
-  dec s.pins[k]
+  s.pins.dec k
 
 const fileChunkCap* = 256 * 1024
   ## Size of a pooled sendFile read buffer (one worker read hop). MUST stay >=
@@ -674,7 +703,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   # nonzero count here means some release was mis-skipped upstream (e.g. by a
   # staleness-check bug); crash at the source in debug, scrub in release.
   doAssert c.totalPins == 0, "slot recycled with live worker pins"
-  for k in PinKind: c.pins[k] = 0
+  c.pins.reset()
   c.closeRequested = false
   c.closeAfterFlush = false
   c.lingerClose = false

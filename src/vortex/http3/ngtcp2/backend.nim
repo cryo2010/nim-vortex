@@ -212,14 +212,9 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
       # the head. QPACK does no byte validation, so a CR/LF/NUL value or non-token
       # name would inject via req.trailers; a pseudo-header or connection-specific
       # field is malformed. Reject the stream rather than store it (#257).
-      if name.len == 0 or name[0] == ':' or
-          not validFieldName(name) or not validFieldValue(val):
+      # Shared rule (fieldrules.validTrailerField, also the h2 codec's).
+      if not validTrailerField(name, val):
         vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
-      case name
-      of "connection", "keep-alive", "transfer-encoding", "upgrade", "te",
-         "proxy-connection":
-        vqStreamReset(h3c.vq, sid, 0x0105); h3c.streams.del(usid); return
-      else: discard
       st.trailers.add (name, val)
     return
   let arr = cast[ptr UncheckedArray[VqHeader]](hdrs)
@@ -774,4 +769,4 @@ proc h3WsLookup(corep: pointer, fd: int32, gen: uint32,
   nil
 
 proc installH3WsHooks*(core: ptr LoopCore) =
-  core.wsH3Lookup = h3WsLookup
+  core.hooks.wsH3Lookup = h3WsLookup

@@ -22,7 +22,8 @@
 import std/[os, times, strutils, uri, httpcore, options]
 import ./request
 from ./conditional import evalPreconditions, ifRangeApplies,
-                          pcProceed, pcNotModified, pcFailed, httpDate
+                          pcProceed, pcNotModified, pcFailed, httpDate,
+                          parseRanges
 
 type
   StaticOptions* = object
@@ -119,32 +120,6 @@ proc readSlice(path: string, start, length: int): string =
   if length > 0:
     let n = f.readBuffer(addr result[0], length)
     result.setLen(n)
-
-proc parseRange(hdr: string, size: int64): (bool, int64, int64) =
-  ## Parse a single `bytes=start-end` range against `size`. Returns
-  ## (satisfiable, start, endInclusive). Multiple ranges / malformed values
-  ## return satisfiable=true with the full [0, size-1] (caller sends 200).
-  if not hdr.startsWith("bytes="): return (true, 0, size - 1)
-  let spec = hdr[6..^1]
-  if ',' in spec: return (true, 0, size - 1)   # multi-range: serve full 200
-  let dash = spec.find('-')
-  if dash < 0: return (true, 0, size - 1)
-  let startS = spec[0..<dash].strip()
-  let endS = spec[dash+1..^1].strip()
-  var s, e: int64
-  try:
-    if startS.len == 0:                        # suffix: last N bytes
-      if endS.len == 0: return (true, 0, size - 1)
-      let n = parseBiggestInt(endS)
-      s = max(0'i64, size - n); e = size - 1
-    else:
-      s = parseBiggestInt(startS)
-      e = if endS.len == 0: size - 1 else: parseBiggestInt(endS)
-  except ValueError:
-    return (true, 0, size - 1)
-  if s > e or s >= size: return (false, 0, 0)  # unsatisfiable -> 416
-  if e >= size: e = size - 1
-  (true, s, e)
 
 const
   fileStreamChunk = 256 * 1024      ## bytes per worker read hop. Larger chunks
@@ -259,12 +234,15 @@ proc serveResolved(req: Request, res: Response, data: string)
   let rangeHdr = req.header("range")
   if rangeHdr.len > 0 and size > 0:
     if ifRangeApplies(req.header("if-range"), condEtag, condLastMod):
-      let (satisfiable, rs, re) = parseRange(rangeHdr, size)
+      let (satisfiable, ranges) = parseRanges(rangeHdr, size)
       if not satisfiable:
         hdrs.add ("Content-Range", "bytes */" & $size)
         res.send(HttpCode(416), "", hdrs); return
-      if not (rs == 0 and re == size - 1):
-        s = rs; e = re; partial = true
+      # parseRanges already collapses a whole-body single range to `@[]` (200);
+      # a genuine multi-range set is served as a full 200 here (streaming emits
+      # one window -- request.serveContent handles multipart/byteranges).
+      if ranges.len == 1:
+        s = ranges[0].start; e = ranges[0].finish; partial = true
 
   let mime = mimeType(real)
   # The byte window to serve: the requested range, or the whole file.

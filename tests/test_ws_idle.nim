@@ -20,7 +20,7 @@ proc mkWs(now: int64): WsConn =
 
 suite "WebSocket idle sweep (h2/h3)":
   test "pings after the idle interval, then times out with no reply":
-    var core = LoopCore(wsPingInterval: 5, wsPongTimeout: 3, nowSec: 100)
+    var core = LoopCore(config: LoopConfig(wsPingInterval: 5, wsPongTimeout: 3), nowSec: 100)
     let w = mkWs(100)
     flushLog = ""
     core.nowSec = 104                        # idle 4s < 5: no ping
@@ -38,7 +38,7 @@ suite "WebSocket idle sweep (h2/h3)":
     check w.closeNotified
 
   test "a frame before the pong deadline keeps it alive":
-    var core = LoopCore(wsPingInterval: 5, wsPongTimeout: 3, nowSec: 100)
+    var core = LoopCore(config: LoopConfig(wsPingInterval: 5, wsPongTimeout: 3), nowSec: 100)
     let w = mkWs(100)
     flushLog = ""
     core.nowSec = 105
@@ -54,13 +54,13 @@ suite "WebSocket idle sweep (h2/h3)":
     check w.pingSent
 
   test "already-closed ws is reaped":
-    var core = LoopCore(wsPingInterval: 5, wsPongTimeout: 3, nowSec: 100)
+    var core = LoopCore(config: LoopConfig(wsPingInterval: 5, wsPongTimeout: 3), nowSec: 100)
     let w = mkWs(100)
     w.closeNotified = true
     check wsSweepIdle(addr core, nil, w)     # true => drop from tracking
 
   test "disabled when wsPingInterval is 0":
-    var core = LoopCore(wsPingInterval: 0, wsPongTimeout: 3, nowSec: 100)
+    var core = LoopCore(config: LoopConfig(wsPingInterval: 0, wsPongTimeout: 3), nowSec: 100)
     let w = mkWs(0)
     core.nowSec = 10_000
     check not wsSweepIdle(addr core, nil, w)
