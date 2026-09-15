@@ -72,6 +72,11 @@ when not defined(plainHttp):
       try: readFile(s.ocspFile) except CatchableError: ""
     else: ""
 
+  proc ocspSourceFile*(s: VortexConfig): string =
+    ## The staple's source path to remember for empty-arg reload re-reads: "" when
+    ## in-memory `ocspResponse` takes precedence (it has no file to re-read).
+    if s.ocspResponse.len > 0: "" else: s.ocspFile
+
 when defined(macosx):
   const SO_NOSIGPIPE = cint(0x1022)
 when defined(linux):

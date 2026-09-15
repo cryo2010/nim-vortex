@@ -61,28 +61,39 @@ proc genMtls() =
   sh("openssl x509 -req -in " & dir & "/client.csr -CA " & dir & "/ca.pem -CAkey " &
      dir & "/ca.key -CAcreateserial -out " & dir & "/client.pem -days 2")
 
+proc certSerial(certPath: string): string =
+  ## The cert's serial as uppercase hex (matching s_client's OCSP dump on
+  ## OpenSSL 3), for asserting which staple the client received.
+  let line = execCmdEx("openssl x509 -in " & certPath &
+                       " -noout -serial")[0].strip()
+  line.split('=', 1)[1].toUpperAscii
+
+proc mintResp(certPath, respName: string) =
+  ## Sign a "good" OCSP response for `certPath` into dir/<respName>.der (CA from
+  ## buildOcsp). index.txt expiry is formatted in Nim (std/times) so no python3
+  ## is needed; -no_nonce because s_client sends no nonce.
+  let serial = certSerial(certPath)
+  let expiry = (now().utc + 2.years).format("yyMMddHHmmss") & "Z"
+  writeFile(dir / "index.txt",
+            "V\t" & expiry & "\t\t" & serial & "\tunknown\t/CN=localhost\n")
+  sh("openssl ocsp -issuer " & dir & "/ca.pem -cert " & certPath &
+     " -reqout " & dir & "/req.der -no_nonce")
+  sh("openssl ocsp -index " & dir & "/index.txt -CA " & dir & "/ca.pem -rsigner " &
+     dir & "/ca.pem -rkey " & dir & "/ca.key -reqin " & dir & "/req.der -respout " &
+     dir / (respName & ".der") & " -ndays 1 -no_nonce")
+  if not fileExists(dir / (respName & ".der")) or
+     getFileSize(dir / (respName & ".der")) == 0:
+    fail("OCSP response was not generated: " & respName)
+
 proc buildOcsp() =
-  ## CA + server cert + a signed OCSP response (resp.der). The index.txt expiry
-  ## is formatted in Nim (std/times) so no python3 dependency is needed.
+  ## CA + server cert (dir/srv.pem) + a signed OCSP response (dir/resp.der).
   sh("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir & "/ca.key -out " &
      dir & "/ca.pem -days 2 -subj /CN=OCSP-CA")
   sh("openssl req -newkey rsa:2048 -nodes -keyout " & dir & "/srv.key -out " &
      dir & "/srv.csr -subj /CN=localhost")
   sh("openssl x509 -req -in " & dir & "/srv.csr -CA " & dir & "/ca.pem -CAkey " &
      dir & "/ca.key -CAcreateserial -out " & dir & "/srv.pem -days 2")
-  let serialOut = execCmdEx("openssl x509 -in " & dir &
-                            "/srv.pem -noout -serial")[0].strip()
-  let serial = serialOut.split('=', 1)[1]
-  let expiry = (now().utc + 2.years).format("yyMMddHHmmss") & "Z"
-  writeFile(dir / "index.txt",
-            "V\t" & expiry & "\t\t" & serial & "\tunknown\t/CN=localhost\n")
-  sh("openssl ocsp -issuer " & dir & "/ca.pem -cert " & dir &
-     "/srv.pem -reqout " & dir & "/req.der -no_nonce")
-  sh("openssl ocsp -index " & dir & "/index.txt -CA " & dir & "/ca.pem -rsigner " &
-     dir & "/ca.pem -rkey " & dir & "/ca.key -reqin " & dir & "/req.der -respout " &
-     dir & "/resp.der -ndays 1 -no_nonce")
-  if not fileExists(dir / "resp.der") or getFileSize(dir / "resp.der") == 0:
-    fail("OCSP response was not generated")
+  mintResp(dir / "srv.pem", "resp")
 
 # --- clients ----------------------------------------------------------------
 proc curlGet(port: Port, args = "", path = "/"): (string, int) =
@@ -288,6 +299,40 @@ of "hotReload":
     fail("cert did not swap to bravo after reload")
   let (o, rc) = curlGet(srv.port)
   if rc != 0 or o != "ok": fail("not serving after reload rc=" & $rc & " body=" & o)
+  ok()
+
+of "ocspReload":
+  # Rotate the stapled OCSP response at runtime through reloadTls. OpenSSL's
+  # server drops a staple whose serial does not match the served leaf, so the
+  # rotation swaps cert+staple together and the client's OCSP dump serial tracks
+  # the served cert's serial.
+  buildOcsp()                                 # CA + srv.pem + resp.der (srv)
+  # a second cert (distinct serial) with its own matching staple
+  sh("openssl req -newkey rsa:2048 -nodes -keyout " & dir & "/srv2.key -out " &
+     dir & "/srv2.csr -subj /CN=localhost")
+  sh("openssl x509 -req -in " & dir & "/srv2.csr -CA " & dir & "/ca.pem -CAkey " &
+     dir & "/ca.key -CAcreateserial -out " & dir & "/srv2.pem -days 2")
+  mintResp(dir / "srv2.pem", "resp2")
+  let serialA = certSerial(dir / "srv.pem").toLowerAscii
+  let serialB = certSerial(dir / "srv2.pem").toLowerAscii
+  var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1,
+    http3 = false, certFile = dir / "srv.pem", keyFile = dir / "srv.key",
+    ocspFile = dir / "resp.der")).start(0)
+  proc staple(): string =
+    execCmdEx("echo | " & opensslBin & " s_client -status -connect 127.0.0.1:" &
+      $srv.port & " 2>/dev/null").output.toLowerAscii
+  var s = staple()
+  if "ocsp response status: successful" notin s or serialA notin s:
+    fail("initial staple A not served: " & s)
+  if not srv.reloadTls(dir / "srv2.pem", dir / "srv2.key",
+                       ocspFile = dir / "resp2.der"):
+    fail("reloadTls(cert+ocsp) returned false")
+  s = staple()
+  if serialB notin s: fail("staple did not rotate to B: " & s)
+  if serialA in s: fail("staple A still served after rotation: " & s)
+  let (o, rc) = curlGet(srv.port)
+  if rc != 0 or o != "ok": fail("not serving after staple reload rc=" & $rc &
+    " body=" & o)
   ok()
 
 else:

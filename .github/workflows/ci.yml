@@ -151,6 +151,9 @@ jobs:
       - name: hot reload
         if: ${{ !cancelled() }}
         run: TLS_CONFIG=hotReload /tmp/tls_harness
+      - name: ocsp reload
+        if: ${{ !cancelled() }}
+        run: TLS_CONFIG=ocspReload /tmp/tls_harness
 
   sanitize:
     runs-on: ubuntu-latest
