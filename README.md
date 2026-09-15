@@ -317,12 +317,15 @@ initVortexConfig(certFile = "default.pem", keyFile = "default.key",
 a client on 1.2. (QUIC/HTTP/3 is always 1.3.)
 
 **OCSP stapling**: hand clients a cached OCSP response in the handshake so they
-don't query the responder. Provide the DER bytes (refresh them out-of-band and
-`reloadTls`); vortex doesn't fetch OCSP itself:
+don't query the responder. Provide the DER bytes; vortex doesn't fetch OCSP
+itself. Responses expire in days, so refresh them out-of-band and rotate the
+staple at runtime with `reloadTls` (no restart, in-flight connections kept):
 
 ```nim
 initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
                  ocspFile = "ocsp.der")        # or ocspResponse = derBytes
+# later, after refreshing ocsp.der (or renewing the cert):
+discard srv.reloadTls(ocspFile = "ocsp.der")   # rotate the staple
 ```
 
 #### Request size limits

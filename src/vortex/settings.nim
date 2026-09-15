@@ -143,8 +143,10 @@ type
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
     minTlsVersion*: TlsVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
     maxTlsVersion*: TlsVersion  ## highest accepted TLS version (TCP; default = no cap)
-    ocspFile*: string         ## DER OCSP response to staple (file; default cert)
-    ocspResponse*: string     ## DER OCSP response to staple (in-memory bytes)
+    ocspFile*: string         ## DER OCSP response to staple (file; default cert;
+                              ## rotate at runtime via reloadTls(ocspFile = ...))
+    ocspResponse*: string     ## DER OCSP response to staple (in-memory bytes;
+                              ## rotate at runtime via reloadTls(ocspResponse=...))
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
     tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default)
 

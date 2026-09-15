@@ -5,7 +5,7 @@
 ## and misreports EOF when data+FIN are already buffered before the first
 ## read, which made responses "vanish" in earlier test versions.
 
-import std/[net, posix, os, osproc, strutils]
+import std/[net, posix, os, osproc, strutils, times]
 
 proc setRecvTimeout*(s: Socket, ms: int) =
   var tv: Timeval
@@ -112,6 +112,60 @@ proc makeCertPair*(dirPrefix: string, cn = "localhost"):
   createDir(dir)
   result = (cert: dir / "cert.pem", key: dir / "key.pem")
   genCert(result.cert, result.key, cn)
+
+# --- OCSP fixtures (Nim-only; no python3) --------------------------------------
+
+proc opensslOk(cmd: string): bool =
+  ## Run an openssl command; true on exit 0. Failures make mintOcsp return "",
+  ## which the OCSP suites treat as "skip" (openssl too old / different).
+  execCmdEx(cmd)[1] == 0
+
+proc genOcspCa*(dir: string) =
+  ## An OCSP-signing CA (CN=OCSP-CA) at dir/ca.pem + dir/ca.key. Reused as the
+  ## OCSP responder (rsigner/rkey) in mintOcsp.
+  let (o, rc) = execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
+    dir & "/ca.key -out " & dir & "/ca.pem -days 2 -subj /CN=OCSP-CA")
+  doAssert rc == 0, o
+
+proc genSignedCert*(dir, name, cn: string) =
+  ## A server cert dir/<name>.pem + dir/<name>.key (CN=<cn>) signed by the CA
+  ## from genOcspCa. -CAcreateserial gives each call a fresh serial, so two
+  ## certs minted from one CA get distinct serials (the rotation test needs it).
+  let key = dir / (name & ".key")
+  let csr = dir / (name & ".csr")
+  let crt = dir / (name & ".pem")
+  var o: string
+  var rc: int
+  (o, rc) = execCmdEx("openssl req -newkey rsa:2048 -nodes -keyout " & key &
+    " -out " & csr & " -subj /CN=" & cn)
+  doAssert rc == 0, o
+  (o, rc) = execCmdEx("openssl x509 -req -in " & csr & " -CA " & dir &
+    "/ca.pem -CAkey " & dir & "/ca.key -CAcreateserial -out " & crt & " -days 2")
+  doAssert rc == 0, o
+
+proc mintOcsp*(dir, certName, respName: string): string =
+  ## Sign a "good" OCSP response for dir/<certName>.pem into dir/<respName>.der
+  ## (CA from genOcspCa), and return the cert's serial as uppercase hex. Returns
+  ## "" if any openssl step fails (older openssl differs) so callers can skip.
+  let crt = dir / (certName & ".pem")
+  let serialOut = execCmdEx("openssl x509 -in " & crt &
+                            " -noout -serial")[0].strip()
+  if '=' notin serialOut: return ""
+  let serial = serialOut.split('=', 1)[1]
+  # index.txt: one "Valid" entry, expiry formatted in Nim (no python3 date math).
+  let expiry = (now().utc + 2.years).format("yyMMddHHmmss") & "Z"
+  writeFile(dir / "index.txt",
+            "V\t" & expiry & "\t\t" & serial & "\tunknown\t/CN=localhost\n")
+  # -no_nonce: s_client doesn't send one, so a nonce would make the staple mismatch.
+  if not opensslOk("openssl ocsp -issuer " & dir & "/ca.pem -cert " & crt &
+                   " -reqout " & dir & "/req.der -no_nonce"): return ""
+  if not opensslOk("openssl ocsp -index " & dir & "/index.txt -CA " & dir &
+      "/ca.pem -rsigner " & dir & "/ca.pem -rkey " & dir & "/ca.key -reqin " &
+      dir & "/req.der -respout " & dir / (respName & ".der") & " -ndays 1 " &
+      "-no_nonce"): return ""
+  let resp = dir / (respName & ".der")
+  if not fileExists(resp) or getFileSize(resp) == 0: return ""
+  serial.toUpperAscii
 
 # --- server fixture -----------------------------------------------------------
 

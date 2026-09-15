@@ -68,7 +68,7 @@ reference below.
 | `verifyClient` | `None` | mTLS: `None` / `Optional` / `Require` client-cert policy |
 | `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (needed when `verifyClient != None`) |
 | `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported) |
-| `ocspFile` / `ocspResponse` | "" | DER OCSP response to staple (static; rotate yourself) |
+| `ocspFile` / `ocspResponse` | "" | DER OCSP response to staple (rotate at runtime via `reloadTls(ocspFile = ...)`) |
 | `http3` | `true` | Serve HTTP/3 over QUIC (requires a cert; ignored without TLS) |
 
 ### Policy and identity
@@ -84,7 +84,13 @@ reference below.
 
 Certificates can be rotated at runtime with `server.reloadTls(certFile, keyFile)`
 (TCP and h3), which validates the new material and swaps it in without dropping
-connections.
+connections. The same call rotates the stapled OCSP response:
+`reloadTls(ocspFile = "staple.der")` (or `ocspResponse = bytes`) swaps in a
+refreshed staple, `clearOcsp = true` drops it, and a bare `reloadTls()` re-reads
+a configured `ocspFile` so a certbot renewal picks up a refreshed staple too.
+Staple rotation applies to the default certificate (SNI and HTTP/3 do not
+staple), and OpenSSL only sends a staple whose serial matches the served
+certificate, so rotate the cert and its staple together.
 
 ## Deployment recipes
 
@@ -133,7 +139,7 @@ proc handler(req: Request, res: Response) =
 var cfg = initVortexConfig(
   certFile = "cert.pem", keyFile = "key.pem",
   minTlsVersion = TlsVersion.V13,          # 1.3 only, if your clients allow it
-  ocspFile = "staple.der",                 # pre-fetched; refresh on a schedule
+  ocspFile = "staple.der",                 # pre-fetched; rotate via reloadTls
   sni = @[SniCertEntry(host: "api.example.com",
                        certFile: "api.pem", keyFile: "api.key")])
 ```

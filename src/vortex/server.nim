@@ -186,7 +186,8 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
                      clientCaPem = settings.clientCaPem,
                      sni = toSniCerts(settings),
                      maxProtoVersion = tlsMaxVer(settings.maxTlsVersion),
-                     ocsp = ocspBytes(settings)))
+                     ocsp = ocspBytes(settings),
+                     ocspFile = ocspSourceFile(settings)))
   else:
     if settings.hasTls:
       raise newException(CatchableError,
@@ -298,13 +299,22 @@ proc close*(server: var Server) =
   server.requestShutdown()
   server.waitFor()
 
-proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
+proc reloadTls*(server: var Server, certFile = "", keyFile = "",
+                ocspFile = "", ocspResponse = "", clearOcsp = false): bool =
   ## Hot-reload the TLS certificate/key for new HTTPS (HTTP/1.1 and HTTP/2)
   ## connections, without a restart and without dropping in-flight ones. Pass
   ## new paths, or leave empty to re-read the originally configured files (e.g.
   ## after certbot renewed them in place). Returns false if TLS is not enabled,
   ## or the new cert/key is missing/invalid/mismatched -- in which case the
   ## running certificate is kept, so a bad renewal never takes the server down.
+  ##
+  ## The stapled OCSP response rotates on the same call: `ocspResponse` supplies
+  ## DER bytes, `ocspFile` a path read now (an unreadable one rejects the reload
+  ## like a bad cert), `clearOcsp = true` drops the staple. With all three empty
+  ## a configured `ocspFile` is re-read best-effort (so a bare `reloadTls()`
+  ## after certbot picks up a refreshed staple without failing on a stale one).
+  ## Staple rotation covers the default cert only: SNI ctxs and HTTP/3 do not
+  ## staple, and the h3 reload signal below stays cert/key-only.
   ##
   ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
   ## inside a raw signal handler. Covers HTTP/1.1, HTTP/2, and (when enabled)
@@ -314,7 +324,8 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = ""): bool =
     false
   else:
     if server.tls == nil: return false
-    let ok = reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile)
+    let ok = reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile,
+                             ocspFile, ocspResponse, clearOcsp)
     # Only signal the h3 loops when the TCP reload succeeded, so TCP and h3
     # never end up on different certificates and the returned bool applies to
     # both. A per-loop h3 apply failure (e.g. a transient bad read) is logged by
@@ -384,7 +395,9 @@ proc stop*(v: Vortex) =
   ## Alias for `close`.
   v.server.close()
 
-proc reloadTls*(v: Vortex, certFile = "", keyFile = ""): bool =
-  ## Hot-reload the TLS cert/key for new connections without a restart (see the
-  ## Server-level docs). Returns false if TLS is off or the new material is bad.
-  v.server.reloadTls(certFile, keyFile)
+proc reloadTls*(v: Vortex, certFile = "", keyFile = "",
+                ocspFile = "", ocspResponse = "", clearOcsp = false): bool =
+  ## Hot-reload the TLS cert/key (and optionally rotate/clear the OCSP staple)
+  ## for new connections without a restart (see the Server-level docs). Returns
+  ## false if TLS is off or the new material is bad.
+  v.server.reloadTls(certFile, keyFile, ocspFile, ocspResponse, clearOcsp)

@@ -59,6 +59,7 @@ const
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
   SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
   SSL_SESS_CACHE_SERVER = clong(0x0002)
+  CRYPTO_EX_INDEX_SSL_CTX = cint(1)   # ex_data class for SSL_CTX (crypto/ex_data)
 
 const
   # OpenSSL protocol version numbers (for set_min_proto_version).
@@ -116,6 +117,7 @@ proc SSL_get_servername(ssl: SslPtr, typ: cint): cstring
 proc SSL_set_SSL_CTX(ssl: SslPtr, ctx: SslCtxPtr): SslCtxPtr
 proc SSL_CTX_callback_ctrl(ctx: SslCtxPtr, cmd: cint, fp: pointer): clong
 proc SSL_ctrl(ssl: SslPtr, cmd: cint, larg: clong, parg: pointer): clong
+proc SSL_CTX_set_ex_data(ctx: SslCtxPtr, idx: cint, arg: pointer): cint
 {.pop.}
 
 {.push importc, cdecl, dynlib: cryptoLibName.}
@@ -142,6 +144,8 @@ proc OPENSSL_sk_value(st: pointer, i: cint): pointer
 proc OPENSSL_sk_pop_free(st: pointer, freefn: proc (p: pointer) {.cdecl.})
 proc CRYPTO_malloc(num: csize_t, file: cstring, line: cint): pointer
 proc CRYPTO_free(p: pointer, file: cstring, line: cint)
+proc CRYPTO_get_ex_new_index(classIndex: cint, argl: clong, argp: pointer,
+                             newFn, dupFn, freeFn: pointer): cint
 {.pop.}
 
 proc passwdCb(buf: cstring, size: cint, rwflag: cint,
@@ -208,6 +212,15 @@ type
     host*: string
     material*: TlsMaterial
 
+  OcspBlob = object
+    ## An immutable DER OCSP response owned by one SSL_CTX. Allocated with
+    ## `allocShared` (loop threads read it lock-free in `statusCb`) and freed by
+    ## OpenSSL through the ctx's ex_data destructor `ocspExFree`, so its lifetime
+    ## is exactly the ctx's: no retire-ring involvement (an SSL on a displaced
+    ## ctx can outlive the grace window, which would be a use-after-free).
+    len: int
+    data: UncheckedArray[byte]
+
   TlsConfig* = object
     ## One per server; SSL_CTX is thread-safe for SSL_new. Lives in shared
     ## memory so loop threads can use it via pointer.
@@ -222,7 +235,11 @@ type
     clientCaFile, clientCaPem: string   ## CA to verify client certs (mTLS)
     minProtoVersion, maxProtoVersion: clong
     cipherList, cipherSuites: string
-    ocsp: string             ## DER OCSP response to staple (immutable; "" = off)
+    ocsp: string             ## DER OCSP staple bytes for the *next* ctx build;
+                             ## reload-thread-only. Handshake threads read the
+                             ## per-ctx blob (ex_data/cb arg), never this field.
+    ocspFile: string         ## source path the staple was last read from ("" =
+                             ## none / in-memory), for empty-arg reload re-reads
     sniHosts: seq[string]              ## per-host SNI: hostnames...
     sniCtx: seq[SslCtxPtr]             ## ...and their ctxs (parallel to sniHosts)
 
@@ -289,15 +306,28 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
     if idx >= 0: discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[idx])
   SSL_TLSEXT_ERR_OK
 
+proc ocspExFree(parent, p: pointer, ad: pointer, idx: cint,
+                argl: clong, argp: pointer) {.cdecl.} =
+  ## CRYPTO_EX_free for the ctx's OcspBlob: OpenSSL calls this exactly when the
+  ## SSL_CTX is destroyed (ring free, freeTlsConfig, or last SSL_free), which is
+  ## the only safe point to free a blob a handshake thread may still be reading.
+  if p != nil: deallocShared(p)
+
+let ocspExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil,
+                                        nil, nil, cast[pointer](ocspExFree))
+  ## Runs once at module load, before any loop thread exists. On -1 (allocation
+  ## failure) stapling degrades to off rather than crashing (attachOcsp skips).
+
 proc statusCb(ssl: SslPtr, arg: pointer): cint {.cdecl.} =
-  ## OCSP stapling: hand the client a copy of the configured DER OCSP response
-  ## (OpenSSL frees the copy after sending). NOACK when none is set.
-  let cfg = cast[ptr TlsConfig](arg)
-  if cfg == nil or cfg.ocsp.len == 0: return SSL_TLSEXT_ERR_NOACK
-  let n = cfg.ocsp.len
+  ## OCSP stapling: hand the client a copy of this ctx's immutable DER OCSP blob
+  ## (OpenSSL frees the copy after sending). `arg` is the OcspBlob, set per-ctx
+  ## by attachOcsp; NOACK when none is set. Reads no shared TlsConfig state.
+  let blob = cast[ptr OcspBlob](arg)
+  if blob == nil or blob.len == 0: return SSL_TLSEXT_ERR_NOACK
+  let n = blob.len
   let buf = CRYPTO_malloc(csize_t(n), nil, 0)
   if buf == nil: return SSL_TLSEXT_ERR_NOACK
-  copyMem(buf, unsafeAddr cfg.ocsp[0], n)
+  copyMem(buf, addr blob.data[0], n)
   # SSL_set_tlsext_status_ocsp_resp (via SSL_ctrl) transfers ownership of `buf`
   # to OpenSSL -- but only on success (returns 1), when it frees the copy after
   # sending. On failure ownership stays with us, so free it and NOACK rather
@@ -306,6 +336,27 @@ proc statusCb(ssl: SslPtr, arg: pointer): cint {.cdecl.} =
     CRYPTO_free(buf, nil, 0)
     return SSL_TLSEXT_ERR_NOACK
   SSL_TLSEXT_ERR_OK
+
+proc attachOcsp(ctx: SslCtxPtr, der: string) =
+  ## Give `ctx` an immutable OCSP staple: allocShared a private OcspBlob copy of
+  ## `der`, publish it as ctx ex_data (so ocspExFree releases it when the ctx
+  ## dies) AND as the status-callback arg, then register statusCb. No-op when
+  ## `der` is empty or the ex_data slot could not be allocated (ocspExIdx < 0),
+  ## in which case the ctx serves without a staple.
+  if der.len == 0 or ocspExIdx < 0: return
+  let blob = cast[ptr OcspBlob](
+    allocShared0(sizeof(OcspBlob) + der.len))
+  blob.len = der.len
+  copyMem(addr blob.data[0], unsafeAddr der[0], der.len)
+  # set_ex_data first: only if it takes ownership do we hand the blob to the
+  # callback. On failure OpenSSL will NOT call ocspExFree for it, so free it
+  # here and skip stapling rather than leak.
+  if SSL_CTX_set_ex_data(ctx, ocspExIdx, blob) != 1:
+    deallocShared(blob)
+    return
+  discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB,
+                                cast[pointer](statusCb))
+  discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, blob)
 
 proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
   ## Load cert + key (+ any bundled CA chain) from PKCS#12 (.pfx/.p12) bytes.
@@ -459,7 +510,7 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        cipherSuites = "", verify: cint = 0,
                        clientCaFile = "", clientCaPem = "",
                        sni: openArray[SniCert] = [], maxProtoVersion: clong = 0,
-                       ocsp = ""): ptr TlsConfig =
+                       ocsp = "", ocspFile = ""): ptr TlsConfig =
   let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
                         minProtoVersion, maxProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
@@ -475,11 +526,9 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   result.cipherList = cipherList
   result.cipherSuites = cipherSuites
   result.ocsp = ocsp
+  result.ocspFile = ocspFile
   SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
-  if ocsp.len > 0:   # OCSP stapling for the default cert
-    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB,
-                                  cast[pointer](statusCb))
-    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, result)
+  attachOcsp(ctx, ocsp)   # OCSP stapling for the default cert
   # SNI: one ctx per host, selected by the servername callback on the default.
   for sc in sni:
     let hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
@@ -493,13 +542,23 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                                   cast[pointer](servernameCb))
     discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, result)
 
-proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
+proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
+                      ocspFile = "", ocspResponse = "",
+                      clearOcsp = false): bool =
   ## Rebuild the SSL_CTX from `certFile`/`keyFile` (or, when empty, the paths
   ## most recently loaded -- initially the configured ones -- e.g. after an
   ## in-place renewal) and atomically install it, so subsequent TLS handshakes
   ## present the new certificate while in-flight connections keep the old one.
   ## Returns false and leaves the running ctx untouched if the new material is
   ## missing/invalid/mismatched.
+  ##
+  ## The stapled OCSP response rotates on the same swap: `ocspResponse` supplies
+  ## bytes, `ocspFile` a path read now, `clearOcsp` drops the staple; all empty
+  ## re-reads a previously configured `ocspFile` (best-effort) or preserves the
+  ## current bytes. An unreadable *explicit* `ocspFile` (like a bad certFile)
+  ## rejects the whole reload; a failed empty-arg re-read does not (a cert
+  ## renewal must not be blocked by a stale staple). `ocspResponse`/`ocspFile`
+  ## together with `clearOcsp` is contradictory and rejected.
   ##
   ## Lock-free and safe: loop threads read `cfg.ctx` with an atomic load in
   ## `newTlsSession`; the displaced ctx is not freed now but retired and freed
@@ -514,6 +573,26 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
     m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   if keyFile.len > 0:
     m.keyFile = keyFile; m.keyPem = ""
+  # Resolve the staple for the new ctx *before* buildTlsCtx, so any rejection
+  # leaves the running ctx (and its staple) completely untouched. newOcsp is the
+  # bytes to attach; newOcspFile the path to remember for future re-reads.
+  var newOcsp = cfg.ocsp
+  var newOcspFile = cfg.ocspFile
+  if clearOcsp and (ocspResponse.len > 0 or ocspFile.len > 0):
+    return false                             # contradictory request
+  elif clearOcsp:
+    newOcsp = ""; newOcspFile = ""
+  elif ocspResponse.len > 0:
+    newOcsp = ocspResponse; newOcspFile = "" # in-memory bytes win, no source path
+  elif ocspFile.len > 0:
+    try: newOcsp = readFile(ocspFile)        # explicit path: unreadable rejects
+    except CatchableError: return false      # the reload (bad-material contract)
+    newOcspFile = ocspFile
+  elif cfg.ocspFile.len > 0:
+    # Empty-arg reload with a stored path (certbot pattern): best-effort re-read;
+    # a failure keeps the current bytes rather than failing the reload.
+    try: newOcsp = readFile(cfg.ocspFile)
+    except CatchableError: discard
   var newCtx: SslCtxPtr
   try:
     newCtx = buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
@@ -522,11 +601,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = ""): bool =
   except CatchableError:
     return false
   SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
-  if cfg.ocsp.len > 0:   # re-attach OCSP stapling to the rebuilt ctx
-    discard SSL_CTX_callback_ctrl(newCtx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB,
-                                  cast[pointer](statusCb))
-    discard SSL_CTX_ctrl(newCtx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, cfg)
+  attachOcsp(newCtx, newOcsp)   # per-ctx staple (own blob, freed with the ctx)
   cfg.material = m
+  cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
+  cfg.ocspFile = newOcspFile
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
   # Retire `old` with a time-based grace rather than freeing the previous
   # retirement outright: freeing at the *next* reload alone is unsafe if two
@@ -630,14 +708,14 @@ proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    pkcs12File = "", pkcs12 = "", verify: cint = 0,
                    clientCaFile = "", clientCaPem = "",
                    sni: openArray[SniCert] = [], maxProtoVersion: clong = 0,
-                   ocsp = ""): ptr TlsConfig =
+                   ocsp = "", ocspFile = ""): ptr TlsConfig =
   let m = TlsMaterial(certFile: certFile, keyFile: keyFile, certPem: certPem,
                       keyPem: keyPem, pkcs12File: pkcs12File, pkcs12: pkcs12,
                       keyPassword: keyPassword)
   newTlsConfigWith(TLS_server_method(), m,
     (if enableH2: "\x02h2\x08http/1.1" else: "\x08http/1.1"),
     minProtoVersion, cipherList, cipherSuites, verify, clientCaFile,
-    clientCaPem, sni, maxProtoVersion, ocsp)
+    clientCaPem, sni, maxProtoVersion, ocsp, ocspFile)
 
 proc peerCertSubject*(ssl: SslPtr): string =
   ## Subject DN of the peer's (client's) certificate, "" if none was presented.
@@ -665,6 +743,7 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.cipherList = ""
   cfg.cipherSuites = ""
   cfg.ocsp = ""
+  cfg.ocspFile = ""
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =

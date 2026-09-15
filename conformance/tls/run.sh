@@ -38,7 +38,7 @@ fi
 # Which configs to run: $TLS_CONFIG, else CLI args, else all.
 configs=(certFile certPem pkcs12File verifyClient clientCaFile clientCaPem sni
          minTlsVersion maxTlsVersion ocspFile ocspResponse tlsCipherSuites
-         tlsCipherList hotReload)
+         tlsCipherList hotReload ocspReload)
 if [ -n "${TLS_CONFIG:-}" ]; then
   configs=("$TLS_CONFIG")
 elif [ "$#" -ge 1 ]; then
