@@ -126,13 +126,18 @@ class H3Client(QuicConnectionProtocol):
         if q is None:
             return
         if isinstance(e, HeadersReceived):
-            status, enc = 0, None
+            status, enc, ct = 0, None, ""
             for k, v in e.headers:
                 if k == b":status":
                     status = int(v)
                 elif k == b"content-encoding":
                     enc = v.decode("ascii", "replace").strip().lower() or None
-            q.put_nowait(("h", (status, enc)))
+                elif k == b"content-type":
+                    # Headers arrive as lowercase byte pairs; keep the value
+                    # verbatim (params like the multipart boundary must survive)
+                    # so the typed workloads can assert the round-trip.
+                    ct = v.decode("ascii", "replace")
+            q.put_nowait(("h", (status, enc, ct)))
             if e.stream_ended:
                 q.put_nowait(("end", None))
         elif isinstance(e, DataReceived):
@@ -169,10 +174,10 @@ class H3Session:
         if content:
             self.c._http.send_data(sid, content, end_stream=True)
             self.c.transmit()
-        status, enc, body = 0, None, bytearray()
+        status, enc, ct, body = 0, None, "", bytearray()
         while True:
             kind, val = await q.get()
-            if kind == "h": status, enc = val
+            if kind == "h": status, enc, ct = val
             elif kind == "d": body += val
             elif kind == "err":
                 self.c._queues.pop(sid, None); raise ConnectionError(val)
@@ -180,7 +185,9 @@ class H3Session:
         self.c._queues.pop(sid, None)
         # Decode content-encoding to match httpx's transparent h1/h2 behavior; the
         # requests workload sends accept-encoding, so /echo comes back compressed.
-        return status, decode_body(bytes(body), enc)
+        # Return the content-type too so the typed workloads can assert it (same
+        # 3-tuple shape as HttpxSession).
+        return status, ct, decode_body(bytes(body), enc)
 
     async def get(self, path, headers=None):
         return await self.request("GET", path, headers)
@@ -191,9 +198,10 @@ class H3Session:
         try:
             while True:
                 kind, val = await q.get()
-                if kind == "h": yield val[0]        # (status, enc); enc unused --
-                elif kind == "d": yield val         # streaming workloads send no
-                elif kind == "err": raise ConnectionError(val)  # accept-encoding
+                if kind == "h": yield val[0]        # (status, enc, ct); only the --
+                elif kind == "d": yield val         # status matters here (streaming
+                elif kind == "err": raise ConnectionError(val)  # workloads send no
+                                                    # accept-encoding, assert no type)
                 else: break
         finally:
             self.c._queues.pop(sid, None)
@@ -221,7 +229,7 @@ class H3Session:
         status = 0
         while True:
             kind, val = await q.get()
-            if kind == "h": status = val[0]         # (status, enc); enc unused
+            if kind == "h": status = val[0]         # (status, enc, ct); status only
             elif kind == "err":
                 self.c._queues.pop(sid, None); raise ConnectionError(val)
             elif kind == "end": break
@@ -243,7 +251,7 @@ class H3Session:
         status = None
         while status is None:
             kind, val = await q.get()
-            if kind == "h": status = val[0]         # (status, enc); enc unused
+            if kind == "h": status = val[0]         # (status, enc, ct); status only
             elif kind == "err":
                 self.c._queues.pop(sid, None); raise ConnectionError(val)
             elif kind == "end": raise ConnectionError("ws CONNECT stream ended")
