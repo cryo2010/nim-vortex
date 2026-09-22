@@ -11,7 +11,7 @@ a small Python load client (`client/stress_client.py`, httpx + websockets) and
 runs the chosen workload:
 
 ```sh
-nimble stressRequests        # buffered GET/POST/PUT at /echo, with compression
+nimble stressRequests        # buffered typed GET/POST/PUT at /echo, with compression
 nimble stressWs              # persistent WebSocket echo
 nimble stressSse             # SSE subscribe; server drops mid-stream; reconnect + Last-Event-ID
 nimble stressStreamUpload    # stream up; the server verifies the SHA-1 (400 on mismatch)
@@ -20,6 +20,17 @@ nimble stress                # short smoke of all five (20 s, 64 MiB); fails on 
 ```
 
 A green run ends with `== <workload>: all cells passed ==`.
+
+The `requests` and `methods` workloads drive a **typed payload mix** at `/echo`
+(text, JSON object + array, urlencoded + multipart form data, binary, XML, CSV,
+HTML), cycled per iteration. Each body is request-compressed and carries its
+`Content-Type`; the server decompresses it and echoes both back, and the client
+verifies the **body bytes and the `Content-Type` round-trip** verbatim (multipart
+boundary included). Each iteration also GETs a typed route (`/plaintext`,
+`/json`, `/html`, `/xml`, `/csv`, `/binary`) and asserts its `Content-Type` and
+exact body. The sizes cover the 0-length / 1-byte framing paths, the sub-1400 B
+no-compress threshold, the compressible large branch per type, and the
+incompressible store-fallback.
 
 ## Configuration (mirrors nim-navi's `NAVI_*`)
 

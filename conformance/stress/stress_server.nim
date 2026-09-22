@@ -6,8 +6,15 @@
 ##
 ## Routes:
 ##   /plaintext /json /big   TechEmpower-style GETs (smoke, shared with loadtest)
-##   /echo   GET/POST/PUT     echo the body; req is decompressed and the response
-##                            compressed per the build + config (requests workload)
+##   /html /xml /csv /binary  typed GETs with exact deterministic bodies and an
+##                            explicit Content-Type (text/html, application/xml,
+##                            text/csv, application/octet-stream) -- a cross-language
+##                            body + type contract the client asserts
+##   /echo   GET/POST/PUT/... echo the body; the non-GET reply reflects the request
+##                            Content-Type verbatim (multipart boundary included),
+##                            falling back to text/plain; req is decompressed and the
+##                            response compressed per the build + config (requests
+##                            workload)
 ##   /ws                      WebSocket echo (text + binary)
 ##   /sse                     N events in id order, closing after each batch so the
 ##                            client must reconnect and resume from Last-Event-ID
@@ -47,6 +54,29 @@ proc genChunk(start, n: int): string =
   result = newString(n)
   for j in 0 ..< n: result[j] = char((start + j) and 0xff)
 
+# --- typed GET bodies (cross-language contract with the Python client) --------
+# Precomputed once so the hot path does no per-request string building, like
+# bigBody above. The formulas are the contract; do not change them casually.
+
+proc buildXmlBody(): string =
+  result = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><items>"
+  for i in 0 .. 39:
+    result &= "<item id=\"" & $i & "\">The quick brown fox jumps over the lazy dog</item>"
+  result &= "</items>"
+
+proc buildCsvBody(): string =
+  result = "id,name,value\n"
+  for i in 0 .. 199:
+    result &= $i & ",name-" & $i & "," & $(i * i) & "\n"
+
+const
+  htmlBody = "<!doctype html><html><head><title>vortex stress</title></head><body>" &
+    "<p>The quick brown fox jumps over the lazy dog.</p>".repeat(30) &
+    "</body></html>"
+  xmlBody = buildXmlBody()
+  csvBody = buildCsvBody()
+  binaryBody = genChunk(0, 8192)     # const: gcsafe (hEcho closes over it)
+
 proc rssBytes(): int =
   ## Current resident set size (bytes), from /proc/self/statm (Linux container).
   try:
@@ -68,9 +98,22 @@ template echoBody(req, res: untyped) =
       vortex.send(res, Http200, """{"message":"Hello, World!"}""",
                   %*{"Content-Type": "application/json"})
     of "/big": vortex.send(res, Http200, bigBody)
+    of "/html":
+      vortex.send(res, Http200, htmlBody, %*{"Content-Type": "text/html"})
+    of "/xml":
+      vortex.send(res, Http200, xmlBody, %*{"Content-Type": "application/xml"})
+    of "/csv":
+      vortex.send(res, Http200, csvBody, %*{"Content-Type": "text/csv"})
+    of "/binary":
+      vortex.send(res, Http200, binaryBody,
+                  %*{"Content-Type": "application/octet-stream"})
     else: vortex.send(res, Http200, "")
   else:
-    vortex.send(res, Http200, req.body)     # POST/PUT echo
+    # POST/PUT/DELETE/PATCH echo: reflect the request Content-Type verbatim
+    # (including any multipart boundary), falling back to text/plain.
+    var ct = req.header("content-type")
+    if ct.len == 0: ct = "text/plain"
+    vortex.send(res, Http200, req.body, %*{"Content-Type": ct})
 
 template sseBody(req, res: untyped) =
   ## Emit a batch of id-ordered events, then close so the client reconnects and
@@ -173,6 +216,10 @@ when isMainModule:
   rt.get("/plaintext", hEcho)
   rt.get("/json", hEcho)
   rt.get("/big", hEcho)
+  rt.get("/html", hEcho)                   # typed GETs: exact deterministic bodies
+  rt.get("/xml", hEcho)                    # with explicit Content-Type (client asserts
+  rt.get("/csv", hEcho)                    # body + type per a cross-language contract)
+  rt.get("/binary", hEcho)
   rt.get("/echo", hEcho)
   rt.post("/echo", hEcho)
   rt.put("/echo", hEcho)

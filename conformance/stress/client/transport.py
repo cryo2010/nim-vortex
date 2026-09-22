@@ -9,7 +9,7 @@ its own workload loops and reporting on top. Kept separate so the correctness
 verifier and the perf harness never share workload/reporting code -- only the
 wire.
 """
-import gzip, hashlib, os
+import gzip, hashlib, json, os, urllib.parse
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 import httpx
@@ -77,6 +77,115 @@ def compress(raw: bytes):
 
 ACCEPT = None if RESP_COMP in ("", "none") else RESP_COMP
 
+# --- typed payload mix (shared with w_requests/w_methods) --------------------
+# A fixed boundary so the outer content-type string and the raw multipart bytes
+# agree exactly -- the server echoes the content-type verbatim (boundary and
+# all) and re-sends the decompressed body, so the boundary must round-trip.
+_MP_BOUNDARY = "----vortexstressBoundary7MA4YWxkTrZu0gW"
+
+def _multipart_body(boundary: str) -> bytes:
+    """Build raw multipart/form-data bytes BY HAND (no httpx multipart): a couple
+    of text fields plus one file part carrying gen_chunk(0, 4096) as
+    application/octet-stream, closed with the final terminator boundary. Hand-
+    built so the exact bytes get request-compressed and echoed like any other
+    body -- httpx's own multipart encoder would own the framing and we could not
+    assert the round-trip byte-for-byte."""
+    dash = b"--" + boundary.encode()
+    parts = []
+    parts.append(dash + b"\r\n")
+    parts.append(b'Content-Disposition: form-data; name="field1"\r\n\r\n')
+    parts.append(b"the quick brown fox\r\n")
+    parts.append(dash + b"\r\n")
+    parts.append(b'Content-Disposition: form-data; name="field2"\r\n\r\n')
+    parts.append(b"jumps over the lazy dog\r\n")
+    parts.append(dash + b"\r\n")
+    parts.append(b'Content-Disposition: form-data; name="file"; filename="blob.bin"\r\n')
+    parts.append(b"Content-Type: application/octet-stream\r\n\r\n")
+    parts.append(gen_chunk(0, 4096))
+    parts.append(b"\r\n")
+    parts.append(dash + b"--\r\n")            # final boundary terminator
+    return b"".join(parts)
+
+def payload_mix() -> list:
+    """The typed request-body mix, shared with w_requests/w_methods. Returns a
+    list of (content_type, raw_bytes). Sizes are chosen to cover the 0-length /
+    1-byte framing paths, the <1400 B no-compress threshold, the compressible
+    >=1400 B branch per type, and the incompressible store-fallback. Built once
+    at startup like the historical mix (os.urandom entries are not deterministic,
+    but the round-trip assertions only need self-consistency)."""
+    mix = []
+    # text/plain length ladder, exactly as the historical mix: empty and single
+    # byte (framing), a tiny body, one just above/around the compress threshold,
+    # and two large compressible bodies.
+    for n in (0, 1, 13, 1280, 64 * 1024, 256 * 1024):
+        mix.append(("text/plain", (b"the quick brown fox " * (n // 20 + 1))[:n]))
+    mix.append(("text/plain", os.urandom(64 * 1024)))   # incompressible: store fallback
+    # ~300 B realistic JSON object (a few string/number/bool/nested fields),
+    # padded to ~300 B so it sits below the compress threshold.
+    obj = {"user": "alice", "id": 42, "active": True, "score": 3.14,
+           "tags": ["a", "b", "c"], "meta": {"role": "admin", "seen": 7},
+           "note": "x" * 180}
+    mix.append(("application/json", json.dumps(obj).encode()))
+    # ~16 KiB JSON array (~100 objects, several fields each) -- JSON-shaped
+    # entropy compresses ~5-10x and is well over the 1400 B threshold, so the
+    # application/json compression branch runs.
+    arr = [{"id": i, "name": f"name-{i:04d}", "ts": f"2026-09-21T00:{i % 60:02d}:00Z",
+            "ratio": i * 0.12345, "ok": (i % 2 == 0)} for i in range(100)]
+    mix.append(("application/json", json.dumps(arr).encode()))
+    # urlencoded with reserved characters (spaces, '&', '=', unicode) so the
+    # value escaping is exercised on the wire.
+    form = {"q": "the quick & brown = fox", "name": " query with spaces",
+            "sym": "a&b=c d", "u": "café naïve ✓"}
+    mix.append(("application/x-www-form-urlencoded",
+                urllib.parse.urlencode(form).encode()))
+    # multipart/form-data: the outer content-type carries the SAME boundary as
+    # the hand-built body (see _multipart_body); the server echoes both verbatim.
+    mix.append((f"multipart/form-data; boundary={_MP_BOUNDARY}",
+                _multipart_body(_MP_BOUNDARY)))
+    mix.append(("application/octet-stream", gen_chunk(0, 8192)))
+    # typed binary, incompressible: the server must NOT compress a non-compressible
+    # response type -- this keeps that branch honest.
+    mix.append(("application/octet-stream", os.urandom(64 * 1024)))
+    # XML document >= 1400 B (repeated <item> elements): the application/xml
+    # compression branch.
+    xml = (b'<?xml version="1.0" encoding="UTF-8"?><items>'
+           + b"".join(b'<item id="%d">The quick brown fox jumps over the lazy dog</item>' % i
+                      for i in range(40))
+           + b"</items>")
+    mix.append(("application/xml", xml))
+    # a few-KB CSV built from a loop.
+    csv = b"id,name,value\n" + b"".join(f"{i},name-{i},{i * i}\n".encode()
+                                        for i in range(200))
+    mix.append(("text/csv", csv))
+    # small HTML page snippet -- intentionally can be < 1400 B (no-compress path).
+    mix.append(("text/html",
+                b"<!doctype html><html><body><h1>hi</h1>"
+                b"<p>The quick brown fox.</p></body></html>"))
+    return mix
+
+def expected_gets() -> list:
+    """The GET-route contract: (path, expected_content_type, expected_body) for
+    the typed GET routes, with the exact deterministic bodies the server serves
+    byte-for-byte (see the server contract). Cycled by the workloads, one GET per
+    iteration, asserting both the content-type and the body exactly."""
+    html = (b"<!doctype html><html><head><title>vortex stress</title></head><body>"
+            + (b"<p>The quick brown fox jumps over the lazy dog.</p>" * 30)
+            + b"</body></html>")
+    xml = (b'<?xml version="1.0" encoding="UTF-8"?><items>'
+           + b"".join(b'<item id="%d">The quick brown fox jumps over the lazy dog</item>' % i
+                      for i in range(40))
+           + b"</items>")
+    csv = b"id,name,value\n" + b"".join(f"{i},name-{i},{i * i}\n".encode()
+                                        for i in range(200))
+    return [
+        ("/plaintext", "text/plain", b"Hello, World!"),
+        ("/json", "application/json", b'{"message":"Hello, World!"}'),
+        ("/html", "text/html", html),
+        ("/xml", "application/xml", xml),
+        ("/csv", "text/csv", csv),
+        ("/binary", "application/octet-stream", gen_chunk(0, 8192)),
+    ]
+
 # --- transport sessions (httpx for h1/h2, aioquic for h3) --------------------
 # The negotiated HTTP version httpx must report for each pinned proto. httpx's
 # http2=True enables h2 but still ALPN-negotiates, so it *can* land on h1 if the
@@ -97,11 +206,14 @@ class HttpxSession:
     async def get(self, path, headers=None):
         r = await self.c.get(BASE + path, headers=headers or {})
         _pin_check(r)
-        return r.status_code, r.content
+        # Return the response content-type too so the typed workloads can assert
+        # the server echoed / served the right type (the verbatim string,
+        # multipart boundary included).
+        return r.status_code, r.headers.get("content-type", ""), r.content
     async def request(self, method, path, headers=None, content=b""):
         r = await self.c.request(method, BASE + path, headers=headers or {}, content=content)
         _pin_check(r)
-        return r.status_code, r.content
+        return r.status_code, r.headers.get("content-type", ""), r.content
     async def stream(self, method, path, headers=None):
         async with self.c.stream(method, BASE + path, headers=headers or {}) as r:
             _pin_check(r)
@@ -132,7 +244,7 @@ async def get_server_stats(s) -> tuple:
     an unparseable body; the caller renders that as `n/a` rather than a
     misleading `0MB`, so a regressed /stats can't masquerade as a healthy zero
     footprint and quietly defeat the soak's leak watch."""
-    st, body = await s.get("/stats")
+    st, _ct, body = await s.get("/stats")
     if st != 200:
         raise RuntimeError(f"/stats -> {st}")
     rss, heap = body.split()

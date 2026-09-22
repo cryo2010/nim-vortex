@@ -40,8 +40,34 @@ https://proxy:8443 {
 			import upstream
 		}
 	}
+	# WebSocket upgrades must not be response-buffered (the 101 hijacks the
+	# connection into a bidirectional relay), so /ws keeps the plain transport.
+	@ws path /ws
+	handle @ws {
+		reverse_proxy vortex:8080 {
+			import upstream
+		}
+	}
+
+	# Buffer buffered responses fully before relaying. Caddy's streaming relay
+	# of multi-buffer (>4 KiB) buffered h1 responses can abort mid-body under
+	# concurrent load ("aborting with incomplete response ... use of closed
+	# network connection"): the client sees the body truncated at a 4 KiB relay
+	# boundary although packet captures on both proxy legs show the origin
+	# sent, and Caddy's kernel ACKed, every byte on a healthy keep-alive
+	# connection before Caddy RSTs it right as the response completes, with no
+	# downstream provocation. It reproduces identically against a stock Go
+	# net/http echo origin, so it is not a vortex issue, and it hits Caddy
+	# 2.10.2 and 2.11.x alike -- the rate is timing-dependent (roughly 1 in a
+	# few hundred echoes on slow CI runners, 1 in a few thousand on fast local
+	# hardware, unseen at low concurrency). Buffering the response sidesteps
+	# the race: the upstream read completes before the downstream relay
+	# starts. 1 MiB covers the suite's largest echo (256 KiB + headers).
+	# Scoped to this buffered handle only -- streaming (above) must deliver as
+	# bytes arrive, and /ws must not buffer.
 	handle {
 		reverse_proxy vortex:8080 {
+			response_buffers 1MiB
 			import upstream
 		}
 	}

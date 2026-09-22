@@ -24,14 +24,15 @@ plus the server's RSS and Nim heap (from /stats) and elapsed time:
     [sse h3 chronos] final 200x1493782 | RSS 29MB | heap 6MB | t=60s
     == sse chronos h3 passed (1493782 events) ==
 """
-import asyncio, hashlib, os, sys, time
+import asyncio, hashlib, sys, time
 from collections import Counter
 import httpx
 from transport import (
     WebSocketException, OP_TEXT, ProtocolPinError,
     WORKLOAD, PROTO, SERVER, BASE, SECONDS, CLIENTS, CONC, STREAM, REPORT,
     MB, IS_H3, UNIT, STREAMING, xfer,
-    expected_sha1, body_gen, gen_chunk, compress, ACCEPT, session, get_server_stats)
+    expected_sha1, body_gen, gen_chunk, compress, ACCEPT, session, get_server_stats,
+    payload_mix, expected_gets)
 
 # --- shared state ------------------------------------------------------------
 class Fail(Exception):
@@ -132,37 +133,48 @@ async def drive(worker):
 
 # --- workloads (transport-agnostic via session) ------------------------------
 async def w_requests():
-    # Body-size mix, cycled per iteration. A single fixed 1280-byte body only ever
-    # exercises one point on the length curve; real traffic is bimodal (empty
-    # GETs/echoes, tiny JSON, occasional large payloads). Include 0 and 1 byte to
-    # cover the 0-length / single-byte framing paths (chunked vs Content-Length),
-    # and an incompressible random body so the codec path sees a non-trivial ratio
-    # and its fall-back-to-store branch, not just the best-case compressible one.
-    raws = []
-    for n in (0, 1, 13, 1280, 64 * 1024, 256 * 1024):
-        raws.append((b"the quick brown fox " * (n // 20 + 1))[:n])
-    raws.append(os.urandom(64 * 1024))         # incompressible
+    # Typed payload mix, cycled per iteration (payload_mix() from transport). A
+    # single fixed body only ever exercises one point on the curve; real traffic
+    # is a mix of content-types AND lengths -- text, JSON (object + array),
+    # urlencoded + multipart form data, binary, XML, CSV, HTML. The mix covers the
+    # 0-length / single-byte framing paths, the <1400 B no-compress threshold, the
+    # compressible >=1400 B branch per type, and the incompressible store-fallback.
+    # Each body is request-compressed (compress + content-encoding + accept-
+    # encoding) AND carries its content-type header; the echo response must return
+    # both the exact bytes and that same content-type verbatim (params included).
     prepared = []
-    for raw in raws:
+    for ctype, raw in payload_mix():
         body, enc = compress(raw)
-        hdrs = {}
+        hdrs = {"content-type": ctype}
         if enc: hdrs["content-encoding"] = enc
         if ACCEPT: hdrs["accept-encoding"] = ACCEPT
-        prepared.append((raw, body, hdrs))
+        prepared.append((ctype, raw, body, hdrs))
+    gets = expected_gets()
     get_hdrs = {"accept-encoding": ACCEPT} if ACCEPT else {}
     async def once():
         async with session() as s:
             k = 0
             while time.monotonic() < deadline:
-                st, b = await s.get("/plaintext", get_hdrs)
-                if st != 200 or b != b"Hello, World!":
-                    raise Fail(f"GET /plaintext -> {st}")
+                # Cycle the typed GET routes, one per iteration, asserting the
+                # served content-type and the exact body bytes.
+                path, want_ct, want_body = gets[k % len(gets)]
+                st, ct, b = await s.get(path, get_hdrs)
+                if st != 200:
+                    raise Fail(f"GET {path} -> {st}")
+                if ct.lower() != want_ct.lower():
+                    raise Fail(f"GET {path} content-type: want {want_ct!r} got {ct!r}")
+                if b != want_body:
+                    raise Fail(f"GET {path} body {len(b)}B (want {len(want_body)}B)")
                 bump(200)
-                raw, body, hdrs = prepared[k % len(prepared)]; k += 1
+                ctype, raw, body, hdrs = prepared[k % len(prepared)]; k += 1
                 for meth in ("POST", "PUT"):
-                    st, b = await s.request(meth, "/echo", hdrs, body)  # body: compressed
+                    st, ct, b = await s.request(meth, "/echo", hdrs, body)  # body: compressed
                     if st != 200 or b != raw:
                         raise Fail(f"{meth} /echo -> {st}, {len(b)}B (want {len(raw)}B)")
+                    # Round-trip the content-type verbatim (do NOT strip params --
+                    # the multipart boundary must survive); normalize case only.
+                    if ct.lower() != ctype.lower():
+                        raise Fail(f"{meth} /echo content-type: want {ctype!r} got {ct!r}")
                     bump(200)
     await asyncio.gather(*[drive(once) for _ in range(CONC)])
 
@@ -293,41 +305,43 @@ async def w_streamdownload():
 async def w_methods():
     # Every HTTP method, transport-agnostic (h1/h2/h3). Used by the reverse-proxy
     # interop suite to confirm each method survives the proxy hop. The body-bearing
-    # methods (POST/PUT/DELETE/PATCH) carry realistic, varied payloads -- a small
-    # JSON-ish document and a few-KiB blob, cycled -- not empty pings, and the h3
-    # client advertises Content-Length like httpx does for h1/h2. GET/HEAD/OPTIONS
-    # carry no body; HEAD returns headers only; OPTIONS is auto-answered (204/Allow).
-    raws = [
-        b'{"user":"alice","op":"update","note":"' + b"x" * 240 + b'"}',   # ~290 B
-        b"the quick brown fox jumps over the lazy dog. " * 96,            # ~4.3 KiB
-    ]
+    # methods (POST/PUT/DELETE/PATCH) carry the same typed payload mix as
+    # w_requests (payload_mix() -- text, JSON, urlencoded + multipart form data,
+    # binary, XML, CSV, HTML), cycled, not empty pings, and the h3 client
+    # advertises Content-Length like httpx does for h1/h2. Each carries its
+    # content-type header and the echo must return that type verbatim (params
+    # included). GET/HEAD/OPTIONS carry no body; HEAD returns headers only (empty
+    # body, no type assertion); OPTIONS is auto-answered (204/Allow).
     prepared = []
-    for raw in raws:
+    for ctype, raw in payload_mix():
         body, enc = compress(raw)
-        h = {}
+        h = {"content-type": ctype}
         if enc: h["content-encoding"] = enc
         if ACCEPT: h["accept-encoding"] = ACCEPT
-        prepared.append((raw, body, h))
+        prepared.append((ctype, raw, body, h))
     get_hdrs = {"accept-encoding": ACCEPT} if ACCEPT else {}
     async def once():
         async with session() as s:
             k = 0
             while time.monotonic() < deadline:
-                st, b = await s.get("/plaintext", get_hdrs)
+                st, _ct, b = await s.get("/plaintext", get_hdrs)
                 if st != 200 or b != b"Hello, World!":
                     raise Fail(f"GET /plaintext -> {st}")
                 bump(200)
-                raw, body, hdrs = prepared[k % len(prepared)]; k += 1
+                ctype, raw, body, hdrs = prepared[k % len(prepared)]; k += 1
                 for meth in ("POST", "PUT", "DELETE", "PATCH"):
-                    st, b = await s.request(meth, "/echo", hdrs, body)
+                    st, ct, b = await s.request(meth, "/echo", hdrs, body)
                     if st != 200 or b != raw:
                         raise Fail(f"{meth} /echo -> {st}, {len(b)}B (want {len(raw)}B)")
+                    # Content-type verbatim (params kept, case normalized only).
+                    if ct.lower() != ctype.lower():
+                        raise Fail(f"{meth} /echo content-type: want {ctype!r} got {ct!r}")
                     bump(200)
-                st, b = await s.request("HEAD", "/echo", get_hdrs)
+                st, _ct, b = await s.request("HEAD", "/echo", get_hdrs)
                 if st != 200 or (b or b"") != b"":
                     raise Fail(f"HEAD /echo -> {st}, {len(b or b'')}B (want 0)")
                 bump(200)
-                st, _ = await s.request("OPTIONS", "/echo", {})
+                st, _ct, _ = await s.request("OPTIONS", "/echo", {})
                 if st not in (200, 204):
                     raise Fail(f"OPTIONS /echo -> {st}")
                 bump(st)
