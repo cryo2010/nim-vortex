@@ -1,7 +1,8 @@
 ---
 name: vortex-stress
 description: >-
-  Start and monitor a vortex Dockerized stress soak from a plain-English prompt.
+  Start and monitor a vortex Dockerized stress soak from a plain-English prompt, fanning the
+  protocol × server matrix out to one parallel opus agent per cell.
   prompt (string): stress run details. Understood hints:
   workload = requests|websockets|sse|stream upload|stream download;
   protocol = h1|h2|h3|all; server = sync|async|async-await|chronos|chronos-await|all;
@@ -14,14 +15,15 @@ allowed-tools: Bash, Read, Edit, Write, Agent, Monitor
 
 # vortex-stress
 
-Turn a plain-English request (`$prompt`) into a `nimble stress<Workload>` Docker soak, run it,
-watch it, and drive an autonomous **fail → fix → restart** loop until one complete run passes
-clean. Then print a report.
+Turn a plain-English request (`$prompt`) into a matrix of pinned `nimble stress<Workload>`
+Docker soaks — **one opus agent per protocol × server cell, all running in parallel** — watch
+them, and drive an autonomous **fail → fix → restart** loop until one complete round passes
+clean on every cell. Then print a report.
 
 `$prompt` is the whole invocation text (also `$ARGUMENTS`). If it is empty, ask the user what to
 stress and stop.
 
-## 1. Parse the prompt into a command
+## 1. Parse the prompt into a cell matrix
 
 Read `$prompt` and pick exactly one workload task, then only the `VORTEX_*` knobs the prompt
 actually names. Rely on harness defaults for everything unnamed (do not invent values).
@@ -35,6 +37,7 @@ actually names. Rely on harness defaults for everything unnamed (do not invent v
 | sse, server-sent, events | `stressSse` |
 | upload, stream up | `stressStreamUpload` |
 | download, stream down | `stressStreamDownload` |
+| (unspecified) | `stress` |
 
 Follow the described **workload**, not any task name the user happens to type. "Stress
 websockets" → `stressWs` even if the user wrote `stressRequests`. (`nimble stress` runs a short
@@ -53,10 +56,6 @@ smoke of all five; use it only if the prompt clearly asks for an all-workloads s
 - `VORTEX_REPORT_SECONDS` = **derived, always set it**: `clamp(round(VORTEX_SECONDS / 32), 60, 900)`.
   (28800/32 = 900; short runs floor at 60.) The harness default is a flat 60, which floods a
   multi-hour soak with report lines — deriving it keeps the cadence sane.
-- `VORTEX_RUN_ID` = **always set it** to a stable slug like `vx-<workload>` (e.g. `vx-ws`). It
-  names the docker network / server container / image tags, so you can find and post-mortem the
-  run deterministically instead of chasing run.sh's PID. It also lets independent soaks run in
-  parallel without clobbering each other.
 - `VORTEX_CHAOS` = `all` | `none` | CSV of `slowread,slowwrite,idle,abort,vanish`: the chaos
   sidecar, a second, **unverified** misbehaving client per cell (slow readers, stalling uploads,
   idle holds, mid-transfer aborts, vanishing connections) running alongside the verified canary.
@@ -72,91 +71,112 @@ smoke of all five; use it only if the prompt clearly asks for an all-workloads s
   workers, default 8), `VORTEX_CHAOS_SEED` (a fixed seed replays an identical chaos schedule;
   set it when reproducing a chaos-correlated failure).
 
-Reference (don't re-derive): the tasks live in `vortex.nimble:221-245`; the orchestration, the
-proto→build-flags matrix, and the per-cell run live in `conformance/stress/run.sh`; the full knob
-table with defaults and the pass/fail banner semantics are in `conformance/stress/README.md`.
+**Expand the matrix into cells.** The skill — not run.sh — walks the matrix: expand
+`VORTEX_PROTO=all` → `h1 h2 h3` and `VORTEX_SERVER=all` → `sync async async-await chronos
+chronos-await`, then take the cross product. `all × all` = 15 cells (h1/sync, h1/async, …,
+h3/chronos-await); a fully pinned prompt ("h2 on chronos") is a 1-cell matrix — same flow, one
+agent. Each cell gets:
 
-**Echo the exact command before running it**, on its own line for observability, e.g.:
+- `VORTEX_PROTO` and `VORTEX_SERVER` pinned to its single value.
+- `VORTEX_RUN_ID` = `vx-<workload>-<proto>-<server>` (e.g. `vx-ws-h3-chronos`). Every docker
+  resource (network, server/chaos containers, image tags) derives from it, so distinct run IDs
+  make the parallel cells collision-free (no host ports are published; everything rides the
+  per-run docker network).
+- The same `VORTEX_SECONDS`, `VORTEX_REPORT_SECONDS`, and any pass-throughs.
+
+Reference (don't re-derive): the tasks live in `vortex.nimble`; the proto→build-flags matrix and
+the per-cell run live in `conformance/stress/run.sh`; the full knob table with defaults and the
+pass/fail banner semantics are in `conformance/stress/README.md`.
+
+**Echo the cell list and one exemplar command before launching**, e.g.:
 
 ```
-VORTEX_PROTO=all VORTEX_SECONDS=28800 VORTEX_REPORT_SECONDS=900 VORTEX_SERVER=chronos VORTEX_RUN_ID=vx-ws nimble stressWs
+15 cells: {h1,h2,h3} × {sync,async,async-await,chronos,chronos-await}, e.g.
+VORTEX_PROTO=h1 VORTEX_SERVER=sync VORTEX_SECONDS=480 VORTEX_REPORT_SECONDS=60 VORTEX_RUN_ID=vx-ws-h1-sync nimble stressWs
 ```
 
 Only include the env vars you actually set (plus the always-set `VORTEX_REPORT_SECONDS` and
 `VORTEX_RUN_ID`). Keep the invariant `<env> nimble stress<Workload>`.
 
-## 2. Launch the soak
+## 2. Fan out: one opus agent per cell
 
-- No separate image to pick: run.sh builds a client image once, then builds a server image
-  **per cell** (protocol × server-runtime) from the current worktree. h3 reuses the h2 server
-  image (only the `STRESS_HTTP3` runtime toggle differs), so an `all` run does not double-build.
-  The first client + server build can take minutes — that's expected.
-- Because the build **Docker-copies the live worktree**, run only on a committed, consistent
-  tree, and do **not** edit `.nim` source while a build is in flight (torn-read compile errors —
-  the `stress-builds-from-worktree` navi memory). Non-source scratch files (logs, `*.md`) are
-  safe to write during a build.
-- Run the built command with **Bash `run_in_background`**, redirecting to
-  `<scratchpad>/<workload>.log` (2>&1).
+Launch **one Agent per cell** (`subagent_type: claude`, `model: opus`), **all in a single
+message** so they run concurrently. Before launching, mind the worktree: the docker builds
+**copy the live worktree** — run only on a committed, consistent tree, and do **not** edit
+`.nim` source while any cell is building (torn-read compile errors — the
+`stress-builds-from-worktree` navi memory; with all cells launching at once, every build is in
+flight in the first minutes). Non-source scratch files (logs, `*.md`) are safe to write. The
+per-cell image tags are distinct but share docker's layer cache, so concurrent builds dedupe;
+the first round of builds can still take minutes — that's expected.
 
-## 3. Monitor the piped log, with a docker liveness guard
+Each cell agent's prompt must contain:
 
-Unlike a single-container soak, vortex's `run.sh` orchestrates the whole matrix **on the host**:
-the server runs as a detached container and each client runs `--rm`, so the PASS/FAIL banners and
-the `[wl proto server] 200x… | RSS … | heap … | t=…s` report lines are written to **run.sh's
-stdout — the piped `<workload>.log`**, not to any one container's logs. So here the piped log
-*is* the source of truth (the inverse of the navi soak).
+- **Its exact pinned command**, e.g.
+  `VORTEX_PROTO=h1 VORTEX_SERVER=sync VORTEX_SECONDS=480 VORTEX_REPORT_SECONDS=60 VORTEX_RUN_ID=vx-ws-h1-sync nimble stressWs`,
+  run from the repo root with **Bash `run_in_background`**, redirected to
+  `<scratchpad>/<workload>-<proto>-<server>.log` (2>&1).
+- **Monitoring instructions** (the piped log is the source of truth: run.sh orchestrates on the
+  host, the server container is detached and clients run `--rm`, so banners and report lines
+  land in the piped log, not any container's logs). Start a **Bash `run_in_background`**
+  until-loop that tails the cell log and **exits on a terminal state**, printing which
+  signature it hit:
+  - **PASS**: `== <workload>: all cells passed ==` (run.sh prints it even for a pinned 1-cell
+    matrix), or for the all-workloads smoke `== stress smoke: all workloads passed ==`.
+  - **FAIL**: any of `== <workload>: FAILURES`, `== stress smoke: FAILURES`,
+    `FAIL <workload>:`, `FAILED (exit`, `mismatch`, `checksum`, `Traceback`, `panic`,
+    `assert`, `Killed`, `server did not start`, `chaos sidecar FAILED`, `FAIL chaos:`
+  - Guard against a silently frozen pipe: if the log stops growing, confirm liveness with
+    `docker ps --filter name=vortex-stress-server-<VORTEX_RUN_ID>`; a frozen pipe with no live
+    container means the run really stopped — treat as FAIL.
+  - Chaos-sidecar log shape (present unless `VORTEX_CHAOS=none`): the cell ends with a
+    `--- chaos sidecar ---` block holding tally lines (`ok: vanish=6 … | err: …`) and
+    `== chaos sidecar passed (fds N -> M) ==`. Expect a quiet gap of up to ~30 s of finishing
+    slow behaviors plus a 15 s (40 s on h3) drain pause between the canary's pass line and that
+    block: it is the fd-leak reaping window, not a hang. A sidecar failure (e.g. `FAIL chaos:
+    fd leak (baseline N, final M, slack 8)`) fails the cell only when the canary passed.
+- **On FAIL, preserve evidence before teardown**: while containers are up, grab
+  `docker logs vortex-stress-server-<VORTEX_RUN_ID>` and
+  `docker logs vortex-stress-chaos-<VORTEX_RUN_ID>` into the scratchpad, and snapshot the cell
+  log's tail. Then clean up the cell's resources (ignore errors — run.sh's own trap may have
+  removed them): `docker rm -f vortex-stress-server-<id> vortex-stress-chaos-<id>`,
+  `docker network rm vortex-stress-<id>`,
+  `docker rmi -f vortex-stress-server-img-<id> vortex-stress-client-img-<id>`.
+- **Hard rules**: never edit source, never commit, never attempt a fix — run, observe, report.
+- **Return a structured verdict**: the cell (workload × proto × server), PASS or FAIL, the
+  terminal signature line, a one-line failure reason (if any), the final
+  `RSS … | heap … | fds …` report line, and the scratchpad paths of any preserved evidence.
 
-Guard against the pipe silently freezing (the driver getting reaped/reparented on a multi-hour
-run — see the `monitor-stress-soaks-via-docker-logs` navi memory): a frozen pipe with no live
-containers means the run really stopped. Confirm liveness with
-`docker ps --filter name=vortex-stress-server-<VORTEX_RUN_ID>` (and the client image
-`vortex-stress-client-img-<VORTEX_RUN_ID>`).
+## 3. Parent monitoring
 
-Start a **Bash `run_in_background`** until-loop that tails `<workload>.log` and **exits on a
-terminal state**, so the harness wakes this skill exactly at the decision point:
+Cell agents notify on completion — collect verdicts as they finish. Also set a `ScheduleWakeup`
+(~1200s) fallback heartbeat in case a cell hangs. On each wake, if cells are still running,
+sample the latest `[wl proto server] 200x… | RSS … | heap … | t=…s` lines across the per-cell
+logs in the scratchpad and check `docker ps --filter name=vortex-stress-server-` so you can
+show progress, per-cell liveness, and the memory-flatness trend.
 
-- **PASS**: line matching `== <workload>: all cells passed ==`
-- **FAIL**: any of `== <workload>: FAILURES`, `FAIL <workload>:`, `FAILED (exit`, `mismatch`,
-  `checksum`, `Traceback`, `panic`, `assert`, `Killed`, `server did not start`,
-  `chaos sidecar FAILED`, `FAIL chaos:`
+**Wait for every cell to reach a terminal state before acting on failures.** The round restarts
+whole-matrix anyway, letting in-flight cells finish collects the full failure set in one
+iteration — and it guarantees no builds are copying the worktree when fix agents start editing
+`.nim`.
 
-Chaos-sidecar log shape (present unless `VORTEX_CHAOS=none`): each cell ends with a
-`--- chaos sidecar ---` block holding its tally lines (`ok: vanish=6 sse:vanish=4 … | err: …`)
-and `== chaos sidecar passed (fds N -> M) ==`. Expect a quiet gap of up to ~30 s of finishing
-slow behaviors plus a 15 s (40 s on h3) drain pause between the canary's per-cell pass line and
-that block: it is the fd-leak reaping window, not a hang. A sidecar failure (e.g. `FAIL chaos:
-fd leak (baseline N, final M, slack 8)`) fails the cell only when the canary passed.
-
-Have the loop print which terminal signature it hit and exit. Also set a `ScheduleWakeup`
-(~1200s) as a fallback heartbeat in case the run hangs and the log stops growing. On each wake,
-if still running, sample the latest report lines (`… 200x… | RSS … | heap … | t=…s`) so you can
-show progress and the memory-flatness trend, and confirm a container is still up.
-
-## 4. On PASS → report and finish
+## 4. All cells PASS → report and finish
 
 Go to section 6.
 
-## 5. On FAIL → stop, fix, restart (the core loop)
+## 5. On failures → fix, then restart the whole matrix
 
-1. **Preserve evidence before teardown.** run.sh tears the server container down per-cell (and
-   again on exit), so grab it while it's up: `docker logs vortex-stress-server-<VORTEX_RUN_ID> >
-   <scratchpad>/srv-logs-<n>.txt 2>&1`. The failing cell (workload × proto × server) and the
-   client's `FAIL <workload>: <reason>` cause are already in `<workload>.log` — snapshot its tail
-   into the scratchpad too.
-2. **Stop the run**: kill the background nimble job, then clean up the run's containers/network/
-   images: `docker rm -f vortex-stress-server-<VORTEX_RUN_ID>
-   vortex-stress-chaos-<VORTEX_RUN_ID>`, `docker network rm vortex-stress-<VORTEX_RUN_ID>`, and
-   `docker rmi -f vortex-stress-server-img-<VORTEX_RUN_ID>
-   vortex-stress-client-img-<VORTEX_RUN_ID>` (ignore errors — run.sh's own trap may have removed
-   them). The chaos sidecar's own log is already dumped into `<workload>.log` per cell; if the
-   run died before that dump, grab `docker logs vortex-stress-chaos-<VORTEX_RUN_ID>` while
-   preserving evidence in step 1.
-3. **Ensure the session fix branch** (create once, lazily, on the first failure; reuse it for
+1. **Evidence is already preserved** by the failing cell agents (section 2); their verdicts
+   carry the cell, cause, and evidence paths.
+2. **Ensure the session fix branch** (create once, lazily, on the first failure; reuse it for
    every later fix): `git checkout -b fix/stress-<workload>-<shortslug>` off `main`. If it
    already exists this session, stay on it.
-4. **Dispatch an opus Agent** (`subagent_type: claude`, `model: opus`) per failure with the
-   failing cell, the log tail, and the preserved server logs. Tell the agent to:
-   - Root-cause and fix the issue in the vortex source.
+3. **Dispatch an opus fix Agent** (`subagent_type: claude`, `model: opus`) per distinct
+   failure, **serially — one at a time**: fix agents share the worktree and each validates
+   with its own build, so they must not overlap each other (or any still-running soak). Give
+   each the failing cell, the verdict, and the preserved evidence paths. Tell the agent to:
+   - Root-cause and fix the issue in the vortex source. When the failure is
+     throughput-sensitive (streaming/h2 timeouts), weigh host contention from the parallel
+     soaks as a possible cause before assuming a code bug.
    - **Validate with a short, focused run** before committing: same workload, pinned to the
      failing `VORTEX_PROTO` and `VORTEX_SERVER`, `VORTEX_SECONDS=120`, its own `VORTEX_RUN_ID`.
      Do **not** edit `.nim` while a stress build is copying the worktree
@@ -164,20 +184,21 @@ Go to section 6.
    - Commit on the session branch: **one commit per fix**, semantic message, **no AI
      attribution** of any kind (`no-claude-attribution` memory). Do **not** push.
    - Return the root cause (one line) and the commit sha.
-5. **Restart the full run** with the original parameters (full duration and matrix) from
-   section 2, and resume monitoring at section 3.
-6. **Repeat** until a complete run reaches the PASS banner with no `FAIL`/mismatch.
+4. **Restart the entire fan-out** — all cells, full duration — from section 2, and resume
+   monitoring at section 3.
+5. **Repeat** until a complete round ends with every cell reporting PASS.
 
 ## 6. Final report
 
 Print a markdown summary:
 
-- The exact command(s) run and total wall-clock.
+- The matrix, the exemplar command, rounds run, and total wall-clock.
+- A per-cell result table: cell, pass/fail per round, final RSS/heap from the cell's last
+  report line (confirm memory stayed flat everywhere).
 - Iterations: how many failures were fixed; per failure: the cell, a one-line root cause, and
   the commit sha.
 - Branch name + `git log --oneline main..<branch>`.
-- Final RSS/heap trend from the last report lines (confirm memory stayed flat).
 - A clear **PASS** statement, and a reminder that the fixes sit on `<branch>` (unpushed) for
   review.
 
-If no failures occurred, say so: one clean run, no branch created.
+If no failures occurred, say so: one clean round, no branch created.

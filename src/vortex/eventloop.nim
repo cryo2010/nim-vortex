@@ -123,6 +123,14 @@ type
                                  # deregistered after an fd/memory-exhaustion
                                  # accept() error (EMFILE/ENFILE/...), then
                                  # re-armed in tick(). 0 = listener armed.
+    bodyPausedConns: int         # HTTP/1 streaming connections whose socket read
+                                 # is paused at the read-ahead high-water (the recv
+                                 # loop stops pulling; the fd stays armed). While
+                                 # > 0 the selector wait is capped short so the
+                                 # async pump keeps draining the consumer (whose
+                                 # ack un-pauses the read); without the cap an idle
+                                 # dispatcher would only wake on the 1s tick and
+                                 # stall the drain (see the select below).
 
 when defined(linux):
   const clockMonotonicCoarse = ClockId(6)
@@ -325,6 +333,11 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
   c.deadline = if secs > 0: loop.core.nowSec + int64(secs) else: 0
 
 proc closeConn(loop: Loop, c: ptr Connection) =
+  if c.bodyReadPaused and loop.bodyPausedConns > 0:
+    # A body-paused connection is going away: release its slot in the paused-conns
+    # count so the selector wait un-caps once none remain.
+    dec loop.bodyPausedConns
+  c.bodyReadPaused = false
   if c.registered:
     loop.selector.unregister(int(c.fd))
     c.registered = false
@@ -628,6 +641,20 @@ proc initH2(loop: Loop, c: ptr Connection) =
                    loop.settings.h2StreamWindow,
                    loop.settings.h2ConnWindow)
 
+const
+  streamBodyHighWater = 1024 * 1024
+    ## HTTP/1 manualAck read-ahead ceiling (one streamRecvBufferCap worth): pause
+    ## the socket recv loop once this many delivered-but-unacked body bytes are
+    ## outstanding. An async pull-reader (await req.read) drains the delivered
+    ## chunks into its own queue and acks on consume; without this bound the loop
+    ## reads (and copies into that queue) the whole upload far faster than the
+    ## handler hashes it -- ~maxBodySize buffered per connection, gigabytes across
+    ## many concurrent uploads (OOM). The sync auto-ack path hashes inline and
+    ## never accrues debt, so it is unaffected.
+  streamBodyLowWater = streamBodyHighWater div 4
+    ## Resume reading once ackBody brings the debt back below this (hysteresis so
+    ## a resume isn't immediately re-paused after one small ack).
+
 proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
   ## Deliver newly-arrived request-body bytes to a streaming handler's onBody.
   ## `c.bodyFed` tracks how much has been delivered; `last` is set once the
@@ -640,6 +667,7 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
     let avail = c.chunkBody.len - c.bodyFed
     if avail > 0:
       cb(toOpenArray(c.chunkBody, c.bodyFed, c.chunkBody.len - 1), last)
+      if c.rs.bodyManualAck: c.bodyUnacked += avail
       # Drop the delivered bytes so a streaming chunked upload stays O(read
       # burst) in memory, matching the Content-Length path. The parser keeps
       # appending to the now-empty buffer; because it bounds chunkBody.len (not a
@@ -683,6 +711,7 @@ proc feedBody(loop: Loop, c: ptr Connection, last: bool) =
       return
     cb(toOpenArray(c.rbuf, bodyStart, bodyStart + avail - 1),
        avail == c.parser.bodyLen)
+    if c.rs.bodyManualAck: c.bodyUnacked += avail
     let tailLen = c.rlen - (bodyStart + avail)
     if tailLen > 0:                              # a pipelined request follows
       moveMem(addr c.rbuf[bodyStart], addr c.rbuf[bodyStart + avail], tailLen)
@@ -697,6 +726,8 @@ proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   if not callStreamRoute(addr loop.core, c.fd, c.gen, 0): return
   c.rs.reqStreaming = true
   c.bodyFed = 0
+  c.bodyUnacked = 0
+  c.bodyReadPaused = false
   let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
   try:
     {.gcsafe.}:
@@ -969,6 +1000,15 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     if c.state != csActive: returnAfterStateChange()
     if c.rlen < c.rbuf.len: continue
   while true:
+    if c.rs.bodyManualAck and c.bodyUnacked >= streamBodyHighWater:
+      # A manualAck streaming body (an async await-req.read consumer) has fallen
+      # behind: >= high-water bytes are delivered-but-unacked (its queue is full).
+      # Stop pulling more -- the unread tail waits in the kernel as TCP
+      # backpressure. The fd stays selector-armed; handleRead's tail flags the
+      # connection so the selector wait is capped short (bodyPausedConns), keeping
+      # the async pump cycling to drain the consumer without a busy-spin, and the
+      # recv loop resumes on the next readable event once ackBody drains the debt.
+      break
     if c.rlen == c.rbuf.len:
       if c.h2 != nil:
         # HTTP/2: process buffered frames to compact consumed bytes, so the
@@ -1062,6 +1102,21 @@ proc handleRead(loop: Loop, c: ptr Connection) =
   loop.processInput(c)
   if c.state != csFree and (c.pendingOut > 0 or c.closeAfterFlush):
     loop.flushOut(c)
+  # Read-ahead backpressure bookkeeping for a manualAck streaming body. Decide on
+  # the LIVE bodyUnacked after this read: the consumer's acks fire synchronously
+  # from inside feedBody (onConsume runs when a fed chunk completes a parked
+  # reader), so a connection that looked behind mid-recv may already be caught up
+  # here. While paused, bodyPausedConns caps the selector wait so the async pump
+  # keeps draining the consumer even though this fd has no new readable event; the
+  # recv loop above stops pulling until ackBody's resume drains the debt.
+  let nowPaused = c.state == csActive and c.rs.reqStreaming and
+      c.rs.bodyManualAck and c.bodyUnacked >= streamBodyHighWater
+  if nowPaused and not c.bodyReadPaused:
+    c.bodyReadPaused = true
+    inc loop.bodyPausedConns
+  elif not nowPaused and c.bodyReadPaused:
+    c.bodyReadPaused = false
+    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
   if c.peerHalfClosed and c.state == csActive and not c.rs.respStreaming:
     # The peer will send no more requests: close once any response has been
     # written (the deferred/worker case sets closeAfterFlush and closes when
@@ -1100,6 +1155,27 @@ when not defined(plainHttp):
       loop.armWrite(c)
     of tlsClosed, tlsError:
       loop.closeConn(c)
+
+proc resumeBodyImpl(loopPtr: pointer, fd: int32, gen: uint32,
+                    n: int) {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.resumeBodyHook: HTTP/1 req.ackBody credit. Repay `n` bytes of
+  ## read-ahead debt and, once it falls below the low-water, clear the pause so the
+  ## recv loop pulls the kernel-buffered tail again. The fd stays selector-armed
+  ## throughout, so clearing the flag is enough -- the next readable event (kept
+  ## prompt by the bodyPausedConns wait cap) resumes the recv loop. Called on the
+  ## loop thread; may run re-entrantly (the consumer's onConsume fires from inside
+  ## feedBody's onBody callback, itself inside handleRead), so it must not re-enter
+  ## the recv loop -- doing so would corrupt the shared rbuf mid-move.
+  {.gcsafe.}:
+    let loop = cast[Loop](loopPtr)
+    if fd < 0: return
+    let c = conn(addr loop.core, fd, gen)
+    if c == nil: return
+    c.bodyUnacked -= n
+    if c.bodyUnacked < 0: c.bodyUnacked = 0
+    if not c.bodyReadPaused or c.bodyUnacked >= streamBodyLowWater: return
+    c.bodyReadPaused = false          # below the low-water: let the recv loop pull
+    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
 
 proc startTls(loop: Loop, c: ptr Connection): bool =
   ## Begin TLS for a TLS listener (leave plaintext otherwise). Returns false if
@@ -1774,6 +1850,7 @@ proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.hooks.kick = kickImpl
   loop.core.hooks.flushHook = flushImpl
+  loop.core.hooks.resumeBodyHook = resumeBodyImpl
   installWsHooks(addr loop.core)   # h2 WebSocket (RFC 8441) stream lookup
   when not defined(plainHttp):
     installH3WsHooks(addr loop.core)   # h3 WebSocket (RFC 9220) stream lookup
@@ -1792,6 +1869,14 @@ proc run*(loop: Loop) =
       # An adapter has pending async operations: bound the wait so
       # timer/IO completions from its dispatcher aren't starved.
       timeoutMs = min(timeoutMs, max(1, loop.pumpCap))
+    if loop.bodyPausedConns > 0:
+      # A streaming read is paused at the read-ahead high-water (recv loop stopped
+      # pulling; fd still armed). The async consumer drains from its own queue on
+      # the pump; its ack un-pauses the read. But between drained chunks the
+      # dispatcher can briefly report no pending operations (pumpCap = -1), which
+      # would let the selector block for the full 1s idle wait and stall the drain.
+      # Cap the wait so the pump keeps cycling until the consumer catches up.
+      timeoutMs = min(timeoutMs, 2)
     when not defined(plainHttp):
       if loop.udpFd >= 0:
         let qt = ngTimeoutMs()

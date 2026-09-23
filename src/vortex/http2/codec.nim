@@ -702,7 +702,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
   ## Send a streamed response's HEADERS (no content-length, no END_STREAM) and
   ## open the body. Subsequent bytes flow via h2StreamWrite/h2StreamFinish.
   let h2 = h2Conn(c)
-  if sid notin h2.streams or h2.streams[sid].rs.responded: return
+  if h2 == nil or sid notin h2.streams or h2.streams[sid].rs.responded: return
   template st: H2Stream = h2.streams[sid]
   st.rs.responded = true
   st.respPhase = if st.isHead: rpHeadSent else: rpStreaming
@@ -853,7 +853,7 @@ proc h2WsAccept*(c: ptr Connection, sid: uint32, maxMessage: int,
   ## (no END_STREAM, so the stream stays open for framing) and attach a
   ## WsConn. Returns false if the stream is not an unanswered ws-connect.
   let h2 = h2Conn(c)
-  if sid notin h2.streams: return false
+  if h2 == nil or sid notin h2.streams: return false
   template st: H2Stream = h2.streams[sid]
   if not st.isWsConnect or st.rs.responded or st.ws != nil: return false
   st.rs.responded = true
@@ -886,7 +886,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
                 body: openArray[char], altSvc = "",
                 secHeaders: openArray[(string, string)] = []) =
   let h2 = h2Conn(c)
-  if sid notin h2.streams: return
+  if h2 == nil or sid notin h2.streams: return
   if h2.streams[sid].rs.responded: return
   h2.streams[sid].rs.responded = true
   let skipBody = h2.streams[sid].isHead
@@ -1690,5 +1690,11 @@ proc h2StreamAlive*(c: ptr Connection, sid: uint32): bool =
 
 proc h2Stream*(c: ptr Connection, sid: uint32): ptr H2Stream =
   ## nil if gone. Pointer valid until the streams table is next mutated.
+  ## Guards c.h2 as well as the stream id: a deferred apply (worker outbox,
+  ## sendFile chunk) resolves its connection by (fd, gen) and can race the h2
+  ## teardown under a client abort, so the resolved connection may hold no
+  ## codec state at all -- dereferencing it here SIGSEGVed the h2+sync chaos
+  ## soak. Mirrors the guard every sibling accessor already has.
   let h2 = h2Conn(c)
+  if h2 == nil: return nil
   if sid in h2.streams: addr h2.streams[sid] else: nil

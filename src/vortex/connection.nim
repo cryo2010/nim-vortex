@@ -182,6 +182,9 @@ type
     onRespDrain*: RespDrainCb ## streamed-response drain callback
     reqStreaming*: bool       ## dispatched early; body flows to onBody
     onBodyCb*: BodyCb         ## inbound streaming sink (req.onBody)
+    bodyManualAck*: bool      ## defer flow-control credit to req.ackBody (the
+                              ## async adapters set this; HTTP/1 then read-ahead-
+                              ## bounds the socket, HTTP/2 the stream window)
     fwdCached*: bool          ## RFC 7239 Forwarded parsed once per request
     cachedForwarded*: seq[tuple[forr, proto, host: string]]
                               ## its elements, reused by forwardedProto/Host/clientIp
@@ -238,6 +241,17 @@ type
     respFraming*: RespFraming ## how the open streaming body is delimited
     respBackedUp*: bool       ## write() reported backpressure; onDrain pending
     bodyFed*: int             ## body bytes already delivered to onBody
+    bodyUnacked*: int         ## manualAck streaming body: bytes delivered to
+                              ## onBody but not yet ackBody'd. Bounds read-ahead
+                              ## so an async pull-reader (await req.read) can't
+                              ## buffer the whole upload faster than it hashes.
+    bodyReadPaused*: bool     ## reads paused: bodyUnacked hit the high-water, so
+                              ## the socket recv loop stops pulling (kernel holds
+                              ## the rest as TCP backpressure) until ackBody drains
+                              ## the debt below the low-water. The fd stays armed;
+                              ## the loop caps its selector wait while any such
+                              ## connection exists so the async consumer still
+                              ## drains on the pump (see eventloop bodyPausedConns)
     respContentLength*: int64 ## declared Content-Length of an open rfContentLength
                               ## streamed response (-1 = not length-delimited);
                               ## reconciled against respBodyWritten at finish()
@@ -302,6 +316,12 @@ type
                       gen: uint32) {.nimcall, gcsafe.}
       ## Flush a connection's write buffer now. Used by a loop-thread
       ## WebSocket send outside the read path. Set by the event loop.
+    resumeBodyHook*: proc (loopPtr: pointer, fd: int32, gen: uint32,
+                           n: int) {.nimcall, gcsafe.}
+      ## HTTP/1 flow-control credit (req.ackBody) for a manualAck streaming
+      ## body: subtract `n` consumed bytes from the connection's read-ahead
+      ## debt and, if reads were paused at the high-water, resume them. Set by
+      ## the event loop; the HTTP/2/3 windows have their own ack paths.
     wsStreamLookup*: proc (c: pointer, stream: uint32): RootRef
                        {.nimcall, gcsafe.}
       ## Resolve an HTTP/2 (RFC 8441) WebSocket stream's WsConn from a
@@ -648,6 +668,7 @@ proc resetRequest*(rs: var RequestState) =
   rs.onRespDrain = nil
   rs.reqStreaming = false
   rs.onBodyCb = nil
+  rs.bodyManualAck = false
   rs.fwdCached = false        # keep cachedForwarded storage; overwritten on next use
 
 proc resetRequestState(c: var Connection) =
@@ -662,6 +683,8 @@ proc resetRequestState(c: var Connection) =
   c.respFraming = rfNone
   c.respBackedUp = false
   c.bodyFed = 0
+  c.bodyUnacked = 0
+  c.bodyReadPaused = false
   c.respContentLength = -1
   c.respBodyWritten = 0
   c.parser.reset(0)
