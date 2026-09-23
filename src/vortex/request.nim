@@ -1542,6 +1542,7 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
     h2SetOnBody(c, req.stream, cb, manualAck)
     return
   c.rs.onBodyCb = cb
+  c.rs.bodyManualAck = manualAck
   # HTTP/1 Expect: 100-continue -> send it now that the handler is reading the
   # body (Go's send-on-read model; h2/h3 have no Expect flow). Loop-thread only;
   # a handler that responds before reading never reaches here, so it never
@@ -1556,8 +1557,9 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
 proc ackBody*(req: Request, n: int) =
   ## Grant flow-control credit for `n` consumed request-body bytes on a
   ## `manualAck` streaming handler: HTTP/2 sends a stream WINDOW_UPDATE, HTTP/3
-  ## resumes reading the QUIC stream. No-op on HTTP/1 (backpressure there is the
-  ## socket) and for the auto-ack default. Loop-thread only.
+  ## resumes reading the QUIC stream, and HTTP/1 repays the bounded read-ahead
+  ## debt so the socket recv loop resumes if it had paused. No-op for the
+  ## auto-ack default. Loop-thread only.
   if n <= 0 or currentThreadId() != req.core.threadId: return
   if req.fd < 0:
     when not defined(plainHttp):
@@ -1570,10 +1572,19 @@ proc ackBody*(req: Request, n: int) =
         # engine pump this same loop iteration.
     return
   let c = conn(req.core, req.fd, req.gen)
-  if c == nil or req.stream == 0: return
-  h2AckBody(c, req.stream, n)
-  try: req.core.hooks.flushHook(req.core.loopPtr, req.fd, req.gen)
-  except Exception: discard
+  if c == nil: return
+  if req.stream != 0:
+    h2AckBody(c, req.stream, n)
+    try: req.core.hooks.flushHook(req.core.loopPtr, req.fd, req.gen)
+    except Exception: discard
+    return
+  # HTTP/1: repay the read-ahead debt and resume the recv loop if it paused.
+  # Backpressure here is the socket (no in-band credit frame): the loop stopped
+  # reading while bodyUnacked was high, leaving unread bytes in the kernel, and
+  # resumes now that the handler has consumed some.
+  if req.core.hooks.resumeBodyHook != nil:
+    try: req.core.hooks.resumeBodyHook(req.core.loopPtr, req.fd, req.gen, n)
+    except Exception: discard
 
 # --- streaming responses ----------------------------------------------------
 
