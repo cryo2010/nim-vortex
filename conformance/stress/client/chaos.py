@@ -690,6 +690,82 @@ async def sample_fds_strict(retries=1, gap=0.0):
             if attempt + 1 < retries and gap > 0: await asyncio.sleep(gap)
     return None
 
+# Baseline warm-up fan-out: how many connections to open concurrently to force
+# the kernel to spread them across every SO_REUSEPORT loop thread before the
+# baseline sample (see warm_baseline). Sized well above any plausible core count
+# so even a big host's loop set is covered; work per connection is a short,
+# aborted /download read.
+WARMUP_CONC = int(os.environ.get("VORTEX_CHAOS_WARMUP", "64"))
+
+async def warm_baseline():
+    """Drive a concurrent burst of short aborted /download reads so every
+    SO_REUSEPORT loop thread runs a handler that genuinely SUSPENDS before we
+    sample the baseline.
+
+    Why this matters (the whole point of the fix): the server runs N =
+    countProcessors() event-loop threads, and each async/chronos loop thread
+    creates its per-thread runtime dispatcher (an epoll/kqueue fd) LAZILY, the
+    first time a handler on that loop actually suspends at an await (e.g.
+    `await res.write` under download backpressure) -- and holds it for the loop's
+    lifetime (freed only at loop teardown; see the adapters' teardown()). Those N
+    dispatcher fds are legitimate, permanent per-loop infrastructure, NOT leaked
+    connections. Sampling the baseline off a still-quiet server (before any loop
+    has suspended a handler) counts ZERO of them; the final sample -- taken after
+    the canary and chaos have driven suspending traffic to every loop -- counts
+    all N. That gap is exactly N (== the core count), deterministic, acquired
+    once early, and flat for the rest of the run -- which is precisely the shape
+    we were mis-reading as a "leak". Warming every loop first folds those N fds
+    INTO the baseline, so the assertion measures real teardown leakage (which
+    scales with iteration count and dwarfs the slack) instead of the one-time
+    per-loop dispatcher cost.
+
+    The warm request MUST suspend server-side: a cheap synchronously-completing
+    GET (/plaintext, /stats) never touches the dispatcher and warms nothing
+    (measured: 64 concurrent /stats GETs left the fd count unchanged, while 64
+    aborted /download reads raised it by exactly N and it stayed flat through
+    192 more). So each warm connection starts the 1 GiB /download, reads a couple
+    of chunks (by which point the server is deep in write backpressure, i.e.
+    suspended), then aborts -- the same early-cancel machinery as b_abort,
+    bounded and cheap.
+
+    Best-effort: any connect/read error is swallowed (the real gate is the
+    baseline sample and the never-connected guard below). Opening many
+    connections AT ONCE is what fans them across loops -- a serial loop would keep
+    landing on whichever loop the kernel hands the next accept to."""
+    async def one():
+        try:
+            if IS_H3:
+                # h3: read a couple of chunks off the raw queue, then STOP_SENDING
+                # via the additive h3.py API (same as b_abort's h3 path).
+                async with session() as s:
+                    connects[0] += 1
+                    sid, q = s.stream_open("GET", "/download")
+                    got = 0
+                    while got < 2:
+                        kind, _val = await q.get()
+                        if kind == "d": got += 1
+                        elif kind in ("end", "err"): break
+                    s.abort_stream(sid)
+                return
+            # h1/h2: read a couple of chunks, then aclose() the stream generator
+            # early (RST_STREAM on h2 / connection drop on h1, as in b_abort).
+            async with session() as s:
+                connects[0] += 1
+                gen = s.stream("GET", "/download")
+                await gen.__anext__()          # status
+                got = 0
+                async for _chunk in gen:
+                    got += 1
+                    if got >= 2: break
+                await gen.aclose()             # early cancel: the server unblocks
+        except Exception:
+            pass
+    await asyncio.gather(*[one() for _ in range(WARMUP_CONC)])
+    # Let the warm-up connections fully tear down (and the server reap them) so
+    # they do not inflate the baseline as transient in-flight sockets; the loops'
+    # dispatcher fds we just forced into existence stay.
+    await asyncio.sleep(2.0)
+
 # --- main: baseline -> chaos -> drain -> final -> verdict ---------------------
 async def run(enabled):
     start = time.monotonic()
@@ -701,10 +777,22 @@ async def run(enabled):
           f"pool={','.join(_fmt_key(k) for k in pool)} seed={SEED} conc={CONC} "
           f"proto={PROTO}", flush=True)
 
-    # Baseline fd sample, before the verified client launches. The server may
-    # still be settling right after "listening", so retry a few times over ~10 s;
-    # zero successful connects HERE is not yet fatal (the run may still connect
-    # later and the "never connected" guard below is the real gate).
+    # Warm every loop thread FIRST so the baseline includes each loop's lazily-
+    # created per-thread dispatcher fd (see warm_baseline). Without this the
+    # baseline is sampled off a cold server and misses N == core-count legitimate
+    # per-loop fds that the final sample then counts, manufacturing a phantom
+    # "leak" of exactly N. This retry-wraps its own connect settling, so it also
+    # covers the "server still settling right after listening" case the baseline
+    # retry used to absorb.
+    for _ in range(10):
+        await warm_baseline()
+        if connects[0] > 0: break
+        await asyncio.sleep(1.0)
+
+    # Baseline fd sample, after warm-up, before the verified client launches. The
+    # server may still be settling right after "listening", so retry a few times
+    # over ~10 s; zero successful connects HERE is not yet fatal (the run may
+    # still connect later and the "never connected" guard below is the real gate).
     baseline = await sample_fds_strict(retries=10, gap=1.0)
     if baseline is _MISSING_FD:
         # /stats served but without the fd field: an older server, chaos can't do
