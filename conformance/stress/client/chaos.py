@@ -519,8 +519,11 @@ async def b_vanish_streamupload(rng):
         finally:
             if task is not None:
                 task.cancel()
+                # CancelledError is a BaseException: without catching it here the
+                # expected cancellation escapes the worker's except Exception and
+                # kills the sidecar.
                 try: await task
-                except Exception: pass
+                except (Exception, asyncio.CancelledError): pass
             try: await s_cm.__aexit__(None, None, None)
             except Exception: pass
         return
@@ -555,8 +558,9 @@ async def b_vanish_streamupload(rng):
         s.upload("/upload", {"x-sha1": "0" * 40}, forever()))
     await asyncio.sleep(rng.uniform(0.5, 2.0))
     task.cancel()
+    # Same as the h3 branch: swallow the CancelledError we just induced.
     try: await task
-    except Exception: pass
+    except (Exception, asyncio.CancelledError): pass
 
 async def b_idle_streamdownload(rng):
     """streamdownload idle: a fully-established download whose consumer reads
