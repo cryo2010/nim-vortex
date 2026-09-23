@@ -85,6 +85,18 @@ proc rssBytes(): int =
   except CatchableError: discard
   0
 
+proc openFds(): int =
+  ## Count of open file descriptors, from the /proc/self/fd directory (Linux
+  ## container). The chaos sidecar samples this before and after its run to catch
+  ## descriptors leaked by connection teardown (sockets, sendFile pins). The
+  ## walkDir listing self-counts its own dirfd (a +1 bias), but that bias is a
+  ## constant that cancels in the sidecar's baseline-vs-final comparison, so it
+  ## needs no correction here. Same defensive style as rssBytes: any failure
+  ## (non-Linux, /proc unavailable) yields 0.
+  try:
+    for _ in walkDir("/proc/self/fd"): inc result
+  except CatchableError: result = 0
+
 # --- shared handler bodies (no await needed; identical sync/async) -----------
 
 template echoBody(req, res: untyped) =
@@ -130,9 +142,12 @@ template sseBody(req, res: untyped) =
   s.close()
 
 template statsBody(req, res: untyped) =
-  ## "<rssBytes> <heapBytes>" for the client's periodic report. getOccupiedMem is
-  ## the live GC heap of the loop thread that handled this request.
-  vortex.send(res, Http200, $rssBytes() & " " & $getOccupiedMem())
+  ## "<rssBytes> <heapBytes> <openFds>" for the client's periodic report.
+  ## getOccupiedMem is the live GC heap of the loop thread that handled this
+  ## request; openFds is the process-wide descriptor count the chaos sidecar
+  ## watches for leaks (see openFds's bias note).
+  vortex.send(res, Http200,
+              $rssBytes() & " " & $getOccupiedMem() & " " & $openFds())
 
 template whoamiBody(req, res: untyped) =
   ## The remote address as vortex sees it: the PROXY-protocol source when behind

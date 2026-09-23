@@ -20,6 +20,14 @@
 #   VORTEX_STREAM_BYTES   streaming transfer size (default 1 GiB)
 #   VORTEX_RUN_ID    isolation id for the docker network/container/image names,
 #                    so runs can go in parallel (default: this run's PID)
+#   VORTEX_CHAOS     none | all | CSV of slowread,slowwrite,idle,abort,vanish
+#                    (default all). Launches a second, UNVERIFIED misbehaving
+#                    client (chaos.py) per cell alongside the verified canary;
+#                    the canary still hard-fails, and the sidecar can only add
+#                    failures, never mask one (canary wins). none = no sidecar
+#                    (and no drain pause), the pre-chaos behavior.
+#   VORTEX_CHAOS_CONC     chaos sidecar worker count (default 8)
+#   VORTEX_CHAOS_SEED     per-worker seeded RNG for reproducible chaos (default 1)
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -38,6 +46,9 @@ clients=${VORTEX_CLIENTS:-3}
 reqc=${VORTEX_REQ_COMPRESSION:-gzip}
 respc=${VORTEX_RESP_COMPRESSION:-gzip}
 sbytes=${VORTEX_STREAM_BYTES:-1073741824}
+chaos=$(printf '%s' "${VORTEX_CHAOS:-all}" | tr 'A-Z' 'a-z')
+chaosconc="${VORTEX_CHAOS_CONC:-8}"
+chaosseed="${VORTEX_CHAOS_SEED:-1}"
 
 # A per-run id isolates concurrent runs: each gets its own docker network,
 # server container, and image tags, so several `run.sh` / `nimble stress`
@@ -67,6 +78,7 @@ if [ "$(uname -m)" = "x86_64" ]; then basearg="--build-arg BASE=archlinux:latest
 
 net=vortex-stress-$id
 srvc=vortex-stress-server-$id
+chc=vortex-stress-chaos-$id
 simg=vortex-stress-server-img-$id
 cimg=vortex-stress-client-img-$id
 
@@ -78,6 +90,7 @@ docker network create "$net" >/dev/null 2>&1 || true
 # unchanged.
 cleanup() {
   docker rm -f "$srvc" >/dev/null 2>&1 || true
+  docker rm -f "$chc" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   docker rmi -f "$simg" "$cimg" >/dev/null 2>&1 || true
 }
@@ -114,7 +127,7 @@ run_cell() {
   p="$1"; s="$2"
   proto_cfg "$p"; codec_flags
   compress=0; [ "$respc" != none ] && [ "$respc" != "" ] && compress=1
-  bflags="$pflags$cflags"
+  bflags="$pflags$cflags${VORTEX_EXTRA_FLAGS:+ ${VORTEX_EXTRA_FLAGS}}"
   echo
   echo "=== $workload [proto=$p server=$s] : ${seconds}s, ${clients}x${conc} ==="
 
@@ -133,6 +146,31 @@ run_cell() {
     sleep 0.1
   done
 
+  # Chaos sidecar: a second, UNVERIFIED client that misbehaves on purpose while
+  # the verified canary below runs unchanged. Launched DETACHED here so it is
+  # already up and has sampled its fd baseline (off the still-quiet server)
+  # before the canary starts adding real traffic; consulted only after the
+  # canary exits (see below), so it can add failures but never mask one.
+  if [ "$chaos" != "none" ]; then
+    docker rm -f "$chc" >/dev/null 2>&1 || true
+    docker run -d --name "$chc" --network "$net" \
+      -e VORTEX_CHAOS="$chaos" -e VORTEX_CHAOS_CONC="$chaosconc" \
+      -e VORTEX_CHAOS_SEED="$chaosseed" -e VORTEX_PROTO="$p" \
+      -e VORTEX_WORKLOAD="$workload" \
+      -e STRESS_BASE="$scheme://server:$port" \
+      -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
+      -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" python chaos.py >/dev/null
+    # Wait for the sidecar's fd baseline so it is sampled before the canary
+    # connects. chaos.py prints "chaos: baseline fds=N" once, before it starts
+    # inducing chaos; cap at ~30 s (300 * 0.1 s), then give up on this cell.
+    i=0
+    until docker logs "$chc" 2>&1 | grep -q "chaos: baseline"; do
+      i=$((i + 1))
+      [ "$i" -gt 300 ] && { echo "chaos sidecar did not reach baseline" >&2; docker logs "$chc"; docker rm -f "$chc" >/dev/null 2>&1 || true; return 1; }
+      sleep 0.1
+    done
+  fi
+
   # The client reports RSS/heap (from the server's /stats) and prints the
   # per-cell "== <workload> <server> <proto> passed ==" line on success.
   set +e
@@ -146,8 +184,36 @@ run_cell() {
   crc=$?
   set -e
 
+  # Wait for the chaos sidecar to finish and collect its verdict. It closes
+  # everything and waits a drain pause (up to 40 s on h3) before its final
+  # /stats fd sample, so the server must stay up until it exits -- hence the
+  # server teardown below moves AFTER this wait. Cap at ~90 s (900 * 0.1 s),
+  # covering the drain plus slack; on cap, treat it as a watchdog fail (3).
+  xrc=0
+  if [ "$chaos" != "none" ]; then
+    i=0
+    until [ "$(docker inspect -f '{{.State.Status}}' "$chc" 2>/dev/null)" != running ]; do
+      i=$((i + 1))
+      if [ "$i" -gt 900 ]; then docker rm -f "$chc" >/dev/null 2>&1 || true; xrc=3; break; fi
+      sleep 0.1
+    done
+    if [ "$xrc" = 0 ]; then xrc=$(docker inspect -f '{{.State.ExitCode}}' "$chc"); fi
+    echo "--- chaos sidecar ---"
+    docker logs "$chc" 2>&1 || true
+    docker rm -f "$chc" >/dev/null 2>&1 || true
+  fi
+
+  # Server teardown. Moved to AFTER the sidecar wait so the sidecar's final
+  # /stats fd sample lands on a live server; when chaos=none the sidecar block
+  # above is skipped and this is exactly where it used to be (a no-op reorder).
   docker rm -f "$srvc" >/dev/null 2>&1 || true
   [ "$crc" = 0 ] || echo "== $workload $s $p FAILED (exit $crc) =="
+  # Canary wins: only fold in the sidecar's verdict when the canary passed, so
+  # chaos can add a failure but never mask one.
+  if [ "$crc" = 0 ] && [ "$xrc" != 0 ]; then
+    echo "== $workload $s $p chaos sidecar FAILED (exit $xrc) =="
+    crc=$xrc
+  fi
   return "$crc"
 }
 

@@ -240,12 +240,17 @@ async def session():
             yield HttpxSession(c)
 
 async def get_server_stats(s) -> tuple:
-    """Sample the server's (rss, heap) bytes from /stats. Raises on a non-2xx or
-    an unparseable body; the caller renders that as `n/a` rather than a
+    """Sample the server's (rss, heap, fds) bytes/count from /stats. Raises on a
+    non-2xx or an unparseable body; the caller renders that as `n/a` rather than a
     misleading `0MB`, so a regressed /stats can't masquerade as a healthy zero
-    footprint and quietly defeat the soak's leak watch."""
+    footprint and quietly defeat the soak's leak watch. The third field (open-fd
+    count, for the chaos sidecar's leak assertion) is tolerated as optional: `fds`
+    is None against an older server that emits only rss+heap, so this stays
+    compatible with a two-field /stats."""
     st, _ct, body = await s.get("/stats")
     if st != 200:
         raise RuntimeError(f"/stats -> {st}")
-    rss, heap = body.split()
-    return int(rss), int(heap)
+    parts = body.split()
+    rss, heap = int(parts[0]), int(parts[1])
+    fds = int(parts[2]) if len(parts) > 2 else None
+    return rss, heap, fds

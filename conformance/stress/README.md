@@ -46,6 +46,9 @@ incompressible store-fallback.
 | `VORTEX_RESP_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - the server compresses the response |
 | `VORTEX_STREAM_BYTES` | `1073741824` | streaming transfer size (1 GiB; lower for a smoke) |
 | `VORTEX_RUN_ID` | this run's PID | isolation id for the docker network / container / image names, so runs can go **in parallel** |
+| `VORTEX_CHAOS` | `all` | `none` \| `all` \| CSV of `slowread,slowwrite,idle,abort,vanish` - launches an **unverified misbehaving** sidecar client per cell (see [Chaos sidecar](#chaos-sidecar)); `none` = no sidecar (and no drain pause), the pre-chaos behavior |
+| `VORTEX_CHAOS_CONC` | `8` | chaos sidecar worker count |
+| `VORTEX_CHAOS_SEED` | `1` | per-worker seeded RNG for reproducible chaos schedules |
 
 The matrix is `VORTEX_PROTO` × `VORTEX_SERVER`; each cell builds its own server
 image and prints `== <workload> [proto=<p> server=<s>]: PASS/FAIL ==`.
@@ -100,6 +103,86 @@ h1/h2, so there is no TCP fallback), and the client asserts h3 was actually
 negotiated. For h1/h2 the client verifies every response's negotiated version
 (`HTTP/1.1` for `h1`, `HTTP/2` for `h2`) and hard-fails on a mismatch, so an
 `h2` run can never quietly measure an `h1` connection.
+
+## Chaos sidecar
+
+The verified client is well-behaved by design: it never reads slowly, idles,
+aborts mid-transfer, or vanishes, so the server's teardown, backpressure, and
+reaping paths carry no load. `VORTEX_CHAOS` adds an **unverified** second client
+(`client/chaos.py`) per cell that misbehaves on purpose while the verified
+client keeps running unchanged as the **canary**. Behaviors come in two forms,
+uniformly weighted in the per-iteration pick pool: the five **generic** styles
+below (the fixed all-routes catalog - `/download`, `/upload`, `/ws`, `/sse`,
+`/plaintext` - in every cell) plus **workload-targeted** variants selected by
+the cell's `VORTEX_WORKLOAD`, so each soak's own protocol paths get targeted
+abuse (slow/idle/vanishing SSE clients under `sse`, half-closing WebSocket
+clients under `ws`, ...). Enabling a style enables both forms; a style with no
+targeted form for the workload just runs generic.
+
+**Canary wins.** run.sh consults the sidecar's exit code only when the verified
+client passed, so chaos can add a failure but never mask one. A chaos failure on
+an otherwise-green cell prints `== <workload> <server> <proto> chaos sidecar
+FAILED (exit N) ==`.
+
+The five behaviors (each iteration picks timings from the seeded RNG):
+
+- `slowread` - stream `/download` (sometimes `/sse`), read a chunk, sleep, clean close: write-scheduler stalls and slow-consumer fairness.
+- `slowwrite` - `POST /upload` with a wrong `x-sha1`, drip-feed small chunks with sleeps (the 400 is expected and swallowed): long-held streaming request state.
+- `idle` - open a WS or keep-alive connection, do nothing for 10-30 s, clean close: keep-alive slot occupancy, ping path, QUIC idle-timeout straddling.
+- `abort` - read part of `/download` then cancel cleanly (h2 RST_STREAM; h3 STOP_SENDING), sometimes abort an upload mid-generator: mid-transfer cancellation cleanup.
+- `vanish` - abrupt death with no goodbye (h1/h2 `SO_LINGER=0` TCP RST; h3 dropped UDP transport, reaped via idle timeout): abrupt-peer-death cleanup and fd reclamation.
+
+The workload-targeted variants (tally keys `workload:style`, printed next to the
+bare generic keys - e.g. `ok: vanish=6 sse:vanish=4 ...` in the report line):
+
+| Workload | Variant | What it does |
+|----------|---------|--------------|
+| ws | `ws:slowread` | burst echoes, then stop reading the replies for seconds so the server's echo write side backs up |
+| ws | `ws:abort` | clean CLOSE frame mid-echo-burst |
+| ws | `ws:vanish` | no close handshake: TCP transport abort (h1/h2) / dropped UDP transport (h3) |
+| sse | `sse:slowread` | consume events at a crawl until the server batch-closes |
+| sse | `sse:idle` | open the stream, read nothing for 10-30 s (server stalls mid-batch), clean close |
+| sse | `sse:abort` | drop mid-batch, resume with a garbage `Last-Event-ID` (the server's parseInt-fallback path) |
+| sse | `sse:vanish` | mid-stream RST / dropped transport on `/sse` |
+| streamupload | `streamupload:slowwrite` | stall-resume: chunks, 5-10 s of dead air mid-body, resume, finish |
+| streamupload | `streamupload:vanish` | die mid-request-body: h1 partial-body RST; h3 dropped transport; h2 cancel+abandon |
+| streamdownload | `streamdownload:idle` | established download, zero consumption for 10-30 s, clean close |
+
+`requests` has no targeted variants (the generic catalog was designed around
+it); `idle@ws` and `abort@streamupload` are intentionally absent, subsumed by
+generic `idle`'s ws hold and generic `abort`'s mid-body generator raise.
+
+**Exit codes** (run.sh folds a nonzero code into the cell only when the canary passed):
+
+| Code | Meaning |
+|------|---------|
+| `0` | ran, connected at least once, fd assertion passed (induced errors tallied + swallowed) |
+| `1` | fd leak (`final > baseline + 8`) |
+| `2` | internal error / unknown behavior name / missing fd field in `/stats` |
+| `3` | self-watchdog fired (also what run.sh reports if the sidecar never exits within its poll cap) |
+| `4` | never connected once (must not pass silently) |
+
+**fd-leak assertion.** `/stats` exposes an open-fd count (from `/proc/self/fd`).
+The sidecar samples a **baseline before the canary launches** (run.sh waits for
+the `chaos: baseline fds=N` log line before starting the verified client),
+induces chaos, closes everything, waits a drain pause (15 s; **40 s on h3** to
+outlive the 30 s QUIC idle timeout), samples again, and fails on `final >
+baseline + slack` where `slack = 8` (a calibrated constant, not a knob).
+
+**Degraded modes.** h3 `slowread` and `ws:slowread` are pacing-only: aioquic
+grants flow-control credit on receipt (and the h3 client queues unread frames
+locally, unbounded), so neither can exert true backpressure. h2 `vanish` and
+`ws:vanish` fall back to abandoning the connection without a clean close when
+the raw socket / transport is not reachable for `SO_LINGER=0` / `.abort()`.
+h2 `streamupload:vanish` is cancel+abandon by construction (the response object
+does not exist mid-request-body, so the socket is unreachable there).
+
+Chaos runs on every cell by default. For a chaos-free run (no sidecar, no
+drain pause):
+
+```sh
+VORTEX_CHAOS=none nimble stress
+```
 
 ## Gaps
 

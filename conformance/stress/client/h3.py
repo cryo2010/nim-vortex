@@ -206,6 +206,34 @@ class H3Session:
         finally:
             self.c._queues.pop(sid, None)
 
+    def stream_open(self, method, path, headers=None):
+        """Open a stream WITHOUT draining it: return the raw (sid, queue) the chaos
+        sidecar reads chunks from by hand, so it can abort mid-transfer via
+        abort_stream. The verified client never calls this (it uses stream(), which
+        owns the drain-and-cleanup loop); this is the low-level door chaos needs to
+        keep a stream open and then reset it, which stream()'s finally-cleanup would
+        preclude."""
+        return self.c._open(method, path, headers or {}, end=True)
+
+    def abort_stream(self, sid, code=0x10c):
+        """Abort one open stream cleanly (the h3 analogue of httpx aclose = h2
+        RST_STREAM). Default code 0x10c is H3_REQUEST_CANCELLED. stop_stream tells
+        the peer to quit writing the response (STOP_SENDING); it raises ValueError
+        when the stream already finished and was reaped -- a race the caller can't
+        avoid (the download may complete first), so swallow it. reset_stream aborts
+        our own send side when it is still open (a GET's FIN may be sent but
+        unacked; sender.reset is idempotent, so the guard only skips the truly
+        finished case). transmit() flushes the frames, then we drop the queue so a
+        late event for this sid is ignored (the same _queues.pop cleanup stream()
+        does in its finally)."""
+        try: self.c._quic.stop_stream(sid, code)
+        except ValueError: pass                 # stream already finished + reaped
+        st = self.c._quic._streams.get(sid)
+        if st is not None and not st.sender.is_finished:
+            self.c._quic.reset_stream(sid, code)
+        self.c.transmit()
+        self.c._queues.pop(sid, None)
+
     async def upload(self, path, headers, body_agen):
         sid, q = self.c._open("POST", path, headers or {}, end=False)
         async for chunk in body_agen:
