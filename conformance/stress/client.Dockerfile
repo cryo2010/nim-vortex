@@ -10,5 +10,6 @@ WORKDIR /client
 COPY conformance/stress/client/transport.py ./transport.py
 COPY conformance/stress/client/stress_client.py ./stress_client.py
 COPY conformance/stress/client/h3.py ./h3.py
+COPY conformance/stress/client/chaos.py ./chaos.py
 
 CMD ["python", "stress_client.py"]

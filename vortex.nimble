@@ -216,7 +216,9 @@ task loadtest, "Configurable k6 load test with live Grafana/Prometheus charts (D
 # hard-fail. Env knobs (mirror nim-navi): VORTEX_PROTO, VORTEX_SERVER (sync|
 # async|chronos|...|all), VORTEX_SECONDS, VORTEX_REPORT_SECONDS, VORTEX_CLIENTS,
 # VORTEX_CONCURRENCY, VORTEX_REQ_COMPRESSION, VORTEX_RESP_COMPRESSION,
-# VORTEX_STREAM_BYTES. Local-only. See conformance/stress/README.md.
+# VORTEX_STREAM_BYTES, VORTEX_CHAOS[,_CONC,_SEED] (misbehaving-client sidecar;
+# default all, VORTEX_CHAOS=none for a chaos-free run). Local-only.
+# See conformance/stress/README.md.
 
 task stressRequests, "Stress soak: buffered GET/POST/PUT with compression (Docker)":
   exec "VORTEX_WORKLOAD=requests sh conformance/stress/run.sh"

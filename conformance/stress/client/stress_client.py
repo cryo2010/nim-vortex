@@ -18,10 +18,10 @@ deliverBody auto-acks the QUIC stream/connection windows as the handler reads,
 and any unread remainder is credited back to the connection window at teardown).
 
 Reports each VORTEX_REPORT_SECONDS in nim-navi's format - status-code tallies
-plus the server's RSS and Nim heap (from /stats) and elapsed time:
+plus the server's RSS, Nim heap, and open-fd count (from /stats) and elapsed time:
 
-    [sse h3 chronos] 200x1481767 | RSS 29MB | heap 7MB | t=45s
-    [sse h3 chronos] final 200x1493782 | RSS 29MB | heap 6MB | t=60s
+    [sse h3 chronos] 200x1481767 | RSS 29MB | heap 7MB | fds 42 | t=45s
+    [sse h3 chronos] final 200x1493782 | RSS 29MB | heap 6MB | fds 41 | t=60s
     == sse chronos h3 passed (1493782 events) ==
 """
 import asyncio, hashlib, sys, time
@@ -63,17 +63,18 @@ def fmt_xfer(now: float) -> str:
     rate = db / dt / MB if dt > 0 else 0.0
     return f" | {xfer[0] // MB}MB xfer @ {rate:.0f}MB/s"
 
-def report_line(prefix, rss, heap):
+def report_line(prefix, rss, heap, fds):
     now = time.monotonic()
     t = int(now - start)
     seg = fmt_xfer(now) if STREAMING else ""
-    # `None` means the /stats sample failed; render "n/a", never a misleading
-    # "0MB" -- a soak exists to watch RSS/heap, so a silently-zeroed metric must
-    # look broken, not healthy.
+    # `None` means the /stats sample failed (or, for fds, an older two-field
+    # /stats); render "n/a", never a misleading "0MB"/"0" -- a soak exists to
+    # watch RSS/heap/fds, so a silently-zeroed metric must look broken, not healthy.
     rss_s = "n/a" if rss is None else f"{rss // MB}MB"
     heap_s = "n/a" if heap is None else f"{heap // MB}MB"
+    fds_s = "n/a" if fds is None else str(fds)
     print(f"[{WORKLOAD} {PROTO} {SERVER}] {prefix}{fmt_codes()}{seg} | "
-          f"RSS {rss_s} | heap {heap_s} | t={t}s", flush=True)
+          f"RSS {rss_s} | heap {heap_s} | fds {fds_s} | t={t}s", flush=True)
 
 async def reporter():
     # One short-lived session per sample, with a hard timeout, and the report
@@ -88,15 +89,15 @@ async def reporter():
     # never share fate with one connection's handshake.
     while time.monotonic() < deadline:
         await asyncio.sleep(REPORT)
-        rss = heap = None              # a bad /stats shows as n/a, not fake 0MB
+        rss = heap = fds = None         # a bad /stats shows as n/a, not fake 0MB
         try:
             async def sample():
                 async with session() as s:
                     return await get_server_stats(s)
-            rss, heap = await asyncio.wait_for(sample(), timeout=REPORT / 2)
+            rss, heap, fds = await asyncio.wait_for(sample(), timeout=REPORT / 2)
         except Exception:
             pass
-        report_line("", rss, heap)
+        report_line("", rss, heap, fds)
 
 async def loop_watchdog():
     # Distinguish a client-side stall from a server-side one. A frozen throughput
@@ -390,13 +391,13 @@ async def main():
     # connect (server already torn down, a transient QUIC/DNS blip) crash the
     # run with a traceback and mask the real pass/fail verdict below. `None`
     # renders as n/a (see report_line), not a misleading 0MB.
-    rss, heap = None, None
+    rss, heap, fds = None, None, None
     try:
         async with session() as s:
-            rss, heap = await get_server_stats(s)
+            rss, heap, fds = await get_server_stats(s)
     except Exception:
         pass
-    report_line("final ", rss, heap)
+    report_line("final ", rss, heap, fds)
     if total == 0:
         print(f"FAIL {WORKLOAD}: no successful iterations", flush=True); return 1
     print(f"== {WORKLOAD} {SERVER} {PROTO} passed ({total} {UNIT}) ==", flush=True)

@@ -275,10 +275,29 @@ Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 | `VORTEX_RESP_COMPRESSION` | `gzip` | Response encoding the server applies: `none` \| `gzip` \| `br` \| `zstd` |
 | `VORTEX_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB; lower for a smoke) |
 | `VORTEX_RUN_ID` | this run's PID | Isolation id for the docker network / container / image names, so several runs can go in parallel without clobbering one another |
+| `VORTEX_CHAOS` | `all` | Chaos sidecar: `none` \| `all` \| CSV of `slowread` \| `slowwrite` \| `idle` \| `abort` \| `vanish`. Launches a second, **unverified** misbehaving client per cell alongside the verified canary (see below); `none` = no sidecar (and no drain pause), the behavior from before the knob existed |
+| `VORTEX_CHAOS_CONC` | `8` | Chaos sidecar worker count |
+| `VORTEX_CHAOS_SEED` | `1` | Seed for the sidecar's per-worker RNG, so a failing chaos schedule replays exactly |
 
 The `VORTEX_SERVER` axis runs each soak against the sync, `vortex/asyncdispatch`,
 and `vortex/chronos` servers - e.g. `VORTEX_SERVER=chronos nimble stressWs`
 exercises chronos's WebSocket path under load.
+
+`VORTEX_CHAOS` adds a **chaos sidecar**: a second client container that
+misbehaves on purpose (slow reads, drip-fed uploads, idle connections,
+mid-transfer aborts, abrupt vanishing with no goodbye) while the verified
+workload keeps running unchanged as the canary. Its induced transport errors are
+expected and swallowed; what it asserts is server health - the canary must still
+pass, and the server's open-fd count (a third field on `/stats`) must return to
+its pre-run baseline after a drain pause, so teardown leaks fail the cell.
+Verdicts merge canary-first: the sidecar can add a failure but never mask one.
+On top of the five generic behaviors, the sidecar runs **workload-targeted**
+variants selected by `VORTEX_WORKLOAD` (slow, idle, and vanishing SSE clients
+for `stressSse`, half-closing WebSocket clients for `stressWs`, mid-body-dying
+uploaders for `stressStreamUpload`, ...); enabling a style enables both its
+generic and targeted forms. Chaos is on by default; `VORTEX_CHAOS=none` gives a
+chaos-free run (no sidecar, no drain pause). See `conformance/stress/README.md`
+for the behavior catalog, exit codes, and per-transport degraded modes.
 
 ---
 
