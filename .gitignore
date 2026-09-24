@@ -39,3 +39,4 @@ config.nims
 # `nim doc` output
 src/htmldocs/
 htmldocs/
+**/__pycache__/
