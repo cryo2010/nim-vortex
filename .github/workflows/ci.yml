@@ -11,9 +11,9 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.claude/**']
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.claude/**', '.checkmate.toml', '.gitignore']
   pull_request:
-    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.claude/**']
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE', '.claude/**', '.checkmate.toml', '.gitignore']
 
 concurrency:
   group: ci-${{ github.ref }}

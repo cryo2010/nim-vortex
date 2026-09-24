@@ -40,3 +40,4 @@ config.nims
 src/htmldocs/
 htmldocs/
 **/__pycache__/
+.checkmate/
