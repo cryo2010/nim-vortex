@@ -2246,6 +2246,13 @@ proc acquireDispatchPin(req: Request, kind: PinKind): bool =
   else:
     let c = conn(req.core, req.fd, req.gen)
     if c == nil: return false
+    if c.closeRequested:
+      # The connection is being torn down (closeConn set this before firing its
+      # teardown callbacks, or a close was deferred while pinned). A new pin here
+      # would either be freed with live pins in closeConn (tripping the totalPins
+      # invariant) or re-pin a slot whose fd is about to close. Refuse: the caller
+      # runs its dead-connection cleanup (reclaim buffer / no-op the send).
+      return false
     acquirePin(req.core, c, kind)
   true
 
@@ -2792,6 +2799,10 @@ proc dispatchWsBlocking*(ws: WebSocket, msg: sink string,
     else:
       let c = conn(ws.core, ws.fd, ws.gen)
       if c == nil: return
+      # A ws.blocking dispatched from an onClose fired during closeConn would pin
+      # a connection that is being freed. Refuse while it is closing (same guard
+      # acquireDispatchPin uses) so the connection-pin invariant holds.
+      if ws.stream == 0 and c.closeRequested: return
       if ws.stream == 0:
         # HTTP/1: pin the whole connection (released by omWsDone stream==0).
         acquirePin(ws.core, c, pkWsBlocking)
