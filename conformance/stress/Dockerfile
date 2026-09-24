@@ -10,9 +10,14 @@
 #     sync | async | async-await | chronos | chronos-await
 #   so VORTEX_SERVER sweeps the sync / asyncdispatch / chronos servers under load.
 #
-# Built -d:danger so the server, not runtime checks, sets the ceiling. Built from
-# the repository root by run.sh; base defaults to arm64, overridden to
-# archlinux:latest on x86_64.
+# Built -d:release (NOT -d:danger): the stress soaks exist to force intermittent
+# crashes and instability, so we keep runtime checks (bounds/overflow/nil) ON so a
+# defect fails fast at its source instead of silently corrupting memory and
+# crashing elsewhere. Optimizations stay on (realistic timing to reproduce races/
+# lifecycle bugs), and --stackTrace/lineTrace/stackTraceMsgs/panics/debugger give a
+# native traceback on the failure. Consequence: RSS/throughput here are a
+# debug-build baseline, not the peak ceiling. Built from the repository root by
+# run.sh; base defaults to arm64, overridden to archlinux:latest on x86_64.
 
 ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
@@ -43,7 +48,9 @@ RUN case "$RUNTIME" in \
     case "$RUNTIME" in \
       chronos|chronos-await) nimble install -y "chronos@>= 4.0.0" ;; \
     esac; \
-    nim c --mm:orc --threads:on -d:danger $BUILD_FLAGS $rtflag -p:src \
+    nim c --mm:orc --threads:on -d:release \
+      --stackTrace:on --stackTraceMsgs:on --lineTrace:on --panics:on --debugger:native \
+      $BUILD_FLAGS $rtflag -p:src \
       -o:stress_server stress_server.nim
 
 # Throwaway self-signed cert for the TLS protocols (unused by the h1 build).

@@ -17,11 +17,14 @@ including `streamupload` over h3 (vortex acks HTTP/3 request-body flow control:
 deliverBody auto-acks the QUIC stream/connection windows as the handler reads,
 and any unread remainder is credited back to the connection window at teardown).
 
-Reports each VORTEX_REPORT_SECONDS in nim-navi's format - status-code tallies
-plus the server's RSS, Nim heap, and open-fd count (from /stats) and elapsed time:
+Reports each VORTEX_REPORT_SECONDS in nim-navi's format - status-code tallies,
+a per-interval throughput rate (2xx completions/s; the streaming workloads show
+MB/s instead), plus the server's RSS, Nim heap, and open-fd count (from /stats)
+and elapsed time. The rate makes a throughput dip or a declining trend visible
+directly, without diffing cumulative counts across lines:
 
-    [sse h3 chronos] 200x1481767 | RSS 29MB | heap 7MB | fds 42 | t=45s
-    [sse h3 chronos] final 200x1493782 | RSS 29MB | heap 6MB | fds 41 | t=60s
+    [sse h3 chronos] 200x1481767 | 33018 events/s | RSS 29MB | heap 7MB | fds 42 | t=45s
+    [sse h3 chronos] final 200x1493782 | 802 events/s | RSS 29MB | heap 6MB | fds 41 | t=60s
     == sse chronos h3 passed (1493782 events) ==
 """
 import asyncio, hashlib, sys, time
@@ -40,14 +43,31 @@ class Fail(Exception):
     run non-zero at once; never retried or tallied."""
 codes = Counter()
 _rate = [0.0, 0]       # [last report monotonic, bytes at last report] for MB/s
+_ops = [0.0, 0]        # [last report monotonic, 2xx count at last report] for ops/s
 start = 0.0
 deadline = 0.0
 
 def bump(status: int, n: int = 1): codes[status] += n
 
+def ok_ops() -> int:
+    """Cumulative successful (2xx) completions -- the throughput numerator."""
+    return sum(n for c, n in codes.items() if 200 <= c < 300)
+
 def fmt_codes() -> str:
     parts = [f"{c}x{n}" for c, n in sorted(codes.items())]
     return " ".join(parts) if parts else "0"
+
+def fmt_rate(now: float) -> str:
+    """A per-interval throughput segment for the non-streaming workloads: the 2xx
+    completion rate since the last report (the streaming workloads show MB/s via
+    fmt_xfer instead). Cumulative codes alone hide a dip or a declining trend --
+    you'd have to diff successive lines by eye -- so surface the rate directly. 0
+    means nothing completed in the interval: a stall."""
+    ops = ok_ops()
+    dt, dn = now - _ops[0], ops - _ops[1]
+    _ops[0], _ops[1] = now, ops
+    rate = dn / dt if dt > 0 else 0.0
+    return f" | {rate:.0f} {UNIT}/s"
 
 def fmt_xfer(now: float) -> str:
     """A throughput segment for the streaming workloads: cumulative bytes plus
@@ -66,7 +86,7 @@ def fmt_xfer(now: float) -> str:
 def report_line(prefix, rss, heap, fds):
     now = time.monotonic()
     t = int(now - start)
-    seg = fmt_xfer(now) if STREAMING else ""
+    seg = fmt_xfer(now) if STREAMING else fmt_rate(now)
     # `None` means the /stats sample failed (or, for fds, an older two-field
     # /stats); render "n/a", never a misleading "0MB"/"0" -- a soak exists to
     # watch RSS/heap/fds, so a silently-zeroed metric must look broken, not healthy.
@@ -358,7 +378,7 @@ async def main():
     if WORKLOAD not in WORKLOADS:
         print(f"unknown VORTEX_WORKLOAD: {WORKLOAD}", flush=True); return 2
     start = time.monotonic()
-    _rate[0] = start
+    _rate[0] = _ops[0] = start
     deadline = start + SECONDS
     rep = asyncio.ensure_future(reporter())
     wd = asyncio.ensure_future(loop_watchdog())
@@ -386,7 +406,7 @@ async def main():
         return 1
     finally:
         rep.cancel(); wd.cancel()
-    total = sum(n for c, n in codes.items() if 200 <= c < 300)
+    total = ok_ops()
     # A fresh session just for the closing RSS/heap sample; never let a failed
     # connect (server already torn down, a transient QUIC/DNS blip) crash the
     # run with a traceback and mask the real pass/fail verdict below. `None`
