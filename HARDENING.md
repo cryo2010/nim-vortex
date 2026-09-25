@@ -32,9 +32,10 @@ reference below.
 |---------|---------|---------|
 | `maxConnections` | 65536 | Live connections per loop thread; excess is accepted then dropped |
 | `maxConcurrentStreams` | 256 | Open HTTP/2 and HTTP/3 streams per connection |
-| `maxResetStreams` | 512 | HTTP/2 peer resets before GOAWAY (rapid reset); 0 disables |
+| `maxResetStreams` | 512 | HTTP/2 and HTTP/3 peer resets before the connection is torn down (rapid reset); 0 disables |
 | `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/PRIORITY between stream progress; 0 disables |
 | `maxRequestsPerSocket` | 0 (off) | HTTP/1 keep-alive requests before the connection is closed |
+| `maxBlockingQueue` | 0 (unbounded) | `blocking:` tasks that may queue for a free worker; past it new dispatches fail fast (503 / `PoolSaturatedError`) instead of queuing behind slow or stuck work |
 | `maxHeaderSize` | 16 KiB | Request line + headers (431); also caps HPACK decoded size |
 | `maxHeaderCount` | 100 | Header fields per request (400) |
 | `maxBodySize` | 8 MiB | Request body (413); per stream on HTTP/2 and HTTP/3; also caps a decompressed body |
@@ -52,7 +53,9 @@ reference below.
 | `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. 0 disables |
 | `keepAliveTimeout` | 60 s | Idle time between requests; 0 disables |
 | `responseTimeout` | 0 (off) | End of request to first response byte (stuck handler) |
+| `writeTimeout` | 0 (off) | Idle time the socket may stay unwritable with output pending (slow-read client that never drains its response); re-armed on send progress |
 | `shutdownGrace` | 10 s | Drain window on graceful shutdown |
+| `shutdownHardTimeout` | `shutdownGrace` + 5 s | Upper bound on `close`/`waitFor`; a thread still inside a never-returning `blocking:` body is detached (leaked) so shutdown cannot hang |
 
 ### TLS
 
