@@ -734,6 +734,57 @@ proc h2Schedule(h2: H2Conn, c: ptr Connection) =
   h2.scheduling = false
   h2.h2ResumeProducers(c)
 
+proc h2WriteDirect(h2: H2Conn, c: ptr Connection, sid: uint32,
+                   data: openArray[char]): int =
+  ## Emit as many DATA frames as flow control allows STRAIGHT from the producer's
+  ## buffer into c.wbuf, and return how many bytes went out (#334). The caller
+  ## parks whatever is left in pendingBody, exactly as the whole chunk used to be:
+  ## a streamed write then costs one copy (into the write buffer) instead of two
+  ## (into pendingBody, then out of it again in emitOneFrame).
+  ##
+  ## Only taken when the result is indistinguishable from what the scheduler
+  ## would have emitted next, so h2Schedule's fairness contract is untouched:
+  ##   * the stream's own backlog is empty, so nothing already queued for it can
+  ##     be overtaken. A stream WITH a backlog appends behind it as before and
+  ##     the new bytes leave in order;
+  ##   * no stream at all is in the ready-queue (h2NextUrgency < 0), so the
+  ##     round-robin has no other claimant this turn. That guard costs almost
+  ##     nothing in practice: a queued stream can only survive a scheduler pass
+  ##     when the pass stopped early, i.e. the connection window is closed or the
+  ##     buffer is at respHighWater -- and both of those also stop the loop
+  ##     below. It matters only for a re-entrant write (a producer writing from
+  ##     inside its own onRespDrain, where h2Schedule's reentrancy guard left the
+  ##     queue loaded), and there we correctly fall back to the queue;
+  ##   * the write buffer is under respHighWater, the same cap the scheduler
+  ##     stops at, re-checked per frame so one write cannot buffer a whole
+  ##     response in RAM.
+  ## Frame shape is emitOneFrame's: bounded by SETTINGS_MAX_FRAME_SIZE and both
+  ## flow-control windows, never padded. END_STREAM is never set here -- this
+  ## runs only for a mid-body write (respPhase == rpStreaming, so pendingIsLast
+  ## is still false); finish(), trailers and the WebSocket close stay with
+  ## emitOneFrame.
+  template st: H2Stream = h2.streams[sid]
+  if st.ws != nil: return 0
+  if st.pendingBody.len > st.pendingPos: return 0    # queued bytes go first
+  if h2.h2NextUrgency() >= 0: return 0               # another stream's turn
+  var off = 0
+  while off < data.len and h2.connSendWindow > 0 and st.sendWindow > 0 and
+        pendingOut(c) < respHighWater:
+    var chunk = min(data.len - off, h2.peerMaxFrame)
+    chunk = min(chunk, int(st.sendWindow))
+    chunk = min(chunk, int(h2.connSendWindow))
+    c.wbuf.addFrameHeader(chunk, ftData, 0'u8, sid)
+    let oldLen = c.wbuf.len
+    c.wbuf.setLen(oldLen + chunk)
+    copyMem(addr c.wbuf[oldLen], unsafeAddr data[off], chunk)
+    st.sendWindow -= int32(chunk)
+    h2.connSendWindow -= int32(chunk)
+    off += chunk
+  if off > 0:
+    h2.noteDataProgress(off)   # outbound progress decays the flood budget (#335)
+    h2.syncSendState(st)       # the send window moved (#339)
+  off
+
 proc h2Reprioritize(h2: H2Conn, sid: uint32, fieldVal: string) =
   ## Apply an RFC 9218 Priority field value to an open stream (Priority request
   ## header or PRIORITY_UPDATE frame). If the stream is already queued it stays
@@ -848,10 +899,15 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   if st.isHead: return 0
   if data.len > 0:
     compactPendingBody(st)               # reclaim the sent prefix first (#331)
-    let oldLen = st.pendingBody.len
-    st.pendingBody.setLen(oldLen + data.len)
-    copyMem(addr st.pendingBody[oldLen], unsafeAddr data[0], data.len)
-    h2.syncSendState(st)                 # backlog grew (#339)
+    # Emit what flow control allows straight from the caller's buffer, and park
+    # only the remainder (#334). h2WriteDirect returns 0 whenever the fast path
+    # does not apply, which degrades to the original copy-then-schedule path.
+    let sent = h2.h2WriteDirect(c, sid, data)
+    if sent < data.len:
+      let oldLen = st.pendingBody.len
+      st.pendingBody.setLen(oldLen + data.len - sent)
+      copyMem(addr st.pendingBody[oldLen], unsafeAddr data[sent], data.len - sent)
+      h2.syncSendState(st)               # backlog grew (#339)
   h2.h2Enqueue(sid)
   h2.h2Schedule(c)
   if sid notin h2.streams: return 0

@@ -515,6 +515,17 @@ proc flushOut(loop: Loop, c: ptr Connection) =
   ## socket still takes bytes, up to h2MaxRefillRounds. Returning to the selector
   ## after every 64 KiB refill (the pre-#332 behaviour) capped an h2 download at
   ## loop-iterations x respHighWater.
+  template drainResume() =
+    ## Refill from the write scheduler and resume producers parked on the buffer
+    ## cap, with the flush held (#334): a resumed producer's res.write would
+    ## otherwise re-enter flushOut through the flush hook and pay a send() per
+    ## resumed stream, when this call is already either about to write the bytes
+    ## itself (the refill branch) or has just armed write interest for them (the
+    ## EAGAIN branches). Holding is never an ordering rule -- wbuf stays FIFO --
+    ## so the bytes go out in the same order either way.
+    holdFlush(c)
+    h2codec.h2DrainResume(c, addr loop.core)
+    discard releaseFlushHold(c)
   var refills = 0
   while true:
     while c.pendingOut > 0:
@@ -529,7 +540,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
             if c.ws != nil: wsBackpressure(c)
             loop.armWrite(c)
             if c.h2 != nil and c.pendingOut < respHighWater:
-              h2codec.h2DrainResume(c, addr loop.core)
+              drainResume()
             return
           of tlsWantRead:
             return               # retried after the next read event
@@ -547,7 +558,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
           if c.ws != nil: wsBackpressure(c)
           loop.armWrite(c)
           if c.h2 != nil and c.pendingOut < respHighWater:
-            h2codec.h2DrainResume(c, addr loop.core)
+            drainResume()
           return
         loop.closeConn(c)
         return
@@ -586,7 +597,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
     else:
       # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it
       # and resume producers parked on the cap (no-op for non-h2 connections).
-      h2codec.h2DrainResume(c, addr loop.core)
+      drainResume()
       if c.pendingOut == 0: return          # nothing more to send: done
       inc refills
       if refills >= h2MaxRefillRounds:
@@ -814,7 +825,18 @@ proc processInput(loop: Loop, c: ptr Connection) =
       armWsPing(addr loop.core, c)
     return
   if c.h2 != nil:
+    # Hold the socket flush for the whole frame batch (#334), as the WebSocket
+    # read batch above does (#333): every handler dispatched from this batch --
+    # and every res.write a streamed producer does inside it -- lands in c.wbuf
+    # and goes out in one send() here, instead of one send() per response and
+    # per chunk. A write that fills the buffer past respHighWater still meets the
+    # socket immediately (flushImpl ignores the hold there), so a producer that
+    # emits megabytes inside one dispatch is unchanged.
+    holdFlush(c)
     loop.h2Input(c)
+    if releaseFlushHold(c) and c.state != csFree and
+        (c.pendingOut > 0 or c.closeAfterFlush):
+      loop.flushOut(c)
     return
   if c.awaitingResponse or c.state == csClosing:
     return
@@ -1628,17 +1650,22 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
       loop.closeConn(c)          # re-defers while other pins remain
       return
     if c.state != csActive: return
+    # Several chunks of the same download can land in one outbox batch (the
+    # read-ahead keeps one read in flight per stream, and a batch can carry the
+    # replies of several streams on this connection). Hold the flush so they cost
+    # one send() for the batch rather than one per chunk (#334); the tail below
+    # no longer needs its own push, releaseBatchFlushes does it.
+    loop.deferBatchFlush(c)
     loop.applyFileMessage(m)
     # The final chunk finished the response: reset and resume the pipeline (the
     # blocking-dispatch path doesn't set awaitingResponse, so finish()'s kick is a
     # no-op here -- mirror the buffered omHttp path explicitly).
     if m.last and not staleConn(c, m.gen):
       loop.resumeAfterRespond(c, m.stream)
-    elif not staleConn(c, m.gen) and c.pendingOut > 0:
-      # The write scheduler fills c.wbuf up to respHighWater and stops; push it to
-      # the socket now. On a fast socket flushOut never hits EAGAIN, so write
-      # interest is never armed and no later Write event would drain it.
-      loop.flushOut(c)
+    # Otherwise the batch tail flushes: the write scheduler fills c.wbuf up to
+    # respHighWater and stops, and on a fast socket flushOut never hits EAGAIN, so
+    # write interest is never armed and no later Write event would drain it. The
+    # hold above makes that one send() for every chunk in this batch (#334).
     return
   # omHttp releases what its task held: prBlocking, prFileChunk, or prNone (an
   # awaitable body's response -- its pkAwait rides omBlockingDone -- or a send from

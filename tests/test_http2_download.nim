@@ -16,6 +16,10 @@ import ./h2client
 const
   totalBytes = 4 * 1024 * 1024    ## response size the tests download
   writeChunk = 8192               ## producer chunk size
+  splitBytes = 512 * 1024         ## body of the one-big-write framing test
+  splitWindow = 16 * 1024         ## per-stream window that test advertises
+  frameChunks = 48                ## producer chunks of the framing test
+  wideGrant = 8 * 1024 * 1024     ## window that never binds (framing test)
 
 var peakPending: Atomic[int]      ## high-water mark of H2Stream.pendingBody.len
 
@@ -46,8 +50,37 @@ proc bigDownload(req: Request, res: Response) {.async.} =
       notePeak(res)
   res.finish()
 
+proc patternByte(i: int): char = char(byte(i mod 251))
+  ## Deterministic body byte, so a mis-stitched write (the direct-emit prefix
+  ## and the parked remainder, #334) shows up as a content mismatch and not just
+  ## a wrong length.
+
+proc splitDownload(req: Request, res: Response) {.async.} =
+  ## ONE write, larger than both the peer's send window and respHighWater: the
+  ## fast path can emit only a prefix straight into the write buffer and the rest
+  ## has to be parked in pendingBody and drained by the scheduler (#334).
+  res.sendHead(Http200, "application/octet-stream")
+  var body = newString(splitBytes)
+  for i in 0 ..< splitBytes: body[i] = patternByte(i)
+  if not res.write(body.toOpenArray(0, body.high)):
+    await res.drained()
+  res.finish()
+
+proc chunkDownload(req: Request, res: Response) {.async.} =
+  ## Producer chunks of exactly SETTINGS_MAX_FRAME_SIZE with a window that never
+  ## binds: one DATA frame per chunk, each exactly max-frame-sized, whether the
+  ## bytes went out through the fast path or through pendingBody (#334).
+  res.sendHead(Http200, "application/octet-stream")
+  let chunk = repeat('y', defaultMaxFrameSize)
+  for i in 0 ..< frameChunks:
+    if not res.write(chunk.toOpenArray(0, chunk.high)):
+      await res.drained()
+  res.finish()
+
 var rt = newRouter()
 rt.get("/big", bigDownload)
+rt.get("/split", splitDownload)
+rt.get("/chunks", chunkDownload)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 
@@ -127,6 +160,53 @@ proc download(port: Port, connCreditChunk: int, connGrant = 0): DlResult =
       if not c.rawSend(wu): break   # peer gone: report what we got
   c.close()
 
+type BodyResult = tuple[body: string, sizes: seq[int], endStream: bool]
+  ## The concatenated DATA payload, every DATA frame's payload length in order,
+  ## and whether the stream was closed with END_STREAM.
+
+proc fetchBody(port: Port, path: string, initialWindow, connGrant: int,
+               credit: bool): BodyResult =
+  ## Fetch `path` frame by frame. `initialWindow` is advertised as
+  ## SETTINGS_INITIAL_WINDOW_SIZE ahead of the request (so it applies to this
+  ## stream's send window) and `connGrant` opens the connection window; with
+  ## `credit`, every DATA byte is handed back as a stream + connection
+  ## WINDOW_UPDATE, which is what lets a small window drain.
+  var c = newH2TestConn(port)
+  var sndTimeout = Timeval(tv_sec: posix.Time(2), tv_usec: 0)
+  discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
+                     addr sndTimeout, SockLen(sizeof(sndTimeout)))
+  var req = ""
+  var settings = ""
+  settings.addSetting(setInitialWindowSize, uint32(initialWindow))
+  req.addFrameHeader(settings.len, ftSettings, 0, 0)
+  req.add settings
+  if connGrant > 0: req.addWindowUpdate(0, connGrant)
+  req.addRequest(1, {":method": "GET", ":scheme": "http",
+                     ":path": path, ":authority": "localhost"}, endStream = true)
+  c.sendRaw(req)
+  let deadline = epochTime() + 60.0
+  while not result.endStream and epochTime() < deadline:
+    let frames = c.readFrames(3000,
+      until = proc(f: seq[Frame]): bool = f.len >= 1)
+    if frames.len == 0: break                 # EOF or a quiet period: give up
+    var consumed = 0
+    var gone = false
+    for f in frames:
+      if f.typ == uint8(ftData):
+        consumed += f.payload.len
+        result.body.add f.payload
+        result.sizes.add f.payload.len
+        if (f.flags and flagEndStream) != 0: result.endStream = true
+      elif f.typ == uint8(ftGoaway) or f.typ == uint8(ftRstStream):
+        gone = true
+    if gone or result.endStream: break
+    if credit and consumed > 0:
+      var wu = ""
+      wu.addWindowUpdate(0, consumed)
+      wu.addWindowUpdate(1, consumed)
+      if not c.rawSend(wu): break             # peer gone: report what we got
+  c.close()
+
 suite "HTTP/2 streaming download":
   test "pendingBody stays bounded while the backlog never reaches zero (#331)":
     peakPending.store(0)
@@ -151,6 +231,46 @@ suite "HTTP/2 streaming download":
     check dl.connUpdates > budget * 10        # well past the old budget
     check dl.goaway == -1                     # no GOAWAY
     check dl.bytes == totalBytes              # and the body arrived in full
+
+  test "one write larger than the window arrives byte-exact (#334)":
+    # write() emits what flow control allows straight from the producer's buffer
+    # and parks the rest in pendingBody. The seam between the two is the risk:
+    # assert the body is byte-for-byte what was written, in order, and that the
+    # framing rules the scheduler applies (never past SETTINGS_MAX_FRAME_SIZE,
+    # END_STREAM only on the final frame) still hold on the fast path.
+    let r = fetchBody(srv.port, "/split", initialWindow = splitWindow,
+                      connGrant = wideGrant, credit = true)
+    check r.endStream
+    check r.body.len == splitBytes
+    var mismatch = -1
+    for i in 0 ..< min(r.body.len, splitBytes):
+      if r.body[i] != patternByte(i):
+        mismatch = i
+        break
+    check mismatch == -1
+    check r.sizes.len > 1                     # really was split into frames
+    var oversized = 0
+    for i, n in r.sizes:
+      if n > defaultMaxFrameSize: inc oversized
+    check oversized == 0
+
+  test "a wide window emits one max-sized DATA frame per producer chunk (#334)":
+    # The peer window never binds here, so each producer chunk (exactly
+    # SETTINGS_MAX_FRAME_SIZE) must leave as exactly one full-sized DATA frame --
+    # the same framing the pre-#334 copy-then-schedule path produced. A short or
+    # doubled frame would mean the direct emit and the parked remainder disagree
+    # about where a frame ends. An empty trailing frame is allowed: finish()
+    # emits a bare END_STREAM DATA when the backlog already drained.
+    let r = fetchBody(srv.port, "/chunks", initialWindow = wideGrant,
+                      connGrant = wideGrant, credit = false)
+    check r.endStream
+    check r.body.len == frameChunks * defaultMaxFrameSize
+    var full, other = 0
+    for i, n in r.sizes:
+      if n == defaultMaxFrameSize: inc full
+      elif not (n == 0 and i == r.sizes.high): inc other
+    check full == frameChunks
+    check other == 0
 
 budgetSrv.close()
 srv.close()
