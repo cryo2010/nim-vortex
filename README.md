@@ -192,6 +192,7 @@ var config = initVortexConfig(
   compress = true,                # response compression
   decompressRequest = true,       # transparently decode gzip/br/zstd request bodies
   responseTimeout = 30,           # seconds a handler may take before the conn is closed
+  writeTimeout = 30,              # close a client that stops draining its response (0 = off)
   shutdownGrace = 10)             # seconds to drain in-flight work on shutdown
 config.serverHeader = "acme"      # fields are settable before serving
 
@@ -383,6 +384,16 @@ usable by name. Anything not named in the call and not read from `req` is a
 compile error (that is the guardrail that keeps loop-thread state off the
 worker). With no values, `req.blocking:` just runs the block on a worker.
 
+The pool is bounded by `workerThreads` (default `numThreads * 2`). By default
+work queues without limit behind busy workers; set `maxBlockingQueue` to shed
+load instead: once every worker is busy and that many tasks are already
+waiting, a new `req.blocking:` answers `503 Service Unavailable` and the
+awaitable `req.blocking(...)` raises `PoolSaturatedError`, so one slow or stuck
+endpoint cannot back up the whole server. Keep `blocking:` bodies bounded and
+give them their own timeouts: Nim cannot cancel a running thread, so a body
+that never returns holds its worker until shutdown, where `shutdownHardTimeout`
+(default `shutdownGrace + 5` seconds) detaches it rather than hanging `close`.
+
 Only **value data** may cross to the worker. A `ref`, `ptr`, or `closure` (or a
 value that has one nested in a field, e.g. an object with a `ref` field) is
 **rejected at compile time**: it would be *shared* with the worker, not copied,
@@ -502,6 +513,7 @@ through a dead connection is a safe no-op.
 | `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
 | `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket |
 | `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
+| `res.setPriority(urgency, incremental = false)` | `void` | RFC 9218 scheduling override for this response over HTTP/2: lower `urgency` (0..7, default 3) is served first; `incremental = true` interleaves with same-urgency streams, `false` delivers it sequentially. Beats the client's `Priority` header / `PRIORITY_UPDATE`. No-op over h1 and h3; loop-thread only |
 | `res.sse(headers = [], retry = 0)` | `SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
 | `res.withSse(s): body` | `template` | block form of an SSE stream |
 | `res.sendFile(path, opts = staticOptions())` | `void` | send one file (see [Static files](#static-files)) |

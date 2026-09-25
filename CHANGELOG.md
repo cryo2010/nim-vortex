@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-24
+
 ### Added
 
 - Worker-pool load shedding: `maxBlockingQueue` (default 0 = unbounded) caps the
@@ -39,6 +41,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/1.1 or a trailing `HEADERS` section on HTTP/2 and HTTP/3. Previously
   received request trailers were discarded and there was no typed response-side
   API.
+- HTTP/2 per-connection write scheduler with RFC 9218 extensible
+  prioritization. Concurrent streams are now served from a ready queue one
+  `DATA` frame at a time instead of draining one stream fully before the next,
+  with 8 urgency levels (lowest urgency first). Within a level, *incremental*
+  streams interleave round-robin and non-incremental streams are delivered one
+  at a time. Clients signal via the `Priority` request header (`u=N, i`) or a
+  `PRIORITY_UPDATE` frame (one arriving ahead of the stream's `HEADERS` is
+  buffered, capped); `res.setPriority(urgency, incremental)` overrides the
+  client signal server-side. `SETTINGS_NO_RFC7540_PRIORITIES=1` is advertised.
+  Bounded by the connection send window and the write-buffer cap, so no stream
+  buffers a whole response in memory. On the fairness micro-benchmark (64
+  concurrent 2 MiB streams, constrained windows) p99 completion fell from
+  1006 ms to 77 ms with throughput and RSS unchanged. `nimble fairness` runs it.
+  No-op over HTTP/1.1 and HTTP/3 (nghttp3 owns its own scheduling).
+- OCSP staple rotation at runtime: `reloadTls(ocspFile = ...)` or
+  `reloadTls(ocspResponse = derBytes)` swaps the stapled response without a
+  restart (an unreadable explicit path rejects the whole reload, like a bad
+  cert), `reloadTls(clearOcsp = true)` drops it, and a bare `reloadTls()`
+  re-reads a configured `ocspFile` best-effort so a certbot-style renewal picks
+  up a refreshed staple. Previously the staple was frozen at startup. SNI
+  contexts and HTTP/3 still do not staple.
+- `maxResetStreams` now also applies to HTTP/3: a per-connection rapid-reset
+  budget (CVE-2023-44487 class) tears the QUIC connection down with
+  `H3_EXCESSIVE_LOAD` once a client's `RESET_STREAM` churn exceeds it.
+- `PoolSaturatedError` (raised by the awaitable `req.blocking(...)` when
+  `maxBlockingQueue` is hit) and `res.setPriority` are new public API.
+- Test infrastructure: a reverse-proxy interop suite (`nimble proxy`, nginx /
+  Caddy / HAProxy in front of the origin over h1/h2/h3, incl. a PROXY-protocol
+  check), a Dockerized cross-language benchmark suite (`nimble bench*`, vortex
+  vs Go vs Rust via the navi client), a chaos sidecar for the stress soaks
+  (`VORTEX_CHAOS`: slow readers, drip-fed and stalling uploads, idle and
+  vanishing clients, with an open-fd leak check), and a `methods` workload.
 
 ### Changed
 
@@ -51,6 +85,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   down" notice so in-flight and racing streams still complete, followed by the
   final `GOAWAY(last-accepted-id)` cutoff. `maxConnections` now also caps
   concurrent HTTP/3 (QUIC) connections.
+
+- HTTP/1.1 request methods are matched case-sensitively (RFC 9110 9.1): a
+  mis-cased method such as `delete /x` is now a `501` like on HTTP/2 and
+  HTTP/3, instead of dispatching the handler. Over HTTP/2 an unknown or
+  non-token `:method` (previously silently mapped to `GET`) and any `CONNECT`
+  request are rejected; this server does not tunnel.
+- Handler-supplied framing and hop-by-hop headers (`Content-Length`,
+  `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `Proxy-Connection`)
+  are dropped from responses and trailers on all three protocols; the codec
+  generates its own framing. Previously HTTP/1.1 echoed them (a second
+  `Content-Length`, or `Transfer-Encoding` alongside `Content-Length`, that a
+  downstream intermediary reads as smuggling) and HTTP/2 and HTTP/3 encoded the
+  connection-specific ones verbatim.
+- A plaintext HTTP/1.1 connection that closes after a response now always
+  linger-closes (`shutdown(SHUT_WR)` then drain) instead of a bare `close()`,
+  so a slow-reading peer never sees a `RST` discard the untransmitted tail of
+  the response (a truncated ~4 KiB echo behind Caddy under load).
+- `Expect: 100-continue` from an HTTP/1.0 client is ignored (RFC 9110 10.1.1)
+  instead of eliciting an unsolicited `100 Continue`.
+- Signed-cookie HMAC and the WebSocket `Sec-WebSocket-Accept` SHA-1 run through
+  OpenSSL EVP (hardware SHA-NI / ARMv8 crypto) in TLS builds; output is
+  byte-identical so existing signed cookies keep verifying. The pure-Nim paths
+  (nimcrypto, the bundled SHA-1) remain the fallback under `-d:plainHttp`.
+- Streamed file downloads (`res.sendFile`) read 256 KiB per hop (was 128 KiB)
+  with a two-chunk read-ahead so disk and socket I/O overlap; file-chunk
+  buffers come from a loop-owned pool (no per-chunk cross-thread allocation)
+  capped at 16 idle buffers per loop. The per-connection streaming write
+  high-water drops from 256 KiB to 64 KiB, and a closed connection frees its
+  read/write buffers instead of pinning peak capacity for the server's life.
+- `validateConfig` names the offending field and value in its error instead of
+  a bare "settings must not be negative".
 
 ### Fixed
 
@@ -76,6 +141,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful shutdown blocked by a `blocking:` handler that never returns now logs
   a clear diagnostic (Nim cannot safely cancel a running thread, so such a
   handler still blocks shutdown; the wedge is now visible instead of silent).
+- HTTP/2 `sendFile` over a small peer flow-control window (httpx, nghttp2
+  clients) wedged at 0 bytes/s: the connection was pinned for every chunk read
+  so the peer's `WINDOW_UPDATE`s were never processed mid-stream. Flow control
+  is now processed while only file-chunk reads are in flight.
+- HTTP/2 keep-alive: a connection serving one stream at a time (e.g. a client
+  consuming SSE batches) was closed `keepAliveTimeout` seconds after it
+  *opened* regardless of traffic, because the idle deadline was armed once and
+  never refreshed. It is re-armed after every request, as on HTTP/1.1.
+- HTTP/2 flow control: the advertised receive window is now enforced
+  (`FLOW_CONTROL_ERROR` on overrun; previously a streaming route could buffer
+  without bound), the first frame after the preface must be `SETTINGS`, a
+  zero-increment `WINDOW_UPDATE` on an idle stream is a connection error, and a
+  `PRIORITY` self-dependency is a stream error rather than a `GOAWAY` that kills
+  every concurrent stream.
+- HTTP/2 correctness review (#230-#240): a use-after-move in the compressed
+  streaming `finish()` path (the stream table could be mutated under a captured
+  pointer); deferred connection-window credit leaked on every abnormal stream
+  end (a few client cancels drained the connection window and every later
+  upload deadlocked); a parked `await res.drained()` producer stranded forever
+  when the client disconnected mid-stream (its `finally` cleanup never ran);
+  refused `HEADERS` (max streams, drain, self-dependency) skipped HPACK decoding
+  and stream accounting so a `REFUSED_STREAM` degraded into connection
+  teardown; `maxControlFrames` bypasses (uncharged PING ACK / GOAWAY / unknown
+  frames / closed-stream `WINDOW_UPDATE` and `DATA`, `SETTINGS` charged per
+  frame not per entry, budget reset on every request) closed and `RST_STREAM`
+  is no longer sent on idle stream ids; a connection whose peer absorbed the
+  initial window then went silent while the server owed response bytes pinned
+  its slot forever and is now reaped via `bodyTimeout`; a declared
+  `content-length` is reconciled against `DATA` received on streaming routes
+  (stream `PROTOCOL_ERROR` on mismatch, an upstream-desync vector); trailer
+  names and values are validated (CR/LF/NUL injection through `req.trailers`);
+  trailers without `END_STREAM`, `HEADERS` on a half-closed stream, and
+  `HEADERS` racing a server early-close are stream-level errors instead of
+  connection errors (h2spec 5.1 cases stay connection errors); frames on
+  even (server-push space) stream ids are rejected; a synchronous response
+  produced while resuming buffered input after a `blocking:` task is flushed;
+  the encoder emits the HPACK dynamic-table-size update after the peer lowers
+  `SETTINGS_HEADER_TABLE_SIZE`; WebSocket-over-h2 no longer `RST_STREAM`s a
+  merely slow peer; a short `GOAWAY` is a `FRAME_SIZE_ERROR`; field values with
+  leading or trailing whitespace are rejected.
+- HTTP/2: a connection error raised while growing the receive buffer (e.g. a
+  frame larger than `SETTINGS_MAX_FRAME_SIZE`) left the queued `GOAWAY` unsent
+  and the socket open until the peer's timeout (h2spec 4.2). Pending output is
+  flushed before unwinding. A deferred worker apply (outbox message, sendFile
+  chunk) racing HTTP/2 teardown under a client abort could dereference freed
+  codec state and crash the loop thread; the codec entry points now degrade to
+  the documented no-op. Tearing down a connection with a parked file-chunk read
+  no longer pins the connection being freed.
+- HTTP/1.1 review fixes (#243-#257): the receive buffer is bounded to
+  `maxHeaderSize` while parsing the head (a header flood without a terminating
+  blank line pinned up to `maxHeaderSize + maxBodySize` per connection);
+  `res.informational` / `res.earlyHints` header names and values are sanitized
+  (CRLF response splitting); a streamed response opened with
+  `sendHead(contentLength = N)` that writes a different number of bytes now
+  closes the connection instead of desyncing the next keep-alive response.
+- HTTP/1.1 framing conformance with Go and llhttp: more than one
+  `Transfer-Encoding` field line is rejected (a TE-desync / smuggling vector),
+  `gzip, chunked` is framed as chunked instead of `501` (only a coding list
+  without a final `chunked` is unsupported), framing / routing / control field
+  names are dropped from the trailer section so they can never reach
+  `req.trailers`, and chunk-extension bytes carrying C0 controls or a bare CR
+  are rejected.
+- HTTP/1.1 async streaming uploads (`await req.read`) buffered whole request
+  bodies: the loop read every connection's body far faster than the handler
+  consumed it, so the streamupload soak (96 concurrent 64 MiB uploads) pinned
+  ~1.3-1.5 GB RSS and was OOM-killed. Delivered-but-unacked bytes now apply
+  socket-level backpressure (high/low water marks, TCP does the rest); RSS on
+  that soak drops to ~480 MB. Sync auto-ack handlers are unaffected.
+- HTTP/3 with PKCS#12-only TLS material advertised h3 via `Alt-Svc` but every
+  QUIC handshake failed: the bundle was never forwarded to the QUIC context,
+  which also accepted a certless context. It is forwarded and the context fails
+  closed. A failed HTTP/3 setup is now logged instead of silently leaving a
+  bound-but-unpolled UDP socket.
+- HTTP/3 `res.trailers` were dropped on send and request trailers were never
+  delivered (nghttp3's trailer callbacks were unregistered); both now work over
+  HTTP/3. The final `GOAWAY` narrowing the accepted-stream range is issued on
+  graceful shutdown (RFC 9114 5.2).
+- HTTP/3 QUIC flow control leaked the shared connection window: buffered
+  request bodies were never credited back, consumed WebSocket tunnel bytes were
+  not credited, and a streaming body the handler never read was not credited at
+  teardown. After ~4 MiB of cumulative body bytes on a long-lived connection
+  the peer stalled flow-control-blocked and the connection closed with
+  application error code 1 (the direct-h3 `requests` and `ws` soaks). All three
+  paths credit correctly. `maxBodySize` is now enforced on buffered HTTP/3
+  bodies: an oversized body is reset with `H3_MESSAGE_ERROR` immediately
+  instead of stalling until the idle timeout.
+- HTTP/3 review fixes (#250-#257): a single `onBody` EOF on normal completion
+  (a raw consumer got a spurious second `last=true`); the configured
+  `maxHeaderSize` is advertised to nghttp3 as `max_field_section_size`
+  (previously unlimited); connections in the draining period after a
+  peer-initiated `CONNECTION_CLOSE` are reaped instead of living until the idle
+  timeout (a connection-slot leak); a rejected accept is honored; a parked
+  `await res.drained()` producer is woken on stream or connection teardown;
+  per-connection un-dispatched buffered request-body memory is capped at
+  `max(h3ConnWindow, maxBodySize)` (mirroring HTTP/2); inbound trailers,
+  outbound response headers / trailers and `content-length` get the same
+  validation as HTTP/2, and a declared length is reconciled against `DATA`
+  received.
+- WebSocket: the 64-bit extended frame length is parsed into `uint64` before
+  the `maxWsMessageSize` check (latent on 64-bit targets).
+- Graceful shutdown could orphan an in-flight async `req.blocking` future when
+  the response and task completion landed in the shutdown window, leaking the
+  suspended continuation (a rare valgrind CI flake). The drain now waits for
+  outstanding async-blocking completions.
+- Worker-pin accounting: a refused `sendFile` chunk read under a saturated
+  pool left a pin counter permanently skewed, a raising chunk reader's fallback
+  `500` released the wrong counter, and a reused worker could drop an awaitable
+  body's send. The pins are now typed per kind with explicit release ownership
+  and asserted on the loop thread. Under load shedding a refused mid-stream
+  file-chunk read now aborts the streamed response cleanly (the client sees a
+  cut-short transfer) and returns its buffer instead of stalling until timeout.
+- The worker pool is shut down before its outboxes are freed on both the clean
+  and the startup-unwind teardown paths (Helgrind flagged the race).
+
+### Security
+
+- Request smuggling / response splitting hardening across the three protocols:
+  duplicate `Transfer-Encoding` rejection, strict RFC 9110 `1*DIGIT`
+  `Content-Length` grammar (no `+`/`-`/underscore forms, no duplicate-differing
+  values) shared by h1/h2/h3, content-length reconciliation on HTTP/2 and
+  HTTP/3 streaming routes, handler framing / hop-by-hop headers filtered from
+  responses, CRLF sanitization of 1xx interim responses, and trailer field
+  validation. See Changed / Fixed above for the individual items.
+- HTTP/2 denial-of-service budgets: the `maxControlFrames` bypasses are closed,
+  the per-connection un-dispatched buffered request-body memory is capped at
+  `max(h2ConnWindow, maxBodySize)` (was up to `maxBodySize x maxConcurrentStreams`,
+  ~2 GiB at defaults), a peer that absorbs the send window and goes silent is
+  reaped, and a slow reader that never drains its response can be bounded with
+  `writeTimeout`.
+- HTTP/3 denial-of-service: `maxResetStreams` rapid-reset budget, the same
+  buffered-body cap as HTTP/2, `max_field_section_size` advertised, and
+  draining connections reaped.
+- The bounded gzip/brotli/zstd request-body decode loop (decompression-bomb
+  cap) and the zlib FFI bindings are now single shared implementations instead
+  of three copies that could drift.
 
 ## [0.4.0] - 2026-08-29
 
@@ -408,7 +608,9 @@ the public API may still change before 1.0.
   memcheck/helgrind race-and-leak matrix, and libFuzzer fuzzing of the
   parser / HPACK / QPACK decoders.
 
-[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-vortex/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cryo2010/nim-vortex/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/cryo2010/nim-vortex/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cryo2010/nim-vortex/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cryo2010/nim-vortex/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/cryo2010/nim-vortex/releases/tag/v0.1.0
