@@ -88,7 +88,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_http2.nim` | HTTP/2 integration (h2c prior knowledge, via curl) |
 | `test_http2_flowcontrol.nim` | Flow-control regression for h2spec 6.9.2 (SETTINGS_INITIAL_WINDOW_SIZE change) |
 | `test_http2_malformed.nim` | Malformed HEADERS answered with RST_STREAM(PROTOCOL_ERROR): bad/duplicate Content-Length (RFC 9113 8.1.1), NUL/CR/LF in field names/values (8.2.1) |
-| `test_http2_download.nim` | Streaming-download regressions: the per-stream `pendingBody` buffer stays bounded while the backlog never reaches zero (#331) |
+| `test_http2_download.nim` | Streaming-download regressions: the per-stream `pendingBody` buffer stays bounded while the backlog never reaches zero (#331); benign connection-level WINDOW_UPDATEs during a long download do not trip the control-frame budget (#335) |
 | `test_http2_priority.nim` | RFC 9218 prioritization: urgency ordering, incremental interleaving, PRIORITY_UPDATE, `res.setPriority` override |
 | `test_connect_disconnect.nim` | Half-open stream closed by the read-idle deadline (slowloris, #201); two-step GOAWAY on graceful shutdown (RFC 9113 6.8, #208) |
 | `test_http2_websocket.nim` | HTTP/2 Extended CONNECT WebSockets (RFC 8441), frame level |
