@@ -38,7 +38,7 @@ tags, and the `servers/<name>/` dirs.
 
 | framework | id | h1 | h2 | h3 | stack |
 |-----------|----|----|----|----|-------|
-| **nim/vortex** | `vortex` | ✓ | ✓ | ✓ | this repo (`conformance/stress/stress_server.nim`) |
+| **nim/vortex** | `vortex` | ✓ | ✓ | ✓ | this repo (`conformance/stress/stress_server.nim`, built `-d:danger --passC:-flto` via the stress Dockerfile's `PROFILE=bench`) |
 | **go/net-http** | `go` | ✓ | ✓ | ✓ | net/http + quic-go (h3) + coder/websocket |
 | **rust/salvo** | `rust` | ✓ | ✓ | ✓ | salvo (rustls h1/h2, quinn h3) |
 
