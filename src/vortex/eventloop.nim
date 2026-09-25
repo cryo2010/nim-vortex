@@ -496,79 +496,106 @@ proc handleDrain(loop: Loop, c: ptr Connection) =
       loop.closeConn(c)
       return
 
+const h2MaxRefillRounds = 16
+  ## How many times one flushOut call may refill c.wbuf from the HTTP/2 write
+  ## scheduler and write it straight back out (#332). h2DrainResume tops the
+  ## buffer up to respHighWater (64 KiB), so this bounds one connection at ~1 MiB
+  ## of h2 output per flushOut before it must yield to the selector. Without a
+  ## bound a producer that refills forever (a large file, a generated stream)
+  ## would starve every other fd in the loop; with one, a fast peer still gets
+  ## ~1 MiB per loop iteration instead of the 64 KiB an arm/wait/disarm round
+  ## trip per chunk used to allow.
+
 proc flushOut(loop: Loop, c: ptr Connection) =
   ## Write as much pending output as the socket accepts; arm write
   ## interest only when the kernel buffer is full.
-  while c.pendingOut > 0:
-    when not defined(plainHttp):
-      if c.ssl != nil:
-        let (n, st) = tlsWrite(c.ssl, addr c.wbuf[c.wpos], c.pendingOut)
-        case st
-        of tlsOk:
-          c.wpos += n
-          continue
-        of tlsWantWrite:
+  ##
+  ## For HTTP/2 the write scheduler is the source of the bytes, so a drained
+  ## buffer is not the end of the work: refill it and keep writing while the
+  ## socket still takes bytes, up to h2MaxRefillRounds. Returning to the selector
+  ## after every 64 KiB refill (the pre-#332 behaviour) capped an h2 download at
+  ## loop-iterations x respHighWater.
+  var refills = 0
+  while true:
+    while c.pendingOut > 0:
+      when not defined(plainHttp):
+        if c.ssl != nil:
+          let (n, st) = tlsWrite(c.ssl, addr c.wbuf[c.wpos], c.pendingOut)
+          case st
+          of tlsOk:
+            c.wpos += n
+            continue
+          of tlsWantWrite:
+            if c.ws != nil: wsBackpressure(c)
+            loop.armWrite(c)
+            if c.h2 != nil and c.pendingOut < respHighWater:
+              h2codec.h2DrainResume(c, addr loop.core)
+            return
+          of tlsWantRead:
+            return               # retried after the next read event
+          of tlsClosed, tlsError:
+            loop.closeConn(c)
+            return
+      let n = send(SocketHandle(c.fd), addr c.wbuf[c.wpos],
+                   c.pendingOut, sendFlags)
+      if n > 0:
+        c.wpos += n
+      else:
+        let err = cint(osLastError())
+        if err == EINTR: continue
+        if err == EAGAIN or err == EWOULDBLOCK:
           if c.ws != nil: wsBackpressure(c)
           loop.armWrite(c)
           if c.h2 != nil and c.pendingOut < respHighWater:
             h2codec.h2DrainResume(c, addr loop.core)
           return
-        of tlsWantRead:
-          return               # retried after the next read event
-        of tlsClosed, tlsError:
-          loop.closeConn(c)
-          return
-    let n = send(SocketHandle(c.fd), addr c.wbuf[c.wpos],
-                 c.pendingOut, sendFlags)
-    if n > 0:
-      c.wpos += n
-    else:
-      let err = cint(osLastError())
-      if err == EINTR: continue
-      if err == EAGAIN or err == EWOULDBLOCK:
-        if c.ws != nil: wsBackpressure(c)
-        loop.armWrite(c)
-        if c.h2 != nil and c.pendingOut < respHighWater:
-          h2codec.h2DrainResume(c, addr loop.core)
+        loop.closeConn(c)
         return
-      loop.closeConn(c)
+    c.wbuf.setLen(0)
+    c.wpos = 0
+    loop.disarmWrite(c)          # no-op once already disarmed, so looping is free
+    if c.closeAfterFlush:
+      # Close gracefully after writing a response on a plaintext HTTP/1 connection:
+      # a bare close() while the kernel still holds untransmitted response bytes and
+      # the peer has unread/half-closed can emit a RST that truncates the tail (a
+      # slow-reading reverse proxy then reports an incomplete body). beginLingerClose
+      # does shutdown(SHUT_WR) + drain so the send buffer flushes with a clean FIN.
+      # This covers every close-after-response path (Connection: close, streaming
+      # finish, drain shutdown, peer-half-close), not just error responses. TLS
+      # (close_notify) and h2/ws keep the direct close unless lingerClose is set.
+      if c.lingerClose or (c.h2 == nil and c.ws == nil):
+        loop.beginLingerClose(c)
+      else:
+        loop.closeConn(c)
       return
-  c.wbuf.setLen(0)
-  c.wpos = 0
-  loop.disarmWrite(c)
-  if c.closeAfterFlush:
-    # Close gracefully after writing a response on a plaintext HTTP/1 connection:
-    # a bare close() while the kernel still holds untransmitted response bytes and
-    # the peer has unread/half-closed can emit a RST that truncates the tail (a
-    # slow-reading reverse proxy then reports an incomplete body). beginLingerClose
-    # does shutdown(SHUT_WR) + drain so the send buffer flushes with a clean FIN.
-    # This covers every close-after-response path (Connection: close, streaming
-    # finish, drain shutdown, peer-half-close), not just error responses. TLS
-    # (close_notify) and h2/ws keep the direct close unless lingerClose is set.
-    if c.lingerClose or (c.h2 == nil and c.ws == nil):
-      loop.beginLingerClose(c)
+    elif c.ws != nil:
+      wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
+      return
+    elif c.rs.respStreaming and c.respBackedUp:
+      c.respBackedUp = false
+      if c.rs.onRespDrain != nil:
+        # Fire once, then clear -- the producer re-registers if it wants the next
+        # drain (matches the h2/h3 codecs). One-shot is required by the file
+        # streamer's read-ahead: it may prefetch the next chunk while still backed
+        # up (no fresh onDrain registered), and a persistent callback would then
+        # re-fire spuriously on the next full drain (issue #273).
+        let cb = c.rs.onRespDrain
+        c.rs.onRespDrain = nil
+        cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
+      return
     else:
-      loop.closeConn(c)
-  elif c.ws != nil:
-    wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
-  elif c.rs.respStreaming and c.respBackedUp:
-    c.respBackedUp = false
-    if c.rs.onRespDrain != nil:
-      # Fire once, then clear -- the producer re-registers if it wants the next
-      # drain (matches the h2/h3 codecs). One-shot is required by the file
-      # streamer's read-ahead: it may prefetch the next chunk while still backed
-      # up (no fresh onDrain registered), and a persistent callback would then
-      # re-fire spuriously on the next full drain (issue #273).
-      let cb = c.rs.onRespDrain
-      c.rs.onRespDrain = nil
-      cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
-  else:
-    # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it and
-    # resume producers parked on the cap (no-op for non-h2 connections). It may
-    # buffer fresh frames, so re-arm write to flush them on the next writable.
-    h2codec.h2DrainResume(c, addr loop.core)
-    if c.pendingOut > 0:
-      loop.armWrite(c)
+      # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it
+      # and resume producers parked on the cap (no-op for non-h2 connections).
+      h2codec.h2DrainResume(c, addr loop.core)
+      if c.pendingOut == 0: return          # nothing more to send: done
+      inc refills
+      if refills >= h2MaxRefillRounds:
+        # Yield: arm write so the fresh frames go out on the next writable and
+        # the rest of the loop gets a turn.
+        loop.armWrite(c)
+        return
+      # else: the socket was still accepting bytes a moment ago, so write the
+      # refill now instead of paying an arm / wait / disarm round trip for it.
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code
