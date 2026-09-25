@@ -228,6 +228,21 @@ type
                               ## streamed response's own WINDOW_UPDATEs flowing
                               ## while it is mid-stream, instead of starving
                               ## them until the read unpins. Loop-thread only.
+    flushHold*: int32         ## > 0 while a batch of loop-thread output is being
+                              ## produced on this connection (a WebSocket read
+                              ## batch, an outbox drain). Producers still append
+                              ## to `wbuf`, but the opportunistic "push it to the
+                              ## socket now" hook (LoopCore.hooks.flushHook) is
+                              ## skipped, so N frames dispatched from one recv()
+                              ## cost one send() instead of N (#333). Contract:
+                              ## whoever takes a hold releases it in the same loop
+                              ## turn (holdFlush/releaseFlushHold) and flushes once
+                              ## when the count reaches 0; a direct flushOut is
+                              ## always allowed (holding is an optimization, never
+                              ## an ordering rule -- wbuf stays FIFO either way),
+                              ## and the hook still flushes past respHighWater so a
+                              ## handler that emits megabytes inside one dispatch
+                              ## cannot buffer them all. Loop thread only.
     closeRequested*: bool     ## close deferred until unpinned
     rs*: RequestState         ## per-request state shared with the h2/h3 streams
     sent100*: bool            ## 100 Continue already sent for this request
@@ -635,6 +650,18 @@ const respHighWater* = 64 * 1024
 proc pendingOut*(c: ptr Connection): int {.inline.} =
   c.wbuf.len - c.wpos
 
+proc holdFlush*(c: ptr Connection) {.inline.} =
+  ## Take one flush hold for the batch about to run (see Connection.flushHold).
+  ## Loop thread only; pair with releaseFlushHold in the same loop turn.
+  inc c.flushHold
+
+proc releaseFlushHold*(c: ptr Connection): bool {.inline.} =
+  ## Drop one flush hold; true when it was the last one, i.e. the caller now owes
+  ## the single end-of-batch flush. Nested holds (an outbox batch whose message
+  ## resumes a WebSocket read batch) collapse to one flush, by the outermost.
+  if c.flushHold > 0: dec c.flushHold
+  c.flushHold == 0
+
 proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
   ## Drop any pending `res.headers` for a connection/slot being torn down (a
   ## request that set headers but never sent). No-op when unused; the table is
@@ -727,6 +754,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   # staleness-check bug); crash at the source in debug, scrub in release.
   doAssert c.totalPins == 0, "slot recycled with live worker pins"
   c.pins.reset()
+  c.flushHold = 0            # a hold never outlives its loop turn; scrub anyway
   c.closeRequested = false
   c.closeAfterFlush = false
   c.lingerClose = false

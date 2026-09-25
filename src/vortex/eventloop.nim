@@ -104,6 +104,12 @@ type
     lastWallSec: int64
     pumpCap: int                 # adapter-suggested selector timeout cap
     outboxScratch: seq[OutMsg]   # reused drain buffer
+    pendingFlush: seq[(int32, uint32)]
+                                 # connections holding a flush for the outbox
+                                 # batch being applied (one entry per hold taken,
+                                 # so the counts always balance); drained at the
+                                 # end of processOutbox, which flushes each
+                                 # connection once (#333)
     readyStreams: seq[uint32]    # reused h2 dispatch buffer
     unpackCt: string             # reused worker-response unpack buffers, so
     unpackHeaders: seq[(string, string)]  # draining the outbox allocates no
@@ -754,7 +760,16 @@ proc processInput(loop: Loop, c: ptr Connection) =
     # Pause frame dispatch while a ws.blocking worker holds the connection:
     # buffered frames wait until it unpins (one message at a time).
     if c.inputPausePins == 0:
+      # Hold the socket flush for the whole read batch (#333): frames produced by
+      # the onMessage handlers land in c.wbuf and go out in one send() here,
+      # instead of one send() (plus an armWrite/disarmWrite pair on every EAGAIN)
+      # per echoed message. A handler that closes mid-batch only sets
+      # closeAfterFlush, so the close still rides this flush.
+      holdFlush(c)
       wsInput(addr loop.core, c)
+      if releaseFlushHold(c) and c.state != csFree and
+          (c.pendingOut > 0 or c.closeAfterFlush):
+        loop.flushOut(c)
     else:
       # We can't parse frames to observe the peer's pong while pinned, but this
       # call is driven by inbound bytes, which prove the peer is alive. Refresh
@@ -967,8 +982,17 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
     let c = conn(addr loop.core, fd, gen)
-    if c != nil and c.pendingOut > 0:
-      loop.flushOut(c)
+    if c == nil or c.pendingOut <= 0: return
+    if c.flushHold > 0 and c.pendingOut < respHighWater:
+      # A batch is dispatching on this connection (a WebSocket read batch, an
+      # outbox drain): the frames this send produced are already in wbuf and the
+      # batch owner flushes once when its hold drops, so one recv() carrying N
+      # messages costs one send() instead of N (#333). Past respHighWater the
+      # hold is ignored: a handler that emits megabytes inside a single dispatch
+      # must still meet the socket (and its EAGAIN -> wsBackpressure/onDrain
+      # signal) rather than buffering the whole burst in wbuf.
+      return
+    loop.flushOut(c)
 
 const h2RecvBufferCap = 1024 * 1024
   ## Hard ceiling on an HTTP/2 connection's receive buffer. With
@@ -1509,6 +1533,20 @@ when not defined(plainHttp):
             m.data.toOpenArray(bodyStart, m.data.len - 1))
     h3Touched = true
 
+proc deferBatchFlush(loop: Loop, c: ptr Connection) =
+  ## Hold this connection's flush for the rest of the outbox batch, to be released
+  ## (and flushed, once) by processOutbox's tail (#333), so a worker's burst of
+  ## frames costs one send() rather than one per message. The hold is taken BEFORE
+  ## the operation it covers, so the counter and the pending list stay balanced
+  ## even if that operation closes the connection. At most one hold (and one list
+  ## entry) per connection per batch: `flushHold == 0` identifies the first
+  ## message for this connection, since nothing else holds across messages -- a
+  ## nested hold (processInput resuming a read batch) is taken and released within
+  ## one message.
+  if c.flushHold == 0:
+    loop.pendingFlush.add (c.fd, c.gen)
+    holdFlush(c)
+
 proc applyOutboxConn(loop: Loop, m: OutMsg) =
   ## Apply one non-blockingDone message on an h1/h2 connection (m.fd >= 0).
   if int(m.fd) >= loop.core.conns.len: return
@@ -1516,30 +1554,29 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
   if staleConn(c, m.gen): return
   if m.kind == omWs or m.kind == omWsClose:
     # A WebSocket frame from an off-loop sender (already serialized): route to the
-    # h1 connection or the h2 stream, then flush.
+    # h1 connection or the h2 stream; the batch's single flush pushes it.
     let w = wsConnForStream(addr loop.core, c, m.stream)
     if w != nil:
+      loop.deferBatchFlush(c)
       wsFlushRaw(addr loop.core, c, w, m.data, m.kind == omWsClose)
-      loop.flushOut(c)
     return
   if m.kind == omWsDone:
     # A ws.blocking worker finished: release its pin and resume dispatching frames
     # held back while it ran. stream 0 (h1) holds a pkWsBlocking connection pin;
-    # an h2 stream holds the per-stream pin, released by wsResume.
+    # an h2 stream holds the per-stream pin, released by wsResume. Either path can
+    # dispatch the next message (and its reply) inline, so hold the flush across
+    # it and let the batch tail push everything at once.
+    loop.deferBatchFlush(c)
     if m.stream == 0:
       # releasePin's hook covers the deferred close and, when frames are buffered,
-      # dispatches the next message; only the flush of what that queued stays here.
+      # dispatches the next message; its output rides the batch flush.
       doAssert m.release == prWsBlocking
       if not loop.releasePin(c, pkWsBlocking): return
-      if c.state != csFree and c.pendingOut > 0:
-        loop.flushOut(c)
     else:
       doAssert m.release == prNone
       let w = wsConnForStream(addr loop.core, c, m.stream)
       if w != nil:
         wsResume(addr loop.core, c, w)
-        if c.state != csFree and c.pendingOut > 0:
-          loop.flushOut(c)
     return
   if m.kind in {omFileStart, omFileChunk}:
     # Only chunk reads (dispatchNextRead -> omFileChunk) release prFileChunk. The
@@ -1584,6 +1621,21 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
                 m.data.toOpenArray(bodyStart, m.data.len - 1))
   loop.resumeAfterRespond(c, m.stream)
 
+proc releaseBatchFlushes(loop: Loop) =
+  ## One socket write per connection for the whole outbox batch (#333). Each entry
+  ## is the one hold deferBatchFlush took for that connection, so dropping it
+  ## flushes everything the batch produced there. A connection that died while the
+  ## batch was applied resolves to nil (its generation was bumped) and its hold
+  ## goes with the slot -- clear() scrubs the counter before it is reused. Runs
+  ## even if applying a message raised, so a hold is never leaked onto a live
+  ## connection (which would mute its flush hook until the next batch).
+  for (fd, gen) in loop.pendingFlush:
+    let c = conn(addr loop.core, fd, gen)
+    if c == nil: continue
+    if releaseFlushHold(c) and (c.pendingOut > 0 or c.closeAfterFlush):
+      loop.flushOut(c)
+  loop.pendingFlush.setLen(0)
+
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing. Each
   ## message is dispatched to a per-transport handler (see applyBlockingDone /
@@ -1592,16 +1644,19 @@ proc processOutbox(loop: Loop) =
   loop.outboxScratch.setLen(0)
   drain(loop.core.outbox, loop.outboxScratch)
   var h3Touched = false
-  for m in loop.outboxScratch.mitems:
-    if m.kind == omBlockingDone:
-      loop.applyBlockingDone(m, h3Touched)
-    elif m.fd < 0:
-      when not defined(plainHttp):
-        loop.applyOutboxH3(m, h3Touched)
+  try:
+    for m in loop.outboxScratch.mitems:
+      if m.kind == omBlockingDone:
+        loop.applyBlockingDone(m, h3Touched)
+      elif m.fd < 0:
+        when not defined(plainHttp):
+          loop.applyOutboxH3(m, h3Touched)
+        else:
+          discard
       else:
-        discard
-    else:
-      loop.applyOutboxConn(m)
+        loop.applyOutboxConn(m)
+  finally:
+    loop.releaseBatchFlushes()
   # Recycle every sendFile read buffer from this batch back to the pool -- once,
   # here, so a buffer is returned exactly once whether its stream was alive (the
   # data was copied above) or the connection had died (the data is discarded).

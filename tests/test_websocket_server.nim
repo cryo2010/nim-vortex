@@ -115,6 +115,46 @@ withServer(RequestHandler(handler),
       check code == 1000
       check s.waitForClose()
 
+    test "a pipelined burst is echoed in order, in one write (#333)":
+      # The whole burst arrives in one recv(), so the loop dispatches all of it
+      # before the single end-of-batch flush: the echoes leave in ONE send()
+      # instead of one per message (which is what a per-send flush cost, plus an
+      # armWrite/disarmWrite pair on every EAGAIN). Syscalls aren't observable
+      # from here, so the proxy is that the client's first read carries every
+      # echo -- with a flush per send the first frame would wake the reader on
+      # its own, well before the rest were dispatched.
+      let s = open()
+      defer: s.close()
+      const burstFrames = 8
+      var burst = ""
+      for i in 0 ..< burstFrames: burst.add buildFrame(0x1, "msg-" & $i)
+      s.send(burst)
+      let got = recvAvailable(s, 4000)
+      let (frames, consumed) = parseFrames(got)
+      check consumed == got.len              # no partial frame: one whole write
+      check frames.len == burstFrames
+      for i in 0 ..< burstFrames:
+        check frames[i].op == 0x1
+        check frames[i].payload == "msg-" & $i
+
+    test "a close pipelined behind data still flushes the batch (#333)":
+      # The close arrives in the same read batch as the data frames, so the
+      # handler-side close lands while the flush is held: the echoes, the close
+      # echo and the connection close must all still happen.
+      let s = open()
+      defer: s.close()
+      var burst = ""
+      for i in 0 ..< 3: burst.add buildFrame(0x1, "b" & $i)
+      burst.add buildFrame(0x8, "\x03\xe8")      # 0x03e8 = 1000
+      s.send(burst)
+      for i in 0 ..< 3:
+        let f = s.recvFrame()
+        check f.op == 0x1
+        check f.payload == "b" & $i
+      let f = s.recvFrame()
+      check f.op == 0x8
+      check s.waitForClose()
+
     test "ws.blocking runs the body on the worker pool":
       let s = open()
       defer: s.close()
