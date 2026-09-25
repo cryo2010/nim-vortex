@@ -452,6 +452,35 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   emitHeaderBlock(h2, c, sid, hb, flagEndStream)
   h2.teardownStream(c, sid)
 
+proc compactPendingBody*(st: var H2Stream) {.inline.} =
+  ## Reclaim the already-sent prefix [0, pendingPos) of a stream's response
+  ## backlog. Compacting only on a full drain (pendingPos == len) was the bug in
+  ## #331: a producer that keeps the backlog non-zero (the normal shape of a
+  ## download -- the scheduler drains all but a few bytes, the producer is
+  ## resumed and appends another chunk behind the dead prefix) never hit that
+  ## case, so pendingBody grew by the whole response. Backpressure could not see
+  ## it either, because bufferedAmount / h2Writable measure `len - pendingPos`.
+  ##
+  ## Threshold: compact once the dead prefix is at least respHighWater AND at
+  ## least as large as the live remainder. Both halves matter:
+  ##   * the absolute floor keeps small responses from memmoving on every frame;
+  ##   * "prefix >= remainder" makes the copying O(1) amortised per byte sent
+  ##     (each compaction moves no more bytes than it reclaims), so a handler
+  ##     that ignores backpressure and queues one huge chunk cannot turn this
+  ##     into an O(n^2) memmove storm.
+  ## Together they bound a well-behaved producer's buffer at roughly
+  ## 2 x respHighWater plus one write chunk instead of the whole response.
+  if st.pendingPos == 0: return
+  let rest = st.pendingBody.len - st.pendingPos
+  if rest == 0:
+    st.pendingBody.setLen 0
+    st.pendingPos = 0
+    return
+  if st.pendingPos < respHighWater or st.pendingPos < rest: return
+  moveMem(addr st.pendingBody[0], addr st.pendingBody[st.pendingPos], rest)
+  st.pendingBody.setLen rest
+  st.pendingPos = 0
+
 proc h2Sendable(h2: H2Conn, st: H2Stream): bool =
   ## Can this stream emit a frame right now, ignoring the connection window
   ## (which gates the whole pass, not queue membership)? A backlog needs its
@@ -503,9 +532,7 @@ proc emitOneFrame(h2: H2Conn, c: ptr Connection, sid: uint32): bool =
   st.pendingPos += chunk
   st.sendWindow -= int32(chunk)
   h2.connSendWindow -= int32(chunk)
-  if st.pendingPos == st.pendingBody.len:
-    st.pendingBody.setLen 0                  # compact a fully-drained buffer
-    st.pendingPos = 0
+  compactPendingBody(st)   # reclaim the sent prefix, not only on a full drain (#331)
   if last:
     h2.teardownStream(c, sid)
   true
@@ -660,9 +687,7 @@ proc wsFlushH2(core: ptr LoopCore, c: ptr Connection,
     return
   template st: H2Stream = h2.streams[sid]
   if w.outBuf.len > 0:
-    if st.pendingPos > 0 and st.pendingPos == st.pendingBody.len:
-      st.pendingBody.setLen 0            # compact a fully-drained buffer
-      st.pendingPos = 0
+    compactPendingBody(st)               # reclaim the sent prefix first (#331)
     st.pendingBody.add w.outBuf
     w.outBuf.setLen 0
     st.pendingIsLast = false
@@ -735,9 +760,7 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   template st: H2Stream = h2.streams[sid]
   if st.isHead: return 0
   if data.len > 0:
-    if st.pendingPos > 0 and st.pendingPos == st.pendingBody.len:
-      st.pendingBody.setLen 0            # compact a fully-drained buffer
-      st.pendingPos = 0
+    compactPendingBody(st)               # reclaim the sent prefix first (#331)
     let oldLen = st.pendingBody.len
     st.pendingBody.setLen(oldLen + data.len)
     copyMem(addr st.pendingBody[oldLen], unsafeAddr data[0], data.len)
