@@ -622,6 +622,14 @@ proc h2Deadline(c: ptr Connection): DeadlineKind =
   ##    streams a long response back (endStreamSeen) is excluded by
   ##    h2AwaitingClient, so a legitimately-silent client is never wrongly reaped.
   ##  - dkNone: nothing to time.
+  ##
+  ## All three questions are answered from counters maintained at the state
+  ## transitions (#339). This runs on every input event, and the two predicates
+  ## used to walk the whole stream table with mpairs, so a 256-stream download
+  ## scanned 256 entries twice for every inbound WINDOW_UPDATE batch. The
+  ## debug-only audit below re-derives them by scanning, so a codec mutation
+  ## site that forgets to update a counter fails the test suite.
+  when not defined(release): h2CheckCounters(c)
   if h2ActiveStreams(c) == 0: dkIdle
   elif h2AwaitingClient(c): dkBody
   elif h2BlockedOnPeerWindow(c): dkBody
