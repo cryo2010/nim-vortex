@@ -5,11 +5,11 @@
 ## returns the credit as WINDOW_UPDATEs, keeping the send windows small so the
 ## server's per-stream backlog never reaches zero.
 
-import std/[unittest, net, httpcore, strutils, atomics, posix, times, oserrors]
-import vortex/[settings, request, server, routing]
+import std/[unittest, net, httpcore, strutils, atomics, posix, times, oserrors, os]
+import vortex/[settings, request, server, routing, staticfiles]
 import vortex/asyncdispatch
 import vortex/http2/frames
-from vortex/connection import conn
+from vortex/connection import conn, fileChunkCap
 from vortex/http2/codec import h2Stream
 import ./h2client
 
@@ -81,6 +81,47 @@ var rt = newRouter()
 rt.get("/big", bigDownload)
 rt.get("/split", splitDownload)
 rt.get("/chunks", chunkDownload)
+
+# --- sendFile read-ahead (#340) ---------------------------------------------
+
+const
+  fileBytes = 3 * 1024 * 1024     ## the file the read-ahead test downloads
+  fileWindow = 32 * 1024          ## per-stream window it advertises
+  fileReadAheadBound = 3 * fileChunkCap
+    ## fileReadAhead (one chunk) + the chunk that passes the gate + the chunk
+    ## already in flight when the gate closes (request.nim: fileReadAhead).
+
+let filePath = getTempDir() / ("vortex_h2_readahead_" & $getCurrentProcessId())
+block:
+  var body = newString(fileBytes)
+  for i in 0 ..< fileBytes: body[i] = patternByte(i)
+  writeFile(filePath, body)
+
+var peakBacklog: Atomic[int]      ## high-water mark of stream 1's backlog
+var peekRuns: Atomic[int]
+
+proc peekBacklogRoute(req: Request, res: Response) {.gcsafe.} =
+  ## Sample the *download* stream's unsent backlog from a second stream on the
+  ## same connection. Runs on the loop thread (a plain handler), so it reads codec
+  ## state safely, and a pkFileChunk pin does not pause h2 input -- which is what
+  ## lets these requests be served while the download is mid-flight.
+  let c = conn(res.core, res.fd, res.gen)
+  if c != nil:
+    let st = h2Stream(c, 1'u32)
+    if st != nil:
+      let backlog = st.pendingBody.len - st.pendingPos
+      if backlog > peakBacklog.load(): peakBacklog.store(backlog)
+  peekRuns.store(peekRuns.load() + 1)
+  res.send(Http200, "ok")
+
+proc fileRoute(path: string): RequestHandler =
+  ## Closure over the path (as tests/test_static_files.nim does): a gcsafe
+  ## handler may not reach a GC'd global.
+  proc (req: Request, res: Response) {.gcsafe.} =
+    res.sendFile(path)
+
+rt.get("/file", fileRoute(filePath))
+rt.get("/peek", peekBacklogRoute)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 
@@ -207,6 +248,54 @@ proc fetchBody(port: Port, path: string, initialWindow, connGrant: int,
       if not c.rawSend(wu): break             # peer gone: report what we got
   c.close()
 
+proc fileDownload(port: Port): tuple[body: string, endStream: bool, peeks: int] =
+  ## Fetch /file (a sendFile response) with a small per-stream window, and probe
+  ## the download stream's backlog from a second stream after every read batch.
+  var c = newH2TestConn(port)
+  var sndTimeout = Timeval(tv_sec: posix.Time(2), tv_usec: 0)
+  discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
+                     addr sndTimeout, SockLen(sizeof(sndTimeout)))
+  var req = ""
+  var settings = ""
+  settings.addSetting(setInitialWindowSize, uint32(fileWindow))
+  req.addFrameHeader(settings.len, ftSettings, 0, 0)
+  req.add settings
+  req.addWindowUpdate(0, wideGrant)          # only the stream window throttles
+  req.addRequest(1, {":method": "GET", ":scheme": "http",
+                     ":path": "/file", ":authority": "localhost"},
+                 endStream = true)
+  c.sendRaw(req)
+  var nextPeek = 3'u32
+  let deadline = epochTime() + 60.0
+  while not result.endStream and epochTime() < deadline:
+    let frames = c.readFrames(3000,
+      until = proc(f: seq[Frame]): bool = f.len >= 1)
+    if frames.len == 0: break
+    var consumed, consumedFile = 0
+    var gone = false
+    for f in frames:
+      if f.typ == uint8(ftData):
+        consumed += f.payload.len
+        if f.streamId == 1:
+          consumedFile += f.payload.len
+          result.body.add f.payload
+          if (f.flags and flagEndStream) != 0: result.endStream = true
+      elif f.typ == uint8(ftGoaway) or
+           (f.typ == uint8(ftRstStream) and f.streamId == 1):
+        gone = true
+    if gone: break
+    var outFrames = ""
+    if consumed > 0: outFrames.addWindowUpdate(0, consumed)
+    if consumedFile > 0: outFrames.addWindowUpdate(1, consumedFile)
+    if not result.endStream:
+      outFrames.addRequest(nextPeek, {":method": "GET", ":scheme": "http",
+                                      ":path": "/peek", ":authority": "localhost"},
+                           endStream = true)
+      nextPeek += 2
+      inc result.peeks
+    if outFrames.len > 0 and not c.rawSend(outFrames): break
+  c.close()
+
 suite "HTTP/2 streaming download":
   test "pendingBody stays bounded while the backlog never reaches zero (#331)":
     peakPending.store(0)
@@ -272,6 +361,30 @@ suite "HTTP/2 streaming download":
     check full == frameChunks
     check other == 0
 
+  test "sendFile read-ahead keeps the backlog bounded and completes (#340)":
+    # A slow reader (32 KiB stream window) against a 3 MiB sendFile: the backlog
+    # is bounded and the transfer still completes, byte for byte. The bound is
+    # the read-ahead budget plus two chunks -- the chunk that passes the gate,
+    # plus the one already in flight, which is always written when it lands. With
+    # the gate moved ahead of the write (#340) but the budget left at two chunks
+    # this test sees ~960 KiB instead of ~736 KiB.
+    peakBacklog.store(0)
+    peekRuns.store(0)
+    let r = fileDownload(srv.port)
+    check r.endStream
+    check r.body.len == fileBytes
+    var mismatch = -1
+    for i in 0 ..< min(r.body.len, fileBytes):
+      if r.body[i] != patternByte(i):
+        mismatch = i
+        break
+    check mismatch == -1
+    check r.peeks > 20                        # the probe really ran, repeatedly
+    check peekRuns.load() > 20
+    check peakBacklog.load() > 0              # and saw a real backlog
+    check peakBacklog.load() <= fileReadAheadBound
+
 budgetSrv.close()
 srv.close()
+removeFile(filePath)
 echo "server shut down cleanly"
