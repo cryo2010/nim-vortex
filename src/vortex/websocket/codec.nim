@@ -42,7 +42,9 @@ type
                    w: WsConn) {.nimcall, gcsafe.}
     ## Move `w.outBuf` to the wire and apply `w.wantClose`. Set at accept
     ## time per transport (`wsFlushH1`, or the HTTP/2 one in http2/codec),
-    ## which keeps the WebSocket codec free of any HTTP/2 import.
+    ## which keeps the WebSocket codec free of any HTTP/2 import. Doubles as the
+    ## transport tag: `wsOut` writes h1 frames straight into `c.wbuf` and only
+    ## h2/h3 stage them in `outBuf` (#337).
 
   WsConn* = ref object of RootObj
     ## The per-WebSocket state: on `Connection.ws` for HTTP/1.1, or on an
@@ -59,14 +61,15 @@ type
     closeSent: bool          ## a close frame has been queued
     closeNotified*: bool     ## onClose has been delivered (the ws is finished)
     subprotocol: string      ## negotiated Sec-WebSocket-Protocol ("" = none)
-    # Transport abstraction: the core appends serialized frames to `outBuf`
-    # and sets `wantClose`; `flush` drains them (HTTP/1 -> c.wbuf, HTTP/2 ->
+    # Transport abstraction: the core appends serialized frames to the buffer
+    # `wsOut` picks (HTTP/1: straight into c.wbuf; h2/h3: `outBuf`) and sets
+    # `wantClose`; `flush` concludes them (HTTP/1: apply the close, HTTP/2:
     # stream DATA). `stream`/`inBuf`/`pinnedByWorker` back the HTTP/2 side.
     stream*: uint32          ## 0 for HTTP/1.1, else the h2/h3 stream id
     fd*: int32               ## handle identity for callbacks (h3 has no Connection)
     gen*: uint32
-    outBuf*: string          ## serialized frames awaiting flush
-    wantClose*: bool         ## close the transport once outBuf is flushed
+    outBuf*: string          ## serialized frames awaiting flush (h2/h3 only)
+    wantClose*: bool         ## close the transport once the frames are flushed
     flush*: WsFlush
     inBuf*: string           ## h2/h3 inbound bytes accumulated from DATA frames
     preAcceptFin*: bool      ## client half-closed (END_STREAM) before accept
@@ -187,13 +190,27 @@ when defined(wsDeflate):
 
 proc wsFlushH1*(core: ptr LoopCore, c: ptr Connection,
                 w: WsConn) {.nimcall, gcsafe.} =
-  ## HTTP/1 transport: move produced frames into the connection write buffer
-  ## and, if the codec asked to close, close the connection after they flush.
+  ## HTTP/1 transport: apply a requested close once the produced frames flush.
+  ## On HTTP/1 the frames are already in `c.wbuf` (see wsOut), so there is
+  ## nothing to move; the drain of a non-empty `outBuf` stays as a backstop for
+  ## any producer that predates that and would otherwise silently drop frames.
   if w.outBuf.len > 0:
     c.wbuf.add w.outBuf
     w.outBuf.setLen 0
   if w.wantClose:
     c.closeAfterFlush = true
+
+proc wsOut(c: ptr Connection, w: WsConn): ptr string {.inline.} =
+  ## Where a produced frame is serialized. On HTTP/1 the connection's write
+  ## buffer IS the WebSocket transport buffer, so frames are appended straight
+  ## into it (#337): staging them in `w.outBuf` first cost a second full copy
+  ## (and a realloc of wbuf) of every outbound message before the syscall.
+  ## HTTP/2 and HTTP/3 keep `outBuf`: their flush re-frames it as per-stream
+  ## DATA, which needs the frame bytes held apart from the connection buffer.
+  ## Backpressure accounting is unaffected: bufferedAmount already reported
+  ## `c.pendingOut` for h1 (the old staging was moved into wbuf by the very next
+  ## `w.flush`) and `h2Pending` for h2/h3.
+  if c != nil and w.flush == wsFlushH1: addr c.wbuf else: addr w.outBuf
 
 # --- handshake --------------------------------------------------------------
 
@@ -294,7 +311,7 @@ proc failClose(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   ## transport (connection for HTTP/1, stream for HTTP/2) once it flushes.
   if not w.closeSent:
     w.closeSent = true
-    w.outBuf.appendClose(code)
+    wsOut(c, w)[].appendClose(code)
   notifyClose(core, c, w, code, "")
   w.wantClose = true
 
@@ -382,7 +399,7 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   case fr.opcode
   of opPing:
     if not w.closeSent:                    # nothing may follow a sent close
-      w.outBuf.appendFrame(opPong, fr.payload)
+      wsOut(c, w)[].appendFrame(opPong, fr.payload)
     true
   of opPong:
     true                                   # unsolicited pong: ignore
@@ -405,7 +422,7 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
         return false
     if not w.closeSent:
       w.closeSent = true
-      w.outBuf.appendClose(code)           # echo the (valid) code back
+      wsOut(c, w)[].appendClose(code)      # echo the (valid) code back
     notifyClose(core, c, w, code, reason)
     w.wantClose = true
     false
@@ -564,7 +581,7 @@ proc wsPeerClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   ## (e.g. an h2 stream END_STREAM): queue a normal close and flush it.
   if w.closeSent: return
   w.closeSent = true
-  w.outBuf.appendClose(1000)
+  wsOut(c, w)[].appendClose(1000)
   w.wantClose = true
   if w.flush != nil:
     w.flush(core, c, w)
@@ -584,7 +601,7 @@ proc wsSweepIdle*(core: ptr LoopCore, c: ptr Connection, w: WsConn): bool =
       if w.flush != nil: w.flush(core, c, w) # push the close / conclude the stream
       return true
   elif core.nowSec - w.lastRx >= int64(core.config.wsPingInterval):
-    w.outBuf.appendFrame(opPing, "")
+    wsOut(c, w)[].appendFrame(opPing, "")
     w.pingSent = true
     w.pingAt = core.nowSec
     if w.flush != nil: w.flush(core, c, w)
@@ -659,7 +676,7 @@ proc wsFlushRaw*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     # send-after-close or a second close racing a peer close).
     if w.flush != nil: w.flush(core, c, w)
     return
-  w.outBuf.add data
+  wsOut(c, w)[].add data
   if close:
     w.closeSent = true
     w.wantClose = true
@@ -718,12 +735,12 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
             # silently or emitting a frame the peer can't decode (R13).
             ws.close(1011)
             return
-          w.outBuf.appendFrame(op, comp, rsv1 = true)
+          wsOut(c, w)[].appendFrame(op, comp, rsv1 = true)
           w.flush(ws.core, c, w)
           if ws.core.hooks.flushHook != nil:
             ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
           return
-      w.outBuf.appendFrame(op, data)
+      wsOut(c, w)[].appendFrame(op, data)
       w.flush(ws.core, c, w)
       if ws.core.hooks.flushHook != nil:
         ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
@@ -753,7 +770,7 @@ proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [
                                    stream: ws.stream, data: frame)))):
       if w.closeSent: return
       w.closeSent = true
-      w.outBuf.appendClose(code, reason)
+      wsOut(c, w)[].appendClose(code, reason)
       w.wantClose = true
       w.flush(ws.core, c, w)
       if ws.core.hooks.flushHook != nil:
