@@ -431,13 +431,31 @@ proc freeOutbox*(ob: ptr Outbox) =
   deallocShared ob
 
 proc push*(ob: ptr Outbox, msg: sink OutMsg) =
+  ## Queue a message for the owning loop, waking it only on the empty ->
+  ## non-empty transition (#338): a worker streaming frames used to pay a wakeup
+  ## write() per message and the loop woke for one-message batches. Coalescing is
+  ## safe because `drain` empties the queue in one swap under the same lock:
+  ##  * A push that finds the queue non-empty is covered by the trigger of the
+  ##    push that made it non-empty. That trigger is either still pending (the
+  ##    loop has not drained yet, and the drain takes this message too) or was
+  ##    already consumed -- in which case the loop's drain runs after it, again
+  ##    taking this message, since both the append and the drain hold the lock.
+  ##  * A push that finds it empty always triggers, so the queue can never go
+  ##    from empty to non-empty without a wakeup. The trigger is issued outside
+  ##    the lock, so a thread descheduled between the two can delay a wakeup, but
+  ##    never drop it: it always runs, and the next drain takes everything.
+  ##  * The loop never sleeps holding messages: after `drain` the queue is empty,
+  ##    so the next push is a transition and triggers.
   acquire ob.lock
+  let wasEmpty = ob.msgs.len == 0
   ob.msgs.add msg
   release ob.lock
-  trigger ob.ev
+  if wasEmpty: trigger ob.ev
 
 proc drain*(ob: ptr Outbox, into: var seq[OutMsg]) =
-  ## Swap out all pending messages; `into` should be empty.
+  ## Swap out all pending messages; `into` should be empty. Must take ALL of them
+  ## (never a partial batch) -- push's wakeup coalescing above relies on the queue
+  ## being empty when this returns.
   acquire ob.lock
   swap(into, ob.msgs)
   release ob.lock
