@@ -201,6 +201,39 @@ proc download(port: Port, connCreditChunk: int, connGrant = 0): DlResult =
       if not c.rawSend(wu): break   # peer gone: report what we got
   c.close()
 
+proc floodIdleUpdates(port: Port, frames: int): int =
+  ## Hold a stream open that can never receive DATA (its window is advertised as
+  ## 0), then flood connection-level WINDOW_UPDATEs of increment 1. None of them
+  ## unblocks anything and no DATA was ever sent to earn credit for them, so the
+  ## budget must still trip. Returns the GOAWAY error code, or -1 if none came.
+  var c = newH2TestConn(port)
+  var sndTimeout = Timeval(tv_sec: posix.Time(2), tv_usec: 0)
+  discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
+                     addr sndTimeout, SockLen(sizeof(sndTimeout)))
+  var req = ""
+  var settings = ""
+  settings.addSetting(setInitialWindowSize, 0'u32)
+  req.addFrameHeader(settings.len, ftSettings, 0, 0)
+  req.add settings
+  req.addRequest(1, {":method": "GET", ":scheme": "http",
+                     ":path": "/big", ":authority": "localhost"}, endStream = true)
+  for i in 0 ..< frames: req.addWindowUpdate(0, 1)
+  discard c.rawSend(req)                      # the peer may close mid-burst
+  result = -1
+  let deadline = epochTime() + 10.0
+  while result < 0 and epochTime() < deadline:
+    let got = c.readFrames(3000,
+      until = proc(f: seq[Frame]): bool = f.len >= 1)
+    if got.len == 0: break
+    for f in got:
+      if f.typ == uint8(ftData) and f.payload.len > 0:
+        result = -2                           # DATA on a zero window: broken test
+        break
+      if f.typ == uint8(ftGoaway) and f.payload.len >= 8:
+        result = int(get32(f.payload, 4))
+        break
+  c.close()
+
 type BodyResult = tuple[body: string, sizes: seq[int], endStream: bool]
   ## The concatenated DATA payload, every DATA frame's payload length in order,
   ## and whether the stream was closed with END_STREAM.
@@ -320,6 +353,13 @@ suite "HTTP/2 streaming download":
     check dl.connUpdates > budget * 10        # well past the old budget
     check dl.goaway == -1                     # no GOAWAY
     check dl.bytes == totalBytes              # and the body arrived in full
+
+  test "a WINDOW_UPDATE flood on a stream we send nothing to still GOAWAYs (#335)":
+    # The other side of the same fix: benign updates ride credit earned by DATA
+    # we sent, so a peer that parks a stream (zero window) and floods updates
+    # that unblock nothing has no credit and must trip ENHANCE_YOUR_CALM (11)
+    # after maxControlFrames, exactly as the PING and SETTINGS floods do.
+    check floodIdleUpdates(budgetSrv.port, frames = budget * 20) == 11
 
   test "one write larger than the window arrives byte-exact (#334)":
     # write() emits what flow control allows straight from the producer's buffer

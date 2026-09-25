@@ -128,6 +128,14 @@ type
                               ## that makes a client emit thousands of benign
                               ## WINDOW_UPDATEs, and it must not be mistaken for
                               ## a flood (#335).
+    windowCredit*: int        ## no-progress WINDOW_UPDATEs the peer has earned
+                              ## by consuming response DATA (one per
+                              ## windowCreditBytes sent, capped); a benign
+                              ## update spends one, and only an update with no
+                              ## credit behind it is charged to the budget, so
+                              ## a peer's flood capacity is proportional to the
+                              ## useful bytes we sent it (#335).
+    windowCreditBytes*: int   ## DATA bytes accumulated toward the next credit
     streamRecvWindow*: int    ## per-stream receive window we advertise
     connRecvWindow*: int      ## per-connection receive window (streaming cap)
     connRecvRemaining*: int   ## bytes the peer may still send at the connection
@@ -436,6 +444,15 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
     c.wbuf.addRstStream(sid, err)
   h2.teardownStream(c, sid)
 
+const
+  windowCreditBytes = 256
+    ## Response DATA bytes that earn one uncharged no-progress WINDOW_UPDATE.
+    ## Real clients return credit per tens of KiB; 256 leaves a 100x margin for
+    ## odd ones while an attacker still gets only a few frames per KiB we sent.
+  windowCreditCap = 4
+    ## windowCredit is capped at this many times maxControlFrames, so a long
+    ## quiet download cannot bank an unbounded flood allowance.
+
 proc noteControlFrame(h2: H2Conn, c: ptr Connection, n = 1) =
   ## Budget control/overhead frames (PING incl. ACK, SETTINGS per entry,
   ## WINDOW_UPDATE / PRIORITY / GOAWAY / unknown types, and every RST_STREAM we
@@ -466,13 +483,40 @@ proc noteDataProgress(h2: H2Conn, n: int) {.inline.} =
   ## overhead frames per unit of useful work -- while a flood that produces no
   ## response bytes still decays nothing and trips as before.
   if h2.maxControlFrames <= 0 or n <= 0: return
+  # Earn credit for the no-progress WINDOW_UPDATEs this DATA will provoke (see
+  # noteIdleWindowUpdate). Credit survives a zero counter, unlike the decay
+  # below: the updates for these bytes arrive AFTER we send them, typically in
+  # a burst while the counter is still zero, and they must not be charged then.
+  h2.windowCreditBytes += n
+  let earned = h2.windowCreditBytes div windowCreditBytes
+  h2.windowCreditBytes -= earned * windowCreditBytes
+  h2.windowCredit = min(h2.windowCredit + earned, windowCreditCap * h2.maxControlFrames)
   if h2.controlFrameCount == 0:
-    h2.dataSinceDecay = 0          # nothing owed: don't carry credit forward
+    h2.dataSinceDecay = 0          # nothing owed: don't carry decay forward
     return
   h2.dataSinceDecay += n
   while h2.dataSinceDecay >= respHighWater and h2.controlFrameCount > 0:
     h2.dataSinceDecay -= respHighWater
     h2.noteControlProgress()
+
+proc noteIdleWindowUpdate(h2: H2Conn, c: ptr Connection) =
+  ## A WINDOW_UPDATE that unblocked nothing (connection-level credit while no
+  ## stream was waiting on the connection window, or credit for a stream that
+  ## is already closed). Legitimate clients send these all the time on a long
+  ## download: the connection window is usually wide open, so every conn update
+  ## is "idle", and the credit for a stream's final bytes lands after the
+  ## stream closed (RFC 9113 5.1 requires tolerating those). But a client can
+  ## only return credit for DATA it received, so the benign rate is bounded by
+  ## the bytes we sent: spend a credit earned in noteDataProgress when there is
+  ## one, and charge the control-frame budget only when there is none. A peer
+  ## that holds a stream open and floods 13-byte updates while we send it
+  ## nothing therefore still trips ENHANCE_YOUR_CALM after maxControlFrames,
+  ## exactly as before #335, while a client returning credit in pieces as small
+  ## as windowCreditBytes never does.
+  if h2.windowCredit > 0:
+    dec h2.windowCredit
+  else:
+    h2.noteControlFrame(c)
 
 # --- response serialization ------------------------------------------------
 
@@ -1680,19 +1724,14 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       # The connection window moved: run a scheduler pass. The ready-queue
       # already holds the stream-sendable streams, so no scan is needed.
       h2.h2Schedule(c)
-    elif h2.activeStreams == 0:
-      # Nothing is open that this credit could ever serve, so the frame is pure
-      # overhead: budget it so a flood trips ENHANCE_YOUR_CALM. With a stream
-      # open it is NOT charged (#335): "unblocked nothing right now" is the
-      # normal shape of a legitimate client's flow control on a long download
-      # (conn updates arrive while every stream is blocked on its own stream
-      # window, or has backlog 0 because its producer is parked), and charging
-      # those tore working downloads down with GOAWAY after ~1000 frames.
-      # A peer that holds a stream open and floods anyway is still bounded:
-      # each such frame costs O(1) here (no scheduler pass, no response), the
-      # increment must be non-zero and must not overflow the window, and
-      # noteDataProgress only forgives the budget for bytes actually sent.
-      h2.noteControlFrame(c)
+    else:
+      # Unblocked nothing: the normal shape of a legitimate client's flow
+      # control on a long download (the connection window is wide open, so the
+      # credit it returns never unblocks anything), but also the shape of a
+      # flood. Spend the credit the DATA we sent earned, charge the budget past
+      # that (#335): charging every one of these tore working downloads down
+      # with GOAWAY after ~1000 frames.
+      h2.noteIdleWindowUpdate(c)
       if c.state == csClosing: return
   elif fh.streamId in h2.streams:
     template st: H2Stream = h2.streams[fh.streamId]
@@ -1704,15 +1743,14 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     h2.h2Schedule(c)
   elif fh.streamId > h2.lastStreamId:
     h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
-  elif h2.activeStreams == 0:
-    # Closed stream (<= lastStreamId, no longer in the table) on an otherwise
-    # idle connection: nothing productive can follow, so a flood of these is
-    # pure overhead -- budget it (#234). While streams are open they are NOT
-    # charged (#335): the peer legally sends WINDOW_UPDATE for the final bytes
-    # of a stream it has not yet seen closed (RFC 9113 5.1 even requires a
-    # receiver to tolerate them for a period after close), and on a multiplexed
-    # download every completed stream produces a few.
-    h2.noteControlFrame(c)
+  else:
+    # Closed stream (<= lastStreamId, no longer in the table): the update is
+    # ignored. The peer legally sends a few of these per stream, for the final
+    # bytes of a stream it has not yet seen closed (RFC 9113 5.1 requires
+    # tolerating them for a period after close), so they ride the credit the
+    # stream's DATA earned; a flood of them beyond that is pure overhead and is
+    # budgeted (#234, #335).
+    h2.noteIdleWindowUpdate(c)
 
 proc handleRstStream(h2: H2Conn, c: ptr Connection, fh: FrameHeader) =
   if fh.streamId == 0: h2.connError(c, errProtocol); return
