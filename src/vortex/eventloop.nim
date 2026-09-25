@@ -350,6 +350,16 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     c.closeRequested = true
     c.state = csClosing
     return
+  # Committed to freeing this slot: mark it closing BEFORE firing any teardown
+  # callback below. Those callbacks resume suspended producers/consumers so their
+  # finally-cleanup runs, but a resumed handler may reach for the dispatch API
+  # (e.g. a streamed sendFile's parked onRespDrain calls dispatchNextRead, or an
+  # onClose body calls ws.blocking) -- which would acquire a fresh worker pin on
+  # a connection we are about to free, tripping the totalPins invariant below.
+  # acquireDispatchPin treats a closing connection as gone and refuses to pin, so
+  # any such dispatch becomes a graceful no-op (the caller reclaims its buffer /
+  # sends nowhere) instead of re-pinning a dead slot.
+  c.closeRequested = true
   if c.rs.onBodyCb != nil:
     # A streaming request's body sink is still open (the client disconnected
     # mid-upload). Deliver a final last=true so an async adapter suspended in
@@ -375,9 +385,9 @@ proc closeConn(loop: Loop, c: ptr Connection) =
   c.h2 = nil
   clearRespHeaders(addr loop.core, c.fd, c.gen)  # drop pending res.headers, if any
   # Actually freeing: no worker task may still pin this slot (R2). The guard at
-  # the top defers while pinned, so this can only fire if one of the teardown
-  # callbacks above re-pinned a dying connection (e.g. a blocking dispatch from
-  # an onClose handler) -- a defect to catch, not mask.
+  # the top defers while pinned, and c.closeRequested (set above) makes
+  # acquireDispatchPin refuse a re-pin from any teardown callback, so this can
+  # only fire on a genuine accounting defect -- catch it, don't mask it.
   doAssert c.totalPins == 0, "connection freed with live worker pins"
   discard posix.close(cint(c.fd))
   # Return the read/write buffers to the allocator now, rather than pinning their
