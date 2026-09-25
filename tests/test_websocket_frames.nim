@@ -101,6 +101,54 @@ suite "frame parsing":
     var f: WsFrame
     check parseFrame(masked(0x2, newString(200)), 300, pos, 100, f) == wpError
 
+  test "RFC 6455 5.7 masked vectors":
+    # "A single-frame masked text message" and "a masked Ping request", verbatim
+    # from RFC 6455 5.7; both carry "Hello" under the key 0x37fa213d.
+    const hello = "\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"
+    let (r1, f1, p1) = parseOne(hello)
+    check r1 == wpFrame and f1.opcode == opText and f1.payload == "Hello"
+    check p1 == hello.len
+    const pingHello = "\x89\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"
+    let (r2, f2, _) = parseOne(pingHello)
+    check r2 == wpFrame and f2.opcode == opPing and f2.payload == "Hello"
+
+  test "unmasking is exact for every length and start offset":
+    # The 8-bytes-at-a-time unmask (#336) has a block loop plus a byte-wise
+    # tail, so walk every length across the block boundary, and start each
+    # frame at a different offset in the buffer so the source of the block
+    # loads is unaligned by 0..7 bytes.
+    var rng = 12345'u32
+    proc nextByte(): uint8 =
+      rng = rng * 1664525'u32 + 1013904223'u32     # LCG: repeatable, no imports
+      uint8((rng shr 16) and 0xff)
+    for n in 0 .. 40:
+      var payload = newString(n)
+      for i in 0 ..< n: payload[i] = char(nextByte())
+      let key = [nextByte(), nextByte(), nextByte(), nextByte()]
+      for pad in 0 .. 7:
+        # `pad` bytes of a preceding (complete) frame shift the start offset.
+        var buf = ""
+        for i in 0 ..< pad: buf.add masked(0x9, "")[i mod 6]
+        let lead = buf.len
+        buf.add masked(0x2, payload, mask = key)
+        var pos = lead
+        var f: WsFrame
+        check parseFrame(buf, buf.len, pos, cap, f) == wpFrame
+        check f.payload.len == n
+        check f.payload == payload
+        check pos == buf.len
+
+  test "a reused frame is fully overwritten (pump buffer reuse)":
+    # wsPump parses every frame into one reused WsFrame, so a shorter payload
+    # must never leave a tail of the previous one behind.
+    var f: WsFrame
+    var pos = 0
+    let two = masked(0x2, "0123456789abcdef") & masked(0x2, "xy")
+    check parseFrame(two, two.len, pos, cap, f) == wpFrame
+    check f.payload == "0123456789abcdef"
+    check parseFrame(two, two.len, pos, cap, f) == wpFrame
+    check f.payload == "xy"
+
   test "two frames back to back":
     let two = masked(0x1, "aa") & masked(0x1, "bb")
     var pos = 0

@@ -359,18 +359,10 @@ proc validCloseCode(code: uint16): bool =
   code in {1000'u16, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011} or
   (code >= 3000 and code <= 4999)
 
-proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
-                     op: WsOpcode, data: string, compressed: bool): bool =
-  ## Deliver a complete message, decompressing first if it was compressed.
-  ## Returns false if the connection is now closing.
-  var payload = data
-  when defined(wsDeflate):
-    if compressed:
-      let r = w.inflate.decompress(data, w.maxMessage)
-      case r.status
-      of dsTooBig: failClose(core, c, w, 1009); return false   # bomb / too big
-      of dsError:  failClose(core, c, w, 1002); return false   # bad deflate
-      of dsOk:     payload = r.data
+proc deliverMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
+                    op: WsOpcode, payload: string): bool =
+  ## Validate and hand one complete, already-decompressed message to onMessage.
+  ## `payload` is a read-only view of the caller's buffer, never a copy of it.
   if op == opText and not validUtf8(payload):
     failClose(core, c, w, 1007)          # not valid UTF-8
     return false
@@ -379,6 +371,25 @@ proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     w.onMessage(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream),
                 payload, kind)
   true
+
+proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
+                     op: WsOpcode, data: string, compressed: bool): bool =
+  ## Deliver a complete message, decompressing first if it was compressed.
+  ## Returns false if the connection is now closing.
+  ##
+  ## `data` is the pump's reusable frame payload (or the reassembly buffer) and
+  ## is handed on to the callback as-is: the former `var payload = data` copied
+  ## every inbound message once more just to have somewhere to put the
+  ## decompressed form (#336). Only permessage-deflate produces a second buffer,
+  ## which zlib allocates anyway.
+  when defined(wsDeflate):
+    if compressed:
+      let r = w.inflate.decompress(data, w.maxMessage)
+      case r.status
+      of dsTooBig: failClose(core, c, w, 1009); return false   # bomb / too big
+      of dsError:  failClose(core, c, w, 1002); return false   # bad deflate
+      of dsOk:     return deliverMessage(core, c, w, op, r.data)
+  deliverMessage(core, c, w, op, data)
 
 proc rsv1Ok(w: WsConn, fr: WsFrame): bool =
   ## RSV1 is only legal on the first frame of a data message, and only when
@@ -400,9 +411,9 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   of opPing:
     if not w.closeSent:                    # nothing may follow a sent close
       wsOut(c, w)[].appendFrame(opPong, fr.payload)
-    true
+    result = true
   of opPong:
-    true                                   # unsolicited pong: ignore
+    result = true                          # unsolicited pong: ignore
   of opClose:
     # A close payload is either empty or at least a 2-byte code; a lone
     # byte is a protocol error (RFC 6455 5.5.1).
@@ -425,7 +436,7 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       wsOut(c, w)[].appendClose(code)      # echo the (valid) code back
     notifyClose(core, c, w, code, reason)
     w.wantClose = true
-    false
+    result = false
   of opText, opBinary:
     if w.fragging:
       failClose(core, c, w, 1002)          # data frame mid-fragment
@@ -435,13 +446,14 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       return false
     let compressed = fr.rsv1
     if fr.fin:
-      dispatchMessage(core, c, w, fr.opcode, fr.payload, compressed)
+      result = dispatchMessage(core, c, w, fr.opcode, fr.payload, compressed)
     else:
       w.fragging = true
       w.fragOp = fr.opcode
-      w.frag = fr.payload
+      w.frag.setLen 0                      # keep the reassembly buffer (#336)
+      w.frag.add fr.payload
       when defined(wsDeflate): w.msgCompressed = compressed
-      true
+      result = true
   of opContinuation:
     if not w.fragging:
       failClose(core, c, w, 1002)          # continuation with nothing open
@@ -456,15 +468,32 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     if fr.fin:
       w.fragging = false
       let op = w.fragOp
-      let msg = move w.frag
-      w.frag = ""
       var compressed = false
       when defined(wsDeflate): compressed = w.msgCompressed
-      dispatchMessage(core, c, w, op, msg, compressed)
+      # Dispatch straight out of the reassembly buffer and keep it afterwards
+      # (the former move-out handed it to the callback and left `frag` empty, so
+      # the next fragmented message had to allocate one again).
+      result = dispatchMessage(core, c, w, op, w.frag, compressed)
+      w.frag.setLen 0
     else:
-      true
+      result = true
 
 # --- inbound pump -----------------------------------------------------------
+
+var pumpFrame {.threadvar.}: WsFrame
+  ## The frame every parseFrame call fills, reused for the life of the loop
+  ## thread (#336): a steady stream of messages then allocates no payload buffer
+  ## at all, and the retained capacity is one buffer per loop thread instead of
+  ## one per connection (which would pin the largest message ever seen on each
+  ## idle WebSocket). A thread-local is sound because frame dispatch never
+  ## re-enters the pump: onMessage runs to completion inside handleFrame, and
+  ## every pump entry point (wsInput / wsFeed / wsResume) is driven by the loop
+  ## between dispatches, never from inside one.
+
+const pumpFrameKeep = 64 * 1024
+  ## Payload capacity the reused frame may carry between batches. Past this the
+  ## buffer is dropped at the end of the pump, so one multi-megabyte message does
+  ## not pin its buffer on the loop thread for the server's lifetime.
 
 proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
             buf: string, avail: int): int =
@@ -473,19 +502,20 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   ## receive buffer or an h2 stream's inBuf); the caller compacts and flushes.
   var pos = 0
   var open = true
+  var peak = 0
   while open:
     # Once onClose has been delivered (peer close, error, or teardown) the ws is
     # finished: do not dispatch further frames onto freed handler state.
     if w.closeNotified or w.wantClose: break
-    var fr: WsFrame
-    case parseFrame(buf, avail, pos, w.maxMessage, fr)
+    case parseFrame(buf, avail, pos, w.maxMessage, pumpFrame)
     of wpNeedMore:
       break
     of wpError:
       failClose(core, c, w, 1002)
       open = false
     of wpFrame:
-      open = handleFrame(core, c, w, fr)
+      if pumpFrame.payload.len > peak: peak = pumpFrame.payload.len
+      open = handleFrame(core, c, w, pumpFrame)
       # A ws.blocking dispatch paused this WebSocket: stop and leave the rest
       # buffered so messages run one at a time, in order. An upgraded HTTP/1
       # connection holds a pkWsBlocking connection pin -- the only pin kind
@@ -499,6 +529,8 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       # discriminate h1 from h3 here).
       if (c != nil and c.pins[pkWsBlocking] > 0) or w.pinnedByWorker:
         break
+  if peak > pumpFrameKeep:
+    pumpFrame.payload = ""     # don't pin an outsized buffer on the loop thread
   pos
 
 proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
