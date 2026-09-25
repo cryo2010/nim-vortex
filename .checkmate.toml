@@ -1,0 +1,42 @@
+# checkmate.toml - configuration for the checkmate test runner
+# CLI flags override these values.
+
+[tests]
+dirs = ["tests"]          # directories scanned recursively for test files
+pattern = "t*.nim"        # filename glob; covers t_*.nim and test_*.nim conventions
+exclude = []              # path globs to skip, e.g. ["tests/fixtures/*"]
+
+[run]
+jobs = 0                  # parallel workers; 0 = number of CPU cores
+loop = 1                  # run the whole suite N times (flake detection)
+loop_in_process = false   # loop each test inside one process per file:
+                          # much faster, but iterations share process state
+bail = false              # stop everything at the first failing test
+timeout = 300             # seconds a single test may run; hung or overlong
+                          # tests fail and their file's process is killed
+                          # (0 disables)
+pass_with_no_tests = false  # exit 0 even when zero tests were run
+allow_empty_tests = false   # don't fail tests that execute zero check/require/expect
+
+[compile]
+nim = "nim"               # compiler executable
+backend = "c"             # nim backend: c | cpp
+flags = ["--passC:-I/opt/homebrew/include", "--passL:-L/opt/homebrew/lib"]                # extra nim flags, e.g. ["-d:release", "--mm:orc"]
+defines = []              # shorthand for -d: defines
+paths = []                # extra --path entries
+
+[output]
+color = "auto"            # auto | always | never
+verbose = false           # also show per-test lines and passing tests' output
+
+[format]
+max_path = 44             # rendered file paths, preceding ellipsis (0 = unlimited)
+max_suite = 60            # suite names, trailing ellipsis (0 = unlimited)
+max_test = 60             # test names, trailing ellipsis (0 = unlimited)
+max_value = 400           # printed values in check failures (0 = unlimited)
+context = 3               # source lines shown around a failing line (0 = just it)
+
+[coverage]
+enabled = false           # line coverage via gcov (needs xcrun, llvm-cov or gcov)
+min_lines = 0             # coverage gate: minimum percent (e.g. 80.0) or, if
+                          # negative, max uncovered lines (e.g. -50); 0 disables
