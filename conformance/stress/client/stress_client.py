@@ -336,7 +336,19 @@ async def w_streamupload():
             raise Fail(f"upload negative probe: wrong x-sha1 accepted -> {st}")
     async def once():
         async with session() as s:
-            st = await s.upload("/upload", {"x-sha1": sha}, body_gen())
+            # `drive` checks the deadline only BETWEEN transfers, so bound this
+            # one by the time actually left -- see w_streamdownload's per-chunk
+            # check for why. On expiry, abandon it uncounted: leaving the
+            # `async with` tears the connection (and the stream) down, and
+            # neither bump(200) nor the xfer tally below runs for a transfer we
+            # did not verify. Truncating body_gen instead would send a short body
+            # and trip the 400 check below as if the server were at fault.
+            try:
+                st = await asyncio.wait_for(
+                    s.upload("/upload", {"x-sha1": sha}, body_gen()),
+                    timeout=max(0.0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                return
             if st == 400: raise Fail("server rejected the SHA-1 (400)")
             if st != 200: raise Fail(f"upload -> {st}")
             bump(200)
@@ -358,6 +370,23 @@ async def w_streamdownload():
             h = hashlib.sha1(); got = 0
             async for chunk in gen:
                 h.update(chunk); got += len(chunk); xfer[0] += len(chunk)
+                # The streaming workloads are the only ones whose unit of work is
+                # a whole transfer; every other `once()` checks the deadline per
+                # iteration itself. `drive` checks it only between transfers, and
+                # one 1 GiB transfer over h3 on a loaded host runs 2-3 minutes --
+                # far past main()'s deadline+60s safety net, which was sized for
+                # workloads that stop within one request. So the last transfer of
+                # a soak overran it and a clean hour was reported as a "stall"
+                # (measured: 125 s/transfer on streamupload h3, 163 s on
+                # streamdownload h3, versus 4-15 s on h1/h2, which is the only
+                # reason those cells passed). Abandon an in-flight transfer at the
+                # deadline instead: leave the body undrained -- exiting the
+                # per-transfer session below resets the stream -- and neither
+                # verify nor count it. This does not blunt the stall detector: a
+                # genuinely wedged stream delivers no chunk, so it never reaches
+                # here and main()'s wait_for still catches it.
+                if time.monotonic() >= deadline:
+                    return
             if got != STREAM or h.hexdigest() != want:
                 raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
             bump(200)
