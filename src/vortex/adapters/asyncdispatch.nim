@@ -80,6 +80,17 @@ proc teardown() {.nimcall, gcsafe.} =
 
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
+proc trackParked() {.inline.} = discard
+  ## Contract shared with the chronos backend: one outstanding future has parked
+  ## on a wakeup that only the vortex loop delivers. This backend needs no tally
+  ## -- a bare parked Future registers no fd, timer or callback with the
+  ## dispatcher, so hasPendingOperations already reads false and the pump below
+  ## already returns -1 (loop may sleep) on its own. See chronos.nim's
+  ## trackParked, whose pump keeps its own count of outstanding futures and so
+  ## cannot tell the difference without being told.
+proc untrackParked() {.inline.} = discard
+  ## The unpark half of trackParked.
+
 template onCompleted(fut, body: untyped) =
   ## Contract shared with the chronos backend: run `body` when `fut` completes
   ## (asyncdispatch callback signature: a plain nullary closure). Unlike chronos,

@@ -127,9 +127,19 @@ proc hWsMsg(req: Request, res: Response) {.async.} =
   ws.messages(msg):                          # async iterator over messages
     ws.send("echo: " & msg)
 
+proc hWsIdle(req: Request, res: Response) {.async.} =
+  # Like hWsMsg, but the reply suspends on the async runtime again after the
+  # message wakes the parked receive -- the ordering the idle-socket test below
+  # pins down.
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):
+    await sleepMs(10)
+    ws.send("slept: " & msg)
+
 var appRouter = newRouter()
 appRouter.get("/ws", hWs)
 appRouter.ws("/wsmsg", hWsMsg)
+appRouter.ws("/wsidle", hWsIdle)
 appRouter.get("/", hRoot)
 appRouter.get("/delay", hDelay)
 appRouter.get("/hello/:name", hCapture)
@@ -280,6 +290,25 @@ withServer(appRouter.toHandler,
       check s.recvFrame().payload == "echo: one"
       s.sendText("two")
       check s.recvFrame().payload == "echo: two"
+
+    test "an idle awaited WebSocket still wakes promptly once the loop sleeps":
+      # A parked `ws.messages` receive can only be completed by a core callback
+      # on the loop thread, so the pump stops spinning and lets the loop block on
+      # its selector -- up to its full 1 s idle wait -- while every socket is
+      # quiet. Go quiet long enough to be inside that wait, then require a
+      # message to still round-trip promptly, including the reply's own
+      # runtime-driven await after the resume: that suspension is the one a wrong
+      # early exit would strand until the next timeout, so a round trip slower
+      # than the idle wait is the failure signature.
+      let s = openWs(srv.port, "/wsidle").sock
+      defer: s.close()
+      sleep(1200)                        # longer than the loop's idle wait
+      let t0 = epochTime()
+      s.sendText("after-idle")
+      check s.recvFrame().payload == "slept: after-idle"
+      check epochTime() - t0 < 0.5       # woken by the socket, not by a timeout
+      s.sendText("again")
+      check s.recvFrame().payload == "slept: again"
 
     test "newVortex overload accepts a bare async handler (no toHandler)":
       proc bare(req: Request, res: Response) {.async.} =
