@@ -42,7 +42,9 @@ type
                    w: WsConn) {.nimcall, gcsafe.}
     ## Move `w.outBuf` to the wire and apply `w.wantClose`. Set at accept
     ## time per transport (`wsFlushH1`, or the HTTP/2 one in http2/codec),
-    ## which keeps the WebSocket codec free of any HTTP/2 import.
+    ## which keeps the WebSocket codec free of any HTTP/2 import. Doubles as the
+    ## transport tag: `wsOut` writes h1 frames straight into `c.wbuf` and only
+    ## h2/h3 stage them in `outBuf` (#337).
 
   WsConn* = ref object of RootObj
     ## The per-WebSocket state: on `Connection.ws` for HTTP/1.1, or on an
@@ -59,14 +61,15 @@ type
     closeSent: bool          ## a close frame has been queued
     closeNotified*: bool     ## onClose has been delivered (the ws is finished)
     subprotocol: string      ## negotiated Sec-WebSocket-Protocol ("" = none)
-    # Transport abstraction: the core appends serialized frames to `outBuf`
-    # and sets `wantClose`; `flush` drains them (HTTP/1 -> c.wbuf, HTTP/2 ->
+    # Transport abstraction: the core appends serialized frames to the buffer
+    # `wsOut` picks (HTTP/1: straight into c.wbuf; h2/h3: `outBuf`) and sets
+    # `wantClose`; `flush` concludes them (HTTP/1: apply the close, HTTP/2:
     # stream DATA). `stream`/`inBuf`/`pinnedByWorker` back the HTTP/2 side.
     stream*: uint32          ## 0 for HTTP/1.1, else the h2/h3 stream id
     fd*: int32               ## handle identity for callbacks (h3 has no Connection)
     gen*: uint32
-    outBuf*: string          ## serialized frames awaiting flush
-    wantClose*: bool         ## close the transport once outBuf is flushed
+    outBuf*: string          ## serialized frames awaiting flush (h2/h3 only)
+    wantClose*: bool         ## close the transport once the frames are flushed
     flush*: WsFlush
     inBuf*: string           ## h2/h3 inbound bytes accumulated from DATA frames
     preAcceptFin*: bool      ## client half-closed (END_STREAM) before accept
@@ -187,13 +190,27 @@ when defined(wsDeflate):
 
 proc wsFlushH1*(core: ptr LoopCore, c: ptr Connection,
                 w: WsConn) {.nimcall, gcsafe.} =
-  ## HTTP/1 transport: move produced frames into the connection write buffer
-  ## and, if the codec asked to close, close the connection after they flush.
+  ## HTTP/1 transport: apply a requested close once the produced frames flush.
+  ## On HTTP/1 the frames are already in `c.wbuf` (see wsOut), so there is
+  ## nothing to move; the drain of a non-empty `outBuf` stays as a backstop for
+  ## any producer that predates that and would otherwise silently drop frames.
   if w.outBuf.len > 0:
     c.wbuf.add w.outBuf
     w.outBuf.setLen 0
   if w.wantClose:
     c.closeAfterFlush = true
+
+proc wsOut(c: ptr Connection, w: WsConn): ptr string {.inline.} =
+  ## Where a produced frame is serialized. On HTTP/1 the connection's write
+  ## buffer IS the WebSocket transport buffer, so frames are appended straight
+  ## into it (#337): staging them in `w.outBuf` first cost a second full copy
+  ## (and a realloc of wbuf) of every outbound message before the syscall.
+  ## HTTP/2 and HTTP/3 keep `outBuf`: their flush re-frames it as per-stream
+  ## DATA, which needs the frame bytes held apart from the connection buffer.
+  ## Backpressure accounting is unaffected: bufferedAmount already reported
+  ## `c.pendingOut` for h1 (the old staging was moved into wbuf by the very next
+  ## `w.flush`) and `h2Pending` for h2/h3.
+  if c != nil and w.flush == wsFlushH1: addr c.wbuf else: addr w.outBuf
 
 # --- handshake --------------------------------------------------------------
 
@@ -294,7 +311,7 @@ proc failClose(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   ## transport (connection for HTTP/1, stream for HTTP/2) once it flushes.
   if not w.closeSent:
     w.closeSent = true
-    w.outBuf.appendClose(code)
+    wsOut(c, w)[].appendClose(code)
   notifyClose(core, c, w, code, "")
   w.wantClose = true
 
@@ -342,18 +359,10 @@ proc validCloseCode(code: uint16): bool =
   code in {1000'u16, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011} or
   (code >= 3000 and code <= 4999)
 
-proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
-                     op: WsOpcode, data: string, compressed: bool): bool =
-  ## Deliver a complete message, decompressing first if it was compressed.
-  ## Returns false if the connection is now closing.
-  var payload = data
-  when defined(wsDeflate):
-    if compressed:
-      let r = w.inflate.decompress(data, w.maxMessage)
-      case r.status
-      of dsTooBig: failClose(core, c, w, 1009); return false   # bomb / too big
-      of dsError:  failClose(core, c, w, 1002); return false   # bad deflate
-      of dsOk:     payload = r.data
+proc deliverMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
+                    op: WsOpcode, payload: string): bool =
+  ## Validate and hand one complete, already-decompressed message to onMessage.
+  ## `payload` is a read-only view of the caller's buffer, never a copy of it.
   if op == opText and not validUtf8(payload):
     failClose(core, c, w, 1007)          # not valid UTF-8
     return false
@@ -362,6 +371,25 @@ proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     w.onMessage(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream),
                 payload, kind)
   true
+
+proc dispatchMessage(core: ptr LoopCore, c: ptr Connection, w: WsConn,
+                     op: WsOpcode, data: string, compressed: bool): bool =
+  ## Deliver a complete message, decompressing first if it was compressed.
+  ## Returns false if the connection is now closing.
+  ##
+  ## `data` is the pump's reusable frame payload (or the reassembly buffer) and
+  ## is handed on to the callback as-is: the former `var payload = data` copied
+  ## every inbound message once more just to have somewhere to put the
+  ## decompressed form (#336). Only permessage-deflate produces a second buffer,
+  ## which zlib allocates anyway.
+  when defined(wsDeflate):
+    if compressed:
+      let r = w.inflate.decompress(data, w.maxMessage)
+      case r.status
+      of dsTooBig: failClose(core, c, w, 1009); return false   # bomb / too big
+      of dsError:  failClose(core, c, w, 1002); return false   # bad deflate
+      of dsOk:     return deliverMessage(core, c, w, op, r.data)
+  deliverMessage(core, c, w, op, data)
 
 proc rsv1Ok(w: WsConn, fr: WsFrame): bool =
   ## RSV1 is only legal on the first frame of a data message, and only when
@@ -382,10 +410,10 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   case fr.opcode
   of opPing:
     if not w.closeSent:                    # nothing may follow a sent close
-      w.outBuf.appendFrame(opPong, fr.payload)
-    true
+      wsOut(c, w)[].appendFrame(opPong, fr.payload)
+    result = true
   of opPong:
-    true                                   # unsolicited pong: ignore
+    result = true                          # unsolicited pong: ignore
   of opClose:
     # A close payload is either empty or at least a 2-byte code; a lone
     # byte is a protocol error (RFC 6455 5.5.1).
@@ -405,10 +433,10 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
         return false
     if not w.closeSent:
       w.closeSent = true
-      w.outBuf.appendClose(code)           # echo the (valid) code back
+      wsOut(c, w)[].appendClose(code)      # echo the (valid) code back
     notifyClose(core, c, w, code, reason)
     w.wantClose = true
-    false
+    result = false
   of opText, opBinary:
     if w.fragging:
       failClose(core, c, w, 1002)          # data frame mid-fragment
@@ -418,13 +446,14 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       return false
     let compressed = fr.rsv1
     if fr.fin:
-      dispatchMessage(core, c, w, fr.opcode, fr.payload, compressed)
+      result = dispatchMessage(core, c, w, fr.opcode, fr.payload, compressed)
     else:
       w.fragging = true
       w.fragOp = fr.opcode
-      w.frag = fr.payload
+      w.frag.setLen 0                      # keep the reassembly buffer (#336)
+      w.frag.add fr.payload
       when defined(wsDeflate): w.msgCompressed = compressed
-      true
+      result = true
   of opContinuation:
     if not w.fragging:
       failClose(core, c, w, 1002)          # continuation with nothing open
@@ -439,15 +468,39 @@ proc handleFrame(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     if fr.fin:
       w.fragging = false
       let op = w.fragOp
-      let msg = move w.frag
-      w.frag = ""
       var compressed = false
       when defined(wsDeflate): compressed = w.msgCompressed
-      dispatchMessage(core, c, w, op, msg, compressed)
+      # Dispatch straight out of the reassembly buffer and keep it afterwards
+      # (the former move-out handed it to the callback and left `frag` empty, so
+      # the next fragmented message had to allocate one again).
+      result = dispatchMessage(core, c, w, op, w.frag, compressed)
+      w.frag.setLen 0
     else:
-      true
+      result = true
 
 # --- inbound pump -----------------------------------------------------------
+
+var pumpFrame {.threadvar.}: WsFrame
+  ## The frame every parseFrame call fills, reused for the life of the loop
+  ## thread (#336): a steady stream of messages then allocates no payload buffer
+  ## at all, and the retained capacity is one buffer per loop thread instead of
+  ## one per connection (which would pin the largest message ever seen on each
+  ## idle WebSocket). A thread-local is sound because frame dispatch never
+  ## re-enters the pump: onMessage runs to completion inside handleFrame, and
+  ## every pump entry point (wsInput / wsFeed / wsResume) is driven by the loop
+  ## between dispatches, never from inside one.
+
+const pumpFrameKeep = 64 * 1024
+  ## Payload capacity the reused frame may carry between batches. Past this the
+  ## buffer is dropped at the end of the pump, so one multi-megabyte message does
+  ## not pin its buffer on the loop thread for the server's lifetime.
+
+proc wsReleasePumpBuffer*() =
+  ## Drop the loop thread's reused frame buffer. Called once by the loop thread
+  ## on its way out: a thread-local is never destroyed at thread exit, so without
+  ## this the last payload buffer outlives the thread as an unreachable heap
+  ## block (valgrind memcheck reports it definitely lost in the ws scenario).
+  reset(pumpFrame)
 
 proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
             buf: string, avail: int): int =
@@ -456,19 +509,20 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   ## receive buffer or an h2 stream's inBuf); the caller compacts and flushes.
   var pos = 0
   var open = true
+  var peak = 0
   while open:
     # Once onClose has been delivered (peer close, error, or teardown) the ws is
     # finished: do not dispatch further frames onto freed handler state.
     if w.closeNotified or w.wantClose: break
-    var fr: WsFrame
-    case parseFrame(buf, avail, pos, w.maxMessage, fr)
+    case parseFrame(buf, avail, pos, w.maxMessage, pumpFrame)
     of wpNeedMore:
       break
     of wpError:
       failClose(core, c, w, 1002)
       open = false
     of wpFrame:
-      open = handleFrame(core, c, w, fr)
+      if pumpFrame.payload.len > peak: peak = pumpFrame.payload.len
+      open = handleFrame(core, c, w, pumpFrame)
       # A ws.blocking dispatch paused this WebSocket: stop and leave the rest
       # buffered so messages run one at a time, in order. An upgraded HTTP/1
       # connection holds a pkWsBlocking connection pin -- the only pin kind
@@ -482,6 +536,8 @@ proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
       # discriminate h1 from h3 here).
       if (c != nil and c.pins[pkWsBlocking] > 0) or w.pinnedByWorker:
         break
+  if peak > pumpFrameKeep:
+    pumpFrame.payload = ""     # don't pin an outsized buffer on the loop thread
   pos
 
 proc wsInput*(core: ptr LoopCore, c: ptr Connection) =
@@ -564,7 +620,7 @@ proc wsPeerClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   ## (e.g. an h2 stream END_STREAM): queue a normal close and flush it.
   if w.closeSent: return
   w.closeSent = true
-  w.outBuf.appendClose(1000)
+  wsOut(c, w)[].appendClose(1000)
   w.wantClose = true
   if w.flush != nil:
     w.flush(core, c, w)
@@ -584,7 +640,7 @@ proc wsSweepIdle*(core: ptr LoopCore, c: ptr Connection, w: WsConn): bool =
       if w.flush != nil: w.flush(core, c, w) # push the close / conclude the stream
       return true
   elif core.nowSec - w.lastRx >= int64(core.config.wsPingInterval):
-    w.outBuf.appendFrame(opPing, "")
+    wsOut(c, w)[].appendFrame(opPing, "")
     w.pingSent = true
     w.pingAt = core.nowSec
     if w.flush != nil: w.flush(core, c, w)
@@ -659,7 +715,7 @@ proc wsFlushRaw*(core: ptr LoopCore, c: ptr Connection, w: WsConn,
     # send-after-close or a second close racing a peer close).
     if w.flush != nil: w.flush(core, c, w)
     return
-  w.outBuf.add data
+  wsOut(c, w)[].add data
   if close:
     w.closeSent = true
     w.wantClose = true
@@ -718,12 +774,12 @@ proc sendFrame(ws: WebSocket, op: WsOpcode,
             # silently or emitting a frame the peer can't decode (R13).
             ws.close(1011)
             return
-          w.outBuf.appendFrame(op, comp, rsv1 = true)
+          wsOut(c, w)[].appendFrame(op, comp, rsv1 = true)
           w.flush(ws.core, c, w)
           if ws.core.hooks.flushHook != nil:
             ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
           return
-      w.outBuf.appendFrame(op, data)
+      wsOut(c, w)[].appendFrame(op, data)
       w.flush(ws.core, c, w)
       if ws.core.hooks.flushHook != nil:
         ws.core.hooks.flushHook(ws.core.loopPtr, ws.fd, ws.gen)
@@ -753,7 +809,7 @@ proc close*(ws: WebSocket, code: uint16 = 1000, reason = "") {.gcsafe, raises: [
                                    stream: ws.stream, data: frame)))):
       if w.closeSent: return
       w.closeSent = true
-      w.outBuf.appendClose(code, reason)
+      wsOut(c, w)[].appendClose(code, reason)
       w.wantClose = true
       w.flush(ws.core, c, w)
       if ws.core.hooks.flushHook != nil:

@@ -33,7 +33,7 @@ reference below.
 | `maxConnections` | 65536 | Live connections per loop thread; excess is accepted then dropped |
 | `maxConcurrentStreams` | 256 | Open HTTP/2 and HTTP/3 streams per connection |
 | `maxResetStreams` | 512 | HTTP/2 and HTTP/3 peer resets before the connection is torn down (rapid reset); 0 disables |
-| `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/PRIORITY between stream progress; 0 disables |
+| `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/PRIORITY between stream progress; decays on accepted requests and on response body bytes sent, and WINDOW_UPDATEs that unblock nothing spend credit earned by body bytes sent (one per 256 bytes) before they count; 0 disables |
 | `maxRequestsPerSocket` | 0 (off) | HTTP/1 keep-alive requests before the connection is closed |
 | `maxBlockingQueue` | 0 (unbounded) | `blocking:` tasks that may queue for a free worker; past it new dispatches fail fast (503 / `PoolSaturatedError`) instead of queuing behind slow or stuck work |
 | `maxHeaderSize` | 16 KiB | Request line + headers (431); also caps HPACK decoded size |

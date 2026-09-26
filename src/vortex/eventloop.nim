@@ -104,6 +104,12 @@ type
     lastWallSec: int64
     pumpCap: int                 # adapter-suggested selector timeout cap
     outboxScratch: seq[OutMsg]   # reused drain buffer
+    pendingFlush: seq[(int32, uint32)]
+                                 # connections holding a flush for the outbox
+                                 # batch being applied (one entry per hold taken,
+                                 # so the counts always balance); drained at the
+                                 # end of processOutbox, which flushes each
+                                 # connection once (#333)
     readyStreams: seq[uint32]    # reused h2 dispatch buffer
     unpackCt: string             # reused worker-response unpack buffers, so
     unpackHeaders: seq[(string, string)]  # draining the outbox allocates no
@@ -490,79 +496,117 @@ proc handleDrain(loop: Loop, c: ptr Connection) =
       loop.closeConn(c)
       return
 
+const h2MaxRefillRounds = 16
+  ## How many times one flushOut call may refill c.wbuf from the HTTP/2 write
+  ## scheduler and write it straight back out (#332). h2DrainResume tops the
+  ## buffer up to respHighWater (64 KiB), so this bounds one connection at ~1 MiB
+  ## of h2 output per flushOut before it must yield to the selector. Without a
+  ## bound a producer that refills forever (a large file, a generated stream)
+  ## would starve every other fd in the loop; with one, a fast peer still gets
+  ## ~1 MiB per loop iteration instead of the 64 KiB an arm/wait/disarm round
+  ## trip per chunk used to allow.
+
 proc flushOut(loop: Loop, c: ptr Connection) =
   ## Write as much pending output as the socket accepts; arm write
   ## interest only when the kernel buffer is full.
-  while c.pendingOut > 0:
-    when not defined(plainHttp):
-      if c.ssl != nil:
-        let (n, st) = tlsWrite(c.ssl, addr c.wbuf[c.wpos], c.pendingOut)
-        case st
-        of tlsOk:
-          c.wpos += n
-          continue
-        of tlsWantWrite:
+  ##
+  ## For HTTP/2 the write scheduler is the source of the bytes, so a drained
+  ## buffer is not the end of the work: refill it and keep writing while the
+  ## socket still takes bytes, up to h2MaxRefillRounds. Returning to the selector
+  ## after every 64 KiB refill (the pre-#332 behaviour) capped an h2 download at
+  ## loop-iterations x respHighWater.
+  template drainResume() =
+    ## Refill from the write scheduler and resume producers parked on the buffer
+    ## cap, with the flush held (#334): a resumed producer's res.write would
+    ## otherwise re-enter flushOut through the flush hook and pay a send() per
+    ## resumed stream, when this call is already either about to write the bytes
+    ## itself (the refill branch) or has just armed write interest for them (the
+    ## EAGAIN branches). Holding is never an ordering rule -- wbuf stays FIFO --
+    ## so the bytes go out in the same order either way.
+    holdFlush(c)
+    h2codec.h2DrainResume(c, addr loop.core)
+    discard releaseFlushHold(c)
+  var refills = 0
+  while true:
+    while c.pendingOut > 0:
+      when not defined(plainHttp):
+        if c.ssl != nil:
+          let (n, st) = tlsWrite(c.ssl, addr c.wbuf[c.wpos], c.pendingOut)
+          case st
+          of tlsOk:
+            c.wpos += n
+            continue
+          of tlsWantWrite:
+            if c.ws != nil: wsBackpressure(c)
+            loop.armWrite(c)
+            if c.h2 != nil and c.pendingOut < respHighWater:
+              drainResume()
+            return
+          of tlsWantRead:
+            return               # retried after the next read event
+          of tlsClosed, tlsError:
+            loop.closeConn(c)
+            return
+      let n = send(SocketHandle(c.fd), addr c.wbuf[c.wpos],
+                   c.pendingOut, sendFlags)
+      if n > 0:
+        c.wpos += n
+      else:
+        let err = cint(osLastError())
+        if err == EINTR: continue
+        if err == EAGAIN or err == EWOULDBLOCK:
           if c.ws != nil: wsBackpressure(c)
           loop.armWrite(c)
           if c.h2 != nil and c.pendingOut < respHighWater:
-            h2codec.h2DrainResume(c, addr loop.core)
+            drainResume()
           return
-        of tlsWantRead:
-          return               # retried after the next read event
-        of tlsClosed, tlsError:
-          loop.closeConn(c)
-          return
-    let n = send(SocketHandle(c.fd), addr c.wbuf[c.wpos],
-                 c.pendingOut, sendFlags)
-    if n > 0:
-      c.wpos += n
-    else:
-      let err = cint(osLastError())
-      if err == EINTR: continue
-      if err == EAGAIN or err == EWOULDBLOCK:
-        if c.ws != nil: wsBackpressure(c)
-        loop.armWrite(c)
-        if c.h2 != nil and c.pendingOut < respHighWater:
-          h2codec.h2DrainResume(c, addr loop.core)
+        loop.closeConn(c)
         return
-      loop.closeConn(c)
+    c.wbuf.setLen(0)
+    c.wpos = 0
+    loop.disarmWrite(c)          # no-op once already disarmed, so looping is free
+    if c.closeAfterFlush:
+      # Close gracefully after writing a response on a plaintext HTTP/1 connection:
+      # a bare close() while the kernel still holds untransmitted response bytes and
+      # the peer has unread/half-closed can emit a RST that truncates the tail (a
+      # slow-reading reverse proxy then reports an incomplete body). beginLingerClose
+      # does shutdown(SHUT_WR) + drain so the send buffer flushes with a clean FIN.
+      # This covers every close-after-response path (Connection: close, streaming
+      # finish, drain shutdown, peer-half-close), not just error responses. TLS
+      # (close_notify) and h2/ws keep the direct close unless lingerClose is set.
+      if c.lingerClose or (c.h2 == nil and c.ws == nil):
+        loop.beginLingerClose(c)
+      else:
+        loop.closeConn(c)
       return
-  c.wbuf.setLen(0)
-  c.wpos = 0
-  loop.disarmWrite(c)
-  if c.closeAfterFlush:
-    # Close gracefully after writing a response on a plaintext HTTP/1 connection:
-    # a bare close() while the kernel still holds untransmitted response bytes and
-    # the peer has unread/half-closed can emit a RST that truncates the tail (a
-    # slow-reading reverse proxy then reports an incomplete body). beginLingerClose
-    # does shutdown(SHUT_WR) + drain so the send buffer flushes with a clean FIN.
-    # This covers every close-after-response path (Connection: close, streaming
-    # finish, drain shutdown, peer-half-close), not just error responses. TLS
-    # (close_notify) and h2/ws keep the direct close unless lingerClose is set.
-    if c.lingerClose or (c.h2 == nil and c.ws == nil):
-      loop.beginLingerClose(c)
+    elif c.ws != nil:
+      wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
+      return
+    elif c.rs.respStreaming and c.respBackedUp:
+      c.respBackedUp = false
+      if c.rs.onRespDrain != nil:
+        # Fire once, then clear -- the producer re-registers if it wants the next
+        # drain (matches the h2/h3 codecs). One-shot is required by the file
+        # streamer's read-ahead: it may prefetch the next chunk while still backed
+        # up (no fresh onDrain registered), and a persistent callback would then
+        # re-fire spuriously on the next full drain (issue #273).
+        let cb = c.rs.onRespDrain
+        c.rs.onRespDrain = nil
+        cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
+      return
     else:
-      loop.closeConn(c)
-  elif c.ws != nil:
-    wsDrained(addr loop.core, c)   # fire onDrain if this WS was backed up
-  elif c.rs.respStreaming and c.respBackedUp:
-    c.respBackedUp = false
-    if c.rs.onRespDrain != nil:
-      # Fire once, then clear -- the producer re-registers if it wants the next
-      # drain (matches the h2/h3 codecs). One-shot is required by the file
-      # streamer's read-ahead: it may prefetch the next chunk while still backed
-      # up (no fresh onDrain registered), and a persistent callback would then
-      # re-fire spuriously on the next full drain (issue #273).
-      let cb = c.rs.onRespDrain
-      c.rs.onRespDrain = nil
-      cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
-  else:
-    # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it and
-    # resume producers parked on the cap (no-op for non-h2 connections). It may
-    # buffer fresh frames, so re-arm write to flush them on the next writable.
-    h2codec.h2DrainResume(c, addr loop.core)
-    if c.pendingOut > 0:
-      loop.armWrite(c)
+      # HTTP/2: the socket drained c.wbuf; run the write scheduler to refill it
+      # and resume producers parked on the cap (no-op for non-h2 connections).
+      drainResume()
+      if c.pendingOut == 0: return          # nothing more to send: done
+      inc refills
+      if refills >= h2MaxRefillRounds:
+        # Yield: arm write so the fresh frames go out on the next writable and
+        # the rest of the loop gets a turn.
+        loop.armWrite(c)
+        return
+      # else: the socket was still accepting bytes a moment ago, so write the
+      # refill now instead of paying an arm / wait / disarm round trip for it.
 
 proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   let msg = $code
@@ -589,6 +633,14 @@ proc h2Deadline(c: ptr Connection): DeadlineKind =
   ##    streams a long response back (endStreamSeen) is excluded by
   ##    h2AwaitingClient, so a legitimately-silent client is never wrongly reaped.
   ##  - dkNone: nothing to time.
+  ##
+  ## All three questions are answered from counters maintained at the state
+  ## transitions (#339). This runs on every input event, and the two predicates
+  ## used to walk the whole stream table with mpairs, so a 256-stream download
+  ## scanned 256 entries twice for every inbound WINDOW_UPDATE batch. The
+  ## debug-only audit below re-derives them by scanning, so a codec mutation
+  ## site that forgets to update a counter fails the test suite.
+  when not defined(release): h2CheckCounters(c)
   if h2ActiveStreams(c) == 0: dkIdle
   elif h2AwaitingClient(c): dkBody
   elif h2BlockedOnPeerWindow(c): dkBody
@@ -754,7 +806,16 @@ proc processInput(loop: Loop, c: ptr Connection) =
     # Pause frame dispatch while a ws.blocking worker holds the connection:
     # buffered frames wait until it unpins (one message at a time).
     if c.inputPausePins == 0:
+      # Hold the socket flush for the whole read batch (#333): frames produced by
+      # the onMessage handlers land in c.wbuf and go out in one send() here,
+      # instead of one send() (plus an armWrite/disarmWrite pair on every EAGAIN)
+      # per echoed message. A handler that closes mid-batch only sets
+      # closeAfterFlush, so the close still rides this flush.
+      holdFlush(c)
       wsInput(addr loop.core, c)
+      if releaseFlushHold(c) and c.state != csFree and
+          (c.pendingOut > 0 or c.closeAfterFlush):
+        loop.flushOut(c)
     else:
       # We can't parse frames to observe the peer's pong while pinned, but this
       # call is driven by inbound bytes, which prove the peer is alive. Refresh
@@ -764,7 +825,18 @@ proc processInput(loop: Loop, c: ptr Connection) =
       armWsPing(addr loop.core, c)
     return
   if c.h2 != nil:
+    # Hold the socket flush for the whole frame batch (#334), as the WebSocket
+    # read batch above does (#333): every handler dispatched from this batch --
+    # and every res.write a streamed producer does inside it -- lands in c.wbuf
+    # and goes out in one send() here, instead of one send() per response and
+    # per chunk. A write that fills the buffer past respHighWater still meets the
+    # socket immediately (flushImpl ignores the hold there), so a producer that
+    # emits megabytes inside one dispatch is unchanged.
+    holdFlush(c)
     loop.h2Input(c)
+    if releaseFlushHold(c) and c.state != csFree and
+        (c.pendingOut > 0 or c.closeAfterFlush):
+      loop.flushOut(c)
     return
   if c.awaitingResponse or c.state == csClosing:
     return
@@ -967,8 +1039,17 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
     let c = conn(addr loop.core, fd, gen)
-    if c != nil and c.pendingOut > 0:
-      loop.flushOut(c)
+    if c == nil or c.pendingOut <= 0: return
+    if c.flushHold > 0 and c.pendingOut < respHighWater:
+      # A batch is dispatching on this connection (a WebSocket read batch, an
+      # outbox drain): the frames this send produced are already in wbuf and the
+      # batch owner flushes once when its hold drops, so one recv() carrying N
+      # messages costs one send() instead of N (#333). Past respHighWater the
+      # hold is ignored: a handler that emits megabytes inside a single dispatch
+      # must still meet the socket (and its EAGAIN -> wsBackpressure/onDrain
+      # signal) rather than buffering the whole burst in wbuf.
+      return
+    loop.flushOut(c)
 
 const h2RecvBufferCap = 1024 * 1024
   ## Hard ceiling on an HTTP/2 connection's receive buffer. With
@@ -1509,6 +1590,20 @@ when not defined(plainHttp):
             m.data.toOpenArray(bodyStart, m.data.len - 1))
     h3Touched = true
 
+proc deferBatchFlush(loop: Loop, c: ptr Connection) =
+  ## Hold this connection's flush for the rest of the outbox batch, to be released
+  ## (and flushed, once) by processOutbox's tail (#333), so a worker's burst of
+  ## frames costs one send() rather than one per message. The hold is taken BEFORE
+  ## the operation it covers, so the counter and the pending list stay balanced
+  ## even if that operation closes the connection. At most one hold (and one list
+  ## entry) per connection per batch: `flushHold == 0` identifies the first
+  ## message for this connection, since nothing else holds across messages -- a
+  ## nested hold (processInput resuming a read batch) is taken and released within
+  ## one message.
+  if c.flushHold == 0:
+    loop.pendingFlush.add (c.fd, c.gen)
+    holdFlush(c)
+
 proc applyOutboxConn(loop: Loop, m: OutMsg) =
   ## Apply one non-blockingDone message on an h1/h2 connection (m.fd >= 0).
   if int(m.fd) >= loop.core.conns.len: return
@@ -1516,30 +1611,29 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
   if staleConn(c, m.gen): return
   if m.kind == omWs or m.kind == omWsClose:
     # A WebSocket frame from an off-loop sender (already serialized): route to the
-    # h1 connection or the h2 stream, then flush.
+    # h1 connection or the h2 stream; the batch's single flush pushes it.
     let w = wsConnForStream(addr loop.core, c, m.stream)
     if w != nil:
+      loop.deferBatchFlush(c)
       wsFlushRaw(addr loop.core, c, w, m.data, m.kind == omWsClose)
-      loop.flushOut(c)
     return
   if m.kind == omWsDone:
     # A ws.blocking worker finished: release its pin and resume dispatching frames
     # held back while it ran. stream 0 (h1) holds a pkWsBlocking connection pin;
-    # an h2 stream holds the per-stream pin, released by wsResume.
+    # an h2 stream holds the per-stream pin, released by wsResume. Either path can
+    # dispatch the next message (and its reply) inline, so hold the flush across
+    # it and let the batch tail push everything at once.
+    loop.deferBatchFlush(c)
     if m.stream == 0:
       # releasePin's hook covers the deferred close and, when frames are buffered,
-      # dispatches the next message; only the flush of what that queued stays here.
+      # dispatches the next message; its output rides the batch flush.
       doAssert m.release == prWsBlocking
       if not loop.releasePin(c, pkWsBlocking): return
-      if c.state != csFree and c.pendingOut > 0:
-        loop.flushOut(c)
     else:
       doAssert m.release == prNone
       let w = wsConnForStream(addr loop.core, c, m.stream)
       if w != nil:
         wsResume(addr loop.core, c, w)
-        if c.state != csFree and c.pendingOut > 0:
-          loop.flushOut(c)
     return
   if m.kind in {omFileStart, omFileChunk}:
     # Only chunk reads (dispatchNextRead -> omFileChunk) release prFileChunk. The
@@ -1556,17 +1650,22 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
       loop.closeConn(c)          # re-defers while other pins remain
       return
     if c.state != csActive: return
+    # Several chunks of the same download can land in one outbox batch (the
+    # read-ahead keeps one read in flight per stream, and a batch can carry the
+    # replies of several streams on this connection). Hold the flush so they cost
+    # one send() for the batch rather than one per chunk (#334); the tail below
+    # no longer needs its own push, releaseBatchFlushes does it.
+    loop.deferBatchFlush(c)
     loop.applyFileMessage(m)
     # The final chunk finished the response: reset and resume the pipeline (the
     # blocking-dispatch path doesn't set awaitingResponse, so finish()'s kick is a
     # no-op here -- mirror the buffered omHttp path explicitly).
     if m.last and not staleConn(c, m.gen):
       loop.resumeAfterRespond(c, m.stream)
-    elif not staleConn(c, m.gen) and c.pendingOut > 0:
-      # The write scheduler fills c.wbuf up to respHighWater and stops; push it to
-      # the socket now. On a fast socket flushOut never hits EAGAIN, so write
-      # interest is never armed and no later Write event would drain it.
-      loop.flushOut(c)
+    # Otherwise the batch tail flushes: the write scheduler fills c.wbuf up to
+    # respHighWater and stops, and on a fast socket flushOut never hits EAGAIN, so
+    # write interest is never armed and no later Write event would drain it. The
+    # hold above makes that one send() for every chunk in this batch (#334).
     return
   # omHttp releases what its task held: prBlocking, prFileChunk, or prNone (an
   # awaitable body's response -- its pkAwait rides omBlockingDone -- or a send from
@@ -1584,6 +1683,21 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
                 m.data.toOpenArray(bodyStart, m.data.len - 1))
   loop.resumeAfterRespond(c, m.stream)
 
+proc releaseBatchFlushes(loop: Loop) =
+  ## One socket write per connection for the whole outbox batch (#333). Each entry
+  ## is the one hold deferBatchFlush took for that connection, so dropping it
+  ## flushes everything the batch produced there. A connection that died while the
+  ## batch was applied resolves to nil (its generation was bumped) and its hold
+  ## goes with the slot -- clear() scrubs the counter before it is reused. Runs
+  ## even if applying a message raised, so a hold is never leaked onto a live
+  ## connection (which would mute its flush hook until the next batch).
+  for (fd, gen) in loop.pendingFlush:
+    let c = conn(addr loop.core, fd, gen)
+    if c == nil: continue
+    if releaseFlushHold(c) and (c.pendingOut > 0 or c.closeAfterFlush):
+      loop.flushOut(c)
+  loop.pendingFlush.setLen(0)
+
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing. Each
   ## message is dispatched to a per-transport handler (see applyBlockingDone /
@@ -1592,16 +1706,19 @@ proc processOutbox(loop: Loop) =
   loop.outboxScratch.setLen(0)
   drain(loop.core.outbox, loop.outboxScratch)
   var h3Touched = false
-  for m in loop.outboxScratch.mitems:
-    if m.kind == omBlockingDone:
-      loop.applyBlockingDone(m, h3Touched)
-    elif m.fd < 0:
-      when not defined(plainHttp):
-        loop.applyOutboxH3(m, h3Touched)
+  try:
+    for m in loop.outboxScratch.mitems:
+      if m.kind == omBlockingDone:
+        loop.applyBlockingDone(m, h3Touched)
+      elif m.fd < 0:
+        when not defined(plainHttp):
+          loop.applyOutboxH3(m, h3Touched)
+        else:
+          discard
       else:
-        discard
-    else:
-      loop.applyOutboxConn(m)
+        loop.applyOutboxConn(m)
+  finally:
+    loop.releaseBatchFlushes()
   # Recycle every sendFile read buffer from this batch back to the pool -- once,
   # here, so a buffer is returned exactly once whether its stream was alive (the
   # data was copied above) or the connection had died (the data is discarded).
@@ -2043,6 +2160,9 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
       discard posix.close(cint(arg.listenFd))
     if arg.udpFd != osInvalidSocket:
       discard posix.close(cint(arg.udpFd))
+  # The WebSocket pump's reused frame buffer is a thread-local; free it here on
+  # both paths, since nothing destroys a thread-local when the thread exits.
+  wsReleasePumpBuffer()
   # Mark this loop thread as exited last (both the clean and error paths), so a
   # timed shutdown (server.waitFor) knows every loop is truly gone before it
   # joins/frees -- and can detach instead of hang if run() never returned.

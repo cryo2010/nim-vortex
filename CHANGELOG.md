@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- HTTP/2: a stream's response buffer (`pendingBody`) is now compacted once the
+  sent prefix passes the high-water mark, not only when the backlog reaches
+  zero. A long streamed download with a client that kept the backlog non-zero
+  grew the buffer without bound (tens of MB per stream; ~768 MB RSS on the
+  cross-language download bench). (#331)
+- HTTP/2: legitimate flow control on a long download no longer trips
+  `maxControlFrames`. A WINDOW_UPDATE that unblocks nothing (connection-level
+  credit while nothing waits on the connection window, or credit for a closed
+  stream) now spends credit earned by response DATA sent (one per 256 bytes,
+  capped at 4x the budget) and is charged only past that; the budget also
+  decays per 64 KiB of response DATA sent. A peer we send nothing to still
+  trips GOAWAY(ENHANCE_YOUR_CALM) after the budget, as before. (#335)
+
+### Changed
+
+- WebSocket: frames sent from an `onMessage` handler, or by a worker's burst
+  through the outbox, are written to the socket once per batch instead of once
+  per message (`Connection.flushHold`), and HTTP/1 frames are serialized
+  straight into the connection buffer. Inbound frames reuse one payload buffer
+  per loop thread, are unmasked 8 bytes at a time, and reach the handler with no
+  extra copy. The outbox wakes the loop only on the empty-to-nonempty
+  transition. Echo throughput with several messages in flight is roughly 9x in
+  a local micro-benchmark. (#333, #336, #337, #338)
+- HTTP/2: after the socket drains, the write loop refills from the scheduler and
+  keeps writing (up to 16 refills per pass) instead of returning to the selector
+  after every 64 KiB. `res.write` on a stream with an empty backlog emits DATA
+  straight from the caller's buffer and parks only what flow control refuses;
+  writes in one frame batch or outbox batch are flushed once. The deadline
+  policy reads maintained counters instead of scanning the stream table on every
+  input event. (#332, #334, #339)
+- `sendFile` over HTTP/2 dispatches the next disk read before writing the chunk
+  that arrived, so the read overlaps the write instead of idling the socket;
+  the read-ahead budget is one chunk (256 KiB) measured before the write, which
+  keeps the same per-stream ceiling. (#340)
+
 ## [0.5.0] - 2026-09-24
 
 ### Added

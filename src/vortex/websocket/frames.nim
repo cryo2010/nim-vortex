@@ -84,12 +84,35 @@ proc parseFrame*(buf: string, avail: int, pos: var int,
   frame.fin = fin
   frame.rsv1 = (b0 and 0x40) != 0
   frame.opcode = op
+  # `frame` is the pump's reusable frame (#336), so setLen keeps the payload
+  # buffer it already owns: a steady stream of same-sized messages allocates
+  # nothing here after the first one.
   frame.payload.setLen(payloadLen)
-  let m0 = uint8(buf[maskOff]); let m1 = uint8(buf[maskOff+1])
-  let m2 = uint8(buf[maskOff+2]); let m3 = uint8(buf[maskOff+3])
-  let mask = [m0, m1, m2, m3]
-  for i in 0 ..< payloadLen:
-    frame.payload[i] = char(uint8(buf[dataOff + i]) xor mask[i and 3])
+  if payloadLen > 0:
+    # Unmask 8 bytes per step. The 4-byte key repeats every 4 bytes, so one word
+    # holding two copies of it XORs a whole 8-byte block; building that word with
+    # copyMem from the key bytes (rather than by shifting) gives it the same byte
+    # order in memory as the data word, so the block XOR is exact on either
+    # endianness. The tail stays byte-wise, and `i and 3` picks up exactly where
+    # the blocks stopped because each block consumes a multiple of 4 bytes.
+    let mask = [uint8(buf[maskOff]), uint8(buf[maskOff+1]),
+                uint8(buf[maskOff+2]), uint8(buf[maskOff+3])]
+    let keyBytes = [mask[0], mask[1], mask[2], mask[3],
+                    mask[0], mask[1], mask[2], mask[3]]
+    var key8: uint64
+    copyMem(addr key8, unsafeAddr keyBytes[0], 8)
+    let src = cast[ptr UncheckedArray[uint8]](unsafeAddr buf[dataOff])
+    let dst = cast[ptr UncheckedArray[uint8]](addr frame.payload[0])
+    var i = 0
+    while i + 8 <= payloadLen:
+      var blk: uint64
+      copyMem(addr blk, addr src[i], 8)
+      blk = blk xor key8
+      copyMem(addr dst[i], addr blk, 8)
+      i += 8
+    while i < payloadLen:
+      dst[i] = src[i] xor mask[i and 3]
+      inc i
   pos = dataOff + payloadLen
   wpFrame
 

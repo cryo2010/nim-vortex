@@ -100,7 +100,8 @@ supported() {  # $1=fw $2=workload $3=proto
       echo "=== build: $fw server ($p) ==="
       case "$fw" in
         vortex) docker build -f "$stressdir/Dockerfile" -t "$simg" $basearg \
-                  --build-arg BUILD_FLAGS="$vflags" --build-arg RUNTIME=sync "$root" ;;
+                  --build-arg BUILD_FLAGS="$vflags" --build-arg RUNTIME=sync \
+                  --build-arg PROFILE=bench "$root" ;;
         go)     docker build -f "$here/servers/go/Dockerfile"   -t "$simg" "$here/servers/go" ;;
         rust)   docker build -f "$here/servers/rust/Dockerfile" -t "$simg" "$here/servers/rust" ;;
         *) echo "unknown framework: $fw" >&2; exit 2 ;;

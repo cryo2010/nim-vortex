@@ -10,14 +10,23 @@
 #     sync | async | async-await | chronos | chronos-await
 #   so VORTEX_SERVER sweeps the sync / asyncdispatch / chronos servers under load.
 #
-# Built -d:release (NOT -d:danger): the stress soaks exist to force intermittent
-# crashes and instability, so we keep runtime checks (bounds/overflow/nil) ON so a
-# defect fails fast at its source instead of silently corrupting memory and
-# crashing elsewhere. Optimizations stay on (realistic timing to reproduce races/
-# lifecycle bugs), and --stackTrace/lineTrace/stackTraceMsgs/panics/debugger give a
-# native traceback on the failure. Consequence: RSS/throughput here are a
-# debug-build baseline, not the peak ceiling. Built from the repository root by
-# run.sh; base defaults to arm64, overridden to archlinux:latest on x86_64.
+#   PROFILE  compiler flag set:
+#     soak   (default) -d:release plus --stackTrace/lineTrace/stackTraceMsgs/
+#            panics/debugger. The stress soaks exist to force intermittent
+#            crashes and instability, so runtime checks (bounds/overflow/nil)
+#            stay ON so a defect fails fast at its source instead of silently
+#            corrupting memory and crashing elsewhere, optimizations stay on
+#            (realistic timing to reproduce races/lifecycle bugs), and the
+#            tracing flags give a native traceback on the failure. Consequence:
+#            RSS/throughput under this profile are a debug-build baseline.
+#     bench  -d:danger --passC:-flto, the same build the perf/benchServer nimble
+#            tasks use. The cross-language bench (conformance/bench/run.sh)
+#            selects it so vortex is compared as a release build against Go's
+#            and Rust's release builds; the tracing flags above cost a bookkeeping
+#            step on every call, which is not what a deployed server pays.
+#
+# Built from the repository root by run.sh; base defaults to arm64, overridden to
+# archlinux:latest on x86_64.
 
 ARG BASE=menci/archlinuxarm:latest
 FROM ${BASE}
@@ -37,7 +46,13 @@ COPY conformance/stress/stress_server.nim ./stress_server.nim
 
 ARG BUILD_FLAGS=""
 ARG RUNTIME=sync
-RUN case "$RUNTIME" in \
+ARG PROFILE=soak
+RUN case "$PROFILE" in \
+      soak)  pflags="-d:release --stackTrace:on --stackTraceMsgs:on --lineTrace:on --panics:on --debugger:native" ;; \
+      bench) pflags="-d:danger --passC:-flto" ;; \
+      *) echo "unknown PROFILE: $PROFILE (soak|bench)" >&2; exit 1 ;; \
+    esac; \
+    case "$RUNTIME" in \
       sync)          rtflag="" ;; \
       async)         rtflag="-d:ltAsync" ;; \
       async-await)   rtflag="-d:ltAsyncAwait" ;; \
@@ -48,8 +63,7 @@ RUN case "$RUNTIME" in \
     case "$RUNTIME" in \
       chronos|chronos-await) nimble install -y "chronos@>= 4.0.0" ;; \
     esac; \
-    nim c --mm:orc --threads:on -d:release \
-      --stackTrace:on --stackTraceMsgs:on --lineTrace:on --panics:on --debugger:native \
+    nim c --mm:orc --threads:on $pflags \
       $BUILD_FLAGS $rtflag -p:src \
       -o:stress_server stress_server.nim
 

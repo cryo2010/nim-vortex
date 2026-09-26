@@ -145,9 +145,12 @@ proc dequeue[T](r: AwaitableReader[T]): T =
   result = r.queue.popFirst()
   if r.onConsume != nil: r.onConsume(result)
 
-proc feed[T](r: AwaitableReader[T], item: T) =
+proc feed[T](r: AwaitableReader[T], item: sink T) =
   ## Deliver an item: hand it to a parked take (via dequeue, so onConsume fires),
-  ## else enqueue it.
+  ## else enqueue it. `sink` so the caller's freshly-built item is moved into the
+  ## queue rather than copied into it: an inbound WebSocket message must be
+  ## copied out of the pump's reusable frame buffer to be queued, but exactly
+  ## once (#336).
   r.queue.addLast item
   if r.waiter != nil and not r.waiter.finished:
     let w = r.waiter

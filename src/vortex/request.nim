@@ -2564,19 +2564,41 @@ proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
     res.core.chunkPool.chunkReturn(buf)
     res.abort()
 
-const fileReadAhead = 2 * fileChunkCap
-  ## Read-ahead budget for streamed downloads: keep at most this much response
-  ## backlog buffered before pausing the next disk read. Two chunks lets the
-  ## next read overlap the current chunk's socket write (disk I/O and network
-  ## I/O pipeline instead of alternating), while a slow client still throttles
-  ## us -- the backlog reaches the budget and reads wait for a drain (issue
-  ## #273). Costs one extra pooled buffer of in-flight backlog per active stream.
+const fileReadAhead = fileChunkCap
+  ## Read-ahead budget for streamed downloads: one chunk of headroom. The next
+  ## disk read is dispatched while at most this much response backlog is still
+  ## queued -- and, because the gate now runs BEFORE the arrived chunk is written
+  ## (applyFileChunk, #340), with a full chunk about to be queued behind it. So
+  ## the socket always has bytes to push for the duration of the read (disk I/O
+  ## and network I/O pipeline instead of alternating), while a slow client still
+  ## throttles us: the backlog reaches the budget and reads wait for a drain
+  ## (issue #273).
+  ##
+  ## Was 2 x fileChunkCap with the gate AFTER the write (#340), which is the same
+  ## dispatch instant measured on the other side of a 256 KiB write -- so moving
+  ## the gate ahead of the write is exactly what this halving pays for. Left at
+  ## two chunks it would have bought a whole extra chunk of backlog instead
+  ## (~960 KiB peak measured, against ~736 KiB here).
+  ##
+  ## The ceiling is the budget plus TWO chunks, not one: the chunk that passes
+  ## the gate is written right after it, and the chunk already in flight is
+  ## written unconditionally when it lands (its pooled buffer is recycled at the
+  ## end of that outbox batch, so it cannot be held back). Read-ahead throttling
+  ## can only stop the read AFTER that one.
+  ##
+  ## It must stay >= respHighWater: parking relies on the preceding write having
+  ## reported backpressure (write() -> h2Writable / c.respBackedUp), which is
+  ## what arms the drain callback pullNext registers. A budget below the
+  ## high-water mark could park a producer that was never marked backed up, and
+  ## no drain would ever resume the read.
 
 proc pullNext(res: Response, nextRead: string, reader: pointer) =
   ## Prefetch the next chunk to overlap its disk read with the current chunk's
   ## socket write. If the response backlog is already at the read-ahead budget,
   ## wait for it to drain first so a slow reader cannot make us buffer without
   ## bound (bufferedAmount covers the h1 wbuf and the h2/h3 per-stream backlog).
+  ## Called BEFORE the freshly-arrived chunk is written (see applyFileChunk), so
+  ## the worker's read runs while the loop thread pushes that chunk to the socket.
   if res.bufferedAmount() < fileReadAhead:
     dispatchNextRead(res, nextRead, reader)
   else:
@@ -2590,27 +2612,38 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## Loop-side: copy a filled pool buffer into the response; finish on the last,
   ## else pull the next read. `buf` is returned to the pool by processOutbox
   ## after the batch (whether or not the connection is still alive).
+  ##
+  ## The next read is dispatched BEFORE this chunk is written (#340). res.write
+  ## is synchronous down to the socket -- on a fast peer flushOut drains the whole
+  ## chunk (and refills from the scheduler) before it returns -- so pulling
+  ## afterwards left the socket idle for the whole disk read every time. Pulling
+  ## first hands the read to a worker while the loop thread is still pushing
+  ## bytes, which is what the read-ahead was for. The gate then sees the backlog
+  ## without this chunk, which is why the budget dropped to one chunk to keep the
+  ## same ceiling (see fileReadAhead).
+  if not last:
+    pullNext(res, nextRead, reader)
   if buf != nil and n > 0:
     discard res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
   if last:
     res.finish()
-    return
-  pullNext(res, nextRead, reader)
 
 proc applyFileStart*(res: Response, status: int, contentType: string,
                      headers: openArray[(string, string)], totalLen: int64,
                      firstChunk: openArray[char], nextRead: string,
                      reader: pointer, last: bool) =
-  ## Loop-side: send the head (Content-Length = totalLen), write the first chunk
-  ## (a plain string from the worker's initial read), then pull the rest through
-  ## the buffer pool.
+  ## Loop-side: send the head (Content-Length = totalLen), pull the rest through
+  ## the buffer pool, and write the first chunk (a plain string from the worker's
+  ## initial read). Head, then read, then write: the second read overlaps the
+  ## first chunk's socket write instead of starting after it (#340, as in
+  ## applyFileChunk).
   res.sendHead(HttpCode(status), contentType, headers,
                contentLength = int(totalLen))
+  if not last:
+    pullNext(res, nextRead, reader)
   discard res.write(firstChunk)
   if last:
     res.finish()
-    return
-  pullNext(res, nextRead, reader)
 
 macro blocking*(request: Request, args: varargs[untyped]): untyped =
   ## Run a block on the worker pool, where blocking calls (sync DB drivers, file
