@@ -661,6 +661,16 @@ proc wsSweepIdle*(core: ptr LoopCore, c: ptr Connection, w: WsConn): bool =
     if w.flush != nil: w.flush(core, c, w)
   false
 
+proc wsCreditStall*(w: WsConn, gap: int64) =
+  ## The loop thread did not run for `gap` seconds (see the loop's creditStall).
+  ## Both keepalive decisions above are "how long since nowSec", so without this
+  ## the stall is charged to the peer: a 14 s deschedule looks like 14 s of
+  ## silence, which is enough to close a WebSocket whose pong was already in
+  ## flight (wsPongTimeout defaults to 10 s). Shift the stamps by the time we
+  ## were away so the keepalive measures peer silence while we could hear it.
+  w.lastRx += gap
+  if w.pingSent: w.pingAt += gap
+
 proc wsClosed*(core: ptr LoopCore, c: ptr Connection) =
   ## Called by the loop when an HTTP/1 connection is torn down.
   if c.ws == nil: return

@@ -1999,6 +1999,45 @@ proc sweepWsPing(loop: Loop, c: ptr Connection) =
   c.setDeadline(loop, dkWsPong)
   loop.flushOut(c)
 
+const stallCreditGapSec = 2'i64
+  ## A tick gap of at least this many seconds means the loop thread missed a
+  ## whole second of sweeps it owed, i.e. it did not run -- see creditStall. One
+  ## second of slack is normal (the selector waits up to 1 s, and nowSec is
+  ## refreshed at the *end* of an iteration), so only a larger gap counts.
+
+proc creditStall(loop: Loop, gap: int64) =
+  ## The loop thread went `gap` seconds without a tick: it was descheduled (an
+  ## oversubscribed host, which is the common case), or one dispatch blocked it.
+  ##
+  ## Every deadline here is an absolute monotonic stamp (setDeadline), and
+  ## sweepTimeouts only runs when nowSec changes, so without this the first sweep
+  ## after a stall fires *every* deadline that fell inside the gap, all in one
+  ## pass -- and it fires them at peers that did nothing wrong. Worse, the phase a
+  ## connection happens to be in decides what the peer sees: a connection still
+  ## in its TLS handshake is reset with no alert (closeConn skips tlsShutdown
+  ## while handshaking), an h2 connection is closed with no GOAWAY, and an
+  ## in-flight request or response is truncated. From the client that is an
+  ## unexplained connect failure, "server disconnected", or a read/write error on
+  ## a server that is otherwise perfectly healthy -- which is exactly what the
+  ## stress soaks saw on an oversubscribed host. Measured there (h2, 14 loop
+  ## threads, host load ~20): in one 60 s window the threads missed ticks by 2, 3,
+  ## 4, 5, 6, 7, 8, 10, 11, 12, 15, 16, 18, 19, 20, 23, 25, 27, 28 and 33 seconds
+  ## -- against a headerTimeout of 10 s guarding every handshake, a wsPongTimeout
+  ## of 10 s, and a bodyTimeout of 30 s.
+  ##
+  ## So credit the time we were away: push the armed deadlines out by it. The
+  ## timeouts then measure what they exist to measure -- a peer that has gone
+  ## quiet while we were able to serve it -- rather than the host's scheduler.
+  ## They are all still finite and still absolute, so a peer that stays silent
+  ## after the loop recovers is reaped one gap later, and a slowloris gains only
+  ## the time the server was unable to serve anyone at all.
+  for c in loop.core.conns.slots:
+    if c.state == csFree: continue
+    if c.deadline != 0: c.deadline += gap
+    if c.writeDeadline != 0: c.writeDeadline += gap
+  for r in loop.core.wsIdle:
+    wsCreditStall(WsConn(r), gap)   # h2/h3 ws keepalive stamps (h1 rides above)
+
 proc sweepTimeouts(loop: Loop) =
   for c in loop.core.conns.slots:
     if c.state == csFree: continue
@@ -2089,10 +2128,15 @@ proc applyQuicReload(loop: Loop) =
 
 proc tick(loop: Loop) =
   let now = monoSec()
-  if now != loop.core.nowSec:
+  if now > loop.core.nowSec:
+    let gap = now - loop.core.nowSec
     loop.core.nowSec = now
     loop.refreshDate()
     when not defined(release): loop.checkBodyPause()
+    if gap >= stallCreditGapSec:
+      # We did not run for `gap` seconds; only the last of them is time the
+      # deadlines should be charged for (see creditStall).
+      loop.creditStall(gap - 1)
     loop.sweepTimeouts()
     loop.sweepWsIdle()
     loop.applyQuicReload()
