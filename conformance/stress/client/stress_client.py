@@ -152,6 +152,19 @@ async def drive(worker):
         except (httpx.TransportError, WebSocketException, ConnectionError, OSError) as e:
             raise Fail(f"transport error ({type(e).__name__}): {e}") from e
 
+async def ramped(i, worker):
+    """`drive` for worker `i`, after its share of the WebSocket ramp (ws_ramp_delay).
+
+    Only the connection-per-worker WebSocket workload needs this: its workers each
+    hold one socket for the whole soak, so without a ramp every handshake in the
+    cell lands in the same instant. Staggering only shifts when steady state
+    starts; the deadline, the verification and the failure handling are `drive`'s,
+    unchanged.
+    """
+    d = ws_ramp_delay(i)
+    if d > 0: await asyncio.sleep(d)
+    await drive(worker)
+
 # --- workloads (transport-agnostic via session) ------------------------------
 async def w_requests():
     # Typed payload mix, cycled per iteration (payload_mix() from transport). A
@@ -199,6 +212,32 @@ async def w_requests():
                     bump(200)
     await asyncio.gather(*[drive(once) for _ in range(CONC)])
 
+# WebSocket opening-handshake budget and burst shaping.
+#
+# Every worker opens its socket at t=0, so a cell slams CLIENTS*CONC (96 by
+# default) simultaneous handshakes at the server from one asyncio loop. The
+# server accepts and upgrades each on whichever SO_REUSEPORT loop thread the
+# kernel hashed it to, and these soaks are run deliberately oversubscribed
+# (several cells in parallel, host load 20-50), where a single loop thread can be
+# descheduled for seconds -- measured: TCP connect stayed under 0.15 s while the
+# upgrade for the connections hashed to one starved thread waited 1-5 s, all
+# released together the moment that thread was scheduled again. `websockets`
+# defaults open_timeout to 10 s, so that cold-start scheduling luck failed an
+# otherwise healthy soak inside its first minute, with a server that went on to
+# echo tens of thousands of messages a second for the rest of the hour.
+#
+# So: scale the budget with the burst size and floor it far above the worst case
+# observed, and spread the initial handshakes over a few seconds instead of
+# opening all of them in one instant. The soak then measures steady-state
+# behaviour, which is what it exists to measure; a genuinely wedged upgrade still
+# fails the cell, just on a timescale that means something.
+WS_OPEN_TIMEOUT = max(60.0, 0.5 * CLIENTS * CONC)
+WS_RAMP = min(5.0, max(0.0, SECONDS / 10.0))    # never eat a short smoke run
+
+def ws_ramp_delay(i: int) -> float:
+    """How long worker `i` waits before its first handshake (0 when not ramping)."""
+    return WS_RAMP * i / CONC if CONC > 1 else 0.0
+
 async def w_ws():
     if IS_H3:                                   # RFC 9220 Extended CONNECT via aioquic
         async def once(i):
@@ -213,7 +252,7 @@ async def w_ws():
                     if op != OP_TEXT or payload != msg:
                         raise Fail(f"ws-h3 echo mismatch: op={op} {payload!r}")
                     bump(200); n += 1
-        await asyncio.gather(*[drive(lambda i=i: once(i)) for i in range(CONC)])
+        await asyncio.gather(*[ramped(i, lambda i=i: once(i)) for i in range(CONC)])
         return
     import websockets
     ws_url = BASE.replace("https://", "wss://").replace("http://", "ws://") + "/ws"
@@ -223,13 +262,14 @@ async def w_ws():
         ssl_ctx = ssl.create_default_context(); ssl_ctx.check_hostname = False; ssl_ctx.verify_mode = ssl.CERT_NONE
     async def once(i):
         n = 0
-        async with websockets.connect(ws_url, ssl=ssl_ctx, max_size=None) as ws:
+        async with websockets.connect(ws_url, ssl=ssl_ctx, max_size=None,
+                                      open_timeout=WS_OPEN_TIMEOUT) as ws:
             while time.monotonic() < deadline:
                 msg = f"msg-{i}-{n}"
                 await ws.send(msg)
                 if await ws.recv() != msg: raise Fail("ws echo mismatch")
                 bump(200); n += 1
-    await asyncio.gather(*[drive(lambda i=i: once(i)) for i in range(CONC)])
+    await asyncio.gather(*[ramped(i, lambda i=i: once(i)) for i in range(CONC)])
 
 async def read_lines(gen):
     """Yield decoded lines from a byte-chunk async generator (SSE framing)."""
