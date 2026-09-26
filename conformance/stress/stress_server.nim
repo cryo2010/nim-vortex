@@ -49,10 +49,33 @@ const
 
 let streamBytes = parseInt(getEnv("STREAM_BYTES", "1073741824"))   # /download size
 
+proc buildDlPattern(): string =
+  ## `dlChunk + 256` bytes of the deterministic generator (byte j = j mod 256).
+  ## The generator has period 256 and `dlChunk` is a whole number of periods, so
+  ## any run of up to `dlChunk` bytes, starting at any global offset, appears in
+  ## here as one contiguous slice beginning at `offset mod 256`. That is what
+  ## lets genChunk below be a memcpy instead of a per-byte loop.
+  result = newString(dlChunk + 256)
+  for j in 0 ..< result.len: result[j] = char(j and 0xff)
+
+const dlPattern = buildDlPattern()
+
 proc genChunk(start, n: int): string =
-  ## `n` bytes of the deterministic generator starting at global index `start`.
-  result = newString(n)
-  for j in 0 ..< n: result[j] = char((start + j) and 0xff)
+  ## `n` bytes of the deterministic generator starting at global index `start`
+  ## (byte i = i mod 256 -- the cross-language contract with the Python client's
+  ## gen_chunk, which the client's whole-stream SHA-1 check depends on).
+  ##
+  ## A slice of the precomputed pattern, not a per-byte loop: the async
+  ## /download handler calls this once per 64 KiB chunk for the whole 1 GiB
+  ## transfer, and the chaos sidecar hammers /download with aborted and
+  ## slow-read connections, so on the event-loop builds this ran 64 Ki
+  ## bounds-checked byte stores per chunk on the loop thread -- CPU the loop
+  ## needs to accept and serve other connections. (The sync build never paid it:
+  ## it serves /download with sendFile from a file generated once at startup.)
+  ## `n` must not exceed dlChunk, which is the largest chunk any caller wants.
+  doAssert n <= dlChunk, "genChunk: n exceeds the precomputed pattern span"
+  let s = start and 0xff
+  result = dlPattern[s ..< s + n]
 
 # --- typed GET bodies (cross-language contract with the Python client) --------
 # Precomputed once so the hot path does no per-request string building, like
