@@ -2160,6 +2160,9 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
       discard posix.close(cint(arg.listenFd))
     if arg.udpFd != osInvalidSocket:
       discard posix.close(cint(arg.udpFd))
+  # The WebSocket pump's reused frame buffer is a thread-local; free it here on
+  # both paths, since nothing destroys a thread-local when the thread exits.
+  wsReleasePumpBuffer()
   # Mark this loop thread as exited last (both the clean and error paths), so a
   # timed shutdown (server.waitFor) knows every loop is truly gone before it
   # joins/frees -- and can detach instead of hang if run() never returned.

@@ -495,6 +495,13 @@ const pumpFrameKeep = 64 * 1024
   ## buffer is dropped at the end of the pump, so one multi-megabyte message does
   ## not pin its buffer on the loop thread for the server's lifetime.
 
+proc wsReleasePumpBuffer*() =
+  ## Drop the loop thread's reused frame buffer. Called once by the loop thread
+  ## on its way out: a thread-local is never destroyed at thread exit, so without
+  ## this the last payload buffer outlives the thread as an unreachable heap
+  ## block (valgrind memcheck reports it definitely lost in the ws scenario).
+  reset(pumpFrame)
+
 proc wsPump(core: ptr LoopCore, c: ptr Connection, w: WsConn,
             buf: string, avail: int): int =
   ## Parse and dispatch complete frames from buf[0 ..< avail]; return the
