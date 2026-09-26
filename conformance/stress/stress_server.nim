@@ -255,6 +255,18 @@ when isMainModule:
   var settings = initVortexConfig(port = port, numThreads = 0,
       compress = getEnv("STRESS_COMPRESS") == "1",
       decompressRequest = true,
+      # vortex's 10 s default is a slowloris guard measured from accept, and it
+      # counts the TLS handshake and any protocol upgrade. That is right for a
+      # deployed server, but these soaks run deliberately oversubscribed (many
+      # cells in parallel, host load 20-50), and there a loop thread can be
+      # descheduled for longer than that -- measured on a loaded host: a
+      # WebSocket upgrade still unserviced 13.9 s after connect, then reset by
+      # this very deadline, while every established connection kept echoing tens
+      # of thousands of messages a second. That reset is the host's scheduler,
+      # not a vortex defect, and failing the cell on it costs an hour of real
+      # coverage. Keep it finite (slowloris is still covered, and a genuinely
+      # wedged handshake still fails) but well clear of the scheduling noise.
+      headerTimeout = parseInt(getEnv("STRESS_HEADER_TIMEOUT", "60")),
       maxBodySize = streamBytes + 1024 * 1024)    # allow the upload workload
   # PROXY protocol (HAProxy send-proxy in front): the proxy interop suite sets
   # STRESS_PROXY_PROTOCOL=require so a missing/invalid header is dropped, proving
