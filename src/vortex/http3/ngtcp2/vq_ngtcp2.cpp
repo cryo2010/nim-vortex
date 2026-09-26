@@ -582,7 +582,16 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
 
   ngtcp2_transport_params tp;
   ngtcp2_transport_params_default(&tp);
-  tp.max_idle_timeout = 30ULL * NGTCP2_SECONDS;
+  // The idle timeout we advertise. QUIC gives each endpoint min(local, peer)
+  // (RFC 9000 10.1), so this number caps the *client's* idle timer as much as
+  // ours -- and the client is the one that reports "Idle timeout" when a loop
+  // thread goes away. It must therefore be at least as generous as the h1/h2
+  // idle budget (keepAliveTimeout, which the loop already credits back for a
+  // stall) and wider than the drain grace, or an h3 connection is reaped where
+  // an h1/h2 one on the same listener survives.
+  const uint64_t idle_sec =
+      e->cfg.max_idle_timeout_sec ? e->cfg.max_idle_timeout_sec : 30ULL;
+  tp.max_idle_timeout = idle_sec * NGTCP2_SECONDS;
   // Receive flow-control windows (configurable via VortexConfig; 0 = default).
   // bidi_remote is the request-body upload window (client-opened streams) and
   // initial_max_data is the connection aggregate -- both extended on consumption
@@ -629,6 +638,20 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
     return nullptr;
 
   ngtcp2_conn_set_tls_native_handle(c->conn, c->ossl);
+
+  // Keep a live connection's idle timers fed. Nothing else does: an h3
+  // connection sends packets only when the application has bytes to move, and
+  // RFC 9000 10.1 restarts an endpoint's idle timer on a *received* packet (a
+  // peer that only sends, like a WebSocket client waiting for its echo, does not
+  // refresh its own). So any gap in application data -- a loop thread
+  // descheduled on an oversubscribed host, a slow handler, the drain pause --
+  // goes entirely silent, and whichever peer notices first closes the
+  // connection with "Idle timeout" against a server that is perfectly healthy.
+  // ngtcp2's keep-alive turns that gap into a PING, which is ack-eliciting and
+  // so restarts the timer at both ends; a third of the window leaves room for
+  // two lost PINGs before the peer gives up.
+  ngtcp2_conn_set_keep_alive_timeout(c->conn,
+                                     idle_sec * NGTCP2_SECONDS / 3);
 
   // Route the client's original DCID and our SCID to this conn.
   e->byCid[cidKey(vc->dcid, vc->dcidlen)] = c;

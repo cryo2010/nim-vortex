@@ -342,7 +342,13 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  verifyClient = int(tlsVerifyMode(settings.verifyClient)),
                  clientCaFile = settings.clientCaFile,
                  clientCaPem = settings.clientCaPem,
-                 sni = toH3SniCerts(settings)):
+                 sni = toH3SniCerts(settings),
+                 # QUIC's idle timeout is the h3 spelling of keepAliveTimeout:
+                 # the budget a connection gets with nothing in flight. Advertise
+                 # the same number the h1/h2 wheel enforces so one protocol does
+                 # not reap a blameless peer the other would have kept -- and so
+                 # it stays wider than the h3 drain grace.
+                 maxIdleTimeout = settings.keepAliveTimeout):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"
@@ -2037,6 +2043,11 @@ proc creditStall(loop: Loop, gap: int64) =
     if c.writeDeadline != 0: c.writeDeadline += gap
   for r in loop.core.wsIdle:
     wsCreditStall(WsConn(r), gap)   # h2/h3 ws keepalive stamps (h1 rides above)
+  when not defined(plainHttp):
+    # ngtcp2's idle and loss timers are absolute stamps of the same kind, but
+    # they live inside the QUIC stack, so they are credited by withholding the
+    # stall from the clock the shim reads instead (see ngCreditStall).
+    if loop.udpFd >= 0: ngCreditStall(gap)
 
 proc sweepTimeouts(loop: Loop) =
   for c in loop.core.conns.slots:

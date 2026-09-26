@@ -82,6 +82,7 @@ type
     client_ca_pem: cstring
     sni: ptr VqSniCert
     sni_len: csize_t
+    max_idle_timeout_sec: uint64
 
   H3SniCert* = object
     ## Per-host certificate material for the QUIC SNI callback (#374). The same
@@ -185,8 +186,33 @@ var
   gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
+  gStallNs {.threadvar.}: uint64             # loop-stall credit; see ngCreditStall
 
-proc nowNs(): uint64 = getMonoTime().ticks.uint64
+proc nowNs(): uint64 = getMonoTime().ticks.uint64 - gStallNs
+  ## The clock every ngtcp2 timer is armed against, minus the time this loop
+  ## thread was unable to run at all (ngCreditStall). See there for why.
+
+proc ngCreditStall*(sec: int64) =
+  ## The loop thread did not tick for `sec` seconds, so it could not have served
+  ## *any* connection on this engine -- the h3 half of the loop's creditStall.
+  ##
+  ## ngtcp2 owns the idle and loss-detection timers, and it arms them as absolute
+  ## stamps on the clock we hand it. So a thread that is descheduled for longer
+  ## than the idle timeout comes back, calls handle_expiry once, and ngtcp2 reaps
+  ## every connection whose idle window fell inside the gap -- peers that did
+  ## nothing wrong, closed for a silence the server caused. That is exactly what
+  ## creditStall fixed for the h1/h2 deadline wheel, but the h3 timers live
+  ## inside ngtcp2 where those absolute stamps cannot be rewritten.
+  ##
+  ## They can be measured against a clock that does not run while we were away.
+  ## Withholding the stall from *every* ngtcp2 entry point (recv, pump, expiry,
+  ## next-expiry) keeps one consistent clock domain, so every relative duration
+  ## ngtcp2 derives -- RTT samples, PTO, the keep-alive interval -- is unchanged;
+  ## only the interval in which no packet could be sent or processed is excluded.
+  ## The clock stays strictly monotonic because the caller credits less than the
+  ## time that actually elapsed, and every timer stays finite: a peer that is
+  ## still silent once the loop recovers is reaped one gap later.
+  if sec > 0: gStallNs += uint64(sec) * 1_000_000_000'u64
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -581,7 +607,8 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxConnections = 0, maxResetStreams = 0,
               tlsCipherSuites = "", maxTlsVersion = 0,
               verifyClient = 0, clientCaFile = "", clientCaPem = "",
-              sni: openArray[H3SniCert] = []): bool =
+              sni: openArray[H3SniCert] = [],
+              maxIdleTimeout = 0): bool =
   ## Build this loop's QUIC engine. tlsCipherSuites / maxTlsVersion carry the
   ## operator's TLS policy onto the QUIC side (#359); maxTlsVersion is an
   ## OpenSSL version constant (0 = no cap) and anything below TLS 1.3 makes the
@@ -589,6 +616,9 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   ## verifyClient is the OpenSSL SSL_VERIFY_* bitmask for mTLS, enforced on h3
   ## exactly as on the TCP listener (#351). `sni` carries the per-host
   ## certificates, each getting its own QUIC context in the shim (#374).
+  ## maxIdleTimeout is the max_idle_timeout we advertise, in seconds (0 = the
+  ## shim default), which also caps the peer's idle timer and arms ngtcp2's
+  ## keep-alive at a third of it.
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
@@ -637,6 +667,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
       pkcs12_len: csize_t(sni[i].pkcs12.len))
   cfg.sni = (if sniC.len > 0: addr sniC[0] else: nil)
   cfg.sni_len = csize_t(sniC.len)
+  cfg.max_idle_timeout_sec = uint64(max(0, maxIdleTimeout))
   gEngine = vqEngineNew(addr cfg)
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))
