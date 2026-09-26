@@ -70,9 +70,14 @@ chaosseed="${VORTEX_CHAOS_SEED:-1}"
 # with slack; exceeding it genuinely still fails the cell.
 chaosgate="${VORTEX_CHAOS_GATE_SECONDS:-180}"
 # drain: how long to wait for the sidecar to exit AFTER a passing canary, i.e.
-# its own drain pause (up to 40 s on h3) plus the final /stats fd sample, plus
-# slack. On cap this is a watchdog fail (exit 3).
-chaosdrain="${VORTEX_CHAOS_DRAIN_SECONDS:-90}"
+# its own drain pause (up to 40 s on h3) plus its settle re-sampling (up to 60 s,
+# see chaos.py's SETTLE) plus the final /stats fd sample, plus slack. On cap this
+# is a watchdog fail (exit 3). The settle loop normally costs nothing here -- it
+# exits on its first sample once the canary is gone, which is exactly when this
+# wait begins -- so this cap is only ever approached by a GENUINE leak, where the
+# count never comes down; it must clear DRAIN + SETTLE so that leak is reported
+# as the leak it is (exit 1) rather than as a sidecar watchdog (exit 3).
+chaosdrain="${VORTEX_CHAOS_DRAIN_SECONDS:-150}"
 
 # A per-run id isolates concurrent runs: each gets its own docker network,
 # server container, and image tags, so several `run.sh` / `nimble stress`
