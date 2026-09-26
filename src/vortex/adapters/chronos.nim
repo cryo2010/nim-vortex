@@ -99,7 +99,12 @@ proc pump(): int {.nimcall, gcsafe.} =
       # selector wait at 5 ms forever, on every one of its loop threads. That
       # is pure burn: it bought no latency (the wakeups come from our own
       # selector) and cost the headroom a loop thread needs to accept and
-      # upgrade new connections on a busy host.
+      # upgrade new connections on a busy host. Measured on one loop thread with
+      # four idle WebSockets open: 0.0527 s of CPU per 5 s idle with the spin,
+      # 0.0004 s without it. That is ~1% of a core per loop thread, paid for as
+      # long as any such connection is open and whether or not it carries
+      # traffic, so it scales with the countProcessors() loop threads a default
+      # server starts -- and the 5 ms cap kept every one of them from sleeping.
       if parkedOps >= pendingOps: return -1
     5
 
