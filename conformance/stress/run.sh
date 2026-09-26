@@ -28,6 +28,10 @@
 #                    (and no drain pause), the pre-chaos behavior.
 #   VORTEX_CHAOS_CONC     chaos sidecar worker count (default 8)
 #   VORTEX_CHAOS_SEED     per-worker seeded RNG for reproducible chaos (default 1)
+#   VORTEX_CHAOS_GATE_SECONDS  how long to wait for the sidecar's fd baseline
+#                    before giving up on the cell (default 180; see run_cell)
+#   VORTEX_CHAOS_DRAIN_SECONDS how long to wait for the sidecar to exit after
+#                    the canary passed (default 90; see run_cell)
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -49,6 +53,26 @@ sbytes=${VORTEX_STREAM_BYTES:-1073741824}
 chaos=$(printf '%s' "${VORTEX_CHAOS:-all}" | tr 'A-Z' 'a-z')
 chaosconc="${VORTEX_CHAOS_CONC:-8}"
 chaosseed="${VORTEX_CHAOS_SEED:-1}"
+# Chaos sidecar waits, in SECONDS (both loops poll every 0.1 s, so the tick
+# counts below are seconds * 10). Named and defaulted here so the caps are
+# explicit and overridable instead of buried as bare iteration counts.
+#
+# gate: how long the sidecar may take to print its fd baseline before we give up
+# on the cell. This must cover chaos.py's whole pre-baseline prelude, which is
+# NOT quick: warm_baseline() runs up to 10 rounds of VORTEX_CHAOS_WARMUP (64)
+# CONCURRENT aborted /download connections, each round followed by a 2 s settle
+# plus a 1 s inter-round gap, and the baseline sample then retries up to 10 times
+# with a 1 s gap. On h3 each of those connections is a full QUIC handshake, so on
+# a loaded host (many cells in parallel) the prelude can take minutes. The old
+# 30 s cap was well under that budget and silently killed loaded h3 cells before
+# they ran a single request -- lost coverage, not a vortex defect. 180 s clears
+# the worst case (10 * (2 + 1) s warm-up + 10 * 1 s sampling + handshake time)
+# with slack; exceeding it genuinely still fails the cell.
+chaosgate="${VORTEX_CHAOS_GATE_SECONDS:-180}"
+# drain: how long to wait for the sidecar to exit AFTER a passing canary, i.e.
+# its own drain pause (up to 40 s on h3) plus the final /stats fd sample, plus
+# slack. On cap this is a watchdog fail (exit 3).
+chaosdrain="${VORTEX_CHAOS_DRAIN_SECONDS:-90}"
 
 # A per-run id isolates concurrent runs: each gets its own docker network,
 # server container, and image tags, so several `run.sh` / `nimble stress`
@@ -162,11 +186,13 @@ run_cell() {
       -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" python chaos.py >/dev/null
     # Wait for the sidecar's fd baseline so it is sampled before the canary
     # connects. chaos.py prints "chaos: baseline fds=N" once, before it starts
-    # inducing chaos; cap at ~30 s (300 * 0.1 s), then give up on this cell.
+    # inducing chaos; cap at $chaosgate seconds (see the default above for why it
+    # is minutes, not seconds), then give up on this cell.
     i=0
+    gateticks=$((chaosgate * 10))
     until docker logs "$chc" 2>&1 | grep -q "chaos: baseline"; do
       i=$((i + 1))
-      [ "$i" -gt 300 ] && { echo "chaos sidecar did not reach baseline" >&2; docker logs "$chc"; docker rm -f "$chc" >/dev/null 2>&1 || true; return 1; }
+      [ "$i" -gt "$gateticks" ] && { echo "chaos sidecar did not reach baseline within ${chaosgate}s" >&2; docker logs "$chc" 2>&1 || true; docker rm -f "$chc" >/dev/null 2>&1 || true; return 1; }
       sleep 0.1
     done
   fi
@@ -187,20 +213,40 @@ run_cell() {
   # Wait for the chaos sidecar to finish and collect its verdict. It closes
   # everything and waits a drain pause (up to 40 s on h3) before its final
   # /stats fd sample, so the server must stay up until it exits -- hence the
-  # server teardown below moves AFTER this wait. Cap at ~90 s (900 * 0.1 s),
-  # covering the drain plus slack; on cap, treat it as a watchdog fail (3).
+  # server teardown below moves AFTER this wait. Cap at $chaosdrain seconds; on
+  # cap, treat it as a watchdog fail (3).
+  #
+  # Whichever path we take, the sidecar's logs are dumped BEFORE the container is
+  # removed: on the watchdog path the sidecar is still mid-soak, and removing it
+  # first made `docker logs` print "No such container" and threw away the tally
+  # that is the only record of what the sidecar did.
   xrc=0
   if [ "$chaos" != "none" ]; then
-    i=0
-    until [ "$(docker inspect -f '{{.State.Status}}' "$chc" 2>/dev/null)" != running ]; do
-      i=$((i + 1))
-      if [ "$i" -gt 900 ]; then docker rm -f "$chc" >/dev/null 2>&1 || true; xrc=3; break; fi
-      sleep 0.1
-    done
-    if [ "$xrc" = 0 ]; then xrc=$(docker inspect -f '{{.State.ExitCode}}' "$chc"); fi
-    echo "--- chaos sidecar ---"
-    docker logs "$chc" 2>&1 || true
-    docker rm -f "$chc" >/dev/null 2>&1 || true
+    if [ "$crc" != 0 ]; then
+      # Canary already failed, and the canary wins: the sidecar's fd verdict is
+      # not folded in (see below), so there is nothing to wait for. Keep its logs
+      # as evidence, then stop it instead of burning the full drain wait.
+      echo "--- chaos sidecar (canary failed; stopped mid-run) ---"
+      docker logs "$chc" 2>&1 || true
+      docker rm -f "$chc" >/dev/null 2>&1 || true
+    else
+      # Canary passed, so the sidecar's verdict counts: wait for its drain and
+      # final fd sample, which is the whole fd-leak assertion.
+      i=0
+      drainticks=$((chaosdrain * 10))
+      until [ "$(docker inspect -f '{{.State.Status}}' "$chc" 2>/dev/null)" != running ]; do
+        i=$((i + 1))
+        if [ "$i" -gt "$drainticks" ]; then
+          echo "chaos sidecar still running after ${chaosdrain}s; giving up on its verdict" >&2
+          xrc=3; break
+        fi
+        sleep 0.1
+      done
+      if [ "$xrc" = 0 ]; then xrc=$(docker inspect -f '{{.State.ExitCode}}' "$chc"); fi
+      echo "--- chaos sidecar ---"
+      docker logs "$chc" 2>&1 || true
+      docker rm -f "$chc" >/dev/null 2>&1 || true
+    fi
   fi
 
   # Server teardown. Moved to AFTER the sidecar wait so the sidecar's final
