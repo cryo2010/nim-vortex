@@ -52,6 +52,29 @@ when not defined(plainHttp):
       check classifyH3Headers(
         [(":method", "CONNECT"), (":authority", "example.com")]) == h3hInvalid
 
+    test "CONNECT carrying :scheme/:path is invalid (RFC 9113 8.5, #240.5)":
+      # The shape 8.5 forbids. It used to satisfy the generic :scheme/:path
+      # checks and dispatch as an ordinary request.
+      check classifyH3Headers(
+        [(":method", "CONNECT"), (":scheme", "https"), (":path", "/"),
+         (":authority", "example.com")]) == h3hInvalid
+
+    test "an unknown method is invalid, never a silent GET (#240.4)":
+      check classifyH3Headers(
+        [(":method", "PURGE"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x")]) == h3hInvalid
+      check classifyH3Headers(
+        [(":method", "GET X"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x")]) == h3hInvalid
+
+    test "a field value starting or ending with SP/HTAB is invalid (#240.7)":
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x"), ("x-ws", " v")]) == h3hInvalid
+      check classifyH3Headers(
+        [(":method", "GET"), (":scheme", "https"), (":path", "/"),
+         (":authority", "x"), ("x-ws", "v\t")]) == h3hInvalid
+
     test "a pseudo-header after a regular header is invalid":
       check classifyH3Headers(
         [(":method", "GET"), ("x-foo", "bar"), (":path", "/")]) == h3hInvalid
