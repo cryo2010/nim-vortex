@@ -294,6 +294,38 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     let arr = cast[ptr UncheckedArray[char]](data)
     wsFeed(h3c.core, nil, WsConn(st.ws), arr.toOpenArray(0, int(len) - 1))
     return
+  if st.isWsConnect:
+    # Same tunnel, before acceptance: the stream dispatched on headers, so DATA
+    # coalesced with the Extended CONNECT handshake arrives while there is no
+    # WsConn to feed. These are WebSocket bytes, not a request body, so bound
+    # them by the ceiling wsFeed applies post-accept and leave them out of the
+    # per-connection buffered-body aggregate: otherwise a client flooding
+    # unaccepted CONNECT streams could park maxBodySize of framing each and pin
+    # that aggregate, which is meant for request bodies (#263). h3WsAccept hands
+    # the bytes to the WsConn (#259).
+    let wsCap = h3c.core.config.maxWsMessage + 1024
+    if st.body.len + int(len) > wsCap:
+      # Over the WebSocket bound before acceptance: there is no WsConn yet to
+      # carry the 1009 close wsFeed would send, so reject the handshake by
+      # resetting the stream (the h3 twin of the h2 REFUSED_STREAM on this same
+      # bound) rather than claiming a malformed request with H3_MESSAGE_ERROR.
+      # Return the connection-window credit for the discarded bytes first, as
+      # the oversize-body path below does, or the shared window leaks.
+      if len > 0 and h3c.vq != nil: vqConnConsume(h3c.vq, len)
+      if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x010b)  # H3_REQUEST_REJECTED
+      h3c.streams.del(usid)
+      return
+    if len > 0:
+      let old = st.body.len
+      st.body.setLen(old + int(len))
+      copyMem(addr st.body[old], data, int(len))
+      if h3c.vq != nil:
+        # Credit as tunnel bytes, exactly as the accepted path above does: the
+        # bound here (not the receive window) is what caps the memory held, and
+        # the handover into inBuf does not credit again, so nothing is counted
+        # twice across acceptance.
+        vqStreamConsume(h3c.vq, sid, len)
+    return
   if not st.rs.reqStreaming and gMaxBody > 0'u64 and
       uint64(st.body.len) + uint64(len) > gMaxBody:
     # Buffered request body over maxBodySize: reject with a stream reset rather
