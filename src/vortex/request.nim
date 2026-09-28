@@ -2066,6 +2066,12 @@ proc send*(s: SseStream, data: string, event = "", id = "",
   ## dispatch step then discards the event without firing any listener. Two
   ## fields leave `"\n"`, so `s.send("", event = "ping")` reaches the client's
   ## `ping` listener with `event.data == "\n"`.
+  ##
+  ## Line breaks in `data` belong to the wire format, not to the payload: a
+  ## CRLF, an LF or a bare CR ends a `data:` field, and the client rebuilds
+  ## every one of them as a single LF. The format has no escape for a literal
+  ## CR, so `send("a\r\nb")` is delivered as `"a\nb"`. Encode the payload
+  ## (base64, or JSON, which escapes a CR) when it has to survive byte for byte.
   var f = ""
   if id.len > 0:    f.add "id: " & sseSanitize(id) & "\n"
   if event.len > 0: f.add "event: " & sseSanitize(event) & "\n"
@@ -2076,8 +2082,20 @@ proc send*(s: SseStream, data: string, event = "", id = "",
     # ("ping", "reload", a typed poke) silently do nothing.
     f.add "data:\ndata:\n"
   else:
-    for line in data.splitLines:
-      f.add "data: " & line & "\n"
+    # Split on the three terminators the SSE grammar defines (CRLF, LF, CR)
+    # explicitly rather than inheriting splitLines' idea of a line break: the
+    # set is part of the wire format here, so it is spelled out. A CR is a
+    # terminator, never payload, which is the limitation the docstring names.
+    var i = 0
+    while true:
+      var j = i
+      while j < data.len and data[j] != '\n' and data[j] != '\r': inc j
+      f.add "data: "
+      f.add data[i ..< j]
+      f.add '\n'
+      if j >= data.len: break
+      i = if data[j] == '\r' and j + 1 < data.len and data[j + 1] == '\n': j + 2
+          else: j + 1
   f.add "\n"                               # blank line terminates the event
   s.res.write(f)
 

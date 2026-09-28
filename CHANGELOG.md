@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailing LF before dispatch, so one field left the buffer empty and the
   WHATWG EventSource dispatch step discarded the event, firing no listener.
   `s.send("", event = "ping")` now dispatches with `event.data == "\n"`. (#266)
+- SSE: `send` splits `data` on the three terminators the wire format defines
+  (CRLF, LF, CR) explicitly instead of leaning on `splitLines`. Behaviour is
+  unchanged, and the lossiness it implies is now documented: the format has no
+  escape for a literal CR, so a CR in `data` is a field boundary that the
+  client rebuilds as an LF (`send("a\r\nb")` arrives as `"a\nb"`). Encode the
+  payload (base64, or JSON) when it must survive byte for byte. (#267)
 - HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
   then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
   INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1

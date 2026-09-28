@@ -929,6 +929,12 @@ trailing LF before dispatch, so a single empty field would leave the data buffer
 empty and EventSource discards such an event without firing a listener. The
 listener sees `event.data == "\n"`.
 
+Line breaks in `data` belong to the wire format: a CRLF, an LF or a bare CR ends
+a `data:` field and the client rebuilds each one as a single LF. There is no
+escape for a literal CR, so `s.send("a\r\nb")` is delivered as `"a\nb"`. Encode
+the payload (base64, or JSON, which escapes a CR) when it has to survive byte
+for byte.
+
 `res.withSse(s): body` is a block form that closes (or aborts on exception) for
 you:
 

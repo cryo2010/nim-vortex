@@ -25,6 +25,14 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     discard s.send("a\nb")                # multi-line data
     discard s.comment("ping")
     s.close()
+  of "/breaks":
+    # #267: every line terminator the wire format knows, including a bare CR.
+    let s = res.sse()
+    discard s.send("a\r\nb")
+    discard s.send("c\rd")
+    discard s.send("e\nf")
+    discard s.send("g\n")
+    s.close()
   of "/empty":
     # #266: a payload-free typed event must still dispatch on the client.
     let s = res.sse()
@@ -98,6 +106,17 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
       check dechunk(body) ==
         "event: ping\ndata:\ndata:\n\n" &      # typed, empty payload
         "data:\ndata:\n\n"                     # untyped, empty payload
+
+    test "CRLF, CR and LF in data all split into data: fields":
+      # The wire format has no escape for a literal CR, so a CR is a field
+      # boundary and the client rebuilds it as an LF: documented, lossy for a
+      # byte-exact payload, which is what base64/JSON encoding is for (#267).
+      let (_, body) = splitHeadBody(rawGet("/breaks"))
+      check dechunk(body) ==
+        "data: a\ndata: b\n\n" &     # "a\r\nb": one CRLF break, not two
+        "data: c\ndata: d\n\n" &     # "c\rd":   a bare CR breaks the line
+        "data: e\ndata: f\n\n" &     # "e\nf":   plain LF
+        "data: g\ndata: \n\n"        # "g\n":    trailing break -> empty tail
 
   suite "router-free inbound streaming (streamPaths + req.stream)":
     test "the upload body is streamed to the handler and counted":
