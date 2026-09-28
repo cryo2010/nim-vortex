@@ -8,7 +8,7 @@
 ## flood plus the server's replies fit in the socket buffers; the client
 ## sends everything, then reads, avoiding a send/recv deadlock.
 
-import std/[unittest, net, httpcore, atomics, strutils, os]
+import std/[unittest, net, posix, httpcore, atomics, strutils, os]
 import vortex/[settings, request, server]
 import vortex/http2/frames
 import ./helper
@@ -32,6 +32,18 @@ var limitSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 
 # A tiny connection cap to exercise accept-and-drop.
 const connCap = 8
 var capSrv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, maxConnections = connCap)).start(0)
+
+# A slow-reader server: a response far larger than any socket buffer plus a
+# tight writeTimeout, so a client that stops draining is reaped quickly while
+# one that keeps taking bytes is not.
+const slowBodyLen = 4 * 1024 * 1024   ## never fits in the socket buffers
+
+proc bigHandler(req: Request, res: Response) {.gcsafe.} =
+  # Built per request: a shared global body would be refcounted across the
+  # loop thread and the test thread.
+  res.send(Http200, "b".repeat(slowBodyLen))
+
+var slowSrv = newVortex(RequestHandler(bigHandler), initVortexConfig(numThreads = 1, writeTimeout = 2)).start(0)
 
 # Tight h1 limits + small initial buffer, but a high stream cap: a large
 # h2 request burst must be processed via receive-buffer compaction rather
@@ -176,8 +188,52 @@ suite "connection cap":
     check "200" in s.recvUntilClose(1000)
     for i in 1 ..< held.len: held[i].close()
 
+suite "slow-reader defenses (writeTimeout)":
+  proc askFor(path: string, rcvbuf: cint): Socket =
+    ## Connect with a receive buffer of `rcvbuf` bytes and request `path`. The
+    ## reply is far bigger than any buffer on the path, so the server is left
+    ## with output pending and an unwritable socket until the caller drains it.
+    result = newSocket(buffered = false)
+    var rb = rcvbuf
+    discard setsockopt(result.getFd, SOL_SOCKET, SO_RCVBUF, addr rb,
+                       SockLen(sizeof(rb)))
+    result.connect("127.0.0.1", slowSrv.port)
+    result.send("GET " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+  test "writeTimeout is armed by default":
+    # Shipped non-zero (like bodyTimeout) so a stalled write is reaped out of
+    # the box; the machinery is inert at 0.
+    check initVortexConfig().writeTimeout == 30
+
+  test "a client that stops draining a large response is reaped":
+    let s = askFor("/big", 4096)
+    defer: s.close()
+    sleep(4000)                       # never read: the 2 s writeTimeout fires
+    let resp = s.recvUntilClose(1000)
+    check resp.len < slowBodyLen      # truncated, not the whole 4 MiB response
+
+  test "a slow but steady reader is never cut off":
+    # The deadline is idle, not total: every partial write re-arms it. This
+    # reader takes a quarter megabyte every 250 ms, so the server holds pending
+    # output for several seconds (many times writeTimeout) and must not be
+    # reaped: the same shape as a streamed response or an SSE feed. (The pause
+    # stays well inside writeTimeout, which is coarse: a deadline armed just
+    # before a tick can fire up to a second early.)
+    let s = askFor("/big", 512 * 1024)
+    defer: s.close()
+    var got = 0
+    var buf = newString(256 * 1024)
+    s.setRecvTimeout(2000)
+    while got < slowBodyLen:
+      sleep(250)                      # a quarter second of no progress, repeatedly
+      let n = recv(s.getFd, addr buf[0], buf.len, cint(0))
+      if n <= 0: break                # reaped (or timed out): the body is short
+      got += n
+    check got >= slowBodyLen          # the whole body, headers on top
+
 floodSrv.close()
 limitSrv.close()
 capSrv.close()
+slowSrv.close()
 tightSrv.close()
 echo "server shut down cleanly"

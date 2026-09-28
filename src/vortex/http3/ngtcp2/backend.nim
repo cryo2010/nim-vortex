@@ -300,6 +300,38 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     let arr = cast[ptr UncheckedArray[char]](data)
     wsFeed(h3c.core, nil, WsConn(st.ws), arr.toOpenArray(0, int(len) - 1))
     return
+  if st.isWsConnect:
+    # Same tunnel, before acceptance: the stream dispatched on headers, so DATA
+    # coalesced with the Extended CONNECT handshake arrives while there is no
+    # WsConn to feed. These are WebSocket bytes, not a request body, so bound
+    # them by the ceiling wsFeed applies post-accept and leave them out of the
+    # per-connection buffered-body aggregate: otherwise a client flooding
+    # unaccepted CONNECT streams could park maxBodySize of framing each and pin
+    # that aggregate, which is meant for request bodies (#263). h3WsAccept hands
+    # the bytes to the WsConn (#259).
+    let wsCap = h3c.core.config.maxWsMessage + 1024
+    if st.body.len + int(len) > wsCap:
+      # Over the WebSocket bound before acceptance: there is no WsConn yet to
+      # carry the 1009 close wsFeed would send, so reject the handshake by
+      # resetting the stream (the h3 twin of the h2 REFUSED_STREAM on this same
+      # bound) rather than claiming a malformed request with H3_MESSAGE_ERROR.
+      # Return the connection-window credit for the discarded bytes first, as
+      # the oversize-body path below does, or the shared window leaks.
+      if len > 0 and h3c.vq != nil: vqConnConsume(h3c.vq, len)
+      if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x010b)  # H3_REQUEST_REJECTED
+      h3c.streams.del(usid)
+      return
+    if len > 0:
+      let old = st.body.len
+      st.body.setLen(old + int(len))
+      copyMem(addr st.body[old], data, int(len))
+      if h3c.vq != nil:
+        # Credit as tunnel bytes, exactly as the accepted path above does: the
+        # bound here (not the receive window) is what caps the memory held, and
+        # the handover into inBuf does not credit again, so nothing is counted
+        # twice across acceptance.
+        vqStreamConsume(h3c.vq, sid, len)
+    return
   if not st.rs.reqStreaming and gMaxBody > 0'u64 and
       uint64(st.body.len) + uint64(len) > gMaxBody:
     # Buffered request body over maxBodySize: reject with a stream reset rather
@@ -775,6 +807,21 @@ proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
   w.flush = wsFlushH3ng
   w.h3conn = conn
   st.ws = w
+  # Hand over any frames the client pipelined with the Extended CONNECT
+  # handshake. An Extended-CONNECT stream dispatches on headers, so DATA that
+  # arrived in the same packet burst landed in st.body while st.ws was nil; move
+  # it into the WsConn instead of dropping it (#259). They are pumped once the
+  # handler installs onMessage (see the post-accept pump in eventloop's h3Drive),
+  # not here, so no message is dispatched into a nil callback. Mirrors h2WsAccept.
+  if st.body.len > 0:
+    w.inBuf.add st.body
+    st.body.setLen(0)
+  # The client may also have half-closed (FIN) the stream before the handler
+  # accepted it: cbStreamEnd could not deliver the peer-close then (there was no
+  # WsConn yet), so carry the FIN over for the post-accept pump to replay,
+  # otherwise the application's onClose never fires and the handle lingers until
+  # the idle sweep reaps it (#261). Twin of h2WsAccept's endStreamSeen.
+  w.preAcceptFin = st.finSeen
   var hdrs: seq[(string, string)] = @[(":status", "200")]
   if core.serverHeader.len > 0: hdrs.add ("server", core.serverHeader)
   hdrs.add ("date", core.dateStr)

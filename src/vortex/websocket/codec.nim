@@ -87,6 +87,10 @@ type
     pingAt*: int64           ## nowSec the outstanding ping was sent
     when defined(wsDeflate):
       pmd: bool              ## permessage-deflate negotiated on this connection
+      pmdClosed: bool        ## the zlib contexts have been freed. Teardown can
+                             ## run twice on one WsConn (an h2/h3 stream reset
+                             ## then the connection dying), and `pmd` stays
+                             ## true, so this is what makes the free idempotent
       msgCompressed: bool    ## the in-progress message's first frame had RSV1
       deflate: Deflator      ## compresses outbound messages
       inflate: Inflator      ## decompresses inbound messages
@@ -605,15 +609,26 @@ proc wsResume*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   wsReleaseStreamPin(core, w)
   wsFeed(core, c, w, [])
 
+when defined(wsDeflate):
+  proc wsClosePmd(w: WsConn) =
+    ## Free the permessage-deflate zlib contexts, exactly once. The guard is
+    ## `pmdClosed`, not `pmd`: `pmd` records that the extension was negotiated
+    ## and stays true afterwards, so gating on it alone handed the same
+    ## z_stream to zlib twice whenever teardown ran twice. Every teardown path
+    ## reaches the contexts through here (via wsStreamClosed).
+    if not w.pmd or w.pmdClosed: return
+    w.pmdClosed = true
+    w.deflate.close()
+    w.inflate.close()
+
 proc wsStreamClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   ## Tear down one WebSocket's WsConn: deliver an abnormal onClose (1006) if
   ## the peer never closed cleanly, and free zlib state. Used for an h2
-  ## stream reset and for every WS stream when the connection dies.
+  ## stream reset and for every WS stream when the connection dies. Idempotent
+  ## in both halves, so a second call on the same WsConn is a no-op.
   notifyClose(core, c, w, 1006, "")
   when defined(wsDeflate):
-    if w.pmd:
-      w.deflate.close()
-      w.inflate.close()
+    wsClosePmd(w)
 
 proc wsPeerClosed*(core: ptr LoopCore, c: ptr Connection, w: WsConn) =
   ## The transport reports the peer closed without a WebSocket close frame
@@ -857,6 +872,11 @@ proc isAlive*(ws: WebSocket): bool =
     result = true
 
 proc subprotocol*(ws: WebSocket): string =
-  ## The negotiated subprotocol, or "" if none was agreed.
-  let (_, w) = wsConnOf(ws)
-  if w != nil: w.subprotocol else: ""
+  ## The negotiated subprotocol, or "" if none was agreed. Loop-thread only
+  ## (see onMessage=): off-loop it reports "" rather than resolving the WsConn
+  ## ref across threads. Read it from a handler callback (the accept handler,
+  ## onMessage) and pass the value along if a worker needs it; the handle
+  ## itself cannot carry the string, since copying one is what the guard
+  ## exists to prevent.
+  withWsConn(ws, _, w):
+    result = w.subprotocol

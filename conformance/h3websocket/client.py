@@ -74,7 +74,16 @@ class WsClient(QuicConnectionProtocol):
                 self._data += e.data
                 self._got_data.set()
 
-    async def open_ws(self, authority, path="/", subprotocols=None):
+    async def open_ws(self, authority, path="/", subprotocols=None,
+                      pipelined=b"", fin=False):
+        """Open an Extended CONNECT WebSocket; return the handshake status.
+
+        `pipelined` bytes are sent as DATA before the first transmit, so the
+        handshake and those WebSocket frames leave in the same packet burst
+        (the server sees them before the handler accepts the stream). `fin`
+        half-closes the stream in that same burst (a QUIC-level FIN, no DATA
+        frame), i.e. before the handler can accept.
+        """
         if self._http is None:
             self._http = H3Connection(self._quic)
         self._sid = self._quic.get_next_available_stream_id()
@@ -90,6 +99,10 @@ class WsClient(QuicConnectionProtocol):
             headers.append(
                 (b"sec-websocket-protocol", ", ".join(subprotocols).encode()))
         self._http.send_headers(self._sid, headers, end_stream=False)
+        if pipelined:
+            self._http.send_data(self._sid, pipelined, end_stream=False)
+        if fin:
+            self._quic.send_stream_data(self._sid, b"", end_stream=True)
         self.transmit()
         await asyncio.wait_for(self._got_headers.wait(), timeout=5)
         return self._status
@@ -116,11 +129,69 @@ class WsClient(QuicConnectionProtocol):
             await asyncio.wait_for(self._got_data.wait(), timeout=remaining)
 
 
-async def run(host, port):
+def client_ctx(host, port):
+    """A fresh QUIC connection (async context manager) to the server."""
     config = QuicConfiguration(alpn_protocols=["h3"], is_client=True)
     config.verify_mode = ssl.CERT_NONE
-    async with connect(host, port, configuration=config,
-                       create_protocol=WsClient) as client:
+    return connect(host, port, configuration=config, create_protocol=WsClient)
+
+
+async def run_coalesced(host, port):
+    """Frames sent in the same burst as the handshake must not be dropped.
+
+    An Extended CONNECT stream dispatches on headers, so DATA that rides along
+    with the handshake reaches the server before the handler accepts the
+    WebSocket. Those bytes must be handed to the WsConn and pumped once
+    onMessage is installed instead of being discarded as a request body.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws(
+            "server", "/", pipelined=ws_frame(OP_TEXT, b"coalesced"))
+        assert status == "200", f"handshake status {status!r}"
+        fr = (await client.recv_ws())[0]
+        assert fr == (OP_TEXT, b"coalesced"), f"coalesced echo: {fr}"
+        print("coalesced handshake + frame OK")
+
+
+async def run_early_fin(host, port):
+    """A half-close before the handler accepts must still close the WebSocket.
+
+    The FIN reaches the server while the stream has no WsConn yet, so it has to
+    be replayed after acceptance: the server answers with a close frame (the
+    same path that delivers the application's onClose) instead of leaving the
+    handle for the idle sweep.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws("server", "/", fin=True)
+        assert status == "200", f"handshake status {status!r}"
+        fr = (await client.recv_ws())[0]
+        assert fr[0] == OP_CLOSE, f"close after pre-accept FIN: {fr}"
+        print("half-close before accept OK")
+
+
+async def run_async_send(host, port):
+    """A reply sent from a loop-thread continuation must go out promptly.
+
+    The server answers "later" from a 200 ms timer, i.e. outside the inbound
+    packet's processing, where the QUIC send buffer has nothing else pushing
+    it onto the wire. The deadline is well under the loop's idle wait, so a
+    frame that waits for an unrelated wakeup fails the case.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws("server", "/")
+        assert status == "200", f"handshake status {status!r}"
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        client.send_ws(OP_TEXT, b"later")
+        fr = (await client.recv_ws())[0]
+        elapsed = loop.time() - started
+        assert fr == (OP_TEXT, b"later"), f"deferred reply: {fr}"
+        assert elapsed < 0.7, f"deferred reply stalled {elapsed:.2f}s on the wire"
+        print(f"deferred (async) send OK in {elapsed:.2f}s")
+
+
+async def run(host, port):
+    async with client_ctx(host, port) as client:
         status = await client.open_ws("server", "/", ["chat", "json"])
         assert status == "200", f"handshake status {status!r}"
         print("handshake 200 OK")
@@ -154,6 +225,9 @@ async def run(host, port):
         assert fr[0] == OP_CLOSE, f"close echo: {fr}"
         print("close handshake OK")
 
+    await run_coalesced(host, port)
+    await run_early_fin(host, port)
+    await run_async_send(host, port)
     print("RESULT: all HTTP/3 WebSocket cases passed.")
 
 

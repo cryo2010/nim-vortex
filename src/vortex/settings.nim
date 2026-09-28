@@ -73,7 +73,8 @@ type
 
     # Limits (bytes unless noted)
     maxHeaderSize*: int       ## request line + headers, 431 when exceeded
-    maxHeaderCount*: int      ## 431 when exceeded
+    maxHeaderCount*: int      ## 431 when exceeded (HTTP/1; HTTP/2 and
+                              ## HTTP/3 bound the header list by size)
     maxBodySize*: int         ## 413 when exceeded
     initialBufferSize*: int   ## per-connection read/write buffer starting size
     maxWsMessageSize*: int    ## largest inbound WebSocket message (close 1009 over it)
@@ -117,8 +118,11 @@ type
     responseTimeout*: int     ## end of request to first response byte (0 disables)
     writeTimeout*: int        ## max time the socket may stay unwritable (no send
                               ## progress) while output is pending; bounds a slow-
-                              ## reading client that never drains the response
-                              ## (idle, re-armed on progress). 0 disables.
+                              ## reading client that never drains the response.
+                              ## Idle, not total: every partial write re-arms it,
+                              ## so a response that keeps moving (a stream, an
+                              ## SSE feed) is never cut off. Defaults to 30 s,
+                              ## like bodyTimeout; 0 disables.
     securityHeaders*: bool    ## auto-add the OWASP baseline headers to responses
     wsPingInterval*: int      ## WebSocket idle before a keepalive ping (0 disables)
     wsPongTimeout*: int       ## close a WebSocket if no frame arrives this long after a ping
@@ -182,7 +186,7 @@ proc initVortexConfig*(
     bodyTimeout = 30,
     keepAliveTimeout = 60,
     responseTimeout = 0,
-    writeTimeout = 0,
+    writeTimeout = 30,
     securityHeaders = false,
     wsPingInterval = 30,
     wsPongTimeout = 10,

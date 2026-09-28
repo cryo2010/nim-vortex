@@ -71,7 +71,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_http1_parser.nim` | HTTP/1.1 request-line and header parsing |
 | `test_http1_codec.nim` | HTTP/1.1 response framing |
 | `test_hpack.nim` | HPACK decoding against RFC 7541 Appendix C vectors |
-| `test_http3_connect.nim` | HTTP/3 Extended CONNECT header classifier (RFC 9220), without a live QUIC stream |
+| `test_http3_connect.nim` | HTTP/3 Extended CONNECT header classifier (RFC 9220), without a live QUIC stream; also the h3 side of the shared `:method` / CONNECT / field-value rules (#240) |
 
 ### HTTP/1.1
 
@@ -87,11 +87,12 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 |------|----------|
 | `test_http2.nim` | HTTP/2 integration (h2c prior knowledge, via curl) |
 | `test_http2_flowcontrol.nim` | Flow-control regression for h2spec 6.9.2 (SETTINGS_INITIAL_WINDOW_SIZE change) |
-| `test_http2_malformed.nim` | Malformed HEADERS answered with RST_STREAM(PROTOCOL_ERROR): bad/duplicate Content-Length (RFC 9113 8.1.1), NUL/CR/LF in field names/values (8.2.1) |
+| `test_http2_malformed.nim` | Malformed HEADERS answered with RST_STREAM(PROTOCOL_ERROR): bad/duplicate Content-Length (RFC 9113 8.1.1), NUL/CR/LF in field names/values (8.2.1). Plus the #240 conformance follow-ups that are visible on the wire: any frame on a permanently idle even stream id (5.1), the 1*DIGIT Content-Length grammar and the field-value whitespace rule (8.2.1), unknown and non-token `:method` values, the CONNECT pseudo-header rules (8.5), connection-specific response fields (8.2.2), the HPACK dynamic-table-size update (RFC 7541 4.2), and the GOAWAY length check (4.2/6.8) |
+| `test_http2_stream_errors.nim` | Stream-level conditions stay stream-level instead of GOAWAY-ing the connection (#239): trailers without END_STREAM (RFC 9113 8.1), HEADERS on a half-closed(remote) stream (5.1), and DATA/trailers racing the server's own early final response (5.1 closed-stream tolerance) |
 | `test_http2_download.nim` | Streaming-download regressions: the per-stream `pendingBody` buffer stays bounded while the backlog never reaches zero (#331); benign connection-level WINDOW_UPDATEs during a long download do not trip the control-frame budget (#335); a single write larger than the peer window arrives byte-exact across the direct-emit / parked-remainder seam, and a wide window still frames one full-sized DATA per producer chunk (#334); a sendFile download against a small peer window keeps the per-stream backlog within the read-ahead budget plus two chunks and still completes byte-exact (#340) |
 | `test_http2_priority.nim` | RFC 9218 prioritization: urgency ordering, incremental interleaving, PRIORITY_UPDATE, `res.setPriority` override |
 | `test_connect_disconnect.nim` | Half-open stream closed by the read-idle deadline (slowloris, #201); two-step GOAWAY on graceful shutdown (RFC 9113 6.8, #208) |
-| `test_http2_websocket.nim` | HTTP/2 Extended CONNECT WebSockets (RFC 8441), frame level |
+| `test_http2_websocket.nim` | HTTP/2 Extended CONNECT WebSockets (RFC 8441), frame level; a close queued behind an exhausted send window drains on the next WINDOW_UPDATE instead of RST_STREAM(CANCEL) (#240.9) |
 
 ### HTTP/3
 

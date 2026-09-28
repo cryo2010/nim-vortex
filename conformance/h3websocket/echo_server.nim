@@ -2,16 +2,26 @@
 ## conformance client. It advertises SETTINGS_ENABLE_CONNECT_PROTOCOL, accepts
 ## an Extended CONNECT WebSocket on a QUIC stream, and echoes each message
 ## back with the same kind. A "proto?" text message reports the negotiated
-## subprotocol so the client can verify negotiation.
+## subprotocol so the client can verify negotiation, and a "later" message
+## replies from an async continuation (a loop-thread send outside the inbound
+## path, which has to drive QUIC egress by itself).
 
 import std/os
 import vortex
+import vortex/asyncdispatch
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   if req.isWebSocketUpgrade:
     let ws = req.acceptWebSocket(["chat", "superchat"])
     ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
       if data == "proto?": ws.send(ws.subprotocol)
+      elif data == "later":
+        # The reply leaves from a timer continuation on the loop thread, long
+        # after the packet that carried "later" was processed: nothing else is
+        # driving this connection, so the send itself must (#262).
+        ws.doAsync:
+          await sleepAsync(200)
+          ws.send("later")
       else: ws.send(data, kind)               # echo, preserving the kind
   else:
     res.send(Http200, "vortex h3 websocket echo")

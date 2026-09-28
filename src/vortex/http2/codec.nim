@@ -301,13 +301,15 @@ proc h2GoawayNotice*(c: ptr Connection) =
   h2.drainNoticeSent = true
   c.wbuf.addGoaway(goawayMaxStreamId, 0'u32)
 
-proc h2Goaway*(c: ptr Connection) =
+proc h2Goaway*(c: ptr Connection, err = errNoError) =
   ## Step 2 (or the immediate cutoff): refuse new streams (RFC 9113 6.8) and send
-  ## GOAWAY(NO_ERROR) up to the last accepted stream. Existing streams finish.
+  ## GOAWAY up to the last accepted stream. Existing streams finish. `err` is
+  ## NO_ERROR for a graceful drain or an expired timeout, and ENHANCE_YOUR_CALM
+  ## when the peer's own volume forced the close (see closeWithGoaway).
   let h2 = h2Conn(c)
   if h2 == nil or h2.goingAway: return
   h2.goingAway = true
-  c.wbuf.addGoaway(h2.lastStreamId, 0'u32)
+  c.wbuf.addGoaway(h2.lastStreamId, err)
 
 proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe, raises: [].}
 

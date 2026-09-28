@@ -187,6 +187,55 @@ withServer(RequestHandler(handler),
       check ended
       c.close()
 
+    test "a close behind an exhausted send window drains, not RST (#240.9)":
+      streamAcc.clear()
+      var c = newH2TestConn(port)
+      # A tiny per-stream send window: the echo cannot leave, so the close the
+      # server queues behind it has to wait for a WINDOW_UPDATE. That is a
+      # merely-slow peer, not a stuck one, and cancelling here dropped both the
+      # queued frames and the close frame.
+      c.sendRaw(block: (var w = "";
+        w.addSettingFrame(setInitialWindowSize, 16); w))
+      check c.openWs(1) == "200"
+      let big = newString(400)                  # NULs: payload bytes, any value
+      var f = ""
+      f.addData(1, wsClient(opText, big))       # echo is 400+ bytes, window is 16
+      f.addData(1, wsClient(opClose, "\x03\xe8"))
+      c.sendRaw(f)
+      var acc = ""
+      let stalled = c.readFrames(400)           # window shut: nothing may cancel
+      acc.add dataOn(stalled, 1)
+      check stalled.rstError(1) == -1
+      check not endStreamOn(stalled, 1)
+      # A partial credit resumes the drain and exhausts the window again with
+      # the close still queued behind the backlog: that is the emit that used
+      # to answer RST_STREAM(CANCEL) instead of waiting for more credit.
+      c.sendRaw(block: (var w = ""; w.addWindowUpdate(1, 32); w))
+      let partial = c.readFrames(400)
+      acc.add dataOn(partial, 1)
+      check partial.rstError(1) == -1
+      check not endStreamOn(partial, 1)
+      c.sendRaw(block: (var w = ""; w.addWindowUpdate(1, 1 shl 20); w))
+      var ended = false
+      var sawClose = false
+      for _ in 0 ..< 20:
+        let frames = c.readFrames(1000, until = proc(fr: seq[Frame]): bool =
+          for x in fr:
+            if x.typ == uint8(ftData) and x.streamId == 1: return true
+          false)
+        check frames.rstError(1) == -1
+        acc.add dataOn(frames, 1)
+        if endStreamOn(frames, 1): ended = true
+        for m in parseWs(acc)[0]:
+          if m.op == opClose: sawClose = true
+        if (sawClose and ended) or frames.len == 0: break
+      let msgs = parseWs(acc)[0]
+      check msgs.len >= 2
+      check msgs[0] == (opText, true, big)      # the queued echo survived
+      check sawClose                            # and so did the close frame
+      check ended
+      c.close()
+
     test "two streams multiplex independent WebSockets":
       var c = newH2TestConn(port)
       check c.openWs(1) == "200"

@@ -3,9 +3,11 @@
 ## instead of it being buffered into `req.body`. Buffered routes on the same
 ## server must keep working unchanged.
 
-import std/[unittest, net, posix, strutils, httpcore, os, osproc]
+import std/[unittest, net, posix, strutils, httpcore, os, osproc, atomics]
 import vortex/[settings, request, server, routing]
 import ./helper
+
+var stallFed: Atomic[int]        # body bytes fed to the never-acking sink below
 
 proc hUpload(req: Request, res: Response) {.gcsafe.} =
   ## Streaming: accumulate via onBody, reply with the byte count on the last
@@ -27,6 +29,18 @@ proc hEchoStream(req: Request, res: Response) {.gcsafe.} =
     if last:
       res.send(Http200, acc[], @[("Content-Type", "application/octet-stream")])
 
+proc hStall(req: Request, res: Response) {.gcsafe.} =
+  ## Streaming route whose manualAck sink never acks: once the read-ahead debt
+  ## reaches the high-water the loop pauses this connection's socket read. The
+  ## response then comes back from a worker, so it is applied from the outbox and
+  ## resets the request with the read still paused, which used to clear the pause
+  ## without releasing its slot in the loop's paused-conns count (#344).
+  req.onBody(proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+    discard stallFed.fetchAdd(chunk.len), manualAck = true)
+  req.blocking:
+    sleep(600)                   # long enough for the read to reach the pause
+    res.send(Http200, "stalled")
+
 proc hBuffered(req: Request, res: Response) {.gcsafe.} =
   res.send(Http200, "buffered:" & $req.body.len)
 
@@ -39,10 +53,12 @@ var rt = newRouter()
 rt.post("/upload", hUpload, streaming = true)
 rt.post("/echo", hEchoStream, streaming = true)
 rt.post("/reject", hReject, streaming = true)
+rt.post("/stall", hStall, streaming = true)
 rt.post("/buffered", hBuffered)
 
 withServer(rt.toHandler,
-           initVortexConfig(numThreads = 1, maxBodySize = 8 * 1024 * 1024),
+           initVortexConfig(numThreads = 1, workerThreads = 2,
+                            maxBodySize = 8 * 1024 * 1024),
            rt.streamPredicate, srv):
   let port = srv.port
 
@@ -86,6 +102,23 @@ withServer(rt.toHandler,
       let k = recv(s.getFd, addr buf[0], buf.len, cint(0))
       if k <= 0: break
       result.add buf[0 ..< k]
+
+  proc pushBody(s: Socket, total: int) =
+    ## Push up to `total` body bytes, best effort. The server stops reading once
+    ## it pauses at the read-ahead high-water, so a blocking send of the whole
+    ## body would stall; a bounded send timeout keeps this to a short write, which
+    ## is all the pause needs.
+    var tv: Timeval
+    tv.tv_sec = posix.Time(0)
+    tv.tv_usec = Suseconds(500 * 1000)
+    discard setsockopt(s.getFd, SOL_SOCKET, SO_SNDTIMEO,
+                       addr tv, SockLen(sizeof(tv)))
+    let chunk = "s".repeat(64 * 1024)
+    var sent = 0
+    while sent < total:
+      let n = posix.send(s.getFd, addr chunk[0], chunk.len, cint(0))
+      if n <= 0: break                   # send timeout, or the peer went away
+      sent += n
 
   proc splitBody(resp: string): string =
     let i = resp.find("\r\n\r\n")
@@ -178,6 +211,29 @@ withServer(rt.toHandler,
           if k <= 0: break
           resp.add buf[0 ..< k]
         check want in resp
+
+    test "a read paused at the high-water is released when the request resets":
+      # Regression for #344. The never-acking sink pauses this connection's socket
+      # read; the worker's response is then applied from the outbox and resets the
+      # request with the pause still set. A reset that clears the pause without
+      # handing back the connection's slot in the loop's paused-conns count leaves
+      # the count > 0 for the life of the loop thread, pinning its selector wait
+      # at the 2 ms paused-body cadence. The debug-build audit catches that drift
+      # (and takes the loop thread down with it), so serving a plain request
+      # afterwards proves the loop is alive and the count balanced.
+      stallFed.store(0)
+      block:
+        let s = newSocket(buffered = false)
+        defer: s.close()
+        s.connect("127.0.0.1", port)
+        s.setRecvTimeout(4000)
+        s.send("POST /stall HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n" &
+               "Content-Length: " & $(4 * 1024 * 1024) & "\r\n\r\n")
+        s.pushBody(3 * 1024 * 1024)      # more than the 1 MiB read-ahead cap
+        check "stalled" in s.recvAvailable(4000)
+      check stallFed.load() >= 1024 * 1024   # the read did reach the high-water
+      sleep(1500)                            # a tick runs the debug audit
+      check splitBody(rawPost("/upload", "still here")) == "got 10"
 
     test "pipelined: streamed upload then a buffered request":
       let s = newSocket(buffered = false)

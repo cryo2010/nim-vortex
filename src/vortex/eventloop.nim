@@ -38,7 +38,7 @@ import ./http1/parser as h1parser
 import ./http1/codec as h1codec
 import ./http2/codec as h2codec
 import ./websocket/codec as wscodec
-from ./http2/frames import connectionPreface
+from ./http2/frames import connectionPreface, errNoError, errEnhanceYourCalm
 when not defined(plainHttp):
   import ./transport/tls
   import ./http3/ngtcp2/backend as h3codec   # HTTP/3 over ngtcp2 + nghttp3
@@ -116,6 +116,10 @@ type
                                  # per-header string/seq (see unpackResponseInto)
     tls: pointer                 # ptr TlsConfig; nil = plaintext
     udpFd: int                   # -1 = no HTTP/3
+    h3FlushPending: bool         # an h3 WebSocket send/close buffered frames
+                                 # outside the input path (flushHook with fd < 0):
+                                 # QUIC egress must be driven before the loop
+                                 # sleeps again (#262). h3Drive clears it.
     quicReload: pointer          # ptr CertReload: main-thread reload signal
     quicReloadSeen: int          # last reload generation this loop applied
     connCount: int               # live TCP connections (maxConnections cap)
@@ -129,6 +133,14 @@ type
                                  # deregistered after an fd/memory-exhaustion
                                  # accept() error (EMFILE/ENFILE/...), then
                                  # re-armed in tick(). 0 = listener armed.
+    pinnedGrowDrops: int         # connections refused because the connection table
+                                 # could not grow while a slot was pinned (see
+                                 # handleAccept). Counted and logged so the drop is
+                                 # never silent: from the client it is an empty
+                                 # connect error, indistinguishable from a network
+                                 # fault or a stalled loop (#343).
+    pinnedGrowLogSec: int64      # monotonic sec of the last drop log line; at most
+                                 # one a second, so a burst cannot flood the log
     bodyPausedConns: int         # HTTP/1 streaming connections whose socket read
                                  # is paused at the read-ahead high-water (the recv
                                  # loop stops pulling; the fd stays armed). While
@@ -338,12 +350,32 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
     of dkNone: 0
   c.deadline = if secs > 0: loop.core.nowSec + int64(secs) else: 0
 
+proc clearBodyPause(loop: Loop, c: ptr Connection) {.inline.} =
+  ## Single owner of "this connection is no longer read-paused": clear the flag AND
+  ## release its slot in bodyPausedConns, so the selector wait un-caps once none
+  ## remain. Every clear must go through here: one that only cleared the flag (a
+  ## request reset, a streaming re-dispatch) leaked the count and pinned this loop
+  ## thread's selector wait at the 2 ms paused-body cadence for the rest of its
+  ## life (#344). checkBodyPause audits the pairing in a debug build.
+  if c.bodyReadPaused:
+    c.bodyReadPaused = false
+    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
+
+proc checkBodyPause(loop: Loop) =
+  ## Debug-only audit of bodyPausedConns against a full scan of the connection
+  ## table, in the spirit of h2CheckCounters: a clear that bypasses clearBodyPause
+  ## trips an assertion in the test suite instead of silently capping the selector
+  ## wait for the life of the loop thread in production. Compiled out of release.
+  when not defined(release):
+    var paused = 0
+    for i in 0 ..< loop.core.conns.len:
+      if loop.core.conns[i].state != csFree and loop.core.conns[i].bodyReadPaused:
+        inc paused
+    assert paused == loop.bodyPausedConns,
+      "bodyPausedConns drift: " & $loop.bodyPausedConns & " vs " & $paused
+
 proc closeConn(loop: Loop, c: ptr Connection) =
-  if c.bodyReadPaused and loop.bodyPausedConns > 0:
-    # A body-paused connection is going away: release its slot in the paused-conns
-    # count so the selector wait un-caps once none remain.
-    dec loop.bodyPausedConns
-  c.bodyReadPaused = false
+  loop.clearBodyPause(c)         # going away: give up its paused-conns slot
   if c.registered:
     loop.selector.unregister(int(c.fd))
     c.registered = false
@@ -617,6 +649,26 @@ proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   c.lingerClose = true       # drain the peer so the error is delivered, no RST
   c.state = csClosing
 
+proc closeWithGoaway(loop: Loop, c: ptr Connection, err: uint32) =
+  ## closeConn, preceded by a GOAWAY when this is an HTTP/2 connection the server
+  ## is dropping on its own account: an expired timeout, the receive-buffer cap,
+  ## the end of the shutdown grace. Without it the peer sees a bare TCP close,
+  ## which is indistinguishable from a network fault, so even an idempotent
+  ## in-flight request cannot be safely retried (httpx reports "Server
+  ## disconnected"). The GOAWAY names the last stream this server processed, so
+  ## everything above it is known-unhandled and retryable.
+  ##
+  ## Best effort and non-blocking: the frame rides the pending output if the
+  ## socket takes it, and the connection closes either way -- a peer that has
+  ## stopped reading must not hold the close. A pinned connection is left alone,
+  ## as in markDrain: materializing H2Conn(c.h2) here would race the worker
+  ## holding the same ref under ORC's non-atomic refcounts.
+  if c.h2 != nil and c.totalPins == 0:
+    h2Goaway(c, err)
+    loop.flushOut(c)
+    if c.state == csFree: return      # the flush found the socket dead and closed
+  loop.closeConn(c)
+
 proc h2Deadline(c: ptr Connection): DeadlineKind =
   ## Classify an active h2 connection's timeout policy for this pass:
   ##  - dkIdle: no streams open -- (re)arm keep-alive. This must refresh on every
@@ -789,7 +841,7 @@ proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   c.rs.reqStreaming = true
   c.bodyFed = 0
   c.bodyUnacked = 0
-  c.bodyReadPaused = false
+  loop.clearBodyPause(c)   # fresh body: no read-ahead debt, so no pause to hold
   let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
   try:
     {.gcsafe.}:
@@ -945,6 +997,9 @@ proc processInput(loop: Loop, c: ptr Connection) =
       if c.closeAfterFlush:
         c.state = csClosing
         return
+      # The reset scrubs bodyReadPaused along with the rest of the per-request
+      # state, so hand the paused-conns slot back with it (#344).
+      loop.clearBodyPause(c)
       c[].resetForNextRequest()
       if c.rlen == 0:
         c.setDeadline(loop, dkIdle)
@@ -974,6 +1029,11 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
     c.state = csClosing
     loop.flushOut(c)
   else:
+    # A response produced outside the dispatch call (worker outbox, async
+    # completion) can land while the socket read is still paused: a manualAck
+    # consumer that answered without draining its read-ahead debt. The reset
+    # clears bodyReadPaused, so release the counter slot with it (#344).
+    loop.clearBodyPause(c)
     c[].resetForNextRequest()
     loop.flushOut(c)
     if c.state == csFree: return
@@ -1038,6 +1098,17 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
   ## loop-thread WebSocket send outside the read path.
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
+    if fd < 0:
+      # HTTP/3 handle: there is no ptr Connection to resolve (fd is a slot
+      # encoding), and the frames are already in the QUIC stream's send buffer
+      # (wsFlushH3ng put them there). Nothing would push them onto the wire
+      # until some unrelated event drove the connection, so mark the loop and
+      # let it drive QUIC egress before it sleeps again (#262). A flag rather
+      # than a direct h3Drive: this hook can run inside a nghttp3 callback
+      # (an inbound frame dispatching onMessage, which sends), and re-entering
+      # the stack from there is not safe.
+      loop.h3FlushPending = true
+      return
     let c = conn(addr loop.core, fd, gen)
     if c == nil or c.pendingOut <= 0: return
     if c.flushHold > 0 and c.pendingOut < respHighWater:
@@ -1110,7 +1181,10 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         if c.state != csActive: returnAfterStateChange()
         if c.rlen == c.rbuf.len:
           if c.rbuf.len >= h2RecvBufferCap:
-            loop.closeConn(c)
+            # Nothing could be compacted (a worker holds the connection) and the
+            # peer keeps sending: drop it, but say so first. ENHANCE_YOUR_CALM,
+            # not NO_ERROR: this is the peer's volume, not our housekeeping.
+            loop.closeWithGoaway(c, errEnhanceYourCalm)
             return
           c.rbuf.setLen(c.rbuf.len * 2)
       else:
@@ -1206,8 +1280,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     c.bodyReadPaused = true
     inc loop.bodyPausedConns
   elif not nowPaused and c.bodyReadPaused:
-    c.bodyReadPaused = false
-    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
+    loop.clearBodyPause(c)
   if c.peerHalfClosed and c.state == csActive and not c.rs.respStreaming:
     # The peer will send no more requests: close once any response has been
     # written (the deferred/worker case sets closeAfterFlush and closes when
@@ -1265,8 +1338,7 @@ proc resumeBodyImpl(loopPtr: pointer, fd: int32, gen: uint32,
     c.bodyUnacked -= n
     if c.bodyUnacked < 0: c.bodyUnacked = 0
     if not c.bodyReadPaused or c.bodyUnacked >= streamBodyLowWater: return
-    c.bodyReadPaused = false          # below the low-water: let the recv loop pull
-    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
+    loop.clearBodyPause(c)            # below the low-water: let the recv loop pull
 
 proc startTls(loop: Loop, c: ptr Connection): bool =
   ## Begin TLS for a TLS listener (leave plaintext otherwise). Returns false if
@@ -1337,7 +1409,21 @@ proc handleAccept(loop: Loop) =
           pinnedAny = true
           break
       if pinnedAny:
+        # Refused, not served: say so. The connection cap above is a configured
+        # policy the operator already knows about, but this drop is an internal
+        # limit (the table cannot move under a worker's `addr conns[fd]`), so it
+        # would otherwise look like a network fault to the client and like nothing
+        # at all here. Rate-limited to one line a second, carrying the running
+        # count so a burst is still visible (#343).
         discard posix.close(client)
+        inc loop.pinnedGrowDrops
+        if loop.pinnedGrowLogSec != loop.core.nowSec:
+          loop.pinnedGrowLogSec = loop.core.nowSec
+          try: stderr.writeLine("vortex: refused a connection (fd " & $fd &
+            " is beyond the " & $loop.core.conns.len & "-slot connection table, " &
+            "which cannot grow while a blocking: worker holds a slot); " &
+            $loop.pinnedGrowDrops & " dropped so far on this loop thread")
+          except IOError, OSError: discard
         continue
       loop.core.conns.setLen(fd + 64)
     let c = addr loop.core.conns[fd]
@@ -1464,7 +1550,31 @@ when not defined(plainHttp):
         except CatchableError:
           h3Apply(addr loop.core, h3SlotFd(slot), gen, uint32(sid),
                   500, "text/plain", [], "500 Internal Server Error")
+        # A freshly-accepted RFC 9220 WebSocket may hold frames the client
+        # pipelined with the Extended CONNECT handshake (they arrived before the
+        # handler ran and were seeded into the WsConn by h3WsAccept). Pump them
+        # now that the handler has installed onMessage -- otherwise they sit in
+        # inBuf until the client happens to send more (#259) -- and deliver a
+        # deferred peer-close if the client half-closed before we accepted
+        # (#261). The ngPump below puts any frames this produced on the wire.
+        # Twin of the h2 post-accept pump in dispatchH2.
+        let h3c = h3ConnOf(addr loop.core, h3SlotFd(slot), gen)
+        if h3c != nil and h3StreamAlive(h3c, sid):
+          # Resolve the WsConn ref before feeding: wsFeed can tear the stream
+          # down, invalidating any ptr into the streams table.
+          let stp = h3StreamPtr(h3c, sid)
+          let w = if stp.ws != nil: WsConn(stp.ws) else: nil
+          if w != nil and (w.inBuf.len > 0 or w.preAcceptFin):
+            if w.inBuf.len > 0:
+              wsFeed(addr loop.core, nil, w, "")
+            if w.preAcceptFin and h3StreamAlive(h3c, sid):
+              w.preAcceptFin = false
+              wsPeerClosed(addr loop.core, nil, w)
     ngHandleExpiry()
+    # Everything buffered up to here goes out in this pump, so a flush request
+    # from a send earlier in this pass is satisfied; only a send after it (none
+    # today) needs another pass (#262).
+    loop.h3FlushPending = false
     ngPump()
     for idx in 0 ..< loop.core.h3slots.len:
       if loop.core.h3slots[idx].conn != nil and
@@ -1761,7 +1871,10 @@ proc sweepTimeouts(loop: Loop) =
       loop.respondError(c, Http503)
       loop.flushOut(c)
     else:
-      loop.closeConn(c)            # includes dkWsPong: no reply, peer is gone
+      # includes dkWsPong: no reply, peer is gone. An h2 connection gets a
+      # GOAWAY(NO_ERROR) first so the client can tell this server-side timeout
+      # from a network fault and retry what was never processed (#342).
+      loop.closeWithGoaway(c, errNoError)
 
 proc sweepWsIdle(loop: Loop) =
   ## Per-stream WebSocket keepalive for h2/h3 (h1 rides the deadline wheel
@@ -1813,6 +1926,7 @@ proc tick(loop: Loop) =
   if now != loop.core.nowSec:
     loop.core.nowSec = now
     loop.refreshDate()
+    when not defined(release): loop.checkBodyPause()
     loop.sweepTimeouts()
     loop.sweepWsIdle()
     loop.applyQuicReload()
@@ -1941,7 +2055,9 @@ proc forceCloseAll(loop: Loop) =
   for fd in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[fd]
     if c.state != csFree:
-      loop.closeConn(c)
+      # h2: GOAWAY(NO_ERROR) before the drop, as on the timeout paths. Idempotent
+      # (h2Goaway is a no-op once goingAway), so re-calling each tick is fine.
+      loop.closeWithGoaway(c, errNoError)
   when not defined(plainHttp):
     for i in 0 ..< loop.core.h3slots.len:
       loop.h3FreeSlot(i)
@@ -2074,6 +2190,16 @@ proc run*(loop: Loop) =
       # finish in the same pass instead of after a selector timeout.
       loop.pumpCap = loop.core.hooks.pumpHook()
     loop.tick()
+    when not defined(plainHttp):
+      # Anything that ran after this iteration's h3Drive (a continuation the
+      # async pump resumed, a timeout sweep) may have sent or closed on an h3
+      # WebSocket: the frames sit in the QUIC send buffer and flushHook flagged
+      # the loop, with nothing left in this iteration to put them on the wire.
+      # Drive egress once more rather than stalling them until the next datagram
+      # or timer wakes us (#262).
+      if loop.h3FlushPending and loop.udpFd >= 0:
+        try: loop.h3Drive()
+        except Exception: discard
     if loop.draining:
       loop.drainSweep()               # close connections that just finished
       if loop.drainComplete():

@@ -3,12 +3,27 @@ import vortex/[settings, request, server]
 import ./helper
 import ./wsclient
 
+# Off-loop probe for the subprotocol accessor: only the length crosses the
+# thread boundary, so the probe itself never copies a string between threads.
+var offLoopThread: Thread[WebSocket]
+var offLoopProtoLen = -1
+
+proc readProtoOffLoop(ws: WebSocket) {.thread.} =
+  offLoopProtoLen = ws.subprotocol.len
+
 proc handler(req: Request, res: Response) {.gcsafe.} =
   if req.isWebSocketUpgrade:
     # Server supports "chat" then "json" (server preference order).
     let ws = req.acceptWebSocket(["chat", "json"])
     ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
       if data == "proto?": ws.send(ws.subprotocol)   # report the negotiated one
+      elif data == "proto-offloop?":
+        # Read it from a non-loop thread: the accessor must refuse rather
+        # than resolve the WsConn ref there.
+        offLoopProtoLen = -1
+        createThread(offLoopThread, readProtoOffLoop, ws)
+        joinThread(offLoopThread)
+        ws.send($offLoopProtoLen)
       else: ws.send(data, kind)
   else:
     res.send(Http200, "http")
@@ -51,6 +66,15 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1), srv):
       check "Sec-WebSocket-Protocol" notin resp
       s.sendText("proto?")
       check s.recvText() == ""
+
+    test "subprotocol is loop-thread only: off-loop it reports empty":
+      let (s, resp) = openOffer("chat")
+      defer: s.close()
+      check "Sec-WebSocket-Protocol: chat" in resp
+      s.sendText("proto?")
+      check s.recvText() == "chat"            # the loop thread sees the value
+      s.sendText("proto-offloop?")
+      check s.recvText() == "0"               # a worker gets "", not the ref
 
     test "no offer at all: header omitted, handshake still succeeds":
       let (s, resp) = openOffer("")

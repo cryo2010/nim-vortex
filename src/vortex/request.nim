@@ -2755,7 +2755,8 @@ proc acceptWebSocket*(req: Request,
   ##
   ## `protocols` is the server's supported subprotocols in preference
   ## order; the first that the client also offered is negotiated and echoed
-  ## in the handshake. Read it back with `ws.subprotocol` ("" if none).
+  ## in the handshake. Read it back with `ws.subprotocol` ("" if none), on
+  ## the loop thread (it reports "" off-loop, like the other accessors).
   result = WebSocket(core: req.core, fd: req.fd, gen: req.gen,
                      stream: req.stream)
   if req.fd < 0:
