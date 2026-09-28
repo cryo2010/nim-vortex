@@ -37,7 +37,7 @@ reference below.
 | `maxRequestsPerSocket` | 0 (off) | HTTP/1 keep-alive requests before the connection is closed |
 | `maxBlockingQueue` | 0 (unbounded) | `blocking:` tasks that may queue for a free worker; past it new dispatches fail fast (503 / `PoolSaturatedError`) instead of queuing behind slow or stuck work |
 | `maxHeaderSize` | 16 KiB | Request line + headers (431); also caps HPACK decoded size |
-| `maxHeaderCount` | 100 | Header fields per request (400) |
+| `maxHeaderCount` | 100 | Header fields per request (431); HTTP/1 only (HTTP/2 and HTTP/3 bound the decoded header list by size instead, see `maxHeaderSize`) |
 | `maxBodySize` | 8 MiB | Request body (413); per stream on HTTP/2 and HTTP/3; also caps a decompressed body |
 | `maxWsMessageSize` | 1 MiB | Largest inbound WebSocket message (close 1009) |
 | `h2StreamWindow` | 1 MiB | HTTP/2 per-stream receive window (upload flow control) |
@@ -61,7 +61,7 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. 0 disables |
 | `keepAliveTimeout` | 60 s | Idle time between requests; 0 disables |
 | `responseTimeout` | 0 (off) | End of request to first response byte (stuck handler) |
-| `writeTimeout` | 0 (off) | Idle time the socket may stay unwritable with output pending (slow-read client that never drains its response); re-armed on send progress |
+| `writeTimeout` | 30 s | Idle time the socket may stay unwritable with output pending (slow-read client that never drains its response); re-armed on every partial write, so a response that keeps moving is never cut off; 0 disables |
 | `shutdownGrace` | 10 s | Drain window on graceful shutdown |
 | `shutdownHardTimeout` | `shutdownGrace` + 5 s | Upper bound on `close`/`waitFor`; a thread still inside a never-returning `blocking:` body is detached (leaked) so shutdown cannot hang |
 

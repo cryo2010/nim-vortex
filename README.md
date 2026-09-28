@@ -192,7 +192,7 @@ var config = initVortexConfig(
   compress = true,                # response compression
   decompressRequest = true,       # transparently decode gzip/br/zstd request bodies
   responseTimeout = 30,           # seconds a handler may take before the conn is closed
-  writeTimeout = 30,              # close a client that stops draining its response (0 = off)
+  writeTimeout = 30,              # close a client that stops draining its response (default; 0 = off)
   shutdownGrace = 10)             # seconds to drain in-flight work on shutdown
 config.serverHeader = "acme"      # fields are settable before serving
 
@@ -338,7 +338,7 @@ rejection when exceeded, and the handler never runs for a rejected request:
 | Field | Default | Enforcement |
 |-------|---------|-------------|
 | `maxHeaderSize` | 16 KiB | request line + headers combined; `431` when exceeded (also bounds the URI/path) |
-| `maxHeaderCount` | 100 | number of header fields; `400` when exceeded |
+| `maxHeaderCount` | 100 | number of header fields; `431` when exceeded (HTTP/1; HTTP/2 and HTTP/3 bound the decoded header list by size) |
 | `maxBodySize` | 8 MiB | request body (post-decompression); `413` when exceeded |
 | `maxWsMessageSize` | 1 MiB | largest inbound WebSocket message; close `1009` over it |
 | `initialBufferSize` | 8 KiB | per-connection read/write buffer starting size (grows as needed) |
