@@ -1,7 +1,12 @@
-## Regression coverage for the unified HTTP/2 stream teardown (#231, fixed in
-## #242): every teardown path -- peer RST_STREAM, stream error, connection close
-## -- must return the stream's un-credited connection-window bytes, so an
-## abnormal end cannot drain the connection window and deadlock later uploads.
+## Regression coverage for the unified HTTP/2 stream teardown (#231 and #232,
+## both fixed in #242). Every teardown path -- peer RST_STREAM, stream error,
+## connection close -- must
+##
+##   * return the stream's un-credited connection-window bytes, so an abnormal
+##     end cannot drain the connection window and deadlock later uploads (#231);
+##   * deliver onBody(last=true) to a streaming request sink and fire a parked
+##     onRespDrain, so a handler suspended in await req.read() / res.drained()
+##     resumes instead of leaking a zombie coroutine (#232).
 ##
 ## A streaming-upload route debits `connRecvRemaining` on receipt and defers the
 ## connection WINDOW_UPDATE to consumption, so a `manualAck` sink that never acks
@@ -15,6 +20,9 @@ import ./h2client
 
 var sinkOpen: Atomic[int]     ## streaming handlers dispatched on /sink
 var sinkBytes: Atomic[int]    ## body bytes delivered to the never-acking sink
+var sinkEof: Atomic[int]      ## onBody(last=true) deliveries on /sink
+var parkArmed: Atomic[int]    ## /park producers parked with an onDrain armed
+var drainFired: Atomic[int]   ## parked onRespDrain callbacks invoked
 
 const
   connWindow = 128 * 1024     ## server connection receive window
@@ -22,6 +30,7 @@ const
   frameSize = 16 * 1024       ## <= the server's SETTINGS_MAX_FRAME_SIZE
   uploadFrames = 3            ## DATA frames per upload
   uploadBytes = uploadFrames * frameSize   ## 48 KiB, under streamWindow
+  parkBytes = 96 * 1024       ## one write past respHighWater: the producer parks
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
@@ -30,7 +39,18 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     # connection-window credit stays deferred until teardown reclaims it.
     discard sinkOpen.fetchAdd(1)
     req.onBody(proc(chunk: openArray[char], last: bool) {.gcsafe.} =
-      discard sinkBytes.fetchAdd(chunk.len), manualAck = true)
+      discard sinkBytes.fetchAdd(chunk.len)
+      if last: discard sinkEof.fetchAdd(1), manualAck = true)
+  of "/park":
+    # A streamed response the client refuses to read (it advertised a zero
+    # initial window): the first write backs up and the producer parks on its
+    # onDrain, the callback a teardown must fire.
+    res.sendHead(Http200, "application/octet-stream")
+    let body = 'p'.repeat(parkBytes)
+    if not res.write(body.toOpenArray(0, body.high)):
+      res.onDrain proc(r: Response) {.gcsafe.} =
+        discard drainFired.fetchAdd(1)
+      discard parkArmed.fetchAdd(1)
   of "/echo":
     res.send(Http200, $req.body.len)
   else:
@@ -133,6 +153,66 @@ suite "HTTP/2 stream teardown":
     check fr.bodyOf(5) == $uploadBytes
     check fr.goawayError() == -1
     c.close()
+
+  test "RST_STREAM delivers onBody(last=true) to a streaming sink (#232)":
+    var c = newH2TestConn(srv.port)
+    discard c.readFrames(300)
+    c.openSink(1)
+    let eofs = sinkEof.load()
+    var d = ""
+    d.addUpload(1, frames = 1)
+    c.sendAll(d)
+    check waitFor(proc(): bool = sinkBytes.load() > 0)
+    check sinkEof.load() == eofs         # no EOF while the upload is open
+    var r = ""
+    r.addRstStream(1, errCancel)
+    c.sendAll(r)
+    # Without the terminating callback a handler suspended in await req.read()
+    # never resumes and its reader-table entry leaks.
+    check waitFor(proc(): bool = sinkEof.load() > eofs)
+    c.close()
+
+  test "RST_STREAM fires a producer parked on its drain callback (#232)":
+    var c = newH2TestConn(srv.port)
+    let armed = parkArmed.load()
+    let drained = drainFired.load()
+    var f = ""
+    f.addSettingFrame(setInitialWindowSize, 0)   # never read the response body
+    f.addRequest(1, head("/park"), endStream = true)
+    c.sendAll(f)
+    check waitFor(proc(): bool = parkArmed.load() > armed)
+    check drainFired.load() == drained   # still parked: nothing drained it
+    var r = ""
+    r.addRstStream(1, errCancel)
+    c.sendAll(r)
+    # Otherwise a producer suspended in await res.drained() hangs forever and its
+    # finally/defer cleanup never runs.
+    check waitFor(proc(): bool = drainFired.load() > drained)
+    c.close()
+
+  test "a client disconnect fires both parked callbacks (#232)":
+    var c = newH2TestConn(srv.port)
+    discard c.readFrames(300)
+    let eofs = sinkEof.load()
+    let armed = parkArmed.load()
+    let drained = drainFired.load()
+    var z = ""
+    z.addSettingFrame(setInitialWindowSize, 0)
+    c.sendAll(z)
+    c.openSink(1)
+    var d = ""
+    d.addUpload(1, frames = 1)
+    c.sendAll(d)
+    check waitFor(proc(): bool = sinkBytes.load() > 0)
+    var f = ""
+    f.addRequest(3, head("/park"), endStream = true)
+    c.sendAll(f)
+    check waitFor(proc(): bool = parkArmed.load() > armed)
+    check sinkEof.load() == eofs
+    check drainFired.load() == drained
+    c.close()                            # disconnect with both streams open
+    check waitFor(proc(): bool = sinkEof.load() > eofs)
+    check waitFor(proc(): bool = drainFired.load() > drained)
 
 srv.close()
 echo "http2 stream teardown ok"
