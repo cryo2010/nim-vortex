@@ -751,6 +751,15 @@ proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
   w.flush = wsFlushH3ng
   w.h3conn = conn
   st.ws = w
+  # Hand over any frames the client pipelined with the Extended CONNECT
+  # handshake. An Extended-CONNECT stream dispatches on headers, so DATA that
+  # arrived in the same packet burst landed in st.body while st.ws was nil; move
+  # it into the WsConn instead of dropping it (#259). They are pumped once the
+  # handler installs onMessage (see the post-accept pump in eventloop's h3Drive),
+  # not here, so no message is dispatched into a nil callback. Mirrors h2WsAccept.
+  if st.body.len > 0:
+    w.inBuf.add st.body
+    st.body.setLen(0)
   var hdrs: seq[(string, string)] = @[(":status", "200")]
   if core.serverHeader.len > 0: hdrs.add ("server", core.serverHeader)
   hdrs.add ("date", core.dateStr)

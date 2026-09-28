@@ -74,7 +74,14 @@ class WsClient(QuicConnectionProtocol):
                 self._data += e.data
                 self._got_data.set()
 
-    async def open_ws(self, authority, path="/", subprotocols=None):
+    async def open_ws(self, authority, path="/", subprotocols=None,
+                      pipelined=b""):
+        """Open an Extended CONNECT WebSocket; return the handshake status.
+
+        `pipelined` bytes are sent as DATA before the first transmit, so the
+        handshake and those WebSocket frames leave in the same packet burst
+        (the server sees them before the handler accepts the stream).
+        """
         if self._http is None:
             self._http = H3Connection(self._quic)
         self._sid = self._quic.get_next_available_stream_id()
@@ -90,6 +97,8 @@ class WsClient(QuicConnectionProtocol):
             headers.append(
                 (b"sec-websocket-protocol", ", ".join(subprotocols).encode()))
         self._http.send_headers(self._sid, headers, end_stream=False)
+        if pipelined:
+            self._http.send_data(self._sid, pipelined, end_stream=False)
         self.transmit()
         await asyncio.wait_for(self._got_headers.wait(), timeout=5)
         return self._status
@@ -116,11 +125,32 @@ class WsClient(QuicConnectionProtocol):
             await asyncio.wait_for(self._got_data.wait(), timeout=remaining)
 
 
-async def run(host, port):
+def client_ctx(host, port):
+    """A fresh QUIC connection (async context manager) to the server."""
     config = QuicConfiguration(alpn_protocols=["h3"], is_client=True)
     config.verify_mode = ssl.CERT_NONE
-    async with connect(host, port, configuration=config,
-                       create_protocol=WsClient) as client:
+    return connect(host, port, configuration=config, create_protocol=WsClient)
+
+
+async def run_coalesced(host, port):
+    """Frames sent in the same burst as the handshake must not be dropped.
+
+    An Extended CONNECT stream dispatches on headers, so DATA that rides along
+    with the handshake reaches the server before the handler accepts the
+    WebSocket. Those bytes must be handed to the WsConn and pumped once
+    onMessage is installed instead of being discarded as a request body.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws(
+            "server", "/", pipelined=ws_frame(OP_TEXT, b"coalesced"))
+        assert status == "200", f"handshake status {status!r}"
+        fr = (await client.recv_ws())[0]
+        assert fr == (OP_TEXT, b"coalesced"), f"coalesced echo: {fr}"
+        print("coalesced handshake + frame OK")
+
+
+async def run(host, port):
+    async with client_ctx(host, port) as client:
         status = await client.open_ws("server", "/", ["chat", "json"])
         assert status == "200", f"handshake status {status!r}"
         print("handshake 200 OK")
@@ -154,6 +184,7 @@ async def run(host, port):
         assert fr[0] == OP_CLOSE, f"close echo: {fr}"
         print("close handshake OK")
 
+    await run_coalesced(host, port)
     print("RESULT: all HTTP/3 WebSocket cases passed.")
 
 

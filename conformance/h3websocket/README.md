@@ -21,8 +21,10 @@ docker network (QUIC is UDP):
   message with its kind.
 - **client** (`client.Dockerfile`, `client.py`) — an aioquic client that
   opens an Extended CONNECT WebSocket and checks: the 200 handshake, text and
-  binary echo, ping→pong, subprotocol negotiation, a fragmented message, and
-  the close handshake. It exits non-zero (failing the run) on any mismatch.
+  binary echo, ping→pong, subprotocol negotiation, a fragmented message, the
+  close handshake, and a frame coalesced with the handshake (sent before the
+  handler accepts the stream). It exits non-zero (failing the run) on any
+  mismatch.
 
 The WebSocket framing in `client.py` is hand-rolled so the test owns exactly
 what goes on the wire; aioquic supplies only the QUIC + HTTP/3 transport.
