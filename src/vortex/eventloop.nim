@@ -2043,11 +2043,14 @@ proc creditStall(loop: Loop, gap: int64) =
     if c.writeDeadline != 0: c.writeDeadline += gap
   for r in loop.core.wsIdle:
     wsCreditStall(WsConn(r), gap)   # h2/h3 ws keepalive stamps (h1 rides above)
-  when not defined(plainHttp):
-    # ngtcp2's idle and loss timers are absolute stamps of the same kind, but
-    # they live inside the QUIC stack, so they are credited by withholding the
-    # stall from the clock the shim reads instead (see ngCreditStall).
-    if loop.udpFd >= 0: ngCreditStall(gap)
+  # ngtcp2's idle and loss timers are absolute stamps of the same kind, but they
+  # live inside the QUIC stack and are deliberately *not* credited: the only
+  # handle on them is the clock the shim hands ngtcp2, ngtcp2 aborts the process
+  # if that clock ever goes behind a stamp it already saw, and a credit from here
+  # could only push it there -- run() drives h3 before it ticks, so the drive that
+  # followed this stall has already stamped ngtcp2 with the full elapsed time. h3
+  # keeps a stalled-on connection by widening the window and PINGing instead; see
+  # ngNowNs in the ngtcp2 backend.
 
 proc sweepTimeouts(loop: Loop) =
   for c in loop.core.conns.slots:

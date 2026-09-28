@@ -186,33 +186,27 @@ var
   gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
-  gStallNs {.threadvar.}: uint64             # loop-stall credit; see ngCreditStall
 
-proc nowNs(): uint64 = getMonoTime().ticks.uint64 - gStallNs
-  ## The clock every ngtcp2 timer is armed against, minus the time this loop
-  ## thread was unable to run at all (ngCreditStall). See there for why.
-
-proc ngCreditStall*(sec: int64) =
-  ## The loop thread did not tick for `sec` seconds, so it could not have served
-  ## *any* connection on this engine -- the h3 half of the loop's creditStall.
+proc ngNowNs*(): uint64 = getMonoTime().ticks.uint64
+  ## The one clock this loop thread hands ngtcp2 -- every entry point (recv,
+  ## pump, expiry, next-expiry) stamps its call with it, and ngtcp2 arms its idle,
+  ## keep-alive and loss-detection timers against it.
   ##
-  ## ngtcp2 owns the idle and loss-detection timers, and it arms them as absolute
-  ## stamps on the clock we hand it. So a thread that is descheduled for longer
-  ## than the idle timeout comes back, calls handle_expiry once, and ngtcp2 reaps
-  ## every connection whose idle window fell inside the gap -- peers that did
-  ## nothing wrong, closed for a silence the server caused. That is exactly what
-  ## creditStall fixed for the h1/h2 deadline wheel, but the h3 timers live
-  ## inside ngtcp2 where those absolute stamps cannot be rewritten.
+  ## It is the raw monotonic clock, with nothing withheld from it, and it must
+  ## stay that way: ngtcp2 checks on every entry that the stamp has not gone
+  ## behind one it was already given (`conn->log.last_ts <= ts`) and aborts the
+  ## process if it has. Crediting a loop-thread stall here -- subtracting the gap
+  ## the thread spent descheduled, the h3 analogue of the loop's creditStall --
+  ## does exactly that, and there is nowhere to put such a credit that does not:
+  ## run() drives h3 *before* it ticks, so the drive that follows a stall has
+  ## already handed ngtcp2 the full elapsed time before the loop has even measured
+  ## the gap, and crediting it afterwards can only rewind the clock.
   ##
-  ## They can be measured against a clock that does not run while we were away.
-  ## Withholding the stall from *every* ngtcp2 entry point (recv, pump, expiry,
-  ## next-expiry) keeps one consistent clock domain, so every relative duration
-  ## ngtcp2 derives -- RTT samples, PTO, the keep-alive interval -- is unchanged;
-  ## only the interval in which no packet could be sent or processed is excluded.
-  ## The clock stays strictly monotonic because the caller credits less than the
-  ## time that actually elapsed, and every timer stays finite: a peer that is
-  ## still silent once the loop recovers is reaped one gap later.
-  if sec > 0: gStallNs += uint64(sec) * 1_000_000_000'u64
+  ## A stall must not make ngtcp2 reap a blameless peer, but that is bought at the
+  ## protocol level instead of by lying about the time: acceptConn advertises an
+  ## idle window as wide as the h1/h2 keepAliveTimeout and arms ngtcp2's
+  ## keep-alive PING at a third of it, so an ordinary stall fits inside the window
+  ## and a live-but-quiet connection keeps both ends' timers fed.
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -685,12 +679,12 @@ proc ngReceive*() =
                         addr peer[0], addr plen)
     if n <= 0: break
     vqEngineRecv(gEngine, addr buf[0], csize_t(n), addr peer[0], csize_t(plen),
-                 addr gLocalSa[0], csize_t(gLocalLen), nowNs())
+                 addr gLocalSa[0], csize_t(gLocalLen), ngNowNs())
 
-proc ngPump*() = vqEnginePump(gEngine, nowNs())
-proc ngHandleExpiry*() = vqEngineHandleExpiry(gEngine, nowNs())
+proc ngPump*() = vqEnginePump(gEngine, ngNowNs())
+proc ngHandleExpiry*() = vqEngineHandleExpiry(gEngine, ngNowNs())
 proc ngTimeoutMs*(): int =
-  let now = nowNs()
+  let now = ngNowNs()
   let e = vqEngineNextExpiry(gEngine, now)
   if e == high(uint64): -1
   elif e <= now: 0
