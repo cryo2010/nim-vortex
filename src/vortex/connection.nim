@@ -729,7 +729,8 @@ proc resetRequestState(c: var Connection) =
   c.respBackedUp = false
   c.bodyFed = 0
   c.bodyUnacked = 0
-  c.bodyReadPaused = false
+  c.bodyReadPaused = false    # the loop-side paused-conns slot is released by
+                              # eventloop.clearBodyPause at every call site (#344)
   c.respContentLength = -1
   c.respBodyWritten = 0
   c.parser.reset(0)

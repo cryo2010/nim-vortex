@@ -338,12 +338,32 @@ proc setDeadline(c: ptr Connection, loop: Loop, kind: DeadlineKind) =
     of dkNone: 0
   c.deadline = if secs > 0: loop.core.nowSec + int64(secs) else: 0
 
+proc clearBodyPause(loop: Loop, c: ptr Connection) {.inline.} =
+  ## Single owner of "this connection is no longer read-paused": clear the flag AND
+  ## release its slot in bodyPausedConns, so the selector wait un-caps once none
+  ## remain. Every clear must go through here: one that only cleared the flag (a
+  ## request reset, a streaming re-dispatch) leaked the count and pinned this loop
+  ## thread's selector wait at the 2 ms paused-body cadence for the rest of its
+  ## life (#344). checkBodyPause audits the pairing in a debug build.
+  if c.bodyReadPaused:
+    c.bodyReadPaused = false
+    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
+
+proc checkBodyPause(loop: Loop) =
+  ## Debug-only audit of bodyPausedConns against a full scan of the connection
+  ## table, in the spirit of h2CheckCounters: a clear that bypasses clearBodyPause
+  ## trips an assertion in the test suite instead of silently capping the selector
+  ## wait for the life of the loop thread in production. Compiled out of release.
+  when not defined(release):
+    var paused = 0
+    for i in 0 ..< loop.core.conns.len:
+      if loop.core.conns[i].state != csFree and loop.core.conns[i].bodyReadPaused:
+        inc paused
+    assert paused == loop.bodyPausedConns,
+      "bodyPausedConns drift: " & $loop.bodyPausedConns & " vs " & $paused
+
 proc closeConn(loop: Loop, c: ptr Connection) =
-  if c.bodyReadPaused and loop.bodyPausedConns > 0:
-    # A body-paused connection is going away: release its slot in the paused-conns
-    # count so the selector wait un-caps once none remain.
-    dec loop.bodyPausedConns
-  c.bodyReadPaused = false
+  loop.clearBodyPause(c)         # going away: give up its paused-conns slot
   if c.registered:
     loop.selector.unregister(int(c.fd))
     c.registered = false
@@ -789,7 +809,7 @@ proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   c.rs.reqStreaming = true
   c.bodyFed = 0
   c.bodyUnacked = 0
-  c.bodyReadPaused = false
+  loop.clearBodyPause(c)   # fresh body: no read-ahead debt, so no pause to hold
   let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
   try:
     {.gcsafe.}:
@@ -945,6 +965,9 @@ proc processInput(loop: Loop, c: ptr Connection) =
       if c.closeAfterFlush:
         c.state = csClosing
         return
+      # The reset scrubs bodyReadPaused along with the rest of the per-request
+      # state, so hand the paused-conns slot back with it (#344).
+      loop.clearBodyPause(c)
       c[].resetForNextRequest()
       if c.rlen == 0:
         c.setDeadline(loop, dkIdle)
@@ -974,6 +997,11 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
     c.state = csClosing
     loop.flushOut(c)
   else:
+    # A response produced outside the dispatch call (worker outbox, async
+    # completion) can land while the socket read is still paused: a manualAck
+    # consumer that answered without draining its read-ahead debt. The reset
+    # clears bodyReadPaused, so release the counter slot with it (#344).
+    loop.clearBodyPause(c)
     c[].resetForNextRequest()
     loop.flushOut(c)
     if c.state == csFree: return
@@ -1206,8 +1234,7 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     c.bodyReadPaused = true
     inc loop.bodyPausedConns
   elif not nowPaused and c.bodyReadPaused:
-    c.bodyReadPaused = false
-    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
+    loop.clearBodyPause(c)
   if c.peerHalfClosed and c.state == csActive and not c.rs.respStreaming:
     # The peer will send no more requests: close once any response has been
     # written (the deferred/worker case sets closeAfterFlush and closes when
@@ -1265,8 +1292,7 @@ proc resumeBodyImpl(loopPtr: pointer, fd: int32, gen: uint32,
     c.bodyUnacked -= n
     if c.bodyUnacked < 0: c.bodyUnacked = 0
     if not c.bodyReadPaused or c.bodyUnacked >= streamBodyLowWater: return
-    c.bodyReadPaused = false          # below the low-water: let the recv loop pull
-    if loop.bodyPausedConns > 0: dec loop.bodyPausedConns
+    loop.clearBodyPause(c)            # below the low-water: let the recv loop pull
 
 proc startTls(loop: Loop, c: ptr Connection): bool =
   ## Begin TLS for a TLS listener (leave plaintext otherwise). Returns false if
@@ -1813,6 +1839,7 @@ proc tick(loop: Loop) =
   if now != loop.core.nowSec:
     loop.core.nowSec = now
     loop.refreshDate()
+    when not defined(release): loop.checkBodyPause()
     loop.sweepTimeouts()
     loop.sweepWsIdle()
     loop.applyQuicReload()
