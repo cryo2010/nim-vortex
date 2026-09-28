@@ -15,10 +15,7 @@ allowed-tools: Bash, Read, Edit, Write, Agent, Monitor
 
 # vortex-stress
 
-Turn a plain-English request (`$prompt`) into a matrix of pinned `nimble stress<Workload>`
-Docker soaks — **one opus agent per protocol × server cell, all running in parallel** — watch
-them, and drive an autonomous **fail → fix → restart** loop until one complete round passes
-clean on every cell. Then print a report.
+Orchestrate the following task: $ARGUMENTS. Turn the task into a matrix of pinned `nimble stress<Workload>` soaks. Fan out to agents (up to eight in parallel) to run the soak, monitor it and report any failures back to you. Each agent should handle one combination of server/protocol/workload (e.g. chronos/h2/sse). Once an agent reports a failure, let the other agents finish, fix the issues serially, and then restart the fanned out stress run. Drive an autonomous **fail → fix → restart** loop until one complete round passes clean on every cell. Then print a report.
 
 `$prompt` is the whole invocation text (also `$ARGUMENTS`). If it is empty, ask the user what to
 stress and stop.
@@ -42,6 +39,8 @@ actually names. Rely on harness defaults for everything unnamed (do not invent v
 Follow the described **workload**, not any task name the user happens to type. "Stress
 websockets" → `stressWs` even if the user wrote `stressRequests`. (`nimble stress` runs a short
 smoke of all five; use it only if the prompt clearly asks for an all-workloads smoke.)
+
+Some simple ways to distribute the work are by workload, server and/or protocol.
 
 **Env knobs** (set only when named in the prompt):
 
