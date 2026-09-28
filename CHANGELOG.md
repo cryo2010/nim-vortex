@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SSE: `s.send("")` (a payload-free event) now reaches the client. An empty
+  `data` goes on the wire as two empty `data:` fields rather than one: a client
+  appends an LF to its data buffer per `data:` field and strips a single
+  trailing LF before dispatch, so one field left the buffer empty and the
+  WHATWG EventSource dispatch step discarded the event, firing no listener.
+  `s.send("", event = "ping")` now dispatches with `event.data == "\n"`. (#266)
 - HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
   then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
   INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1

@@ -922,6 +922,13 @@ proc events(req: Request, res: Response) =
 `await s.response.drained()` with an adapter) expose backpressure; `s.alive`
 reports client disconnect; `s.close` ends it (`s.abort` truncates).
 `req.lastEventId` gives the `Last-Event-ID` a client echoes on reconnect.
+
+An empty `data` is emitted as two empty `data:` fields, so a payload-free event
+still dispatches: a client appends an LF per `data:` field and strips one
+trailing LF before dispatch, so a single empty field would leave the data buffer
+empty and EventSource discards such an event without firing a listener. The
+listener sees `event.data == "\n"`.
+
 `res.withSse(s): body` is a block form that closes (or aborts on exception) for
 you:
 

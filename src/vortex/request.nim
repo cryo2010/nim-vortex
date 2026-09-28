@@ -2058,12 +2058,26 @@ proc send*(s: SseStream, data: string, event = "", id = "",
   ## as the request header on reconnect), `retry` (ms) overrides the delay.
   ## Returns false when the write backlog is full (see `bufferedAmount` /
   ## `onDrain`); the producer should pause. A dead connection returns false.
+  ##
+  ## An empty `data` still dispatches on the client. It goes on the wire as two
+  ## empty `data:` fields rather than one: a client appends an LF to its data
+  ## buffer per `data:` field and strips a single trailing LF before dispatch,
+  ## so one empty field leaves the buffer empty and the WHATWG EventSource
+  ## dispatch step then discards the event without firing any listener. Two
+  ## fields leave `"\n"`, so `s.send("", event = "ping")` reaches the client's
+  ## `ping` listener with `event.data == "\n"`.
   var f = ""
   if id.len > 0:    f.add "id: " & sseSanitize(id) & "\n"
   if event.len > 0: f.add "event: " & sseSanitize(event) & "\n"
   if retry > 0:     f.add "retry: " & $retry & "\n"
-  for line in data.splitLines:
-    f.add "data: " & line & "\n"
+  if data.len == 0:
+    # Two empty fields, deliberately: see the docstring. One field ("data:\n")
+    # is a dispatch-less event, which makes a payload-free notification
+    # ("ping", "reload", a typed poke) silently do nothing.
+    f.add "data:\ndata:\n"
+  else:
+    for line in data.splitLines:
+      f.add "data: " & line & "\n"
   f.add "\n"                               # blank line terminates the event
   s.res.write(f)
 

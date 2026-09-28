@@ -25,6 +25,12 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     discard s.send("a\nb")                # multi-line data
     discard s.comment("ping")
     s.close()
+  of "/empty":
+    # #266: a payload-free typed event must still dispatch on the client.
+    let s = res.sse()
+    discard s.send("", event = "ping")
+    discard s.send("")
+    s.close()
   of "/upload":
     var total = 0
     req.stream(chunk, last):
@@ -83,6 +89,15 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
         "id: 1\nevent: greet\ndata: hello\n\n" &  # first event
         "data: a\ndata: b\n\n" &                  # multi-line data
         ": ping\n\n"                              # comment / heartbeat
+
+    test "an empty data payload emits two data: fields so the event dispatches":
+      # One `data:` field leaves the client's data buffer empty after it strips
+      # the trailing LF, and EventSource then discards the event. Two fields
+      # leave "\n", which dispatches (#266).
+      let (_, body) = splitHeadBody(rawGet("/empty"))
+      check dechunk(body) ==
+        "event: ping\ndata:\ndata:\n\n" &      # typed, empty payload
+        "data:\ndata:\n\n"                     # untyped, empty payload
 
   suite "router-free inbound streaming (streamPaths + req.stream)":
     test "the upload body is streamed to the handler and counted":
