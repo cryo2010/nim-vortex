@@ -897,6 +897,11 @@ HTTP/1.1 trailers. On a mid-stream error call `res.abort()` rather than `finish`
 HTTP/1.1 closes the connection before the terminating chunk, HTTP/2 and HTTP/3
 reset the stream, so the client sees the transfer was cut short.
 
+A body that declared a `contentLength` and then ends at a different length is
+treated as that same truncation, whichever way `finish` was reached: the server
+closes the connection (HTTP/1.1) or resets the stream (HTTP/2, HTTP/3) instead of
+terminating the body cleanly at a length the head already contradicted.
+
 ### Server-Sent Events
 
 `res.sse` opens a `text/event-stream` response over the streaming primitives, so

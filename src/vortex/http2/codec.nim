@@ -46,6 +46,11 @@ type
     respPhase*: RespPhase            ## streamed-response send state machine
                                      ## (h2-local; replaces the old rs.respStreaming
                                      ## flag for this path)
+    respDeclaredLen*: int64          ## Content-Length this streamed response
+                                     ## declared (-1 = none); set by h2SendHead
+    respBodyWritten*: int64          ## response body bytes accepted by
+                                     ## h2StreamWrite so far; reconciled against
+                                     ## respDeclaredLen at h2StreamFinish (#345)
     pendingBody*: string             ## response bytes awaiting send window
     pendingPos*: int
     pendingIsLast*: bool
@@ -905,14 +910,20 @@ proc h2DrainResume*(c: ptr Connection, core: ptr LoopCore) =
 
 proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
                  dateStr, serverHeader, contentType: string,
-                 extraHeaders: openArray[(string, string)], altSvc = "") =
-  ## Send a streamed response's HEADERS (no content-length, no END_STREAM) and
-  ## open the body. Subsequent bytes flow via h2StreamWrite/h2StreamFinish.
+                 extraHeaders: openArray[(string, string)], altSvc = "",
+                 contentLength: int64 = -1) =
+  ## Send a streamed response's HEADERS (no END_STREAM) and open the body.
+  ## Subsequent bytes flow via h2StreamWrite/h2StreamFinish. `contentLength` is
+  ## the length the caller already declared in `extraHeaders` (-1 = none); it is
+  ## not encoded here, only remembered, so h2StreamFinish can reconcile it
+  ## against what the body actually wrote (#345).
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or h2.streams[sid].rs.responded: return
   template st: H2Stream = h2.streams[sid]
   st.rs.responded = true
   st.respPhase = if st.isHead: rpHeadSent else: rpStreaming
+  st.respDeclaredLen = contentLength
+  st.respBodyWritten = 0
   if st.isHead:
     st.pendingIsLast = true            # HEAD: headers only, close the stream
   var hb = ""
@@ -942,6 +953,7 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   template st: H2Stream = h2.streams[sid]
   if st.isHead: return 0
   if data.len > 0:
+    st.respBodyWritten += data.len       # reconciled at finish (#345)
     compactPendingBody(st)               # reclaim the sent prefix first (#331)
     # Emit what flow control allows straight from the caller's buffer, and park
     # only the remainder (#334). h2WriteDirect returns 0 whenever the fast path
@@ -957,16 +969,38 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   if sid notin h2.streams: return 0
   h2.streams[sid].pendingBody.len - h2.streams[sid].pendingPos
 
+proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
+  ## Abort a streamed response mid-body: RST_STREAM(INTERNAL_ERROR) so the peer
+  ## sees the transfer was cut short, not cleanly completed. No-op unless the
+  ## stream is an open streamed response.
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams or
+      h2.streams[sid].respPhase != rpStreaming:
+    return
+  h2.streams[sid].respPhase = rpAborted
+  h2.streams[sid].rs.onRespDrain = nil
+  h2.streamError(c, sid, errInternal)
+
 proc h2StreamFinish*(c: ptr Connection, sid: uint32,
                      trailers: openArray[(string, string)] = []) =
   ## Terminate a streamed response: mark the pending body final so the last
   ## DATA frame carries END_STREAM (or, when `trailers` are given, a trailing
   ## HEADERS frame does), then push.
+  ##
+  ## A body that came up short of (or ran past) a Content-Length the head already
+  ## declared is aborted instead: END_STREAM at the wrong length is a well-formed
+  ## lie the peer can only report as a protocol error, so RST_STREAM makes the
+  ## truncation visible on our side too, as HTTP/1 forces the connection closed
+  ## on the same mismatch (#248, #345).
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or
       h2.streams[sid].respPhase != rpStreaming:
     return
   template st: H2Stream = h2.streams[sid]
+  if not st.isHead and st.respDeclaredLen >= 0 and
+      st.respBodyWritten != st.respDeclaredLen:
+    h2StreamAbort(c, sid)      # tears the stream down: clears every counter
+    return
   st.respPhase = rpFinished
   st.rs.onRespDrain = nil
   clearBackedUp(h2, st)            # finished: never let a drain path resume it
@@ -988,18 +1022,6 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
     # out without END_STREAM, so emit a bare END_STREAM DATA frame to close it.
     c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
     h2.teardownStream(c, sid)
-
-proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
-  ## Abort a streamed response mid-body: RST_STREAM(INTERNAL_ERROR) so the peer
-  ## sees the transfer was cut short, not cleanly completed. No-op unless the
-  ## stream is an open streamed response.
-  let h2 = h2Conn(c)
-  if h2 == nil or sid notin h2.streams or
-      h2.streams[sid].respPhase != rpStreaming:
-    return
-  h2.streams[sid].respPhase = rpAborted
-  h2.streams[sid].rs.onRespDrain = nil
-  h2.streamError(c, sid, errInternal)
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
   ## LoopCore.hooks.wsStreamLookup: resolve a stream's WsConn for the public API.

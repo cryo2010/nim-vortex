@@ -77,10 +77,29 @@ proc chunkDownload(req: Request, res: Response) {.async.} =
       await res.drained()
   res.finish()
 
+# --- declared vs written body length (#345) ----------------------------------
+
+const declaredLen = 4096
+  ## Content-Length the three length routes below declare in their head.
+
+proc lengthRoute(written: int): RequestHandler =
+  ## A streamed response that declares `declaredLen` but writes `written` bytes,
+  ## then finishes. Closure over the count (a gcsafe handler may not reach a
+  ## GC'd global), as fileRoute below does.
+  proc (req: Request, res: Response) {.gcsafe.} =
+    res.sendHead(Http200, "application/octet-stream", [],
+                 contentLength = declaredLen)
+    let body = repeat('L', written)
+    if written > 0: discard res.write(body.toOpenArray(0, body.high))
+    res.finish()
+
 var rt = newRouter()
 rt.get("/big", bigDownload)
 rt.get("/split", splitDownload)
 rt.get("/chunks", chunkDownload)
+rt.get("/exactlen", lengthRoute(declaredLen))
+rt.get("/shortlen", lengthRoute(declaredLen div 2))
+rt.get("/longlen", lengthRoute(declaredLen + 1))
 
 # --- sendFile read-ahead (#340) ---------------------------------------------
 
@@ -234,17 +253,21 @@ proc floodIdleUpdates(port: Port, frames: int): int =
         break
   c.close()
 
-type BodyResult = tuple[body: string, sizes: seq[int], endStream: bool]
+type BodyResult = tuple[body: string, sizes: seq[int], endStream: bool,
+                        rst: int]
   ## The concatenated DATA payload, every DATA frame's payload length in order,
-  ## and whether the stream was closed with END_STREAM.
+  ## whether the stream was closed with END_STREAM, and the RST_STREAM error code
+  ## it was reset with instead (-1 if none) -- the two are mutually exclusive
+  ## outcomes, and #345 is precisely about which one a short body gets.
 
 proc fetchBody(port: Port, path: string, initialWindow, connGrant: int,
-               credit: bool): BodyResult =
+               credit: bool, verb = "GET"): BodyResult =
   ## Fetch `path` frame by frame. `initialWindow` is advertised as
   ## SETTINGS_INITIAL_WINDOW_SIZE ahead of the request (so it applies to this
   ## stream's send window) and `connGrant` opens the connection window; with
   ## `credit`, every DATA byte is handed back as a stream + connection
   ## WINDOW_UPDATE, which is what lets a small window drain.
+  result.rst = -1
   var c = newH2TestConn(port)
   var sndTimeout = Timeval(tv_sec: posix.Time(2), tv_usec: 0)
   discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
@@ -255,7 +278,7 @@ proc fetchBody(port: Port, path: string, initialWindow, connGrant: int,
   req.addFrameHeader(settings.len, ftSettings, 0, 0)
   req.add settings
   if connGrant > 0: req.addWindowUpdate(0, connGrant)
-  req.addRequest(1, {":method": "GET", ":scheme": "http",
+  req.addRequest(1, {":method": verb, ":scheme": "http",
                      ":path": path, ":authority": "localhost"}, endStream = true)
   c.sendRaw(req)
   let deadline = epochTime() + 60.0
@@ -271,7 +294,13 @@ proc fetchBody(port: Port, path: string, initialWindow, connGrant: int,
         result.body.add f.payload
         result.sizes.add f.payload.len
         if (f.flags and flagEndStream) != 0: result.endStream = true
+      elif f.typ == uint8(ftHeaders) and f.streamId == 1 and
+           (f.flags and flagEndStream) != 0:
+        result.endStream = true               # HEAD: headers only, stream closed
       elif f.typ == uint8(ftGoaway) or f.typ == uint8(ftRstStream):
+        if f.typ == uint8(ftRstStream) and f.streamId == 1 and
+            f.payload.len >= 4:
+          result.rst = int(get32(f.payload, 0))
         gone = true
     if gone or result.endStream: break
     if credit and consumed > 0:
@@ -400,6 +429,45 @@ suite "HTTP/2 streaming download":
       elif not (n == 0 and i == r.sizes.high): inc other
     check full == frameChunks
     check other == 0
+
+  test "a body short of its declared Content-Length is reset, not ended (#345)":
+    # HTTP/1 forces the connection closed when a length-delimited streamed body
+    # ends at the wrong length (#248), so the peer at least sees an incomplete
+    # read. h2 had no such net: finish() emitted a well-formed END_STREAM under a
+    # head that promised more, which only the client can notice (its h2 stack
+    # raises InvalidBodyLengthError) -- the server logged nothing. It must
+    # RST_STREAM instead, and the DATA already sent stands.
+    let r = fetchBody(srv.port, "/shortlen", initialWindow = wideGrant,
+                      connGrant = wideGrant, credit = false)
+    check not r.endStream
+    check r.rst == int(errInternal)
+    check r.body.len == declaredLen div 2
+
+  test "a body past its declared Content-Length is reset too (#345)":
+    # The other direction of the same mismatch: extra bytes desync an h1
+    # keep-alive and overrun the length an h2/h3 peer allocated for.
+    let r = fetchBody(srv.port, "/longlen", initialWindow = wideGrant,
+                      connGrant = wideGrant, credit = false)
+    check not r.endStream
+    check r.rst == int(errInternal)
+
+  test "a body that matches its declared Content-Length completes (#345)":
+    # The guard must not fire on the normal case (what every sendFile response
+    # does): exactly content-length bytes, then END_STREAM, no reset.
+    let r = fetchBody(srv.port, "/exactlen", initialWindow = wideGrant,
+                      connGrant = wideGrant, credit = false)
+    check r.endStream
+    check r.rst == -1
+    check r.body.len == declaredLen
+
+  test "HEAD with a declared Content-Length is not reset (#345)":
+    # HEAD writes no body by design, so its declared length must stay exempt:
+    # the stream closes on the HEADERS frame and the write is a no-op.
+    let r = fetchBody(srv.port, "/exactlen", initialWindow = wideGrant,
+                      connGrant = wideGrant, credit = false, verb = "HEAD")
+    check r.endStream
+    check r.rst == -1
+    check r.body.len == 0
 
   test "sendFile read-ahead keeps the backlog bounded and completes (#340)":
     # A slow reader (32 KiB stream window) against a 3 MiB sendFile: the backlog

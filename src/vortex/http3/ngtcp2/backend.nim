@@ -112,6 +112,11 @@ type
     contentLength: int64     ## declared content-length (-1 = absent); reconciled
                              ## against bodyReceived at stream end (#257)
     bodyReceived: int64      ## cumulative DATA payload bytes received
+    respDeclaredLen: int64   ## Content-Length this streamed RESPONSE declared
+                             ## (-1 = none); set by h3SendHead
+    respBodyWritten: int64   ## response body bytes accepted by h3StreamWrite so
+                             ## far; reconciled against respDeclaredLen at
+                             ## h3StreamFinish (#345)
     uncredited: int          ## streaming body bytes received but not yet
                              ## credited to QUIC flow control
     bufferedCounted: int     ## bytes this un-dispatched buffered body currently
@@ -198,7 +203,8 @@ proc cbHeaders(user, connUd: pointer, sid: int64, hdrs: ptr VqHeader, n: csize_t
   let h3c = cast[H3Conn](connUd)
   let usid = uint64(sid)
   if usid notin h3c.streams:
-    h3c.streams[usid] = H3Stream(id: usid, contentLength: -1)
+    h3c.streams[usid] = H3Stream(id: usid, contentLength: -1,
+                                 respDeclaredLen: -1)
   template st: H3Stream = h3c.streams[usid]
   if st.headersDone:
     # A header block after the request head is the trailer section (RFC 9114
@@ -574,11 +580,18 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
     (if sendBody: csize_t(body.len) else: 0), 1)
 
 proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
-                 contentType: string, extraHeaders: openArray[(string, string)]) =
+                 contentType: string, extraHeaders: openArray[(string, string)],
+                 contentLength: int64 = -1) =
+  ## Send a streamed response's HEADERS and open the body. `contentLength` is the
+  ## length the caller already declared in `extraHeaders` (-1 = none); it is not
+  ## encoded here, only remembered, so h3StreamFinish can reconcile it against
+  ## what the body actually wrote (#345).
   if conn.vq == nil or sid notin conn.streams or conn.streams[sid].rs.responded: return
   template st: H3Stream = conn.streams[sid]
   st.rs.responded = true
   st.rs.respStreaming = not st.isHead
+  st.respDeclaredLen = contentLength
+  st.respBodyWritten = 0
   let hdrs = buildRespHeaders(core, code, contentType, extraHeaders,
                               bodyLen = -1, st.isHead, bodiless = false)
   var nv = toVq(hdrs)
@@ -588,13 +601,30 @@ proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
 proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
   if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return 0
   if data.len > 0:
+    conn.streams[sid].respBodyWritten += data.len   # reconciled at finish (#345)
     return int(vqStreamWrite(conn.vq, int64(sid),
                              cast[ptr uint8](unsafeAddr data[0]), csize_t(data.len)))
   int(vqStreamBacklog(conn.vq, int64(sid)))
 
+proc h3StreamAbort*(conn: H3Conn, sid: uint64) =
+  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
+  conn.streams[sid].rs.respStreaming = false
+  conn.streams[sid].rs.onRespDrain = nil
+  vqStreamReset(conn.vq, int64(sid), 0x0102)   # H3_INTERNAL_ERROR
+
 proc h3StreamFinish*(conn: H3Conn, sid: uint64,
                      trailers: openArray[(string, string)] = []) =
+  ## Terminate a streamed response with the FIN (preceded by any trailer
+  ## section). A body that came up short of (or ran past) a Content-Length the
+  ## head already declared is RESET instead: a clean end at the wrong length is a
+  ## well-formed lie the peer can only report as a protocol error, so the reset
+  ## makes the truncation visible on our side too, as HTTP/1 forces the
+  ## connection closed on the same mismatch (#248, #345).
   if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
+  if conn.streams[sid].respDeclaredLen >= 0 and
+      conn.streams[sid].respBodyWritten != conn.streams[sid].respDeclaredLen:
+    h3StreamAbort(conn, sid)
+    return
   conn.streams[sid].rs.respStreaming = false
   conn.streams[sid].rs.onRespDrain = nil
   # Submit any trailer fields before the FIN so nghttp3 keeps the stream open for
@@ -621,12 +651,6 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
   if conn.vq == nil or sid notin conn.streams: return 0
   int(vqStreamBacklog(conn.vq, int64(sid)))
-
-proc h3StreamAbort*(conn: H3Conn, sid: uint64) =
-  if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
-  conn.streams[sid].rs.respStreaming = false
-  conn.streams[sid].rs.onRespDrain = nil
-  vqStreamReset(conn.vq, int64(sid), 0x0102)   # H3_INTERNAL_ERROR
 
 proc h3RespComp*(conn: H3Conn, sid: uint64): RootRef =
   if sid in conn.streams: conn.streams[sid].rs.respComp else: nil

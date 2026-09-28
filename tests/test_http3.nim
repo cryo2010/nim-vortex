@@ -43,6 +43,19 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     for i in 0 ..< 64:
       discard res.write(chunk)
     res.finish()
+  of "/exactlen":
+    # A streamed body that delivers exactly the Content-Length it declared: the
+    # normal case (every sendFile response), which must still end cleanly.
+    res.sendHead(Http200, "text/plain", [], contentLength = 5)
+    res.write("short")
+    res.finish()
+  of "/shortlen":
+    # ... and one that ends short of it. A clean FIN there is a well-formed lie
+    # only the client can catch, so h3StreamFinish must reset the stream instead
+    # (#345), as HTTP/1 forces the connection closed on the same mismatch (#248).
+    res.sendHead(Http200, "text/plain", [], contentLength = 64)
+    res.write("short")
+    res.finish()
   of "/trailer":
     res.sendHead(Http200, "text/plain")
     res.write("body")
@@ -138,6 +151,23 @@ withServer(RequestHandler(handler),
     test "a mid-stream exception resets the h3 stream (client sees an error)":
       let (_, rc) = h3curl("-o /dev/null " & base & "/boom")
       check rc != 0
+
+    test "a body short of its declared Content-Length resets the stream (#345)":
+      # Before the fix, finish() FIN'd the stream cleanly after 5 of the 64 bytes
+      # the head declared: a well-formed response that only the client could tell
+      # was a lie (its QUIC stack reported a short read, and the server logged
+      # nothing). The reset makes it the server's error, which is what curl now
+      # names -- so assert the diagnostic, not just the non-zero exit: the short
+      # read alone failed the transfer before the fix too. -S shows the error on
+      # stderr, which execCmdEx folds into the output.
+      let (err, rc) = h3curl("-S -o /dev/null " & base & "/shortlen")
+      check rc != 0
+      check "reset" in err.toLowerAscii
+
+    test "a body matching its declared Content-Length completes (#345)":
+      let (output, rc) = h3curl(base & "/exactlen")
+      check rc == 0
+      check output == "short"
 
     test "streamed request body over h3 (DATA -> onBody)":
       let tmp = certDir / "up.bin"
