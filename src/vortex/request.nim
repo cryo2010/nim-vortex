@@ -2143,16 +2143,13 @@ proc lastEventId*(req: Request): string = req.header("last-event-id")
   ## The `Last-Event-ID` the client echoes when reconnecting an SSE stream (the
   ## `id:` of the last event it saw). Empty on first connect; use it to resume.
 
-template withSse*(res: Response, s, body: untyped) =
-  ## Block form for a finite stream: opens an SSE stream bound to `s`, runs
-  ## `body`, then closes it (aborting on exception, like `res.stream`). Named
-  ## `withSse` (not `sse`) to avoid clashing with the `res.sse(...)` handle
-  ## constructor, following the `withLock`/`withFile` scoped-resource idiom.
-  ##
-  ##   res.withSse(s):
-  ##     for row in report: s.send(row.toJson, event = "row", id = $row.id)
+template withSseScope(res: Response, s, sseHeaders, sseRetry, body: untyped) =
+  ## Internal: the scoped-resource expansion `withSse` produces, with the
+  ## `res.sse` arguments already resolved. Kept a template rather than inlined
+  ## into the macro's result so `sse`, `close` and `abort` bind here, at
+  ## definition scope, instead of wherever the block is written.
   block:
-    var s = res.sse()
+    var s = res.sse(sseHeaders, sseRetry)
     var sseCompleted = false
     try:
       body
@@ -2160,6 +2157,47 @@ template withSse*(res: Response, s, body: untyped) =
     finally:
       if sseCompleted: s.close()
       else: s.abort()
+
+macro withSse*(res: Response, args: varargs[untyped]): untyped =
+  ## Block form for a finite stream: opens an SSE stream bound to `s`, runs
+  ## `body`, then closes it (aborting on exception, like `res.stream`). Named
+  ## `withSse` (not `sse`) to avoid clashing with the `res.sse(...)` handle
+  ## constructor, following the `withLock`/`withFile` scoped-resource idiom.
+  ##
+  ##   res.withSse(s):
+  ##     for row in report: s.send(row.toJson, event = "row", id = $row.id)
+  ##
+  ## `res.sse`'s arguments pass through, by name, so the block form is not a
+  ## worse-equipped `res.sse`:
+  ##
+  ##   res.withSse(s, retry = 3000):                       # reconnect delay
+  ##     ...
+  ##   res.withSse(s, headers = [("X-Stream", "report")], retry = 3000):
+  ##     ...
+  ##
+  ## A macro rather than a template because Nim binds a trailing block to the
+  ## last parameter positionally: with `headers`/`retry` as defaulted template
+  ## parameters, `res.withSse(s): body` would hand the block to `headers`.
+  if args.len < 2:
+    error("withSse needs a stream name and a body: `res.withSse(s): ...`", res)
+  let sName = args[0]
+  let body = args[^1]
+  var hdrs = newNimNode(nnkBracket)      # matches res.sse's `headers = []`
+  var retry = newLit(0)
+  for i in 1 ..< args.len - 1:
+    let a = args[i]
+    if a.kind != nnkExprEqExpr:
+      error("withSse: pass res.sse's arguments by name, e.g. " &
+            "`res.withSse(s, retry = 3000): ...`", a)
+    case $a[0]
+    of "headers": hdrs = a[1]
+    of "retry":   retry = a[1]
+    else:
+      error("withSse: unknown argument `" & $a[0] &
+            "`; res.sse takes `headers` and `retry`", a)
+  # bindSym so the expansion reaches withSseScope, which stays off the public
+  # API (the same shape as the `blocking` macro's dispatch helpers).
+  newCall(bindSym"withSseScope", res, sName, hdrs, retry, body)
 
 # --- blocking dispatch ------------------------------------------------------
 

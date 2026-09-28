@@ -515,7 +515,7 @@ through a dead connection is a safe no-op.
 | `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
 | `res.setPriority(urgency, incremental = false)` | `void` | RFC 9218 scheduling override for this response over HTTP/2: lower `urgency` (0..7, default 3) is served first; `incremental = true` interleaves with same-urgency streams, `false` delivers it sequentially. Beats the client's `Priority` header / `PRIORITY_UPDATE`. No-op over h1 and h3; loop-thread only |
 | `res.sse(headers = [], retry = 0)` | `SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
-| `res.withSse(s): body` | `template` | block form of an SSE stream |
+| `res.withSse(s, headers = [], retry = 0): body` | `macro` | block form of an SSE stream; `headers`/`retry` forward to `res.sse` (pass them by name) |
 | `res.sendFile(path, opts = staticOptions())` | `void` | send one file (see [Static files](#static-files)) |
 
 Two helpers build header pairs to pass in `res.send`'s `headers`:
@@ -942,6 +942,14 @@ you:
 
 ```nim
 res.withSse(s):
+  for row in report: discard s.send(row.toJson, event = "row", id = $row.id)
+```
+
+`res.sse`'s arguments pass through it, by name, so the block form is no less
+capable than the handle constructor:
+
+```nim
+res.withSse(s, headers = [("X-Stream", "report")], retry = 3000):
   for row in report: discard s.send(row.toJson, event = "row", id = $row.id)
 ```
 

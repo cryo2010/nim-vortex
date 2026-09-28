@@ -48,6 +48,17 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     discard s.send("e\nf")
     discard s.send("g\n")
     s.close()
+  of "/withsse":
+    # #269: the bare block form, unchanged.
+    res.withSse(s):
+      discard s.send("plain")
+  of "/withsse-opts":
+    # #269: res.sse's arguments forwarded through the block form.
+    res.withSse(s, headers = [("X-Stream", "report")], retry = 3000):
+      discard s.send("opts")
+  of "/withsse-retry":
+    res.withSse(s, retry = 1500):
+      discard s.send("retry")
   of "/probe":
     let s = res.sse()
     probeSse = s
@@ -149,6 +160,22 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
       check dechunk(body) ==
         "data: off false 0\n\n" &
         "data: on true\n\n"
+
+  suite "withSse block form":
+    test "the bare form still opens, sends and closes the stream":
+      let (head, body) = splitHeadBody(rawGet("/withsse"))
+      check "Content-Type: text/event-stream" in head
+      check dechunk(body) == "data: plain\n\n"
+
+    test "retry passes through to res.sse":
+      let (_, body) = splitHeadBody(rawGet("/withsse-retry"))
+      check dechunk(body) == "retry: 1500\n\n" & "data: retry\n\n"
+
+    test "headers and retry both pass through to res.sse":
+      let (head, body) = splitHeadBody(rawGet("/withsse-opts"))
+      check "X-Stream: report" in head
+      check "Cache-Control: no-cache, no-transform" in head   # still applied
+      check dechunk(body) == "retry: 3000\n\n" & "data: opts\n\n"
 
   suite "router-free inbound streaming (streamPaths + req.stream)":
     test "the upload body is streamed to the handler and counted":

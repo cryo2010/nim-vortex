@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream maps and the write buffers. A `blocking:` worker still sees
   `req.isAlive == true`: its connection is pinned for the body's duration. This
   matches the WebSocket handles, which already guarded both. (#268)
+- SSE: `res.withSse` forwards `res.sse`'s arguments, so the block form can set
+  the reconnect delay and extra response headers:
+  `res.withSse(s, headers = [("X-Stream", "report")], retry = 3000): ...`. It
+  hardcoded `res.sse()`, which meant reaching for the handle constructor and
+  hand-writing the close/abort pairing to get either. The existing
+  `res.withSse(s): ...` form is unchanged. (#269)
 - HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
   then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
   INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1
