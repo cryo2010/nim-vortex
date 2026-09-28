@@ -73,6 +73,15 @@ proc addSettingsFrame*(buf: var string) =
   buf.addFrameHeader(payload.len, ftSettings, 0, 0)
   buf.add payload
 
+proc addSettingFrame*(buf: var string, id: uint16, value: uint32) =
+  ## SETTINGS frame carrying exactly one entry (e.g. a zero
+  ## SETTINGS_INITIAL_WINDOW_SIZE, which parks every response body the server
+  ## produces, or a lowered SETTINGS_HEADER_TABLE_SIZE).
+  var payload = ""
+  payload.addSetting(id, value)
+  buf.addFrameHeader(payload.len, ftSettings, 0, 0)
+  buf.add payload
+
 proc addExtendedConnect*(buf: var string, sid: uint32,
                          headers: openArray[(string, string)]) =
   ## HEADERS frame for an RFC 8441 Extended CONNECT: END_HEADERS but NOT
@@ -174,6 +183,18 @@ proc rstError*(frames: seq[Frame], sid: uint32): int =
     if f.typ == uint8(ftRstStream) and f.streamId == sid and f.payload.len >= 4:
       return int(get32(f.payload, 0))
   -1
+
+proc hasResponse*(frames: seq[Frame], sid: uint32): bool =
+  ## True when a response HEADERS frame arrived on `sid`, i.e. the request was
+  ## answered rather than reset (or lost with the whole connection).
+  for f in frames:
+    if f.typ == uint8(ftHeaders) and f.streamId == sid: return true
+
+proc headerPayload*(frames: seq[Frame], sid: uint32): string =
+  ## The still-HPACK-encoded payload of the first response HEADERS on `sid`
+  ## ("" if none), for assertions about the encoding itself.
+  for f in frames:
+    if f.typ == uint8(ftHeaders) and f.streamId == sid: return f.payload
 
 proc close*(c: var H2TestConn) =
   c.sock.close()
