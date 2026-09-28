@@ -4,6 +4,7 @@
 
 import std/[unittest, net, httpcore, strutils]
 import vortex/[settings, request, server]
+import vortex/connection            # LoopCore/LoopConfig for the unit-level teardown
 import vortex/websocket/deflate
 import ./helper
 import ./wsclient
@@ -15,6 +16,21 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       ws.send(data, kind)                     # echo (server compresses it back)
   else:
     res.send(Http200, "http")
+
+# --- teardown (unit level, no server needed) --------------------------------
+
+suite "permessage-deflate teardown":
+  test "a second wsStreamClosed on the same WsConn is a no-op":
+    # Two teardown paths can reach one WsConn (an h2/h3 stream reset and then
+    # the connection dying), so the zlib free must be idempotent instead of
+    # relying on the caller nil-ing its reference in between (#264).
+    var core = LoopCore(config: LoopConfig(wsCompression: true), nowSec: 1)
+    let setup = wsSetup(addr core, 3, 0, 4096, 7, "permessage-deflate", "", [])
+    check "permessage-deflate" in setup.extensions   # the contexts were created
+    wsStreamClosed(addr core, nil, setup.w)
+    check setup.w.closeNotified
+    wsStreamClosed(addr core, nil, setup.w)          # must not re-enter zlib
+    check setup.w.closeNotified
 
 type Client = object
   s: Socket
