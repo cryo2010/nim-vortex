@@ -760,6 +760,12 @@ proc h3WsAccept*(core: ptr LoopCore, conn: H3Conn, sid: uint64, fd: int32,
   if st.body.len > 0:
     w.inBuf.add st.body
     st.body.setLen(0)
+  # The client may also have half-closed (FIN) the stream before the handler
+  # accepted it: cbStreamEnd could not deliver the peer-close then (there was no
+  # WsConn yet), so carry the FIN over for the post-accept pump to replay,
+  # otherwise the application's onClose never fires and the handle lingers until
+  # the idle sweep reaps it (#261). Twin of h2WsAccept's endStreamSeen.
+  w.preAcceptFin = st.finSeen
   var hdrs: seq[(string, string)] = @[(":status", "200")]
   if core.serverHeader.len > 0: hdrs.add ("server", core.serverHeader)
   hdrs.add ("date", core.dateStr)

@@ -75,12 +75,14 @@ class WsClient(QuicConnectionProtocol):
                 self._got_data.set()
 
     async def open_ws(self, authority, path="/", subprotocols=None,
-                      pipelined=b""):
+                      pipelined=b"", fin=False):
         """Open an Extended CONNECT WebSocket; return the handshake status.
 
         `pipelined` bytes are sent as DATA before the first transmit, so the
         handshake and those WebSocket frames leave in the same packet burst
-        (the server sees them before the handler accepts the stream).
+        (the server sees them before the handler accepts the stream). `fin`
+        half-closes the stream in that same burst (a QUIC-level FIN, no DATA
+        frame), i.e. before the handler can accept.
         """
         if self._http is None:
             self._http = H3Connection(self._quic)
@@ -99,6 +101,8 @@ class WsClient(QuicConnectionProtocol):
         self._http.send_headers(self._sid, headers, end_stream=False)
         if pipelined:
             self._http.send_data(self._sid, pipelined, end_stream=False)
+        if fin:
+            self._quic.send_stream_data(self._sid, b"", end_stream=True)
         self.transmit()
         await asyncio.wait_for(self._got_headers.wait(), timeout=5)
         return self._status
@@ -149,6 +153,22 @@ async def run_coalesced(host, port):
         print("coalesced handshake + frame OK")
 
 
+async def run_early_fin(host, port):
+    """A half-close before the handler accepts must still close the WebSocket.
+
+    The FIN reaches the server while the stream has no WsConn yet, so it has to
+    be replayed after acceptance: the server answers with a close frame (the
+    same path that delivers the application's onClose) instead of leaving the
+    handle for the idle sweep.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws("server", "/", fin=True)
+        assert status == "200", f"handshake status {status!r}"
+        fr = (await client.recv_ws())[0]
+        assert fr[0] == OP_CLOSE, f"close after pre-accept FIN: {fr}"
+        print("half-close before accept OK")
+
+
 async def run(host, port):
     async with client_ctx(host, port) as client:
         status = await client.open_ws("server", "/", ["chat", "json"])
@@ -185,6 +205,7 @@ async def run(host, port):
         print("close handshake OK")
 
     await run_coalesced(host, port)
+    await run_early_fin(host, port)
     print("RESULT: all HTTP/3 WebSocket cases passed.")
 
 

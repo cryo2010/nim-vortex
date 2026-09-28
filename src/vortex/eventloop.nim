@@ -1539,17 +1539,22 @@ when not defined(plainHttp):
         # pipelined with the Extended CONNECT handshake (they arrived before the
         # handler ran and were seeded into the WsConn by h3WsAccept). Pump them
         # now that the handler has installed onMessage -- otherwise they sit in
-        # inBuf until the client happens to send more (#259). The ngPump below
-        # puts any frames the dispatch produced on the wire. Twin of the h2
-        # post-accept pump in dispatchH2.
+        # inBuf until the client happens to send more (#259) -- and deliver a
+        # deferred peer-close if the client half-closed before we accepted
+        # (#261). The ngPump below puts any frames this produced on the wire.
+        # Twin of the h2 post-accept pump in dispatchH2.
         let h3c = h3ConnOf(addr loop.core, h3SlotFd(slot), gen)
         if h3c != nil and h3StreamAlive(h3c, sid):
           # Resolve the WsConn ref before feeding: wsFeed can tear the stream
           # down, invalidating any ptr into the streams table.
           let stp = h3StreamPtr(h3c, sid)
           let w = if stp.ws != nil: WsConn(stp.ws) else: nil
-          if w != nil and w.inBuf.len > 0:
-            wsFeed(addr loop.core, nil, w, "")
+          if w != nil and (w.inBuf.len > 0 or w.preAcceptFin):
+            if w.inBuf.len > 0:
+              wsFeed(addr loop.core, nil, w, "")
+            if w.preAcceptFin and h3StreamAlive(h3c, sid):
+              w.preAcceptFin = false
+              wsPeerClosed(addr loop.core, nil, w)
     ngHandleExpiry()
     ngPump()
     for idx in 0 ..< loop.core.h3slots.len:
