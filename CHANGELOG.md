@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escape for a literal CR, so a CR in `data` is a field boundary that the
   client rebuilds as an LF (`send("a\r\nb")` arrives as `"a\nb"`). Encode the
   payload (base64, or JSON) when it must survive byte for byte. (#267)
+- SSE, streaming: `req.isAlive`, `res.bufferedAmount` and the `SseStream`
+  `alive` / `bufferedAmount` that delegate to them are now guarded by the same
+  loop-thread check every mutating call takes, so an off-thread read reports
+  false / 0 instead of racing the loop over the connection table, the h2/h3
+  stream maps and the write buffers. A `blocking:` worker still sees
+  `req.isAlive == true`: its connection is pinned for the body's duration. This
+  matches the WebSocket handles, which already guarded both. (#268)
 - HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
   then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
   INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1

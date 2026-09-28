@@ -93,8 +93,25 @@ proc response*(req: Request): Response =
   ## this exists for code that stored only the read half.
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream)
 
+var cachedThreadId {.threadvar.}: int
+
+proc currentThreadId(): int {.inline.} =
+  ## getThreadId() is a syscall on Linux; caching it matters on the
+  ## per-request fast path.
+  if cachedThreadId == 0:
+    cachedThreadId = getThreadId()
+  cachedThreadId
+
 proc isAlive*(req: Request): bool =
+  ## True while the client is still connected (this request's stream is open).
+  ## Loop-thread only: false from any other thread, since the connection table
+  ## and the h2/h3 stream maps are loop-owned. A `blocking:` worker is the one
+  ## exception and returns true below: its connection is pinned for the body.
   if req.snap != nil: return true    # pinned for the blocking body's duration
+  # Same guard every mutating call takes (write, finish, sendHead, ...): reading
+  # loop-owned state from a foreign thread races the loop, so report the handle
+  # as dead rather than answer from a torn read.
+  if currentThreadId() != req.core.threadId: return false
   if req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -197,15 +214,6 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
 
 proc lowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
-
-var cachedThreadId {.threadvar.}: int
-
-proc currentThreadId(): int {.inline.} =
-  ## getThreadId() is a syscall on Linux; caching it matters on the
-  ## per-request fast path.
-  if cachedThreadId == 0:
-    cachedThreadId = getThreadId()
-  cachedThreadId
 
 proc headers*(res: Response): var ResponseHeaders =
   ## Response headers to send with the eventual `res.send`. Set them from
@@ -1892,7 +1900,10 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
 
 proc bufferedAmount*(res: Response): int =
   ## Bytes queued for the streaming response but not yet written to the
-  ## socket. Zero when idle or on a dead connection.
+  ## socket. Zero when idle or on a dead connection. Loop-thread only: zero
+  ## from any other thread, since the write buffers are loop-owned (read them
+  ## from the handler, an async continuation or an `onDrain` callback).
+  if currentThreadId() != res.core.threadId: return 0
   if res.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(res.core, res.fd, res.gen)
@@ -2107,6 +2118,7 @@ proc comment*(s: SseStream, text = ""): bool {.discardable, raises: [].} =
 
 proc bufferedAmount*(s: SseStream): int = s.res.bufferedAmount
   ## Bytes queued for the SSE stream but not yet written to the socket.
+  ## Loop-thread only: zero from any other thread.
 
 proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
   ## Fire `cb` (loop thread) when a backed-up SSE stream's write backlog
@@ -2117,7 +2129,7 @@ proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
 proc alive*(s: SseStream): bool =
   ## False once the client disconnects; the producer loop should stop. Use this
   ## rather than `send` returning false, which is ambiguous (backpressure *or*
-  ## a dead connection).
+  ## a dead connection). Loop-thread only: false from any other thread.
   Request(core: s.res.core, fd: s.res.fd, gen: s.res.gen,
           stream: s.res.stream).isAlive
 

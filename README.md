@@ -463,7 +463,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
 | `req.params` | `PathParams` | all router path parameters |
 | `req.param(name)` | `string` | one router path parameter; "" if absent |
-| `req.isAlive` | `bool` | connection/stream still open |
+| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned) |
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
@@ -511,7 +511,7 @@ through a dead connection is a safe no-op.
 | `res.abort()` | `void` | truncate a streamed response (error mid-body) |
 | `res.stream(code = Http200, contentType, headers = []): body` | `template` | block form of a streamed response |
 | `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
-| `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket |
+| `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket; loop-thread only (0 from another thread) |
 | `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
 | `res.setPriority(urgency, incremental = false)` | `void` | RFC 9218 scheduling override for this response over HTTP/2: lower `urgency` (0..7, default 3) is served first; `incremental = true` interleaves with same-urgency streams, `false` delivers it sequentially. Beats the client's `Priority` header / `PRIORITY_UPDATE`. No-op over h1 and h3; loop-thread only |
 | `res.sse(headers = [], retry = 0)` | `SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
@@ -920,7 +920,9 @@ proc events(req: Request, res: Response) =
 `event`/`id`/`retry` are optional) and returns `false` under write backpressure;
 `s.comment` sends a heartbeat; `s.bufferedAmount` / `s.onDrain` (and
 `await s.response.drained()` with an adapter) expose backpressure; `s.alive`
-reports client disconnect; `s.close` ends it (`s.abort` truncates).
+reports client disconnect; `s.close` ends it (`s.abort` truncates). Like the
+rest of the streaming surface these are loop-thread only: read from another
+thread, `s.alive` is false and `s.bufferedAmount` is 0.
 `req.lastEventId` gives the `Last-Event-ID` a client echoes on reconnect.
 
 An empty `data` is emitted as two empty `data:` fields, so a payload-free event

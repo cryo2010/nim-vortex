@@ -11,6 +11,21 @@ import std/[unittest, net, strutils, httpcore]
 import vortex/[settings, request, server, streaming]
 import ./helper
 
+# #268: `alive` and `bufferedAmount` read loop-owned state (the connection
+# table, the h2/h3 stream maps, the write buffers), so an off-thread read has to
+# report "dead"/"idle" instead of racing the loop thread. The probe runs on a
+# plain createThread while the loop thread is parked in joinThread, so the
+# handle it reads is genuinely live: only the thread guard makes it answer
+# false/0. SseStream is a handle of a pointer plus three ints, so a global copy
+# of one carries no GC'd memory across the thread boundary.
+var probeSse: SseStream
+var probeAlive = true
+var probeBuffered = -1
+
+proc probeOffThread(unused: int) {.thread.} =
+  probeAlive = probeSse.alive
+  probeBuffered = probeSse.bufferedAmount
+
 proc pathOnly(req: Request): string =
   ## streaming.nim keeps its own copy private, so the handler needs a local one.
   result = req.path
@@ -32,6 +47,15 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     discard s.send("c\rd")
     discard s.send("e\nf")
     discard s.send("g\n")
+    s.close()
+  of "/probe":
+    let s = res.sse()
+    probeSse = s
+    var thr: Thread[int]
+    createThread(thr, probeOffThread, 0)
+    joinThread(thr)
+    discard s.send("off " & $probeAlive & " " & $probeBuffered)
+    discard s.send("on " & $s.alive)
     s.close()
   of "/empty":
     # #266: a payload-free typed event must still dispatch on the client.
@@ -117,6 +141,14 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
         "data: c\ndata: d\n\n" &     # "c\rd":   a bare CR breaks the line
         "data: e\ndata: f\n\n" &     # "e\nf":   plain LF
         "data: g\ndata: \n\n"        # "g\n":    trailing break -> empty tail
+
+    test "alive and bufferedAmount are loop-thread guarded":
+      # Off-thread: false / 0 without touching loop state. On the loop thread
+      # the same live handle still reports alive (#268).
+      let (_, body) = splitHeadBody(rawGet("/probe"))
+      check dechunk(body) ==
+        "data: off false 0\n\n" &
+        "data: on true\n\n"
 
   suite "router-free inbound streaming (streamPaths + req.stream)":
     test "the upload body is streamed to the handler and counted":
