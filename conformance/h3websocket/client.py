@@ -169,6 +169,27 @@ async def run_early_fin(host, port):
         print("half-close before accept OK")
 
 
+async def run_async_send(host, port):
+    """A reply sent from a loop-thread continuation must go out promptly.
+
+    The server answers "later" from a 200 ms timer, i.e. outside the inbound
+    packet's processing, where the QUIC send buffer has nothing else pushing
+    it onto the wire. The deadline is well under the loop's idle wait, so a
+    frame that waits for an unrelated wakeup fails the case.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws("server", "/")
+        assert status == "200", f"handshake status {status!r}"
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        client.send_ws(OP_TEXT, b"later")
+        fr = (await client.recv_ws())[0]
+        elapsed = loop.time() - started
+        assert fr == (OP_TEXT, b"later"), f"deferred reply: {fr}"
+        assert elapsed < 0.7, f"deferred reply stalled {elapsed:.2f}s on the wire"
+        print(f"deferred (async) send OK in {elapsed:.2f}s")
+
+
 async def run(host, port):
     async with client_ctx(host, port) as client:
         status = await client.open_ws("server", "/", ["chat", "json"])
@@ -206,6 +227,7 @@ async def run(host, port):
 
     await run_coalesced(host, port)
     await run_early_fin(host, port)
+    await run_async_send(host, port)
     print("RESULT: all HTTP/3 WebSocket cases passed.")
 
 

@@ -23,8 +23,10 @@ docker network (QUIC is UDP):
   opens an Extended CONNECT WebSocket and checks: the 200 handshake, text and
   binary echo, ping→pong, subprotocol negotiation, a fragmented message, the
   close handshake, a frame coalesced with the handshake (sent before the
-  handler accepts the stream), and a half-close in that same burst. It exits
-  non-zero (failing the run) on any mismatch.
+  handler accepts the stream), a half-close in that same burst, and a reply
+  sent from an async continuation (which must reach the wire without waiting
+  for an unrelated event). It exits non-zero (failing the run) on any
+  mismatch.
 
 The WebSocket framing in `client.py` is hand-rolled so the test owns exactly
 what goes on the wire; aioquic supplies only the QUIC + HTTP/3 transport.

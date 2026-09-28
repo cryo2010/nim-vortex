@@ -116,6 +116,10 @@ type
                                  # per-header string/seq (see unpackResponseInto)
     tls: pointer                 # ptr TlsConfig; nil = plaintext
     udpFd: int                   # -1 = no HTTP/3
+    h3FlushPending: bool         # an h3 WebSocket send/close buffered frames
+                                 # outside the input path (flushHook with fd < 0):
+                                 # QUIC egress must be driven before the loop
+                                 # sleeps again (#262). h3Drive clears it.
     quicReload: pointer          # ptr CertReload: main-thread reload signal
     quicReloadSeen: int          # last reload generation this loop applied
     connCount: int               # live TCP connections (maxConnections cap)
@@ -1094,6 +1098,17 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
   ## loop-thread WebSocket send outside the read path.
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
+    if fd < 0:
+      # HTTP/3 handle: there is no ptr Connection to resolve (fd is a slot
+      # encoding), and the frames are already in the QUIC stream's send buffer
+      # (wsFlushH3ng put them there). Nothing would push them onto the wire
+      # until some unrelated event drove the connection, so mark the loop and
+      # let it drive QUIC egress before it sleeps again (#262). A flag rather
+      # than a direct h3Drive: this hook can run inside a nghttp3 callback
+      # (an inbound frame dispatching onMessage, which sends), and re-entering
+      # the stack from there is not safe.
+      loop.h3FlushPending = true
+      return
     let c = conn(addr loop.core, fd, gen)
     if c == nil or c.pendingOut <= 0: return
     if c.flushHold > 0 and c.pendingOut < respHighWater:
@@ -1556,6 +1571,10 @@ when not defined(plainHttp):
               w.preAcceptFin = false
               wsPeerClosed(addr loop.core, nil, w)
     ngHandleExpiry()
+    # Everything buffered up to here goes out in this pump, so a flush request
+    # from a send earlier in this pass is satisfied; only a send after it (none
+    # today) needs another pass (#262).
+    loop.h3FlushPending = false
     ngPump()
     for idx in 0 ..< loop.core.h3slots.len:
       if loop.core.h3slots[idx].conn != nil and
@@ -2171,6 +2190,16 @@ proc run*(loop: Loop) =
       # finish in the same pass instead of after a selector timeout.
       loop.pumpCap = loop.core.hooks.pumpHook()
     loop.tick()
+    when not defined(plainHttp):
+      # Anything that ran after this iteration's h3Drive (a continuation the
+      # async pump resumed, a timeout sweep) may have sent or closed on an h3
+      # WebSocket: the frames sit in the QUIC send buffer and flushHook flagged
+      # the loop, with nothing left in this iteration to put them on the wire.
+      # Drive egress once more rather than stalling them until the next datagram
+      # or timer wakes us (#262).
+      if loop.h3FlushPending and loop.udpFd >= 0:
+        try: loop.h3Drive()
+        except Exception: discard
     if loop.draining:
       loop.drainSweep()               # close connections that just finished
       if loop.drainComplete():
