@@ -129,6 +129,14 @@ type
                                  # deregistered after an fd/memory-exhaustion
                                  # accept() error (EMFILE/ENFILE/...), then
                                  # re-armed in tick(). 0 = listener armed.
+    pinnedGrowDrops: int         # connections refused because the connection table
+                                 # could not grow while a slot was pinned (see
+                                 # handleAccept). Counted and logged so the drop is
+                                 # never silent: from the client it is an empty
+                                 # connect error, indistinguishable from a network
+                                 # fault or a stalled loop (#343).
+    pinnedGrowLogSec: int64      # monotonic sec of the last drop log line; at most
+                                 # one a second, so a burst cannot flood the log
     bodyPausedConns: int         # HTTP/1 streaming connections whose socket read
                                  # is paused at the read-ahead high-water (the recv
                                  # loop stops pulling; the fd stays armed). While
@@ -1363,7 +1371,21 @@ proc handleAccept(loop: Loop) =
           pinnedAny = true
           break
       if pinnedAny:
+        # Refused, not served: say so. The connection cap above is a configured
+        # policy the operator already knows about, but this drop is an internal
+        # limit (the table cannot move under a worker's `addr conns[fd]`), so it
+        # would otherwise look like a network fault to the client and like nothing
+        # at all here. Rate-limited to one line a second, carrying the running
+        # count so a burst is still visible (#343).
         discard posix.close(client)
+        inc loop.pinnedGrowDrops
+        if loop.pinnedGrowLogSec != loop.core.nowSec:
+          loop.pinnedGrowLogSec = loop.core.nowSec
+          try: stderr.writeLine("vortex: refused a connection (fd " & $fd &
+            " is beyond the " & $loop.core.conns.len & "-slot connection table, " &
+            "which cannot grow while a blocking: worker holds a slot); " &
+            $loop.pinnedGrowDrops & " dropped so far on this loop thread")
+          except IOError, OSError: discard
         continue
       loop.core.conns.setLen(fd + 64)
     let c = addr loop.core.conns[fd]
