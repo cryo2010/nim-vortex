@@ -1733,6 +1733,11 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
   ## Append a body chunk to a streaming response and flush. Returns false once
   ## the unsent backlog reaches `respHighWater`; the producer should then stop
   ## and wait for `onDrain`. Safe no-op (returns false) on a dead connection.
+  ## Loop-thread only (the handler, an async continuation, an `onDrain`
+  ## callback): a call from a worker or a thread of your own is also a no-op
+  ## returning false, so false is not exclusively backpressure. Use
+  ## `req.isAlive` to tell a dead connection from a full backlog, and don't
+  ## stream from off the loop thread at all.
   ## `{.raises: [].}` (the body is contained) so it composes in strict-effect
   ## async bodies -- a producer's `if not res.write(chunk): await res.drained()`.
   try:
@@ -1886,6 +1891,8 @@ proc finish*(res: Response) {.raises: [].} =
 proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## Register a callback fired (loop thread) when a backed-up streaming
   ## response's write backlog empties, so the producer can resume writing.
+  ## Loop-thread only to register, too: an off-thread registration is dropped
+  ## silently, and a producer that then waits for the callback waits for good.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
   # The h3 reflush path cannot pass the handle words, so the callback closes
@@ -2083,6 +2090,17 @@ proc send*(s: SseStream, data: string, event = "", id = "",
   ## every one of them as a single LF. The format has no escape for a literal
   ## CR, so `send("a\r\nb")` is delivered as `"a\nb"`. Encode the payload
   ## (base64, or JSON, which escapes a CR) when it has to survive byte for byte.
+  ##
+  ## Loop-thread only, like the rest of the streaming surface: push events from
+  ## the handler, an async continuation, an `onDrain` callback or a loop timer,
+  ## never from a `blocking:` worker or a thread of your own. An off-thread call
+  ## is a no-op that returns false, which a producer reads as backpressure and
+  ## waits out for good, so it asserts instead (compiled out under
+  ## `--assertions:off` / `-d:danger`, where it is the silent no-op `res.write`
+  ## is). Hand the payload to the loop thread and send it there.
+  assert currentThreadId() == s.res.core.threadId,
+    "SseStream.send is loop-thread only; a worker cannot push events " &
+    "(hand the payload to the loop thread and send it from there)"
   var f = ""
   if id.len > 0:    f.add "id: " & sseSanitize(id) & "\n"
   if event.len > 0: f.add "event: " & sseSanitize(event) & "\n"
@@ -2113,7 +2131,12 @@ proc send*(s: SseStream, data: string, event = "", id = "",
 proc comment*(s: SseStream, text = ""): bool {.discardable, raises: [].} =
   ## Emit a comment line (`: text`). Clients ignore it; use it as a heartbeat
   ## to keep idle connections and proxies from timing out. `s.comment()` is a
-  ## bare `:` ping.
+  ## bare `:` ping. Loop-thread only and asserts off-thread, exactly like
+  ## `send`: a heartbeat that silently returns false stops keeping anything
+  ## warm, and the connection then dies on the idle timeout.
+  assert currentThreadId() == s.res.core.threadId,
+    "SseStream.comment is loop-thread only; a worker cannot send a heartbeat " &
+    "(schedule it on the loop thread instead)"
   s.res.write(": " & sseSanitize(text) & "\n\n")
 
 proc bufferedAmount*(s: SseStream): int = s.res.bufferedAmount
@@ -2122,7 +2145,8 @@ proc bufferedAmount*(s: SseStream): int = s.res.bufferedAmount
 
 proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
   ## Fire `cb` (loop thread) when a backed-up SSE stream's write backlog
-  ## empties, so the producer can resume.
+  ## empties, so the producer can resume. Loop-thread only to register, too:
+  ## an off-thread registration is dropped silently.
   let captured = cb
   s.res.onDrain(proc(r: Response) {.gcsafe.} = captured(SseStream(res: r)))
 

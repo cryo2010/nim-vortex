@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hardcoded `res.sse()`, which meant reaching for the handle constructor and
   hand-writing the close/abort pairing to get either. The existing
   `res.withSse(s): ...` form is unchanged. (#269)
+- SSE: `s.send` and `s.comment` called from off the loop thread now assert
+  (`res.headers`-style, so compiled out under `--assertions:off` / `-d:danger`)
+  instead of returning false. False is the producer's "backlog full, pause and
+  wait for `onDrain`", so a worker pushing events got a silent no-op that read
+  as backpressure, and a producer waiting on a drain that could never come.
+  `res.write`, `res.onDrain` and their SSE wrappers document that false, and a
+  dropped `onDrain` registration, mean an off-thread call too. (#270)
 - HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
   then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
   INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1

@@ -21,10 +21,23 @@ import ./helper
 var probeSse: SseStream
 var probeAlive = true
 var probeBuffered = -1
+var probeSendAsserted = false
+
+# #270: off-thread `send` asserts rather than returning the false a producer
+# would read as backpressure. The assert is compiled out with assertions off
+# (-d:danger), and under --panics:on it aborts instead of raising, so the probe
+# only tries it where the Defect can be caught.
+const sseAssertLive = compileOption("assertions") and not defined(nimPanics)
 
 proc probeOffThread(unused: int) {.thread.} =
   probeAlive = probeSse.alive
   probeBuffered = probeSse.bufferedAmount
+  when sseAssertLive:
+    try:
+      discard probeSse.send("from a worker")
+      probeSendAsserted = false
+    except Defect:
+      probeSendAsserted = true
 
 proc pathOnly(req: Request): string =
   ## streaming.nim keeps its own copy private, so the handler needs a local one.
@@ -160,6 +173,15 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
       check dechunk(body) ==
         "data: off false 0\n\n" &
         "data: on true\n\n"
+
+    test "send from another thread asserts instead of returning false":
+      # False is the producer's "pause and wait for onDrain", so an off-thread
+      # send that returned it would park the producer for good (#270).
+      when sseAssertLive:
+        discard rawGet("/probe")
+        check probeSendAsserted
+      else:
+        skip()
 
   suite "withSse block form":
     test "the bare form still opens, sends and closes the stream":

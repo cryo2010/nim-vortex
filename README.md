@@ -504,7 +504,7 @@ through a dead connection is a safe no-op.
 | `res.earlyHints(links, headers = [])` | `void` | 103 Early Hints with `Link` headers (RFC 8297) so the client can preload/preconnect while the handler works |
 | `res.serveContent(body, contentType = "application/octet-stream", etag = "", lastModified = none(Time), cacheControl = "")` | `void` | serve an in-memory body with conditional requests (If-Match / If-Unmodified-Since → 412, If-None-Match / If-Modified-Since → 304, If-Range) and byte ranges (206, `multipart/byteranges`, 416); the `http.ServeContent` analog |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
-| `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
+| `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure, a dead connection, or an (unsupported) call from off the loop thread |
 | `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
 | `res.finish()` | `void` | end a streamed response cleanly (emits `res.trailers`, if any) |
 | `res.trailers[name] = v` | `void` | set a response *trailer* emitted after the streamed body: the chunked trailer section on h1, a trailing `HEADERS` frame on h2 and h3. Same shape as `res.headers`; set before `res.finish` |
@@ -876,6 +876,12 @@ The same block works synchronously (`discard res.write(...)` inside it).
 producer that outruns a slow client should instead pause and resume from
 `res.onDrain` (`res.bufferedAmount` reports the current backlog).
 
+`false` is not exclusively backpressure: a dead connection and a call from off
+the loop thread also return it. Streaming is loop-thread only (the handler, an
+async continuation, an `onDrain` callback, a loop timer), so check `req.isAlive`
+to tell a gone client from a full backlog, and never write from a `blocking:`
+worker or a thread of your own.
+
 **Producing chunks over time.** When chunks are produced over time rather than
 in one straight-line block (from a timer, a worker-pool completion, an upstream
 you are proxying, or an `onDrain` resume), drive the stream directly: `sendHead`
@@ -922,7 +928,9 @@ proc events(req: Request, res: Response) =
 `await s.response.drained()` with an adapter) expose backpressure; `s.alive`
 reports client disconnect; `s.close` ends it (`s.abort` truncates). Like the
 rest of the streaming surface these are loop-thread only: read from another
-thread, `s.alive` is false and `s.bufferedAmount` is 0.
+thread, `s.alive` is false and `s.bufferedAmount` is 0, and `s.send` /
+`s.comment` assert rather than return the `false` a producer would read as
+backpressure. Hand the payload to the loop thread and send it there.
 `req.lastEventId` gives the `Last-Event-ID` a client echoes on reconnect.
 
 An empty `data` is emitted as two empty `data:` fields, so a payload-free event
