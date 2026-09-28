@@ -1651,12 +1651,15 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     let effLen = if enc.len > 0: -1 else: contentLength
     if effLen >= 0 and (res.fd < 0 or res.stream != 0):
       hdrs.add ("content-length", $effLen)   # h2/h3: informational header
+    # h2/h3 also carry effLen out of band, so the codec can reconcile it against
+    # the body the producer actually writes and reset the stream on a mismatch --
+    # what finish() does for HTTP/1 below (#248), generalized to all three (#345).
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
           h3SendHead(res.core, h3c, uint64(res.stream), int(code),
-                     contentType, hdrs)
+                     contentType, hdrs, int64(effLen))
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             if enc.len > 0:
               h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
@@ -1665,7 +1668,8 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     if c == nil: return
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
-                 res.core.serverHeader, contentType, hdrs, res.core.altSvc)
+                 res.core.serverHeader, contentType, hdrs, res.core.altSvc,
+                 int64(effLen))
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         if enc.len > 0:
           let st = h2Stream(c, res.stream)

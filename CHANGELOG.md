@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
+  then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
+  INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1
+  reconciled the declared length against the body written (#248, where the
+  mismatch forces the connection closed); on h2/h3 a short streamed body -- a
+  truncated file read, a producer that stopped early -- was a well-formed lie
+  that only the client could notice, and the server logged nothing. HEAD, which
+  declares a length and writes no body by design, stays exempt. (#345)
 - HTTP/2: a stream's response buffer (`pendingBody`) is now compacted once the
   sent prefix passes the high-water mark, not only when the backlog reaches
   zero. A long streamed download with a client that kept the backlog non-zero
