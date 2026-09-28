@@ -45,6 +45,14 @@ reference below.
 | `h3StreamWindow` | 1 MiB | HTTP/3 per-stream receive window (upload flow control) |
 | `h3ConnWindow` | 4 MiB | HTTP/3 per-connection receive window (aggregate cap on buffered uploads) |
 
+HTTP/1 has no configurable upload window, but it is bounded too: a streaming
+route whose consumer acks on consume (the async `await req.read()` API, which
+registers its `onBody` sink with `manualAck`) may hold at most 1 MiB
+delivered-but-unacked before the loop stops reading the socket, so the rest of
+the upload waits in the kernel as TCP backpressure instead of piling up in the
+consumer's queue. `req.ackBody` repays that debt and resumes the read. It is the
+coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
+
 ### Timeouts
 
 | Setting | Default | Purpose |
