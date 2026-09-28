@@ -21,6 +21,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped at 4x the budget) and is charged only past that; the budget also
   decays per 64 KiB of response DATA sent. A peer we send nothing to still
   trips GOAWAY(ENHANCE_YOUR_CALM) after the budget, as before. (#335)
+- HTTP/2: a connection the server closes on its own account (an expired idle,
+  header, body or pong deadline, the receive-buffer cap, or the end of the
+  shutdown grace) now sends GOAWAY first, NO_ERROR for a timeout or shutdown
+  and ENHANCE_YOUR_CALM for the cap, so a client can tell a server-side close
+  from a network fault and retry what was never processed. (#342)
+- HTTP/1 streaming: every clear of a paused body read now releases the loop's
+  paused-connection slot. A response applied from a worker or async completion
+  while the read was still paused leaked the count and pinned that loop thread
+  at the 2 ms paused-body selector cadence for good; a debug build now audits
+  the count every second. (#344)
+- A connection refused because the connection table cannot grow while a
+  `blocking:` worker pins a slot is now counted and logged (rate-limited), not
+  dropped silently. (#343)
+- HTTP/3 WebSockets: frames the client pipelines with the Extended CONNECT
+  handshake are handed to the accepted WebSocket instead of being lost; a
+  client that half-closes before the handler accepts now gets `onClose`
+  delivered; a send or close issued on the loop thread outside the input path
+  (a timer, an async continuation) drives QUIC egress instead of stalling until
+  an unrelated packet; pre-accept bytes are bounded by the WebSocket message
+  limit and no longer counted against the request-body aggregate. (#259, #261,
+  #262, #263)
+- WebSocket: `ws.subprotocol` is loop-thread only like the other accessors (it
+  reports "" off-loop) instead of resolving the connection ref across threads;
+  the permessage-deflate contexts are freed exactly once, so a second teardown
+  of the same WebSocket is a no-op. (#260, #264)
+- Regression coverage for fixes that had already landed without tests: the
+  HTTP/2 stream-level error scope and racing-frame tolerance (#239), the HTTP/2
+  conformance follow-ups (#240), and the HTTP/1 streaming read-ahead bound for
+  async `req.read()` consumers (#271).
 
 ### Changed
 
@@ -43,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that arrived, so the read overlaps the write instead of idling the socket;
   the read-ahead budget is one chunk (256 KiB) measured before the write, which
   keeps the same per-stream ceiling. (#340)
+- `writeTimeout` now defaults to 30 s (was 0, off), matching `bodyTimeout`, so a
+  slow-reading client that stops draining a response is reaped out of the box.
+  It is idle-style (re-armed on every partial write), so a response that keeps
+  moving is never cut off; set it to 0 to restore the old behaviour. The
+  `maxHeaderCount` limit is documented as answering 431, not 400, and as
+  HTTP/1 only. (#249)
 
 ## [0.5.0] - 2026-09-24
 
