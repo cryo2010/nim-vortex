@@ -857,6 +857,11 @@ proc isAlive*(ws: WebSocket): bool =
     result = true
 
 proc subprotocol*(ws: WebSocket): string =
-  ## The negotiated subprotocol, or "" if none was agreed.
-  let (_, w) = wsConnOf(ws)
-  if w != nil: w.subprotocol else: ""
+  ## The negotiated subprotocol, or "" if none was agreed. Loop-thread only
+  ## (see onMessage=): off-loop it reports "" rather than resolving the WsConn
+  ## ref across threads. Read it from a handler callback (the accept handler,
+  ## onMessage) and pass the value along if a worker needs it; the handle
+  ## itself cannot carry the string, since copying one is what the guard
+  ## exists to prevent.
+  withWsConn(ws, _, w):
+    result = w.subprotocol
