@@ -38,7 +38,7 @@ import ./http1/parser as h1parser
 import ./http1/codec as h1codec
 import ./http2/codec as h2codec
 import ./websocket/codec as wscodec
-from ./http2/frames import connectionPreface
+from ./http2/frames import connectionPreface, errNoError, errEnhanceYourCalm
 when not defined(plainHttp):
   import ./transport/tls
   import ./http3/ngtcp2/backend as h3codec   # HTTP/3 over ngtcp2 + nghttp3
@@ -645,6 +645,26 @@ proc respondError(loop: Loop, c: ptr Connection, code: HttpCode) =
   c.lingerClose = true       # drain the peer so the error is delivered, no RST
   c.state = csClosing
 
+proc closeWithGoaway(loop: Loop, c: ptr Connection, err: uint32) =
+  ## closeConn, preceded by a GOAWAY when this is an HTTP/2 connection the server
+  ## is dropping on its own account: an expired timeout, the receive-buffer cap,
+  ## the end of the shutdown grace. Without it the peer sees a bare TCP close,
+  ## which is indistinguishable from a network fault, so even an idempotent
+  ## in-flight request cannot be safely retried (httpx reports "Server
+  ## disconnected"). The GOAWAY names the last stream this server processed, so
+  ## everything above it is known-unhandled and retryable.
+  ##
+  ## Best effort and non-blocking: the frame rides the pending output if the
+  ## socket takes it, and the connection closes either way -- a peer that has
+  ## stopped reading must not hold the close. A pinned connection is left alone,
+  ## as in markDrain: materializing H2Conn(c.h2) here would race the worker
+  ## holding the same ref under ORC's non-atomic refcounts.
+  if c.h2 != nil and c.totalPins == 0:
+    h2Goaway(c, err)
+    loop.flushOut(c)
+    if c.state == csFree: return      # the flush found the socket dead and closed
+  loop.closeConn(c)
+
 proc h2Deadline(c: ptr Connection): DeadlineKind =
   ## Classify an active h2 connection's timeout policy for this pass:
   ##  - dkIdle: no streams open -- (re)arm keep-alive. This must refresh on every
@@ -1146,7 +1166,10 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         if c.state != csActive: returnAfterStateChange()
         if c.rlen == c.rbuf.len:
           if c.rbuf.len >= h2RecvBufferCap:
-            loop.closeConn(c)
+            # Nothing could be compacted (a worker holds the connection) and the
+            # peer keeps sending: drop it, but say so first. ENHANCE_YOUR_CALM,
+            # not NO_ERROR: this is the peer's volume, not our housekeeping.
+            loop.closeWithGoaway(c, errEnhanceYourCalm)
             return
           c.rbuf.setLen(c.rbuf.len * 2)
       else:
@@ -1809,7 +1832,10 @@ proc sweepTimeouts(loop: Loop) =
       loop.respondError(c, Http503)
       loop.flushOut(c)
     else:
-      loop.closeConn(c)            # includes dkWsPong: no reply, peer is gone
+      # includes dkWsPong: no reply, peer is gone. An h2 connection gets a
+      # GOAWAY(NO_ERROR) first so the client can tell this server-side timeout
+      # from a network fault and retry what was never processed (#342).
+      loop.closeWithGoaway(c, errNoError)
 
 proc sweepWsIdle(loop: Loop) =
   ## Per-stream WebSocket keepalive for h2/h3 (h1 rides the deadline wheel
@@ -1990,7 +2016,9 @@ proc forceCloseAll(loop: Loop) =
   for fd in 0 ..< loop.core.conns.len:
     let c = addr loop.core.conns[fd]
     if c.state != csFree:
-      loop.closeConn(c)
+      # h2: GOAWAY(NO_ERROR) before the drop, as on the timeout paths. Idempotent
+      # (h2Goaway is a no-op once goingAway), so re-calling each tick is fine.
+      loop.closeWithGoaway(c, errNoError)
   when not defined(plainHttp):
     for i in 0 ..< loop.core.h3slots.len:
       loop.h3FreeSlot(i)
