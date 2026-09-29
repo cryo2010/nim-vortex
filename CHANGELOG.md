@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- SSE: `s.send("")` (a payload-free event) now reaches the client. An empty
+  `data` goes on the wire as two empty `data:` fields rather than one: a client
+  appends an LF to its data buffer per `data:` field and strips a single
+  trailing LF before dispatch, so one field left the buffer empty and the
+  WHATWG EventSource dispatch step discarded the event, firing no listener.
+  `s.send("", event = "ping")` now dispatches with `event.data == "\n"`. (#266)
+- SSE: `send` splits `data` on the three terminators the wire format defines
+  (CRLF, LF, CR) explicitly instead of leaning on `splitLines`. Behaviour is
+  unchanged, and the lossiness it implies is now documented: the format has no
+  escape for a literal CR, so a CR in `data` is a field boundary that the
+  client rebuilds as an LF (`send("a\r\nb")` arrives as `"a\nb"`). Encode the
+  payload (base64, or JSON) when it must survive byte for byte. (#267)
+- SSE, streaming: `req.isAlive`, `res.bufferedAmount` and the `SseStream`
+  `alive` / `bufferedAmount` that delegate to them are now guarded by the same
+  loop-thread check every mutating call takes, so an off-thread read reports
+  false / 0 instead of racing the loop over the connection table, the h2/h3
+  stream maps and the write buffers. A `blocking:` worker still sees
+  `req.isAlive == true`: its connection is pinned for the body's duration. This
+  matches the WebSocket handles, which already guarded both. (#268)
+- SSE: `res.withSse` forwards `res.sse`'s arguments, so the block form can set
+  the reconnect delay and extra response headers:
+  `res.withSse(s, headers = [("X-Stream", "report")], retry = 3000): ...`. It
+  hardcoded `res.sse()`, which meant reaching for the handle constructor and
+  hand-writing the close/abort pairing to get either. The existing
+  `res.withSse(s): ...` form is unchanged. (#269)
+- SSE: `s.send` and `s.comment` called from off the loop thread now assert
+  (`res.headers`-style, so compiled out under `--assertions:off` / `-d:danger`)
+  instead of returning false. False is the producer's "backlog full, pause and
+  wait for `onDrain`", so a worker pushing events got a silent no-op that read
+  as backpressure, and a producer waiting on a drain that could never come.
+  `res.write`, `res.onDrain` and their SSE wrappers document that false, and a
+  dropped `onDrain` registration, mean an off-thread call too. (#270)
 - HTTP/2 and HTTP/3: a streamed response that declared a `Content-Length` and
   then ended at a different length is now reset (RST_STREAM / RESET_STREAM with
   INTERNAL_ERROR) instead of closed with a clean END_STREAM / FIN. Only HTTP/1

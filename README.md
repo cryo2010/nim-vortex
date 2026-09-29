@@ -463,7 +463,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
 | `req.params` | `PathParams` | all router path parameters |
 | `req.param(name)` | `string` | one router path parameter; "" if absent |
-| `req.isAlive` | `bool` | connection/stream still open |
+| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned) |
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
@@ -504,18 +504,18 @@ through a dead connection is a safe no-op.
 | `res.earlyHints(links, headers = [])` | `void` | 103 Early Hints with `Link` headers (RFC 8297) so the client can preload/preconnect while the handler works |
 | `res.serveContent(body, contentType = "application/octet-stream", etag = "", lastModified = none(Time), cacheControl = "")` | `void` | serve an in-memory body with conditional requests (If-Match / If-Unmodified-Since → 412, If-None-Match / If-Modified-Since → 304, If-Range) and byte ranges (206, `multipart/byteranges`, 416); the `http.ServeContent` analog |
 | `res.sendHead(code, contentType = "", headers = [], contentLength = -1)` | `void` | begin a streamed response (see [Download](#download)) |
-| `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure |
+| `res.write(data)` | `bool` | append a streamed chunk (sync); `false` signals backpressure, a dead connection, or an (unsupported) call from off the loop thread |
 | `await res.write(chunk)` | `Future[void]` | append a chunk and await the drain (async adapter) |
 | `res.finish()` | `void` | end a streamed response cleanly (emits `res.trailers`, if any) |
 | `res.trailers[name] = v` | `void` | set a response *trailer* emitted after the streamed body: the chunked trailer section on h1, a trailing `HEADERS` frame on h2 and h3. Same shape as `res.headers`; set before `res.finish` |
 | `res.abort()` | `void` | truncate a streamed response (error mid-body) |
 | `res.stream(code = Http200, contentType, headers = []): body` | `template` | block form of a streamed response |
 | `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
-| `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket |
+| `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket; loop-thread only (0 from another thread) |
 | `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
 | `res.setPriority(urgency, incremental = false)` | `void` | RFC 9218 scheduling override for this response over HTTP/2: lower `urgency` (0..7, default 3) is served first; `incremental = true` interleaves with same-urgency streams, `false` delivers it sequentially. Beats the client's `Priority` header / `PRIORITY_UPDATE`. No-op over h1 and h3; loop-thread only |
 | `res.sse(headers = [], retry = 0)` | `SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
-| `res.withSse(s): body` | `template` | block form of an SSE stream |
+| `res.withSse(s, headers = [], retry = 0): body` | `macro` | block form of an SSE stream; `headers`/`retry` forward to `res.sse` (pass them by name) |
 | `res.sendFile(path, opts = staticOptions())` | `void` | send one file (see [Static files](#static-files)) |
 
 Two helpers build header pairs to pass in `res.send`'s `headers`:
@@ -876,6 +876,12 @@ The same block works synchronously (`discard res.write(...)` inside it).
 producer that outruns a slow client should instead pause and resume from
 `res.onDrain` (`res.bufferedAmount` reports the current backlog).
 
+`false` is not exclusively backpressure: a dead connection and a call from off
+the loop thread also return it. Streaming is loop-thread only (the handler, an
+async continuation, an `onDrain` callback, a loop timer), so check `req.isAlive`
+to tell a gone client from a full backlog, and never write from a `blocking:`
+worker or a thread of your own.
+
 **Producing chunks over time.** When chunks are produced over time rather than
 in one straight-line block (from a timer, a worker-pool completion, an upstream
 you are proxying, or an `onDrain` resume), drive the stream directly: `sendHead`
@@ -920,13 +926,38 @@ proc events(req: Request, res: Response) =
 `event`/`id`/`retry` are optional) and returns `false` under write backpressure;
 `s.comment` sends a heartbeat; `s.bufferedAmount` / `s.onDrain` (and
 `await s.response.drained()` with an adapter) expose backpressure; `s.alive`
-reports client disconnect; `s.close` ends it (`s.abort` truncates).
+reports client disconnect; `s.close` ends it (`s.abort` truncates). Like the
+rest of the streaming surface these are loop-thread only: read from another
+thread, `s.alive` is false and `s.bufferedAmount` is 0, and `s.send` /
+`s.comment` assert rather than return the `false` a producer would read as
+backpressure. Hand the payload to the loop thread and send it there.
 `req.lastEventId` gives the `Last-Event-ID` a client echoes on reconnect.
+
+An empty `data` is emitted as two empty `data:` fields, so a payload-free event
+still dispatches: a client appends an LF per `data:` field and strips one
+trailing LF before dispatch, so a single empty field would leave the data buffer
+empty and EventSource discards such an event without firing a listener. The
+listener sees `event.data == "\n"`.
+
+Line breaks in `data` belong to the wire format: a CRLF, an LF or a bare CR ends
+a `data:` field and the client rebuilds each one as a single LF. There is no
+escape for a literal CR, so `s.send("a\r\nb")` is delivered as `"a\nb"`. Encode
+the payload (base64, or JSON, which escapes a CR) when it has to survive byte
+for byte.
+
 `res.withSse(s): body` is a block form that closes (or aborts on exception) for
 you:
 
 ```nim
 res.withSse(s):
+  for row in report: discard s.send(row.toJson, event = "row", id = $row.id)
+```
+
+`res.sse`'s arguments pass through it, by name, so the block form is no less
+capable than the handle constructor:
+
+```nim
+res.withSse(s, headers = [("X-Stream", "report")], retry = 3000):
   for row in report: discard s.send(row.toJson, event = "row", id = $row.id)
 ```
 

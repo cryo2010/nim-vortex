@@ -93,8 +93,25 @@ proc response*(req: Request): Response =
   ## this exists for code that stored only the read half.
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream)
 
+var cachedThreadId {.threadvar.}: int
+
+proc currentThreadId(): int {.inline.} =
+  ## getThreadId() is a syscall on Linux; caching it matters on the
+  ## per-request fast path.
+  if cachedThreadId == 0:
+    cachedThreadId = getThreadId()
+  cachedThreadId
+
 proc isAlive*(req: Request): bool =
+  ## True while the client is still connected (this request's stream is open).
+  ## Loop-thread only: false from any other thread, since the connection table
+  ## and the h2/h3 stream maps are loop-owned. A `blocking:` worker is the one
+  ## exception and returns true below: its connection is pinned for the body.
   if req.snap != nil: return true    # pinned for the blocking body's duration
+  # Same guard every mutating call takes (write, finish, sendHead, ...): reading
+  # loop-owned state from a foreign thread races the loop, so report the handle
+  # as dead rather than answer from a torn read.
+  if currentThreadId() != req.core.threadId: return false
   if req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -197,15 +214,6 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
 
 proc lowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
-
-var cachedThreadId {.threadvar.}: int
-
-proc currentThreadId(): int {.inline.} =
-  ## getThreadId() is a syscall on Linux; caching it matters on the
-  ## per-request fast path.
-  if cachedThreadId == 0:
-    cachedThreadId = getThreadId()
-  cachedThreadId
 
 proc headers*(res: Response): var ResponseHeaders =
   ## Response headers to send with the eventual `res.send`. Set them from
@@ -1725,6 +1733,11 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
   ## Append a body chunk to a streaming response and flush. Returns false once
   ## the unsent backlog reaches `respHighWater`; the producer should then stop
   ## and wait for `onDrain`. Safe no-op (returns false) on a dead connection.
+  ## Loop-thread only (the handler, an async continuation, an `onDrain`
+  ## callback): a call from a worker or a thread of your own is also a no-op
+  ## returning false, so false is not exclusively backpressure. Use
+  ## `req.isAlive` to tell a dead connection from a full backlog, and don't
+  ## stream from off the loop thread at all.
   ## `{.raises: [].}` (the body is contained) so it composes in strict-effect
   ## async bodies -- a producer's `if not res.write(chunk): await res.drained()`.
   try:
@@ -1878,6 +1891,8 @@ proc finish*(res: Response) {.raises: [].} =
 proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## Register a callback fired (loop thread) when a backed-up streaming
   ## response's write backlog empties, so the producer can resume writing.
+  ## Loop-thread only to register, too: an off-thread registration is dropped
+  ## silently, and a producer that then waits for the callback waits for good.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
   # The h3 reflush path cannot pass the handle words, so the callback closes
@@ -1892,7 +1907,10 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
 
 proc bufferedAmount*(res: Response): int =
   ## Bytes queued for the streaming response but not yet written to the
-  ## socket. Zero when idle or on a dead connection.
+  ## socket. Zero when idle or on a dead connection. Loop-thread only: zero
+  ## from any other thread, since the write buffers are loop-owned (read them
+  ## from the handler, an async continuation or an `onDrain` callback).
+  if currentThreadId() != res.core.threadId: return 0
   if res.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(res.core, res.fd, res.gen)
@@ -2058,34 +2076,84 @@ proc send*(s: SseStream, data: string, event = "", id = "",
   ## as the request header on reconnect), `retry` (ms) overrides the delay.
   ## Returns false when the write backlog is full (see `bufferedAmount` /
   ## `onDrain`); the producer should pause. A dead connection returns false.
+  ##
+  ## An empty `data` still dispatches on the client. It goes on the wire as two
+  ## empty `data:` fields rather than one: a client appends an LF to its data
+  ## buffer per `data:` field and strips a single trailing LF before dispatch,
+  ## so one empty field leaves the buffer empty and the WHATWG EventSource
+  ## dispatch step then discards the event without firing any listener. Two
+  ## fields leave `"\n"`, so `s.send("", event = "ping")` reaches the client's
+  ## `ping` listener with `event.data == "\n"`.
+  ##
+  ## Line breaks in `data` belong to the wire format, not to the payload: a
+  ## CRLF, an LF or a bare CR ends a `data:` field, and the client rebuilds
+  ## every one of them as a single LF. The format has no escape for a literal
+  ## CR, so `send("a\r\nb")` is delivered as `"a\nb"`. Encode the payload
+  ## (base64, or JSON, which escapes a CR) when it has to survive byte for byte.
+  ##
+  ## Loop-thread only, like the rest of the streaming surface: push events from
+  ## the handler, an async continuation, an `onDrain` callback or a loop timer,
+  ## never from a `blocking:` worker or a thread of your own. An off-thread call
+  ## is a no-op that returns false, which a producer reads as backpressure and
+  ## waits out for good, so it asserts instead (compiled out under
+  ## `--assertions:off` / `-d:danger`, where it is the silent no-op `res.write`
+  ## is). Hand the payload to the loop thread and send it there.
+  assert currentThreadId() == s.res.core.threadId,
+    "SseStream.send is loop-thread only; a worker cannot push events " &
+    "(hand the payload to the loop thread and send it from there)"
   var f = ""
   if id.len > 0:    f.add "id: " & sseSanitize(id) & "\n"
   if event.len > 0: f.add "event: " & sseSanitize(event) & "\n"
   if retry > 0:     f.add "retry: " & $retry & "\n"
-  for line in data.splitLines:
-    f.add "data: " & line & "\n"
+  if data.len == 0:
+    # Two empty fields, deliberately: see the docstring. One field ("data:\n")
+    # is a dispatch-less event, which makes a payload-free notification
+    # ("ping", "reload", a typed poke) silently do nothing.
+    f.add "data:\ndata:\n"
+  else:
+    # Split on the three terminators the SSE grammar defines (CRLF, LF, CR)
+    # explicitly rather than inheriting splitLines' idea of a line break: the
+    # set is part of the wire format here, so it is spelled out. A CR is a
+    # terminator, never payload, which is the limitation the docstring names.
+    var i = 0
+    while true:
+      var j = i
+      while j < data.len and data[j] != '\n' and data[j] != '\r': inc j
+      f.add "data: "
+      f.add data[i ..< j]
+      f.add '\n'
+      if j >= data.len: break
+      i = if data[j] == '\r' and j + 1 < data.len and data[j + 1] == '\n': j + 2
+          else: j + 1
   f.add "\n"                               # blank line terminates the event
   s.res.write(f)
 
 proc comment*(s: SseStream, text = ""): bool {.discardable, raises: [].} =
   ## Emit a comment line (`: text`). Clients ignore it; use it as a heartbeat
   ## to keep idle connections and proxies from timing out. `s.comment()` is a
-  ## bare `:` ping.
+  ## bare `:` ping. Loop-thread only and asserts off-thread, exactly like
+  ## `send`: a heartbeat that silently returns false stops keeping anything
+  ## warm, and the connection then dies on the idle timeout.
+  assert currentThreadId() == s.res.core.threadId,
+    "SseStream.comment is loop-thread only; a worker cannot send a heartbeat " &
+    "(schedule it on the loop thread instead)"
   s.res.write(": " & sseSanitize(text) & "\n\n")
 
 proc bufferedAmount*(s: SseStream): int = s.res.bufferedAmount
   ## Bytes queued for the SSE stream but not yet written to the socket.
+  ## Loop-thread only: zero from any other thread.
 
 proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
   ## Fire `cb` (loop thread) when a backed-up SSE stream's write backlog
-  ## empties, so the producer can resume.
+  ## empties, so the producer can resume. Loop-thread only to register, too:
+  ## an off-thread registration is dropped silently.
   let captured = cb
   s.res.onDrain(proc(r: Response) {.gcsafe.} = captured(SseStream(res: r)))
 
 proc alive*(s: SseStream): bool =
   ## False once the client disconnects; the producer loop should stop. Use this
   ## rather than `send` returning false, which is ambiguous (backpressure *or*
-  ## a dead connection).
+  ## a dead connection). Loop-thread only: false from any other thread.
   Request(core: s.res.core, fd: s.res.fd, gen: s.res.gen,
           stream: s.res.stream).isAlive
 
@@ -2099,16 +2167,13 @@ proc lastEventId*(req: Request): string = req.header("last-event-id")
   ## The `Last-Event-ID` the client echoes when reconnecting an SSE stream (the
   ## `id:` of the last event it saw). Empty on first connect; use it to resume.
 
-template withSse*(res: Response, s, body: untyped) =
-  ## Block form for a finite stream: opens an SSE stream bound to `s`, runs
-  ## `body`, then closes it (aborting on exception, like `res.stream`). Named
-  ## `withSse` (not `sse`) to avoid clashing with the `res.sse(...)` handle
-  ## constructor, following the `withLock`/`withFile` scoped-resource idiom.
-  ##
-  ##   res.withSse(s):
-  ##     for row in report: s.send(row.toJson, event = "row", id = $row.id)
+template withSseScope(res: Response, s, sseHeaders, sseRetry, body: untyped) =
+  ## Internal: the scoped-resource expansion `withSse` produces, with the
+  ## `res.sse` arguments already resolved. Kept a template rather than inlined
+  ## into the macro's result so `sse`, `close` and `abort` bind here, at
+  ## definition scope, instead of wherever the block is written.
   block:
-    var s = res.sse()
+    var s = res.sse(sseHeaders, sseRetry)
     var sseCompleted = false
     try:
       body
@@ -2116,6 +2181,47 @@ template withSse*(res: Response, s, body: untyped) =
     finally:
       if sseCompleted: s.close()
       else: s.abort()
+
+macro withSse*(res: Response, args: varargs[untyped]): untyped =
+  ## Block form for a finite stream: opens an SSE stream bound to `s`, runs
+  ## `body`, then closes it (aborting on exception, like `res.stream`). Named
+  ## `withSse` (not `sse`) to avoid clashing with the `res.sse(...)` handle
+  ## constructor, following the `withLock`/`withFile` scoped-resource idiom.
+  ##
+  ##   res.withSse(s):
+  ##     for row in report: s.send(row.toJson, event = "row", id = $row.id)
+  ##
+  ## `res.sse`'s arguments pass through, by name, so the block form is not a
+  ## worse-equipped `res.sse`:
+  ##
+  ##   res.withSse(s, retry = 3000):                       # reconnect delay
+  ##     ...
+  ##   res.withSse(s, headers = [("X-Stream", "report")], retry = 3000):
+  ##     ...
+  ##
+  ## A macro rather than a template because Nim binds a trailing block to the
+  ## last parameter positionally: with `headers`/`retry` as defaulted template
+  ## parameters, `res.withSse(s): body` would hand the block to `headers`.
+  if args.len < 2:
+    error("withSse needs a stream name and a body: `res.withSse(s): ...`", res)
+  let sName = args[0]
+  let body = args[^1]
+  var hdrs = newNimNode(nnkBracket)      # matches res.sse's `headers = []`
+  var retry = newLit(0)
+  for i in 1 ..< args.len - 1:
+    let a = args[i]
+    if a.kind != nnkExprEqExpr:
+      error("withSse: pass res.sse's arguments by name, e.g. " &
+            "`res.withSse(s, retry = 3000): ...`", a)
+    case $a[0]
+    of "headers": hdrs = a[1]
+    of "retry":   retry = a[1]
+    else:
+      error("withSse: unknown argument `" & $a[0] &
+            "`; res.sse takes `headers` and `retry`", a)
+  # bindSym so the expansion reaches withSseScope, which stays off the public
+  # API (the same shape as the `blocking` macro's dispatch helpers).
+  newCall(bindSym"withSseScope", res, sName, hdrs, retry, body)
 
 # --- blocking dispatch ------------------------------------------------------
 
