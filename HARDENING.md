@@ -93,6 +93,15 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `decompressRequest` | `false` | Decode gzip/br/zstd request bodies, bounded by `maxBodySize` |
 | `compress` | `false` | gzip/brotli-compress eligible responses |
 
+TLS renegotiation is refused on every context (`SSL_OP_NO_RENEGOTIATION`), and
+there is no setting to allow it. A renegotiation is a full ECDHE key agreement
+plus a server signature, run inline on the event-loop thread, for a few hundred
+bytes of client effort, and OpenSSL neither counts nor rate-limits it: the
+CVE-2011-1473 shape. A client that asks gets a warning-level
+`no_renegotiation` alert and keeps its connection. This is a TLS 1.2 and below
+mechanism; TLS 1.3 has no renegotiation (its KeyUpdate is a separate and much
+cheaper thing) and QUIC is TLS 1.3 only.
+
 The TLS listener offers ALPN `h2` and `http/1.1`. A client that advertises an
 ALPN list overlapping neither is refused with a fatal `no_application_protocol`
 alert (RFC 7301 3.2) rather than being handed a no-ALPN connection that it would

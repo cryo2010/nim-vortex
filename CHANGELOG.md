@@ -166,6 +166,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected outright, and the ignored path is no longer recorded in the stored
   material (which used to let a later cert-only reload pair a new certificate
   with it). Rotate both halves together. (#363)
+- TLS: every context is now built with `SSL_OP_NO_RENEGOTIATION`, so
+  renegotiation is refused as this server's own policy rather than inherited
+  from a library default. A renegotiation is a full ECDHE key agreement plus a
+  server signature run inline on the loop thread for a few hundred bytes of
+  client effort, unmetered (the CVE-2011-1473 shape). OpenSSL 3.0 already
+  refuses client-initiated renegotiation unless
+  `SSL_OP_ALLOW_CLIENT_RENEGOTIATION` is set, but that default can be flipped by
+  a system `openssl.cnf` and does not exist in a pre-3.0 libssl, which the
+  Linux dynlib pattern can still resolve. TLS 1.3 has no renegotiation and is
+  unaffected. (#376)
 
 ## [0.5.0] - 2026-09-24
 

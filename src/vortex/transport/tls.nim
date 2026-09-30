@@ -58,6 +58,7 @@ const
   SSL_MODE_ENABLE_PARTIAL_WRITE = clong(1)
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
   SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
+  SSL_OP_NO_RENEGOTIATION = uint64(1) shl 30   # <openssl/ssl.h> SSL_OP_BIT(30)
   SSL_SESS_CACHE_SERVER = clong(0x0002)
   CRYPTO_EX_INDEX_SSL_CTX = cint(1)   # ex_data class for SSL_CTX (crypto/ex_data)
 
@@ -88,6 +89,8 @@ proc SSL_CTX_set_session_id_context(ctx: SslCtxPtr, sid: cstring,
                                     len: cuint): cint
 proc SSL_CTX_ctrl(ctx: SslCtxPtr, cmd: cint, larg: clong,
                   parg: pointer): clong
+proc SSL_CTX_set_options(ctx: SslCtxPtr, op: uint64): uint64
+proc SSL_CTX_get_options(ctx: SslCtxPtr): uint64
 proc SSL_CTX_set_cipher_list(ctx: SslCtxPtr, str: cstring): cint
 proc SSL_CTX_set_ciphersuites(ctx: SslCtxPtr, str: cstring): cint
 proc SSL_CTX_set_alpn_select_cb(ctx: SslCtxPtr,
@@ -524,6 +527,17 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
+  # Refuse renegotiation outright (TLS 1.2 and below; TLS 1.3 has no such
+  # mechanism). Each renegotiation costs a full ECDHE key agreement plus a
+  # server signature, run synchronously on the loop thread inside tlsRead /
+  # tlsWrite, against a few hundred bytes of client effort, with no counter and
+  # no cap: the CVE-2011-1473 shape. OpenSSL 3.0 already refuses
+  # *client*-initiated renegotiation unless SSL_OP_ALLOW_CLIENT_RENEGOTIATION
+  # is set, but that is a library default a system openssl.cnf can flip and one
+  # a pre-3.0 libssl does not have, so state the policy here rather than
+  # inherit it. OpenSSL answers a renegotiation attempt with a warning-level
+  # no_renegotiation alert, leaving the connection usable.
+  discard SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION)
   if minProtoVersion != 0:
     if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION,
                     minProtoVersion, nil) != 1:
@@ -784,6 +798,11 @@ proc ctxCertSubject*(cfg: ptr TlsConfig): string =
   let s = X509_NAME_oneline(X509_get_subject_name(x), buf.cstring, 512)
   if s == nil: return ""
   $s
+
+proc ctxRefusesRenegotiation*(cfg: ptr TlsConfig): bool =
+  ## Is renegotiation refused on the active ctx (SSL_OP_NO_RENEGOTIATION)? For
+  ## tests/introspection, like ctxCertSubject above.
+  (SSL_CTX_get_options(cfg.ctx) and SSL_OP_NO_RENEGOTIATION) != 0
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0, cipherList = "", cipherSuites = "",
