@@ -90,6 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/2 stream-level error scope and racing-frame tolerance (#239), the HTTP/2
   conformance follow-ups (#240), and the HTTP/1 streaming read-ahead bound for
   async `req.read()` consumers (#271).
+- HTTP/3: a connection error from nghttp3 is now terminal for nghttp3 before
+  control returns to ngtcp2. The QUIC shim deleted nothing and reported success
+  when `nghttp3_conn_read_stream` failed, so ngtcp2 kept decoding the rest of
+  the datagram and every remaining STREAM frame, stream close, ack and window
+  update re-entered a connection the library documents as usable only for
+  `nghttp3_conn_del`: one hostile datagram (a malformed frame sequence on one
+  stream, any bytes on a second) could crash the loop thread and every
+  connection on it. The poisoned connection is now freed on the spot, the
+  callback fails so ngtcp2 abandons the datagram, and the CONNECTION_CLOSE
+  still carries the HTTP/3 error code. (#362)
 
 ### Changed
 

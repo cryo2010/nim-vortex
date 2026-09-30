@@ -159,9 +159,25 @@ ngtcp2_conn *getConnFromRef(ngtcp2_crypto_conn_ref *ref) {
   return static_cast<Conn *>(ref->user_data)->conn;
 }
 
-// Schedule an HTTP/3/QPACK CONNECTION_CLOSE carrying the app error code inferred
-// from an nghttp3 error (so h3spec sees the right code); emitted by writeConn.
+// Terminal handling for a connection error reported by nghttp3: delete the
+// poisoned nghttp3_conn, then schedule an HTTP/3/QPACK CONNECTION_CLOSE carrying
+// the app error code inferred from the nghttp3 error (so h3spec sees the right
+// code); the close itself is emitted by writeConn.
+//
+// Deleting c->h3 here is what makes the failure terminal (#362). nghttp3
+// documents that once nghttp3_conn_read_stream or nghttp3_conn_writev_stream
+// return a negative code the connection is in error and "calling nghttp3 API
+// other than nghttp3_conn_del causes undefined behavior" -- yet the rest of the
+// datagram ngtcp2_conn_read_pkt is already parsing (further STREAM frames,
+// stream closes, acks, window updates) would keep calling into it, as would a
+// response submitted from the Nim side before the next pump reaps the conn.
+// Every nghttp3 call site is guarded by `if (c->h3)`, so a null h3 turns them
+// all into no-ops, and ~Conn skips the (already done) nghttp3_conn_del.
 void failConn(Conn *c, int nghttp3_rv) {
+  if (c->h3) {
+    nghttp3_conn_del(c->h3);
+    c->h3 = nullptr;
+  }
   if (c->wantClose || c->closed) return;
   ngtcp2_ccerr_set_application_error(
       &c->ccerr, nghttp3_err_infer_quic_app_error_code(nghttp3_rv), nullptr, 0);
@@ -377,6 +393,10 @@ int setupHttpConn(Conn *c) {
 
 int cbHandshakeCompleted(ngtcp2_conn *, void *user_data) {
   auto *c = static_cast<Conn *>(user_data);
+  // A connection whose nghttp3_conn failConn already deleted must never get a
+  // fresh one: a null h3 with a close scheduled means HTTP/3 is over for this
+  // connection (#362).
+  if (c->wantClose || c->closed) return 0;
   if (!c->h3 && setupHttpConn(c) != 0) return NGTCP2_ERR_CALLBACK_FAILURE;
   return 0;
 }
@@ -390,8 +410,11 @@ int cbStreamOpen(ngtcp2_conn *, int64_t stream_id, void *user_data) {
     s->id = stream_id;
     s->conn_ud = c->conn_ud;
     c->streams[stream_id] = std::move(s);
-    nghttp3_conn_set_stream_user_data(c->h3, stream_id,
-                                      c->streams[stream_id].get());
+    // h3 can be absent here: a stream may open before the handshake completes,
+    // or after failConn deleted the nghttp3_conn (#362).
+    if (c->h3)
+      nghttp3_conn_set_stream_user_data(c->h3, stream_id,
+                                        c->streams[stream_id].get());
   }
   return 0;
 }
@@ -407,9 +430,14 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   if (n < 0) {
     // nghttp3 detected an HTTP/3/QPACK protocol error: close the connection
     // with the corresponding application error code (RFC 9114/9204), not a
-    // generic transport failure.
+    // generic transport failure. failConn deletes the now-poisoned
+    // nghttp3_conn, and returning CALLBACK_FAILURE (instead of 0) makes
+    // ngtcp2_conn_read_pkt abandon the remaining frames of this packet and the
+    // packets coalesced behind it, rather than driving more callbacks from the
+    // same datagram (#362). vq_engine_recv turns that error into the terminal
+    // CONNECTION_CLOSE, keeping the h3 ccerr failConn just set.
     failConn(c, static_cast<int>(n));
-    return 0;
+    return NGTCP2_ERR_CALLBACK_FAILURE;
   }
   // nghttp3 tells us via deferred_consume how much QPACK-blocked data it kept;
   // the bytes it did consume are extended here.
@@ -597,6 +625,23 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
 
 // --- egress -----------------------------------------------------------------
 
+// Emit the pending CONNECTION_CLOSE(ccerr) and mark the conn for reaping: the
+// terminal packet ngtcp2 documents for every error path other than DRAINING,
+// DROP_CONN and an idle close.
+void sendConnClose(Conn *c, uint64_t now_ns) {
+  uint8_t buf[kMaxUdpPayload];
+  ngtcp2_path_storage ps;
+  ngtcp2_path_storage_zero(&ps);
+  ngtcp2_pkt_info pi{};
+  ngtcp2_ssize nw = ngtcp2_conn_write_connection_close(
+      c->conn, &ps.path, &pi, buf, sizeof buf, &c->ccerr, now_ns);
+  auto &send = c->engine->cfg.cb.on_send;
+  if (nw > 0 && send)
+    send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
+         static_cast<size_t>(nw), ps.path.remote.addr, ps.path.remote.addrlen);
+  c->closed = true;
+}
+
 void writeConn(Conn *c, uint64_t now_ns) {
   if (!c->conn || c->closed) return;
   uint8_t buf[kMaxUdpPayload];
@@ -608,12 +653,7 @@ void writeConn(Conn *c, uint64_t now_ns) {
   // A pending HTTP/3/QPACK error: emit one CONNECTION_CLOSE with the app error
   // code, then reap the connection.
   if (c->wantClose) {
-    ngtcp2_ssize nw = ngtcp2_conn_write_connection_close(
-        c->conn, &ps.path, &pi, buf, sizeof buf, &c->ccerr, now_ns);
-    if (nw > 0 && send)
-      send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
-           static_cast<size_t>(nw), ps.path.remote.addr, ps.path.remote.addrlen);
-    c->closed = true;
+    sendConnClose(c, now_ns);
     return;
   }
 
@@ -624,7 +664,17 @@ void writeConn(Conn *c, uint64_t now_ns) {
     nghttp3_ssize vcnt = 0;
     if (c->h3 && ngtcp2_conn_get_max_data_left(c->conn)) {
       vcnt = nghttp3_conn_writev_stream(c->h3, &sid, &fin, vec, 16);
-      if (vcnt < 0) { c->closed = true; return; }
+      if (vcnt < 0) {
+        // Same nghttp3 contract as the read path: the connection is in error
+        // and only nghttp3_conn_del may still be called. Dropping the Conn
+        // silently (the old behaviour) left c->h3 alive and reachable from
+        // vq_stream_write / vq_submit_response until the next pump reaped it
+        // (#362). failConn deletes it and sets the h3 error code; emit the
+        // terminal CONNECTION_CLOSE instead of going silent (R15).
+        failConn(c, static_cast<int>(vcnt));
+        sendConnClose(c, now_ns);
+        return;
+      }
     }
     ngtcp2_ssize ndatalen = 0;
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
