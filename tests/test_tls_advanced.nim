@@ -59,6 +59,33 @@ suite "PKCS#12":
     let (o, rc) = curlGet(srv.port)
     check rc == 0 and o == "ok"
 
+suite "PKCS#12 reload":
+  test "a key-only reload is rejected and the running bundle keeps serving":
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(
+      numThreads = 1, pkcs12File = dir / "bundle.p12",
+      keyPassword = "p12pass")).start(0)
+    defer: srv.close()
+    proc subject(): string =
+      execCmdEx("echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " 2>/dev/null | " & opensslBin &
+        " x509 -noout -subject")[0].strip()
+    check "localhost" in subject()
+    genCert(dir / "rot.pem", dir / "rotkey.pem", "rotated.vortex")
+    # A PKCS#12 bundle carries cert and key together, so a lone key cannot
+    # apply to it: this must fail closed, not report a rotation that did not
+    # happen.
+    check not srv.reloadTls(keyFile = dir / "rotkey.pem")
+    check "localhost" in subject()                 # old bundle still presented
+    check "rotated.vortex" notin subject()
+    # The rejected call must not have persisted its keyFile either: a cert-only
+    # reload now has no key to pair with and fails, rather than quietly using
+    # the key recorded during the ignored call.
+    check not srv.reloadTls(certFile = dir / "rot.pem")
+    check "localhost" in subject()
+    # Rotating both halves replaces the bundle and does take effect.
+    check srv.reloadTls(certFile = dir / "rot.pem", keyFile = dir / "rotkey.pem")
+    check "rotated.vortex" in subject()
+
 suite "mTLS":
   test "require: connection without a client cert is refused":
     var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = ClientVerify.Require, clientCaFile = dir / "ca.pem")).start(0)

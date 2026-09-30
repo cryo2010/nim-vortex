@@ -313,6 +313,9 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## after certbot renewed them in place). Returns false if TLS is not enabled,
   ## or the new cert/key is missing/invalid/mismatched -- in which case the
   ## running certificate is kept, so a bad renewal never takes the server down.
+  ## A `keyFile`-only call against a server whose current material is a PKCS#12
+  ## bundle is one such rejection: the bundle carries both halves, so rotate
+  ## both (`certFile` + `keyFile`) rather than the key alone.
   ##
   ## The stapled OCSP response rotates on the same call: `ocspResponse` supplies
   ## DER bytes, `ocspFile` a path read now (an unreadable one rejects the reload

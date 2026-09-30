@@ -155,6 +155,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idle timeout. The QUIC shim already alerted; the two paths now agree. A client
   that sends no ALPN extension at all is unaffected (OpenSSL does not invoke the
   callback for it) and still gets HTTP/1.1. (#370)
+- TLS: `reloadTls(keyFile = ...)` against a server whose certificate came from
+  a PKCS#12 bundle now returns false instead of reporting a rotation that never
+  happened. The `keyFile` branch did not clear `pkcs12`/`pkcs12File` the way the
+  `certFile` branch does, and `loadCertKey` gives a bundle unconditional
+  precedence, so the context was rebuilt from the old bundle, the cert/key
+  consistency check passed (they match each other), and an operator rotating a
+  disclosed key got positive confirmation while the server kept presenting it. A
+  lone key cannot apply to a bundle that carries both halves, so the call is
+  rejected outright, and the ignored path is no longer recorded in the stored
+  material (which used to let a later cert-only reload pair a new certificate
+  with it). Rotate both halves together. (#363)
 
 ## [0.5.0] - 2026-09-24
 

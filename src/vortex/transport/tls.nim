@@ -621,7 +621,9 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## in-place renewal) and atomically install it, so subsequent TLS handshakes
   ## present the new certificate while in-flight connections keep the old one.
   ## Returns false and leaves the running ctx untouched if the new material is
-  ## missing/invalid/mismatched.
+  ## missing/invalid/mismatched, including a `keyFile`-only reload of a server
+  ## whose current material is a PKCS#12 bundle (rotate both halves, or supply
+  ## a new bundle by reconfiguring). Nothing is persisted on a rejection.
   ##
   ## The stapled OCSP response rotates on the same swap: `ocspResponse` supplies
   ## bytes, `ocspFile` a path read now, `clearOcsp` drops the staple; all empty
@@ -640,10 +642,20 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   # Explicit file paths override any stored in-memory/PKCS#12 material; empty
   # means "reuse what was last loaded" (files, PEM, or p12).
   var m = cfg.material
+  let p12Sourced = m.pkcs12.len > 0 or m.pkcs12File.len > 0
   if certFile.len > 0:
     m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   if keyFile.len > 0:
-    m.keyFile = keyFile; m.keyPem = ""
+    # A key-only rotation cannot apply to a PKCS#12-sourced certificate: the
+    # bundle carries both halves and loadCertKey gives it unconditional
+    # precedence, so leaving pkcs12/pkcs12File set would rebuild the *old*
+    # cert and key, pass the consistency check because they match each other,
+    # and report success while the new key was never opened. Reject it (a lone
+    # key against a p12 certificate is meaningless) rather than silently
+    # no-op, and clear the bundle fields either way so the branches are
+    # symmetric with certFile's.
+    if certFile.len == 0 and p12Sourced: return false
+    m.keyFile = keyFile; m.keyPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   # Resolve the staple for the new ctx *before* buildTlsCtx, so any rejection
   # leaves the running ctx (and its staple) completely untouched. newOcsp is the
   # bytes to attach; newOcspFile the path to remember for future re-reads.
