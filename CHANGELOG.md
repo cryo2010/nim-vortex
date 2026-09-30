@@ -127,6 +127,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   get local issuer certificate". The loaders now read the OpenSSL error queue
   and accept the stop only on PEM's benign "no start line", exactly as
   OpenSSL's own `SSL_CTX_use_certificate_chain_file` does. (#367)
+- TLS: a `clientCaPem` bundle must now parse in full. The loader treated any
+  read failure as clean end-of-data and reported success whenever at least one
+  CA had loaded, so a bundle truncated or corrupted part-way through (a
+  ConfigMap or Vault render, a non-atomic `curl` fetch) silently installed a
+  partial trust store: the server started healthy and every client issued by a
+  CA after the damage was rejected at handshake time with an unable-to-get-issuer
+  alert, with no startup failure to correlate against. A trust-anchor set is now
+  accepted only when the whole bundle was consumed cleanly and held at least one
+  CA. (#368)
 
 ## [0.5.0] - 2026-09-24
 

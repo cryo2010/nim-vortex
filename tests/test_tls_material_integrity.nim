@@ -11,8 +11,9 @@ when defined(plainHttp):
   echo "SKIP: -d:plainHttp has no TLS"
   quit 0
 let opensslBin = findExe("openssl")
-if opensslBin.len == 0:
-  echo "SKIP: need openssl"
+let curlBin = findExe("curl")
+if opensslBin.len == 0 or curlBin.len == 0:
+  echo "SKIP: need openssl and curl"
   quit 0
 
 let dir = getTempDir() / "vortex_tlsmat_" & $getCurrentProcessId()
@@ -46,6 +47,25 @@ proc mangle(pem: string): string =
   lines[mid] = repeat('!', lines[mid].len)
   lines.join("\n") & "\n"
 
+# Two client CAs and a client certificate issued by the *last* one, so a bundle
+# that stops at the first CA cannot verify it.
+must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+     "/caA.key -out " & dir & "/caA.pem -days 2 -subj /CN=BundleCA-A")
+must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+     "/caB.key -out " & dir & "/caB.pem -days 2 -subj /CN=BundleCA-B")
+must("openssl req -newkey rsa:2048 -nodes -keyout " & dir &
+     "/client.key -out " & dir & "/client.csr -subj /CN=bundle-client")
+must("openssl x509 -req -in " & dir & "/client.csr -CA " & dir & "/caB.pem -CAkey " &
+     dir & "/caB.key -CAcreateserial -out " & dir & "/client.pem -days 2")
+
+let caBundle = readFile(dir / "caA.pem") & readFile(dir / "caB.pem")
+
+proc truncateLast(pem: string): string =
+  ## Drop the tail of the last PEM block (a bundle written non-atomically, or
+  ## cut mid-certificate by a partial write).
+  let lines = pem.strip.splitLines()
+  lines[0 ..< lines.len - 3].join("\n") & "\n"
+
 let goodChain = leafPem & caPem
 let corruptChain = leafPem & mangle(caPem) & caPem   # damage between valid blocks
 let goodChainFile = dir / "good-chain.pem"
@@ -54,7 +74,11 @@ writeFile(goodChainFile, goodChain)
 writeFile(badChainFile, corruptChain)
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
-  res.send(Http200, "ok")
+  if req.path == "/whoami":
+    let sub = req.clientCertSubject
+    res.send(Http200, if sub.len > 0: sub else: "-")
+  else:
+    res.send(Http200, "ok")
 
 proc servedCerts(port: Port): int =
   ## How many certificates the server puts in its Certificate message.
@@ -83,6 +107,35 @@ suite "certificate chain integrity":
     check not srv.reloadTls(certFile = badChainFile, keyFile = leafKeyFile)
     check servedCerts(srv.port) == 2                  # old chain still served
     check srv.reloadTls(certFile = goodChainFile, keyFile = leafKeyFile)
+
+suite "client CA bundle integrity":
+  test "a clean multi-CA bundle verifies a client from the last CA":
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(
+      numThreads = 1, certFile = dir / "leaf.pem", keyFile = leafKeyFile,
+      verifyClient = ClientVerify.Require, clientCaPem = caBundle)).start(0)
+    defer: srv.close()
+    let (o, rc) = execCmdEx(curlBin & " -sk --http1.1 -m 5 --cert " & dir &
+      "/client.pem --key " & dir & "/client.key https://127.0.0.1:" &
+      $srv.port & "/whoami")
+    check rc == 0
+    check "bundle-client" in o
+
+  test "a truncated CA bundle is rejected at startup":
+    expect CatchableError:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = dir / "leaf.pem", keyFile = leafKeyFile,
+        verifyClient = ClientVerify.Require,
+        clientCaPem = truncateLast(caBundle))).start(0)
+      srv.close()
+
+  test "a CA bundle with a mangled block is rejected at startup":
+    expect CatchableError:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = dir / "leaf.pem", keyFile = leafKeyFile,
+        verifyClient = ClientVerify.Require,
+        clientCaPem = readFile(dir / "caA.pem") &
+                      mangle(readFile(dir / "caB.pem")))).start(0)
+      srv.close()
 
 suite "h3 shim certificate chain integrity":
   # The QUIC engine builds its own SSL_CTX from the same PEM bytes (the C++

@@ -433,8 +433,14 @@ proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
 
 proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
   ## Add PEM CA cert(s) from memory to the ctx trust store (client verification).
+  ## The whole bundle must parse: this is the trust-anchor set for client-cert
+  ## verification, so a bundle that is truncated or corrupt part-way through is
+  ## rejected rather than installed up to the damage (which would reject every
+  ## client issued by a CA that came after it, at handshake time, with nothing
+  ## in the config or the logs to point at the cause).
   let store = SSL_CTX_get_cert_store(ctx)
   if store == nil or pem.len == 0: return false
+  ERR_clear_error()     # so pemReadEndedCleanly sees only our own errors
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
   defer: discard BIO_free(bio)
@@ -442,13 +448,13 @@ proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
   while true:
     let x = PEM_read_bio_X509(bio, nil, nil, nil)
     if x == nil:
-      ERR_clear_error()
-      break
+      # A real parse error reads as nil just like end-of-data; only a clean PEM
+      # EOF after at least one CA counts as a fully consumed bundle.
+      return pemReadEndedCleanly() and added > 0
     let ok = X509_STORE_add_cert(store, x) == 1     # up-refs x
     X509_free(x)
     if not ok: return false
     inc added
-  added > 0
 
 proc applyClientVerify(ctx: SslCtxPtr, verify: cint,
                        caFile, caPem: string): bool =
