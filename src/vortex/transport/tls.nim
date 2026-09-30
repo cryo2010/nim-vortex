@@ -123,6 +123,7 @@ proc SSL_CTX_set_ex_data(ctx: SslCtxPtr, idx: cint, arg: pointer): cint
 {.push importc, cdecl, dynlib: cryptoLibName.}
 proc ERR_clear_error()
 proc ERR_get_error(): culong
+proc ERR_peek_last_error(): culong
 proc ERR_error_string(e: culong, buf: cstring): cstring
 proc X509_get_subject_name(x: pointer): pointer          # X509_NAME* (borrowed)
 proc X509_NAME_oneline(name: pointer, buf: cstring, size: cint): cstring
@@ -158,8 +159,50 @@ proc passwdCb(buf: cstring, size: cint, rwflag: cint,
   if n > 0: copyMem(buf, u, n)
   cint(n)
 
+const
+  # OpenSSL error-code layout (<openssl/err.h>) and the one PEM reason that
+  # means "clean end of PEM data" (<openssl/pemerr.h>). ERR_GET_LIB and
+  # ERR_GET_REASON are static inlines in the header, so they cannot be
+  # imported; errGetLib/errGetReason below mirror them exactly.
+  ERR_LIB_SYS = cint(2)
+  ERR_LIB_PEM = cint(9)
+  ERR_SYSTEM_FLAG = culong(0x80000000)   # (unsigned int)INT_MAX + 1
+  ERR_SYSTEM_MASK = culong(0x7FFFFFFF)   # (unsigned int)INT_MAX
+  ERR_LIB_OFFSET = 23
+  ERR_LIB_MASK = culong(0xFF)
+  ERR_REASON_MASK = culong(0x7FFFFF)
+  PEM_R_NO_START_LINE = cint(108)
+
+proc errGetLib(e: culong): cint =
+  ## ERR_GET_LIB from <openssl/err.h>, including its system-error special case.
+  if (e and ERR_SYSTEM_FLAG) != 0: ERR_LIB_SYS
+  else: cint((e shr ERR_LIB_OFFSET) and ERR_LIB_MASK)
+
+proc errGetReason(e: culong): cint =
+  ## ERR_GET_REASON from <openssl/err.h>, including its system-error case.
+  if (e and ERR_SYSTEM_FLAG) != 0: cint(e and ERR_SYSTEM_MASK)
+  else: cint(e and ERR_REASON_MASK)
+
+proc pemReadEndedCleanly(): bool =
+  ## Did the PEM read loop that just stopped stop at end-of-data, or on a real
+  ## parse error? `PEM_read_bio_X509` returns nil for *every* failure (bad
+  ## base64, a truncated block, an ASN.1 decode failure, out of memory), so the
+  ## error queue is the only thing that distinguishes them: a clean EOF leaves
+  ## PEM's benign "no start line", anything else is genuine corruption. Clears
+  ## the queue on a clean EOF and leaves the real error in place otherwise, so
+  ## the caller's failure is reported with its cause. This is exactly what
+  ## OpenSSL's own SSL_CTX_use_certificate_chain_file does.
+  let e = ERR_peek_last_error()
+  if errGetLib(e) == ERR_LIB_PEM and errGetReason(e) == PEM_R_NO_START_LINE:
+    ERR_clear_error()
+    true
+  else:
+    false
+
 proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
   ## Load a PEM certificate chain (leaf first, then intermediates) from memory.
+  ## Rejects a chain that does not parse in full (see pemReadEndedCleanly).
+  ERR_clear_error()     # so pemReadEndedCleanly sees only our own errors
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
   defer: discard BIO_free(bio)
@@ -170,13 +213,14 @@ proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
   while true:
     let extra = PEM_read_bio_X509(bio, nil, nil, nil)
     if extra == nil:
-      ERR_clear_error()          # expected: end of PEM data
-      break
+      # Not necessarily end-of-data: a mangled or truncated block after the
+      # leaf reads as nil too. Accept the stop only on a clean PEM EOF, so a
+      # corrupt chain is rejected instead of silently served leaf-only.
+      return pemReadEndedCleanly()
     # SSL_CTX_add_extra_chain_cert takes ownership; do not free on success.
     if SSL_CTX_ctrl(ctx, SSL_CTRL_EXTRA_CHAIN_CERT, 0, extra) != 1:
       X509_free(extra)
       return false
-  true
 
 proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   ## Load a PEM private key from memory, decrypting with `password` if set.

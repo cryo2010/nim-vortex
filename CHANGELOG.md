@@ -118,6 +118,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moving is never cut off; set it to 0 to restore the old behaviour. The
   `maxHeaderCount` limit is documented as answering 431, not 400, and as
   HTTP/1 only. (#249)
+- TLS: an in-memory certificate chain (`certPem`, and the same bytes on the
+  HTTP/3 side) that does not parse in full is now rejected instead of loaded
+  up to the point of damage. `PEM_read_bio_X509` returns nil for every failure,
+  not only end-of-data, so a mangled or truncated block after the leaf left a
+  silently leaf-only chain: the server started, `reloadTls` returned true, and
+  clients without the intermediate cached failed the handshake with "unable to
+  get local issuer certificate". The loaders now read the OpenSSL error queue
+  and accept the stop only on PEM's benign "no start line", exactly as
+  OpenSSL's own `SSL_CTX_use_certificate_chain_file` does. (#367)
 
 ## [0.5.0] - 2026-09-24
 

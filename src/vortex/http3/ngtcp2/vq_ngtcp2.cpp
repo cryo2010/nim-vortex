@@ -12,6 +12,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/pemerr.h>
 #include <openssl/pkcs12.h>
 
 #include <arpa/inet.h>
@@ -720,14 +721,29 @@ static bool loadKey(SSL_CTX *ctx, const char *pem, const char *file,
 }
 
 // Load the leaf cert (+ any following chain certs) into `ctx` from a PEM blob.
+// A chain that does not parse in full is rejected: PEM_read_bio_X509 returns
+// null for every failure, not only end-of-data, so the error queue is what
+// distinguishes a clean EOF (PEM's benign "no start line") from a mangled or
+// truncated block. Clearing it unconditionally would install a silently
+// truncated, leaf-only chain. Mirrors OpenSSL's own
+// SSL_CTX_use_certificate_chain_file and the TCP path's loadCertChainMem.
 static bool loadCertChain(SSL_CTX *ctx, const char *pem) {
   BioPtr b(BIO_new_mem_buf(pem, -1));
   if (!b) return false;
+  ERR_clear_error();   // so the peek below sees only our own errors
   X509Ptr leaf(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
   bool ok = leaf && SSL_CTX_use_certificate(ctx, leaf.get()) == 1;
   while (ok) {
     X509Ptr x(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
-    if (!x) { ERR_clear_error(); break; }   // expected: end of PEM data
+    if (!x) {
+      const unsigned long e = ERR_peek_last_error();
+      if (ERR_GET_LIB(e) == ERR_LIB_PEM &&
+          ERR_GET_REASON(e) == PEM_R_NO_START_LINE)
+        ERR_clear_error();               // end of PEM data
+      else
+        ok = false;                      // a real parse error: reject
+      break;
+    }
     // add0 takes ownership on success, so release; on failure the unique_ptr frees.
     if (SSL_CTX_add0_chain_cert(ctx, x.get()) != 1) ok = false;
     else (void)x.release();
