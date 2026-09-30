@@ -183,6 +183,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped the other thread's entry and leaked it. The documented contract
   ("call from an ordinary thread") always implied concurrent calls were fine;
   now they are. (#360)
+- TLS: a certificate hot-reload now releases the displaced `SSL_CTX` right
+  away and `newTlsSession` holds a reference to the context it hands to
+  `SSL_new`, replacing the four-slot retire ring and its 5 s grace window. The
+  ring had to evict, and free, a context once a fifth reload arrived inside the
+  window, which by construction is the moment every retained context was still
+  within its grace period: a renewal hook or config-file watcher firing a few
+  times in a few seconds could free a context a loop thread had loaded but not
+  yet up-ref'd, along with the OCSP staple attached to it. A reference per
+  session makes a displaced context live exactly as long as the last connection
+  using it, so both the slot cap and the window are gone. (#364)
 
 ## [0.5.0] - 2026-09-24
 

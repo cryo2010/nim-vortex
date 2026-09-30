@@ -5,12 +5,7 @@
 ## Build with -d:plainHttp to exclude TLS (and the libssl runtime
 ## requirement) entirely.
 
-import std/[locks, monotimes, times]
-
-const
-  ctxRetireSlots = 4     ## displaced SSL_CTXs kept during their grace window
-  ctxGraceSec = 5        ## free a retired ctx only this long after it was
-                         ## displaced (a thread mid-SSL_new keeps it valid)
+import std/locks
 
 const sslLibName {.strdefine.} =
   when defined(macosx):
@@ -81,6 +76,7 @@ type
 proc TLS_server_method(): pointer
 proc SSL_CTX_new(m: pointer): SslCtxPtr
 proc SSL_CTX_free(ctx: SslCtxPtr)
+proc SSL_CTX_up_ref(ctx: SslCtxPtr): cint
 proc SSL_CTX_use_certificate_chain_file(ctx: SslCtxPtr, file: cstring): cint
 proc SSL_CTX_use_certificate(ctx: SslCtxPtr, x: pointer): cint   # up-refs x
 proc SSL_CTX_use_PrivateKey(ctx: SslCtxPtr, pkey: pointer): cint # up-refs pkey
@@ -264,22 +260,24 @@ type
     ## An immutable DER OCSP response owned by one SSL_CTX. Allocated with
     ## `allocShared` (loop threads read it lock-free in `statusCb`) and freed by
     ## OpenSSL through the ctx's ex_data destructor `ocspExFree`, so its lifetime
-    ## is exactly the ctx's: no retire-ring involvement (an SSL on a displaced
-    ## ctx can outlive the grace window, which would be a use-after-free).
+    ## is exactly the ctx's, and the ctx is refcounted: one displaced by a reload
+    ## lives until the last SSL created on it is freed, so a handshake thread can
+    ## never read a blob whose ctx a reload has released.
     len: int
     data: UncheckedArray[byte]
 
   TlsConfig* = object
     ## One per server; SSL_CTX is thread-safe for SSL_new. Lives in shared
     ## memory so loop threads can use it via pointer.
-    ctx*: SslCtxPtr          ## active SSL_CTX; loop threads load it atomically
-                             ## so a certificate hot-reload can swap it in
-    retired: array[ctxRetireSlots, SslCtxPtr]   ## displaced ctxs pending free
-    retiredAt: array[ctxRetireSlots, MonoTime]  ## when each was displaced
-    reloadLock: Lock         ## serialises reloadTlsConfig. The retire ring and
-                             ## the material/OCSP fields below are read-modify-
-                             ## written across the call, so two reloads running
-                             ## at once would double-free or leak an SSL_CTX
+    ctx*: SslCtxPtr          ## active SSL_CTX; readers load it and take a
+                             ## reference in one step (acquireCtx), so a
+                             ## hot-reload can swap and release it underneath
+    ctxLock: Lock            ## held only across {load ctx, up-ref it} and
+                             ## {swap ctx, release the old one}: see acquireCtx
+    reloadLock: Lock         ## serialises reloadTlsConfig. The material/OCSP
+                             ## fields below are read-modify-written across the
+                             ## call, so two reloads running at once would tear
+                             ## them
     protos: string           ## ALPN preference list, wire format
     meth: pointer            ## method the ctx was built with (rebuild on reload)
     material: TlsMaterial    ## the default cert/key source (reloaded in place)
@@ -369,8 +367,9 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
 proc ocspExFree(parent, p: pointer, ad: pointer, idx: cint,
                 argl: clong, argp: pointer) {.cdecl.} =
   ## CRYPTO_EX_free for the ctx's OcspBlob: OpenSSL calls this exactly when the
-  ## SSL_CTX is destroyed (ring free, freeTlsConfig, or last SSL_free), which is
-  ## the only safe point to free a blob a handshake thread may still be reading.
+  ## SSL_CTX is destroyed, i.e. once the config's reference and every session's
+  ## reference are gone, which is the only safe point to free a blob a handshake
+  ## thread may still be reading.
   if p != nil: deallocShared(p)
 
 let ocspExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil,
@@ -603,6 +602,7 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
                         minProtoVersion, maxProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
+  initLock(result.ctxLock)
   initLock(result.reloadLock)
   result.ctx = ctx
   result.protos = protos
@@ -632,6 +632,26 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                                   cast[pointer](servernameCb))
     discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, result)
 
+# --- active SSL_CTX lifetime -------------------------------------------------
+#
+# A reload swaps `cfg.ctx` while loop threads are creating sessions on it, and
+# releases the displaced ctx immediately afterwards, so no reader may hold a
+# bare pointer across the swap. Readers take `cfg.ctxLock` for exactly as long
+# as it takes to up-ref what they loaded: that gives them a reference of their
+# own, which turns the reload's release into a decrement and keeps the ctx alive
+# until they are done with it. The work itself (SSL_new, reading the cert) then
+# runs outside the lock, so a handshake never waits on another thread's session
+# setup, and a reload never waits on a handshake.
+
+proc acquireCtx(cfg: ptr TlsConfig): SslCtxPtr =
+  ## The active SSL_CTX, with a reference held on the caller's behalf. Pair
+  ## every call with an `SSL_CTX_free` once the caller (or an object it handed
+  ## the ctx to, like the SSL from `SSL_new`) has taken its own reference.
+  acquire(cfg.ctxLock)
+  result = atomicLoadN(addr cfg.ctx, ATOMIC_ACQUIRE)
+  discard SSL_CTX_up_ref(result)   # only fails without a live reference to it
+  release(cfg.ctxLock)
+
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                       ocspFile = "", ocspResponse = "",
                       clearOcsp = false): bool =
@@ -654,13 +674,13 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ##
   ## Callable from any ordinary thread, including several at once: the whole
   ## body runs under `cfg.reloadLock`, so concurrent reloads serialise instead
-  ## of interleaving their retire-ring bookkeeping (two threads claiming the
-  ## same slot double-free or leak an SSL_CTX) or tearing the stored
-  ## material/OCSP fields, which are read at the top and rewritten at the
-  ## bottom. Loop threads never take that lock: they read `cfg.ctx` with an
-  ## atomic load in `newTlsSession`, and the displaced ctx is retired rather
-  ## than freed here, so a thread mid-`SSL_new` keeps a valid pointer. Not
-  ## callable from a raw signal handler (it takes a lock and reads files).
+  ## of tearing the stored material/OCSP fields, which are read at the top and
+  ## rewritten at the bottom. Loop threads never take that lock; they take
+  ## `cfg.ctxLock` only to up-ref the ctx they load (see acquireCtx above), so
+  ## the ctx displaced here is released rather than destroyed and survives
+  ## until the last session created on it is freed: in-flight connections keep
+  ## the certificate they handshook with, however many reloads follow. Not
+  ## callable from a raw signal handler (it takes locks and reads files).
   acquire(cfg.reloadLock)
   defer: release(cfg.reloadLock)
   # Explicit file paths override any stored in-memory/PKCS#12 material; empty
@@ -712,27 +732,18 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile
+  # Publish the new ctx and drop the config's reference to the old one, with the
+  # swap under the same lock readers up-ref beneath: a reader either loaded
+  # `old` before the swap and holds a reference of its own, so the free below is
+  # a decrement, or it loads `newCtx` after it. `old` therefore lives exactly as
+  # long as the sessions on it, which is what the retire ring this replaces only
+  # approximated: with a fixed number of slots and a time-based grace window, a
+  # burst of reloads had to evict (and free) a ctx a thread could still be
+  # holding between its load and SSL_new.
+  acquire(cfg.ctxLock)
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
-  # Retire `old` with a time-based grace rather than freeing the previous
-  # retirement outright: freeing at the *next* reload alone is unsafe if two
-  # reloads land within a thread's load->SSL_new window (the ctx it loaded could
-  # be freed before it up-refs). Free only ctxs displaced at least ctxGraceSec
-  # ago; keep the rest in a small fixed ring.
-  let now = getMonoTime()
-  for i in 0 ..< ctxRetireSlots:
-    if cfg.retired[i] != nil and (now - cfg.retiredAt[i]).inSeconds >= ctxGraceSec:
-      SSL_CTX_free(cfg.retired[i]); cfg.retired[i] = nil
-  var placed = false
-  for i in 0 ..< ctxRetireSlots:
-    if cfg.retired[i] == nil:
-      cfg.retired[i] = old; cfg.retiredAt[i] = now; placed = true; break
-  if not placed:
-    # Ring full (many reloads within the grace window): evict the oldest.
-    var oldest = 0
-    for i in 1 ..< ctxRetireSlots:
-      if cfg.retiredAt[i] < cfg.retiredAt[oldest]: oldest = i
-    SSL_CTX_free(cfg.retired[oldest])
-    cfg.retired[oldest] = old; cfg.retiredAt[oldest] = now
+  release(cfg.ctxLock)
+  SSL_CTX_free(old)       # the config's reference; sessions keep their own
   true
 
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
@@ -802,7 +813,9 @@ proc ctxCertSubject*(cfg: ptr TlsConfig): string =
   ## The subject line of the certificate currently installed on `cfg.ctx`, for
   ## tests/introspection: proves an in-place reload actually reached the ctx.
   ## "" if no certificate is set.
-  let x = SSL_CTX_get0_certificate(cfg.ctx)
+  let ctx = acquireCtx(cfg)          # a concurrent reload must not release it
+  defer: SSL_CTX_free(ctx)           # under the borrowed X509 below
+  let x = SSL_CTX_get0_certificate(ctx)
   if x == nil: return ""
   var buf = newString(512)
   let s = X509_NAME_oneline(X509_get_subject_name(x), buf.cstring, 512)
@@ -842,9 +855,10 @@ proc peerCertSubject*(ssl: SslPtr): string =
   if s == nil: "" else: $s
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
+  # Releases the config's references; a ctx with sessions still open on it is
+  # destroyed by their last SSL_free. Loop threads are joined before this runs,
+  # so no acquireCtx can be in flight.
   SSL_CTX_free(cfg.ctx)
-  for i in 0 ..< ctxRetireSlots:
-    if cfg.retired[i] != nil: SSL_CTX_free(cfg.retired[i])
   for c in cfg.sniCtx: SSL_CTX_free(c)
   cfg.sniCtx = @[]
   cfg.sniHosts = @[]
@@ -857,11 +871,16 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.ocsp = ""
   cfg.ocspFile = ""
   deinitLock(cfg.reloadLock)
+  deinitLock(cfg.ctxLock)
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =
-  # Atomic load: a concurrent certificate hot-reload may swap cfg.ctx.
-  let ctx = atomicLoadN(addr cfg.ctx, ATOMIC_ACQUIRE)
+  # A concurrent hot-reload may swap cfg.ctx and release the old one, so take a
+  # reference to what we loaded (acquireCtx) instead of carrying a bare pointer
+  # into SSL_new, which up-refs the ctx itself once it gets there. Ours is
+  # dropped on the way out; the SSL keeps the ctx alive for its own lifetime.
+  let ctx = acquireCtx(cfg)
+  defer: SSL_CTX_free(ctx)
   result = SSL_new(ctx)
   if result == nil: return nil
   if SSL_set_fd(result, fd) != 1:
