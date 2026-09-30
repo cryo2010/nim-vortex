@@ -258,7 +258,9 @@ nim c -d:httpBrotli -d:httpGzip -d:httpZstd --passL:"-lbrotlienc -lbrotlicommon"
 #### Transport Layer Security (TLS)
 
 Providing a certificate turns on TLS, which enables HTTP/2 (via ALPN) and
-HTTP/3 (over QUIC):
+HTTP/3 (over QUIC). The TLS listener offers `h2` and `http/1.1`; a client that
+offers no ALPN gets HTTP/1.1, and one whose offer overlaps neither is refused
+with the fatal `no_application_protocol` alert RFC 7301 requires:
 
 ```nim
 app.serve(8443, config = initVortexConfig(

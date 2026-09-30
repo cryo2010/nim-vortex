@@ -58,6 +58,32 @@ suite "TLS":
     check rc == 0
     check output.strip() == "hello over TLS|200"
 
+  test "ALPN negotiates the protocols the server offers":
+    for proto in ["h2", "http/1.1"]:
+      let (o, rc) = execCmdEx("echo | openssl s_client -connect localhost:" &
+        $srv.port & " -alpn " & proto & " 2>/dev/null")
+      check rc == 0
+      check ("ALPN protocol: " & proto) in o
+
+  test "an unknown ALPN offer gets a fatal no_application_protocol alert":
+    # RFC 7301 3.2: no overlap between the client's list and the server's must
+    # be a fatal alert (number 120), not a completed handshake with no ALPN
+    # extension, which a client is entitled to read as its offer accepted.
+    let (o, rc) = execCmdEx("echo | openssl s_client -connect localhost:" &
+      $srv.port & " -alpn bogus 2>&1")
+    check rc != 0
+    check "no application protocol" in o.toLowerAscii
+
+  test "a client offering no ALPN at all still gets HTTP/1.1":
+    # OpenSSL does not call the select callback when the ClientHello carries no
+    # ALPN extension, so the no-offer case stays a plain HTTP/1 connection and
+    # must not be alerted.
+    let (o, rc) = execCmdEx("printf 'GET / HTTP/1.0\r\n\r\n' | " &
+      "openssl s_client -quiet -connect localhost:" & $srv.port &
+      " 2>/dev/null")
+    check rc == 0
+    check "hello over TLS" in o
+
 # --- minimum TLS version -----------------------------------------------------
 
 proc handshakeOk(port: Port, tlsFlag: string): bool =

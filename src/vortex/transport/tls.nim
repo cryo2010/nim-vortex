@@ -66,6 +66,7 @@ const
   TLS1_2_VERSION* = clong(0x0303)
   TLS1_3_VERSION* = clong(0x0304)
   SSL_TLSEXT_ERR_OK = cint(0)
+  SSL_TLSEXT_ERR_ALERT_FATAL = cint(2)
   SSL_TLSEXT_ERR_NOACK = cint(3)
   OPENSSL_NPN_NEGOTIATED = cint(1)
 
@@ -309,7 +310,15 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
     outLen[] = chosenLen
     SSL_TLSEXT_ERR_OK
   else:
-    SSL_TLSEXT_ERR_NOACK      # no overlap: proceed without ALPN (=> h1)
+    # No overlap between the client's list and ours. RFC 7301 3.2 requires a
+    # fatal no_application_protocol alert here, and that is what OpenSSL's
+    # ALERT_FATAL means for this callback. NOACK would instead behave as if no
+    # callback were set: the handshake completes with no ALPN extension, the
+    # connection is framed as HTTP/1, and a client entitled to assume its offer
+    # was honoured misreads the result. OpenSSL does not invoke this callback
+    # at all when the client sent no ALPN extension, so the no-ALPN case still
+    # gets plain HTTP/1 rather than an alert.
+    SSL_TLSEXT_ERR_ALERT_FATAL
 
 proc cstrEq(cs: cstring, s: string): bool =
   ## Compare a NUL-terminated C string to a Nim string without allocating (the

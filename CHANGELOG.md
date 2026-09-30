@@ -146,6 +146,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `clientCertSubject` was always "". `validateConfig` names the missing setting,
   and the context build refuses it too, so direct `TlsConfig` users and rebuilds
   fail closed as well. (#369)
+- TLS: an ALPN offer that overlaps nothing the server supports now gets the
+  fatal `no_application_protocol` alert RFC 7301 3.2 requires, instead of
+  completing the handshake with no ALPN extension. The callback returned
+  `SSL_TLSEXT_ERR_NOACK`, which OpenSSL implements as "behave as if no callback
+  were set", so an HTTP/3-only or legacy client that reached the TCP port got a
+  successful handshake, was framed as HTTP/1, and answered 400 or hung until the
+  idle timeout. The QUIC shim already alerted; the two paths now agree. A client
+  that sends no ALPN extension at all is unaffected (OpenSSL does not invoke the
+  callback for it) and still gets HTTP/1.1. (#370)
 
 ## [0.5.0] - 2026-09-24
 

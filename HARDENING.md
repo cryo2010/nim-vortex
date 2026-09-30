@@ -93,6 +93,11 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `decompressRequest` | `false` | Decode gzip/br/zstd request bodies, bounded by `maxBodySize` |
 | `compress` | `false` | gzip/brotli-compress eligible responses |
 
+The TLS listener offers ALPN `h2` and `http/1.1`. A client that advertises an
+ALPN list overlapping neither is refused with a fatal `no_application_protocol`
+alert (RFC 7301 3.2) rather than being handed a no-ALPN connection that it would
+misframe; a client that advertises no ALPN at all still gets HTTP/1.1.
+
 Certificates can be rotated at runtime with `server.reloadTls(certFile, keyFile)`
 (TCP and h3), which validates the new material and swaps it in without dropping
 connections. The same call rotates the stapled OCSP response:
