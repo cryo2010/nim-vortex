@@ -259,6 +259,9 @@ type
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
     lingerClose*: bool        ## drain peer before close (reliable error delivery)
+    tlsCloseNotified*: bool   ## TLS close_notify already handed to OpenSSL by the
+                              ## lingering close, so closeConn must not run a
+                              ## second SSL_shutdown over a half-closed socket
     peerHalfClosed*: bool     ## peer sent FIN (half-close): no more requests,
                               ## but a buffered one still gets its response
     # HTTP/1-only streaming state; the shared flags/callbacks live in `rs`.
@@ -796,6 +799,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.closeRequested = false
   c.closeAfterFlush = false
   c.lingerClose = false
+  c.tlsCloseNotified = false
   c.peerHalfClosed = false
   c.requestCount = 0
   c.resetRequestState()

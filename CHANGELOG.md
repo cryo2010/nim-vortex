@@ -170,6 +170,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued and re-driven by the loop (re-checked when the body ack or the worker
   unpin lifts the block), and the selector does not wait while any are
   queued. (#366)
+- TLS: a connection that asked for a lingering close now gets one. It was
+  exempted on the grounds that "TLS has its own close_notify", but close_notify
+  is a TLS-layer record and does nothing to stop the kernel sending RST instead
+  of FIN when `close()` runs with unread data still in the receive queue, and
+  that RST discards the whole send queue: the error response the client had not
+  read yet, and the close_notify with it (the truncated upstream response a
+  reverse proxy reports). HTTPS now takes the same sequence as plaintext,
+  close_notify then `shutdown(SHUT_WR)` then drain to the peer's FIN or the
+  drain deadline, and the session is shut down and freed exactly once. (#373)
 
 ### Changed
 

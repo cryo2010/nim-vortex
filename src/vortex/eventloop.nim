@@ -482,7 +482,12 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     h2WsTeardownAll(c)            # onClose for every RFC 8441 WebSocket stream
   when not defined(plainHttp):
     if c.ssl != nil:
-      if not c.handshaking:
+      # One close_notify per session: beginLingerClose may already have sent it
+      # (tlsCloseNotified) and this socket is half-closed by now, so a second
+      # SSL_shutdown could only fail into the error queue. The session is freed
+      # exactly once either way: c.ssl is nil'd here, and the pinned-connection
+      # guard above returns before this block, so the deferred close frees it.
+      if not c.handshaking and not c.tlsCloseNotified:
         tlsShutdown(c.ssl)
       freeTlsSession(c.ssl)
       c.ssl = nil
@@ -568,10 +573,17 @@ proc beginLingerClose(loop: Loop, c: ptr Connection) =
   ## remaining bytes so close() sends a clean FIN instead of a RST that
   ## would truncate the error the client hasn't read yet. Bounded by the
   ## drain deadline and the connection cap.
+  ##
+  ## TLS takes the same path, with close_notify queued ahead of the FIN.
+  ## close_notify is a TLS-layer record: it does nothing to stop the kernel
+  ## sending RST instead of FIN when close() runs with unread data still in the
+  ## receive queue, and that RST discards the whole send queue -- close_notify
+  ## and the response with it. The window is wider under TLS than plaintext,
+  ## not narrower (#373).
   when not defined(plainHttp):
-    if c.ssl != nil:
-      loop.closeConn(c)          # TLS has its own close_notify; skip drain
-      return
+    if c.ssl != nil and not c.handshaking:
+      tlsShutdown(c.ssl)         # close_notify into the send queue
+      c.tlsCloseNotified = true  # ... so closeConn does not repeat it
   discard shutdown(SocketHandle(c.fd), cint(SHUT_WR))
   c.state = csDraining
   # Ensure the fd watches Read so handleDrain observes the peer FIN and reaps
@@ -690,14 +702,15 @@ proc flushOut(loop: Loop, c: ptr Connection) =
       # watches writability (#372). Always false on a plaintext connection.
       loop.disarmWrite(c)
     if c.closeAfterFlush:
-      # Close gracefully after writing a response on a plaintext HTTP/1 connection:
-      # a bare close() while the kernel still holds untransmitted response bytes and
-      # the peer has unread/half-closed can emit a RST that truncates the tail (a
+      # Close gracefully after writing a response on an HTTP/1 connection: a bare
+      # close() while the kernel still holds untransmitted response bytes and the
+      # peer has unread/half-closed can emit a RST that truncates the tail (a
       # slow-reading reverse proxy then reports an incomplete body). beginLingerClose
       # does shutdown(SHUT_WR) + drain so the send buffer flushes with a clean FIN.
       # This covers every close-after-response path (Connection: close, streaming
-      # finish, drain shutdown, peer-half-close), not just error responses. TLS
-      # (close_notify) and h2/ws keep the direct close unless lingerClose is set.
+      # finish, drain shutdown, peer-half-close), not just error responses, and TLS
+      # as well as plaintext: close_notify is a TLS record and does not stop the
+      # RST (#373). h2/ws keep the direct close unless lingerClose is set.
       if c.lingerClose or (c.h2 == nil and c.ws == nil):
         loop.beginLingerClose(c)
       else:

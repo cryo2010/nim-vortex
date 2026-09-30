@@ -1,13 +1,15 @@
-## Event-loop TLS I/O regressions: selector interest around a stalled
-## handshake, a blocked SSL_write, and an SSL_read that needs the socket
-## writable.
+## Event-loop TLS I/O regressions: selector interest around a stalled handshake
+## (#365) and a stalled response flush (#371), plaintext left buffered inside
+## OpenSSL after an early exit from the receive loop (#366), and the lingering
+## close of a TLS connection (#373).
 ##
-## These are liveness/CPU bugs rather than protocol ones, so the assertions are
-## process CPU time (getrusage over an otherwise idle window: the test's own
-## thread sleeps, so whatever is spent belongs to the loop thread) and request
-## completion, not response bytes.
+## The first two are liveness/CPU bugs rather than protocol ones, so they assert
+## process CPU time (getrusage over an otherwise idle window: this thread sleeps
+## through it, so whatever is spent belongs to the loop thread) rather than
+## response bytes. See the commit messages for #371 and #372 for the two arms
+## that cannot be driven from a client at all.
 
-import std/[unittest, net, posix, os, strutils, httpcore]
+import std/[unittest, net, posix, os, strutils, httpcore, openssl]
 import vortex/[settings, request, server]
 import ./helper
 
@@ -228,3 +230,61 @@ suite "TLS plaintext buffered inside OpenSSL":
       check text.count("HTTP/1.1 200") == 2
       check "slow done" in text
       check ("got " & $(req2.len - req2.find("\r\n\r\n") - 4)) in text
+
+# --- #373: a TLS close after a response must not RST-truncate it -------------
+
+proc rejectHandler(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "ok")
+
+proc readAfterReject(port: Port): tuple[text: string, err: string] =
+  ## Send a header flood over TLS (the server answers 431 and closes), then read
+  ## the answer. Returns whatever arrived plus the error that ended the read: a
+  ## RST-truncated close surfaces as a connection reset, a lingering close as a
+  ## clean EOF.
+  let ctx = newContext(verifyMode = CVerifyNone)
+  let s = newSocket(buffered = false)
+  defer:
+    # A peer that reset us makes std/net's close raise out of its SSL_shutdown.
+    try: s.close()
+    except CatchableError: discard
+  s.connect("127.0.0.1", port)
+  ctx.wrapConnectedSocket(s, handshakeAsClient, "localhost")
+  # One burst, far larger than maxHeaderSize, so most of it is still unread in
+  # the server's receive queue when it answers 431 and closes. Written with a
+  # single SSL_write rather than Socket.send: std/net's SSL send retries a
+  # failed write forever (its default SafeDisconn swallows the error), which on
+  # a peer that has just reset us is an infinite loop in the test client.
+  let flood = "GET / HTTP/1.1\r\nHost: x\r\nX-Big: " &
+              repeat('a', 128 * 1024) & "\r\n\r\n"
+  if SSL_write(s.sslHandle, cstring(flood), flood.len) <= 0:
+    result.err = "write: peer went away mid-flood"   # a reset while sending
+  discard shutdown(s.getFd, SHUT_WR)   # our FIN ends the server's drain
+  s.setRecvTimeout(3000)
+  var buf = newString(8192)
+  while true:
+    var n = 0
+    try: n = s.recv(addr buf[0], buf.len)
+    except CatchableError as e:
+      result.err = e.msg
+      break
+    if n <= 0: break
+    result.text.add buf[0 ..< n]
+
+suite "TLS lingering close":
+  ## An error response plus a client that has not been read yet: the close must
+  ## drain the peer's unread bytes (shutdown(SHUT_WR) + drain) so the kernel
+  ## sends FIN. A bare close() with data still in the receive queue sends RST
+  ## instead, which discards the queued response and the close_notify with
+  ## it (#373).
+  test "a 431 closes cleanly on a TLS connection that is still sending":
+    let cfg = initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                               maxHeaderSize = 4096)
+    withServer(RequestHandler(rejectHandler), cfg, srv):
+      var delivered = 0
+      var resets: seq[string]
+      for _ in 0 ..< 5:            # the RST is timing dependent; take five shots
+        let (text, err) = readAfterReject(srv.port)
+        if "431" in text: inc delivered
+        if err.len > 0: resets.add err
+      check resets.len == 0        # every close was a FIN, not a RST
+      check delivered == 5
