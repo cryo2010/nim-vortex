@@ -150,6 +150,21 @@ type
                                  # fault or a stalled loop (#343).
     pinnedGrowLogSec: int64      # monotonic sec of the last drop log line; at most
                                  # one a second, so a burst cannot flood the log
+    sslReady: seq[(int32, uint32)]
+                                 # TLS connections whose SSL object still holds
+                                 # decrypted plaintext the recv loop stopped
+                                 # consuming: their socket is drained, so no fd
+                                 # event is coming and only the loop can come
+                                 # back for those bytes (#366). fd+generation,
+                                 # like pendingFlush, so a recycled slot is
+                                 # skipped instead of read under its new
+                                 # occupant. Drained once per pass by
+                                 # driveSslReady; while non-empty the selector
+                                 # does not wait at all.
+    sslReadyScratch: seq[(int32, uint32)]
+                                 # drain buffer for the above, swapped in so a
+                                 # re-queue from inside the drain lands on the
+                                 # next pass instead of extending this one
     bodyPausedConns: int         # HTTP/1 streaming connections whose socket read
                                  # is paused at the read-ahead high-water (the recv
                                  # loop stops pulling; the fd stays armed). While
@@ -388,6 +403,42 @@ proc checkBodyPause(loop: Loop) =
         inc paused
     assert paused == loop.bodyPausedConns,
       "bodyPausedConns drift: " & $loop.bodyPausedConns & " vs " & $paused
+
+proc queueSslReady(loop: Loop, c: ptr Connection) =
+  ## Queue a connection for a re-drive on this loop pass: OpenSSL holds decrypted
+  ## plaintext that the recv loop stopped consuming, and the socket it came from
+  ## is already drained, so a level-triggered fd will never report readable for
+  ## those bytes. Nothing but the loop itself can come back for them (#366).
+  c.sslPending = false           # the debt is now the queue's, not the flag's
+  loop.sslReady.add (c.fd, c.gen)
+
+proc noteSslPending(loop: Loop, c: ptr Connection) =
+  ## Settle what OpenSSL still holds after the recv loop stopped early. Drivable
+  ## now: queue it. Still read-paused or held by a worker (the two conditions the
+  ## recv loop breaks on): remember it on the connection and let the resume paths
+  ## queue it once the block clears, so the loop never spins on a connection it
+  ## is not allowed to read yet.
+  when not defined(plainHttp):
+    if c.ssl == nil or c.state != csActive: return
+    if not tlsPending(c.ssl):
+      c.sslPending = false
+      return
+    if c.bodyReadPaused or c.totalPins > 0:
+      c.sslPending = true
+    else:
+      loop.queueSslReady(c)
+
+proc sslResumeCheck(loop: Loop, c: ptr Connection) =
+  ## Re-check the debt from a resume path (a body ack, a worker unpin, a deferred
+  ## response landing): whatever blocked the recv loop is gone, so the plaintext
+  ## inside OpenSSL can be pulled now. The recv loop is deliberately NOT
+  ## re-entered here -- resumeBodyImpl can run inside feedBody inside handleRead,
+  ## where a second recv loop would corrupt rbuf mid-move -- the queue defers it
+  ## to the loop.
+  when not defined(plainHttp):
+    if c.sslPending and c.state == csActive and not c.bodyReadPaused and
+        c.totalPins == 0:
+      loop.queueSslReady(c)
 
 proc closeConn(loop: Loop, c: ptr Connection) =
   loop.clearBodyPause(c)         # going away: give up its paused-conns slot
@@ -1084,6 +1135,7 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
       loop.flushOut(c)
     if c.state == csActive and c.rlen == 0 and not c.awaitingResponse:
       c.setDeadline(loop, dkIdle)
+    loop.sslResumeCheck(c)       # the reset above may have lifted a read pause
 
 proc releasePin(loop: Loop, c: ptr Connection, k: PinKind): bool {.discardable.} =
   ## Release one typed pin after applying its outbox message, then run the
@@ -1111,6 +1163,8 @@ proc releasePin(loop: Loop, c: ptr Connection, k: PinKind): bool {.discardable.}
   if c.inputPausePins == 0 and c.rlen > 0:
     loop.processInput(c)
     if c.state == csFree: return false
+  loop.sslResumeCheck(c)   # TLS: the pin that stopped the recv loop is gone, and
+                           # a pipelined request may be decrypted inside OpenSSL
   true
 
 proc releasePin(loop: Loop, slot: ptr H3SlotEntry, k: PinKind) =
@@ -1211,6 +1265,10 @@ proc handleRead(loop: Loop, c: ptr Connection) =
       # connection so the selector wait is capped short (bodyPausedConns), keeping
       # the async pump cycling to drain the consumer without a busy-spin, and the
       # recv loop resumes on the next readable event once ackBody drains the debt.
+      # Under TLS part of the tail can be decrypted inside OpenSSL rather than
+      # waiting in the kernel, and no readable event announces that: handleRead's
+      # tail records it (noteSslPending) so the resume re-drives the connection
+      # instead of waiting for an event that never comes (#366).
       break
     if c.rlen == c.rbuf.len:
       if c.h2 != nil:
@@ -1241,6 +1299,9 @@ proc handleRead(loop: Loop, c: ptr Connection) =
           # worker thread. Stop reading instead: the bytes stay in the kernel
           # (backpressure) and are consumed once the worker unpins. The current
           # request is already fully buffered; only the next pipelined one waits.
+          # Under TLS that next request may already be decrypted inside OpenSSL
+          # with the socket drained, so the unpin re-drives the connection rather
+          # than waiting for a readable event (noteSslPending / releasePin, #366).
           break
         if c.rs.reqStreaming and c.rs.onBodyCb != nil and
             c.rbuf.len >= streamRecvBufferCap:
@@ -1333,6 +1394,12 @@ proc handleRead(loop: Loop, c: ptr Connection) =
     inc loop.bodyPausedConns
   elif not nowPaused and c.bodyReadPaused:
     loop.clearBodyPause(c)
+  # Under TLS the "unread bytes wait in the kernel as backpressure" invariant the
+  # recv loop's early breaks rely on does not hold: a tlsRead with a small
+  # `wanted` returns that much and keeps the rest of the record decrypted inside
+  # OpenSSL, with the socket already drained. Settle that debt here, on the live
+  # pause/pin state after this read (#366).
+  loop.noteSslPending(c)
   if c.peerHalfClosed and c.state == csActive and not c.rs.respStreaming:
     # The peer will send no more requests: close once any response has been
     # written (the deferred/worker case sets closeAfterFlush and closes when
@@ -1399,6 +1466,28 @@ proc resumeBodyImpl(loopPtr: pointer, fd: int32, gen: uint32,
     if c.bodyUnacked < 0: c.bodyUnacked = 0
     if not c.bodyReadPaused or c.bodyUnacked >= streamBodyLowWater: return
     loop.clearBodyPause(c)            # below the low-water: let the recv loop pull
+    loop.sslResumeCheck(c)            # TLS: plaintext may be waiting in OpenSSL
+
+proc driveSslReady(loop: Loop) =
+  ## Read the connections queueSslReady flagged: OpenSSL is holding decrypted
+  ## plaintext for them and no fd event will arrive, so the loop drives the read
+  ## itself. Costs one length check per idle pass. A connection that is blocked
+  ## again by the time we get here (the pause came back, a fresh worker pin) goes
+  ## back on the flag and is re-queued by the resume paths, so this never spins.
+  if loop.sslReady.len == 0: return
+  swap(loop.sslReady, loop.sslReadyScratch)
+  for (fd, gen) in loop.sslReadyScratch:
+    let c = conn(addr loop.core, fd, gen)   # nil once closed or recycled
+    if c == nil or c.state != csActive or c.ssl == nil: continue
+    if c.bodyReadPaused or c.totalPins > 0:
+      c.sslPending = true
+      continue
+    try:
+      loop.handleRead(c)
+    except Exception:
+      # A per-connection bug must never take down the loop thread (as in run()).
+      if c.state != csFree: loop.closeConn(c)
+  loop.sslReadyScratch.setLen(0)
 
 proc startTls(loop: Loop, c: ptr Connection): bool =
   ## Begin TLS for a TLS listener (leave plaintext otherwise). Returns false if
@@ -2185,6 +2274,12 @@ proc run*(loop: Loop) =
         let qt = ngTimeoutMs()
         if qt >= 0:
           timeoutMs = max(1, min(timeoutMs, qt))
+    if loop.sslReady.len > 0:
+      # Decrypted plaintext is waiting inside OpenSSL for a connection whose
+      # socket is drained: there is no event to wait for, so do not wait. Without
+      # this a body that paused and then resumed stalls until some unrelated
+      # event happens to wake the loop (#366).
+      timeoutMs = 0
     var n = 0
     try:
       n = loop.selector.selectInto(timeoutMs, keys)
@@ -2242,6 +2337,11 @@ proc run*(loop: Loop) =
         # A per-connection bug must never take down the loop thread.
         if c.state != csFree:
           loop.closeConn(c)
+    # Connections whose plaintext sits inside OpenSSL rather than in the kernel:
+    # drive them here so bytes that arrived with this batch are consumed in the
+    # same pass (#366). Anything queued after this point (an ack from the async
+    # pump, a worker unpinning) rides the next pass, which does not wait.
+    loop.driveSslReady()
     when not defined(plainHttp):
       # Drive QUIC on datagrams, timer expiry, and every wakeup: the stack owns
       # its own retransmission/idle timers.

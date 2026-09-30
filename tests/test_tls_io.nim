@@ -159,3 +159,72 @@ suite "TLS write-path stalls":
       # The stalled flush resumes as soon as we read again.
       s.setRecvTimeout(3000)
       check s.sslDrain(bigLen) > 1024 * 1024
+
+# --- #366: decrypted plaintext left inside OpenSSL must still be consumed ----
+
+const
+  pinnedSleepMs = 800     ## how long the worker holds the connection pinned
+  recLen = 16 * 1024      ## one full TLS record of plaintext
+  pinnedHead = "POST /size HTTP/1.1\r\nHost: x\r\nContent-Length: "
+
+proc pinHandler(req: Request, res: Response) {.gcsafe.} =
+  case req.path
+  of "/slow":
+    req.blocking:
+      sleep(pinnedSleepMs)             # holds a worker pin on the connection
+      res.send(Http200, "slow done")
+  of "/size":
+    res.send(Http200, "got " & $req.body.len)
+  else:
+    res.send(Http404)
+
+proc pipelinedRequest(): string =
+  ## A complete request of exactly one TLS record, so the server's SSL_read
+  ## drains it from the kernel in full and can only return part of it.
+  var bodyLen = recLen - pinnedHead.len - len("\r\n\r\n")
+  var digits = len($bodyLen)
+  bodyLen -= digits
+  while len($bodyLen) != digits:       # the length field shrank a digit
+    bodyLen -= 1
+    digits = len($bodyLen)
+  result = pinnedHead & $bodyLen & "\r\n\r\n" & repeat('b', bodyLen)
+  doAssert result.len == recLen, $result.len
+
+proc sslText(s: Socket, quietMs = 1500): string =
+  ## Read over TLS until the peer goes quiet for quietMs (or closes).
+  s.setRecvTimeout(quietMs)
+  var buf = newString(recLen)
+  while true:
+    var n = 0
+    try: n = s.recv(addr buf[0], buf.len)
+    except CatchableError: break
+    if n <= 0: break
+    result.add buf[0 ..< n]
+
+suite "TLS plaintext buffered inside OpenSSL":
+  ## The recv loop's early exits assume the bytes it did not take are still in
+  ## the kernel, held there as TCP backpressure until the next readable event.
+  ## Under TLS that is false: a read with a small `wanted` keeps the rest of the
+  ## record decrypted inside OpenSSL while the socket goes empty, and a
+  ## level-triggered fd never reports readable again. The loop must come back
+  ## for those bytes itself (#366).
+  test "a pipelined request decrypted behind a pinned worker is still served":
+    let cfg = initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                               bodyTimeout = 2)   # fail fast if it stalls
+    withServer(RequestHandler(pinHandler), cfg, srv):
+      let ctx = newContext(verifyMode = CVerifyNone)
+      let s = newSocket(buffered = false)
+      defer: s.close()
+      s.connect("127.0.0.1", srv.port)
+      ctx.wrapConnectedSocket(s, handshakeAsClient, "localhost")
+      s.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+      sleep(200)                       # let the worker take its pin
+      # One record, larger than the room left in the receive buffer: the recv
+      # loop stops at the pin with the tail decrypted inside OpenSSL and the
+      # socket drained.
+      let req2 = pipelinedRequest()
+      s.send(req2)
+      let text = s.sslText()
+      check text.count("HTTP/1.1 200") == 2
+      check "slow done" in text
+      check ("got " & $(req2.len - req2.find("\r\n\r\n") - 4)) in text

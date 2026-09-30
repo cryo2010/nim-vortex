@@ -269,6 +269,14 @@ type
                               ## onBody but not yet ackBody'd. Bounds read-ahead
                               ## so an async pull-reader (await req.read) can't
                               ## buffer the whole upload faster than it hashes.
+    sslPending*: bool         ## TLS: OpenSSL still holds decrypted plaintext that
+                              ## the recv loop stopped consuming (it broke at the
+                              ## read-ahead high-water, or under a pinned worker
+                              ## that forbids growing rbuf). The socket itself is
+                              ## drained, so a level-triggered fd never reports
+                              ## readable for those bytes again: the loop owes
+                              ## this connection another read once the block
+                              ## clears (see eventloop sslReady, #366).
     bodyReadPaused*: bool     ## reads paused: bodyUnacked hit the high-water, so
                               ## the socket recv loop stops pulling (kernel holds
                               ## the rest as TCP backpressure) until ackBody drains
@@ -776,6 +784,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.dlKind = dkNone
   c.writeArmed = false
   c.sslReadWantsWrite = false
+  c.sslPending = false
   # A recycled slot must never inherit pin residue (R4): leftover counts would
   # make totalPins/inputPausePins lie for the next occupant -- input running
   # under a live worker (UAF) or a permanently-paused fresh connection. A

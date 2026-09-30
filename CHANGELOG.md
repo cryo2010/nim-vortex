@@ -157,6 +157,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SSL object, so the record was stranded until the connection timed out. The
   flush also no longer drops the write interest that such a retry depends
   on. (#372)
+- TLS: decrypted plaintext left inside OpenSSL is no longer stranded. The
+  receive loop's early exits (a streaming body parked at the read-ahead
+  high-water, a `blocking:` worker that forbids growing the receive buffer)
+  assumed the bytes not taken were still in the kernel, waiting as TCP
+  backpressure for the next readable event. Under TLS a read with a small
+  `wanted` returns that much and keeps the rest of the record decrypted inside
+  OpenSSL with the socket already drained, and a level-triggered fd never
+  reports readable for those bytes again: an HTTPS upload to an
+  `await req.read()` handler could stall until `bodyTimeout`, and a pipelined
+  HTTPS request behind a worker was never answered. Such connections are now
+  queued and re-driven by the loop (re-checked when the body ack or the worker
+  unpin lifts the block), and the selector does not wait while any are
+  queued. (#366)
 
 ### Changed
 
