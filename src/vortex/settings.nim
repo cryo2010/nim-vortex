@@ -145,7 +145,8 @@ type
                                   ## non-None mode without one is rejected)
     clientCaFile*: string     ## CA (PEM file) to verify client certs against
     clientCaPem*: string      ## CA (in-memory PEM) to verify client certs against
-    sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname
+    sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname, on
+                              ## HTTP/1.1, HTTP/2 and HTTP/3 alike
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
     minTlsVersion*: TlsVersion  ## lowest accepted TLS version (QUIC clamps it up
                                 ## to 1.3, which is all QUIC can negotiate)

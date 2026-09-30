@@ -121,6 +121,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data before `SSL_free` as ngtcp2's OpenSSL backend requires, which a
   handshake rejected for a missing client certificate would otherwise turn into
   a use-after-free. (#351)
+- HTTP/3: `sni` (per-hostname certificates) is now served over QUIC. The engine
+  had one `SSL_CTX` and one certificate per loop and no servername callback at
+  all, so a browser that followed the server's own Alt-Svc advertisement for an
+  SNI host was handed the *default* certificate and aborted with a name
+  mismatch, while the identical request over TCP got the right certificate. Each
+  host now gets its own QUIC context, built through the same path as the default
+  one (so it inherits the verify mode, cipher suites and TLS 1.3 pinning), and
+  the servername callback switches to it: an exact host wins over a wildcard,
+  matched case-insensitively. A certificate reload rebuilds the per-host
+  contexts from their own material, and they are freed with the engine. (#374)
 
 ### Changed
 

@@ -46,6 +46,17 @@ type
     on_conn_close: OnConnClose
     on_send: OnSend
 
+  VqSniCert {.importc, header: "vq_ngtcp2.h", bycopy.} = object
+    host: cstring
+    cert_file: cstring
+    key_file: cstring
+    cert_pem: cstring
+    key_pem: cstring
+    key_password: cstring
+    pkcs12_file: cstring
+    pkcs12: ptr uint8
+    pkcs12_len: csize_t
+
   VqConfig {.importc, header: "vq_ngtcp2.h", bycopy.} = object
     user: pointer
     cb: VqCallbacks
@@ -69,6 +80,18 @@ type
     verify_client: cint
     client_ca_file: cstring
     client_ca_pem: cstring
+    sni: ptr VqSniCert
+    sni_len: csize_t
+
+  H3SniCert* = object
+    ## Per-host certificate material for the QUIC SNI callback (#374). The same
+    ## shape as settings.SniCertEntry; eventloop converts, which keeps this
+    ## module free of the settings import like the rest of its parameters.
+    host*: string
+    certFile*, keyFile*: string
+    certPem*, keyPem*: string
+    pkcs12File*, pkcs12*: string
+    keyPassword*: string
 
 {.push header: "vq_ngtcp2.h", cdecl.}
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
@@ -513,13 +536,15 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               streamRecvWindow = 0, connRecvWindow = 0,
               maxConnections = 0, maxResetStreams = 0,
               tlsCipherSuites = "", maxTlsVersion = 0,
-              verifyClient = 0, clientCaFile = "", clientCaPem = ""): bool =
+              verifyClient = 0, clientCaFile = "", clientCaPem = "",
+              sni: openArray[H3SniCert] = []): bool =
   ## Build this loop's QUIC engine. tlsCipherSuites / maxTlsVersion carry the
   ## operator's TLS policy onto the QUIC side (#359); maxTlsVersion is an
   ## OpenSSL version constant (0 = no cap) and anything below TLS 1.3 makes the
   ## engine refuse to start, since QUIC cannot negotiate below 1.3.
   ## verifyClient is the OpenSSL SSL_VERIFY_* bitmask for mTLS, enforced on h3
-  ## exactly as on the TCP listener (#351).
+  ## exactly as on the TCP listener (#351). `sni` carries the per-host
+  ## certificates, each getting its own QUIC context in the shim (#374).
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
@@ -553,6 +578,21 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.verify_client = cint(verifyClient)
   cfg.client_ca_file = clientCaFile.cstring
   cfg.client_ca_pem = clientCaPem.cstring
+  # Views into the caller's SniCert strings, valid for the vqEngineNew call
+  # (the shim copies the material it keeps), like the default cert fields above.
+  var sniC = newSeq[VqSniCert](sni.len)
+  for i in 0 ..< sni.len:
+    sniC[i] = VqSniCert(
+      host: sni[i].host.cstring,
+      cert_file: sni[i].certFile.cstring, key_file: sni[i].keyFile.cstring,
+      cert_pem: sni[i].certPem.cstring, key_pem: sni[i].keyPem.cstring,
+      key_password: sni[i].keyPassword.cstring,
+      pkcs12_file: sni[i].pkcs12File.cstring,
+      pkcs12: (if sni[i].pkcs12.len > 0:
+                 cast[ptr uint8](unsafeAddr sni[i].pkcs12[0]) else: nil),
+      pkcs12_len: csize_t(sni[i].pkcs12.len))
+  cfg.sni = (if sniC.len > 0: addr sniC[0] else: nil)
+  cfg.sni_len = csize_t(sniC.len)
   gEngine = vqEngineNew(addr cfg)
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))

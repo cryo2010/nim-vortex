@@ -90,6 +90,22 @@ typedef struct {
 } VqCallbacks;
 
 /* ---- engine config -------------------------------------------------------- */
+
+/* One per-hostname certificate for SNI (#374). The material comes from the same
+ * sources, with the same precedence, as the default cert/key fields of VqConfig:
+ * a PKCS#12 bundle wins, then in-memory PEM, then PEM files. */
+typedef struct {
+  const char *host;           /* exact host, or "*.example.com" (one label) */
+  const char *cert_file;
+  const char *key_file;
+  const char *cert_pem;
+  const char *key_pem;
+  const char *key_password;
+  const char *pkcs12_file;
+  const uint8_t *pkcs12;
+  size_t pkcs12_len;
+} VqSniCert;
+
 typedef struct {
   void *user;                 /* engine context (loop core) passed to callbacks */
   VqCallbacks cb;
@@ -134,13 +150,22 @@ typedef struct {
   int verify_client;
   const char *client_ca_file;
   const char *client_ca_pem;
+  /* Per-host certificates selected by SNI (#374): sni_len entries, each getting
+   * its own SSL_CTX built like the default one (so the verify mode, cipher
+   * suites and version pinning above apply to them too). Borrowed for the
+   * vq_engine_new call only; the shim copies what it keeps. */
+  const VqSniCert *sni;
+  size_t sni_len;
 } VqConfig;
 
 /* Create/destroy the per-loop engine. Returns NULL on failure (bad cert etc.).*/
 VqEngine *vq_engine_new(const VqConfig *cfg);
 void      vq_engine_free(VqEngine *e);
 
-/* Swap the TLS certificate/key in place (hot reload; PEM blobs). 0 on success. */
+/* Swap the TLS certificate/key in place (hot reload; PEM blobs). 0 on success.
+ * Any per-host (SNI) contexts are rebuilt from the material they were
+ * configured with, so a rotation of on-disk per-host certificates is picked up
+ * with the default one; a failure there leaves every context as it was. */
 int vq_engine_reload_cert(VqEngine *e, const char *cert_pem, const char *key_pem);
 
 /* Feed one received datagram. peer/local are sockaddr pointers (the shim copies

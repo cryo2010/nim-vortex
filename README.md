@@ -311,7 +311,9 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
 default cert is the fallback; `sni` adds host-specific certs (each from files,
 PEM, or PKCS#12). A `host` of `*.example.com` matches a single leading label
 (`api.example.com`, not `example.com` or `a.b.example.com`); an exact host wins
-over a wildcard:
+over a wildcard. Per-host certificates are served over HTTP/3 as well, so a
+browser that follows the Alt-Svc upgrade to QUIC gets the same certificate it
+got over TCP:
 
 ```nim
 initVortexConfig(certFile = "default.pem", keyFile = "default.key",

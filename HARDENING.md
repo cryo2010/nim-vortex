@@ -78,7 +78,7 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default); applies to HTTP/1.1, HTTP/2 and HTTP/3 |
 | `verifyClient` | `None` | mTLS: `None` / `Optional` / `Require` client-cert policy; enforced on HTTP/1.1, HTTP/2 and HTTP/3 |
 | `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (**required** when `verifyClient != None`: a config with neither is rejected at startup, since it would verify against an empty trust store) |
-| `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported) |
+| `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported); served on HTTP/1.1, HTTP/2 and HTTP/3 |
 | `ocspFile` / `ocspResponse` | "" | DER OCSP response to staple (rotate at runtime via `reloadTls(ocspFile = ...)`) |
 | `http3` | `true` | Serve HTTP/3 over QUIC (requires a cert; ignored without TLS) |
 
@@ -118,7 +118,10 @@ staple), and OpenSSL only sends a staple whose serial matches the served
 certificate, so rotate the cert and its staple together. Reload from any
 ordinary thread, and from two at once if that is how your renewal plumbing is
 built (concurrent reloads serialise internally); not from inside a raw signal
-handler, since the call takes a lock and reads files.
+handler, since the call takes a lock and reads files. On the HTTP/3 side the
+reload also rebuilds the per-host (SNI) contexts from the material they were
+configured with, so per-host certificate *files* replaced by the same renewal
+are picked up even though `reloadTls` names only the default pair.
 
 ## Deployment recipes
 

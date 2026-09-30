@@ -58,6 +58,15 @@ when not defined(plainHttp):
         keyPem: e.keyPem, pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
         keyPassword: e.keyPassword))
 
+  proc toH3SniCerts*(s: VortexConfig): seq[H3SniCert] =
+    ## The same SNI entries in the shape the h3 backend takes, so per-host
+    ## certificates are served over QUIC too (#374).
+    for e in s.sni:
+      result.add H3SniCert(host: e.host, certFile: e.certFile,
+        keyFile: e.keyFile, certPem: e.certPem, keyPem: e.keyPem,
+        pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
+        keyPassword: e.keyPassword)
+
   proc tlsMaxVer*(v: TlsVersion): clong =
     ## Map the max-version enum to an OpenSSL version number (0 = no cap).
     case v
@@ -323,7 +332,8 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  maxTlsVersion = int(tlsMaxVer(settings.maxTlsVersion)),
                  verifyClient = int(tlsVerifyMode(settings.verifyClient)),
                  clientCaFile = settings.clientCaFile,
-                 clientCaPem = settings.clientCaPem):
+                 clientCaPem = settings.clientCaPem,
+                 sni = toH3SniCerts(settings)):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"

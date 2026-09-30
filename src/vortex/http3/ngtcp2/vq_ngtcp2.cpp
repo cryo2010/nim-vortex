@@ -152,12 +152,27 @@ struct Conn {
   }
 };
 
+// An owned copy of one certificate's material. The caller's VqConfig /
+// VqSniCert strings are borrowed for the vq_engine_new call only, and a per-host
+// context must stay rebuildable on a certificate reload, so the engine keeps its
+// own copies. Same sources and precedence as VqConfig's default cert fields.
+struct Material {
+  std::string host;   // "" for the default certificate
+  std::string cert_file, key_file, cert_pem, key_pem, key_password, pkcs12_file;
+  std::string pkcs12;  // PKCS#12 DER bytes
+};
+
 struct Engine {
   VqConfig cfg{};
   SslCtxPtr ssl_ctx;                   // RAII: freed when the Engine is deleted
   std::string key_pw;   // owns the passphrase (cfg.key_password char* may dangle)
   std::string cipher_suites;  // ditto for the TLS 1.3 suite list (#359)
   std::string client_ca_file, client_ca_pem;   // ... and the mTLS CA (#351)
+  // Per-host certificates (SNI, #374): the material and the contexts built from
+  // it, parallel arrays. The contexts are freed with the Engine; a connection
+  // that already switched to one keeps it alive through its own reference.
+  std::vector<Material> sni;
+  std::vector<SslCtxPtr> sni_ctx;
   // Every CID that routes to a conn (our SCIDs + the client's original DCID).
   std::unordered_map<std::string, Conn *> byCid;
   std::vector<std::unique_ptr<Conn>> conns;
@@ -950,6 +965,113 @@ static SslCtxPtr makeCtx(const VqConfig *cfg) {
   return ctx;
 }
 
+// --- SNI: one context per host, switched by the servername callback (#374) ---
+
+static Material materialOf(const VqSniCert *s) {
+  auto str = [](const char *p) { return std::string(p ? p : ""); };
+  Material m;
+  m.host = str(s->host);
+  m.cert_file = str(s->cert_file);
+  m.key_file = str(s->key_file);
+  m.cert_pem = str(s->cert_pem);
+  m.key_pem = str(s->key_pem);
+  m.key_password = str(s->key_password);
+  m.pkcs12_file = str(s->pkcs12_file);
+  if (s->pkcs12 && s->pkcs12_len)
+    m.pkcs12.assign(reinterpret_cast<const char *>(s->pkcs12), s->pkcs12_len);
+  return m;
+}
+
+// A VqConfig view over the engine's retained TLS policy plus `m`'s certificate
+// material: what makeCtx needs to build a per-host context, or rebuild one after
+// the caller's pointers are gone. Going through makeCtx is the point -- a host
+// context inherits the client verification, cipher suites and TLS 1.3 pinning of
+// the default one instead of drifting from it.
+static VqConfig ctxConfig(const Engine *e, const Material &m) {
+  VqConfig c = e->cfg;    // policy fields (its string pointers were cleared)
+  c.tls_cipher_suites = e->cipher_suites.c_str();
+  c.client_ca_file = e->client_ca_file.c_str();
+  c.client_ca_pem = e->client_ca_pem.c_str();
+  c.cert_file = m.cert_file.c_str();
+  c.key_file = m.key_file.c_str();
+  c.cert_pem = m.cert_pem.c_str();
+  c.key_pem = m.key_pem.c_str();
+  c.key_password = m.key_password.c_str();
+  c.pkcs12_file = m.pkcs12_file.c_str();
+  c.pkcs12 = m.pkcs12.empty()
+                 ? nullptr
+                 : reinterpret_cast<const uint8_t *>(m.pkcs12.data());
+  c.pkcs12_len = m.pkcs12.size();
+  c.sni = nullptr;
+  c.sni_len = 0;
+  return c;
+}
+
+// (Re)build every per-host context from the stored material. All or nothing: on
+// any failure the engine keeps the contexts it had, so a broken per-host
+// certificate cannot quietly drop that host back to the default certificate.
+static bool buildSniCtxs(Engine *e) {
+  std::vector<SslCtxPtr> built;
+  built.reserve(e->sni.size());
+  for (const auto &m : e->sni) {
+    VqConfig c = ctxConfig(e, m);
+    SslCtxPtr hc = makeCtx(&c);
+    if (!hc) return false;
+    built.push_back(std::move(hc));
+  }
+  e->sni_ctx = std::move(built);
+  return true;
+}
+
+static inline char lcAscii(char c) {
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+// Compare a NUL-terminated SNI name to a configured host, case-insensitively:
+// DNS names are case-insensitive and a client may send any casing. (The TCP
+// path's matching is byte-exact today, which is issue #358.)
+static bool hostEq(const char *name, const std::string &host) {
+  size_t i = 0;
+  for (; i < host.size(); i++)
+    if (name[i] == '\0' || lcAscii(name[i]) != lcAscii(host[i])) return false;
+  return name[i] == '\0';
+}
+
+// `*.example.com` matches exactly one leading label: foo.example.com yes,
+// example.com no, a.b.example.com no. Mirrors the TCP path's wildMatch.
+static bool hostWildMatch(const char *name, const std::string &pat) {
+  if (pat.size() < 3 || pat[0] != '*' || pat[1] != '.') return false;
+  size_t dot = 0;
+  while (name[dot] != '\0' && name[dot] != '.') ++dot;
+  if (dot == 0 || name[dot] != '.') return false;   // need a label then a dot
+  size_t i = dot, j = 1;                            // both include the dot
+  for (; j < pat.size(); ++i, ++j)
+    if (name[i] == '\0' || lcAscii(name[i]) != lcAscii(pat[j])) return false;
+  return name[i] == '\0';
+}
+
+// Switch the connection to the context whose host matches the requested server
+// name (an exact match wins over a wildcard); no match keeps the default
+// context. SSL_set_SSL_CTX replaces the certificate and the context-level
+// settings only: the QUIC record-layer callbacks and transport parameters
+// ngtcp2_crypto_ossl_configure_server_session installed live on the SSL, so
+// they survive the switch.
+static int servernameCb(SSL *ssl, int * /*al*/, void *arg) {
+  auto *e = static_cast<Engine *>(arg);
+  const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+  if (name) {
+    size_t n = e->sni_ctx.size();
+    size_t idx = n;
+    for (size_t i = 0; i < n; i++)
+      if (hostEq(name, e->sni[i].host)) { idx = i; break; }
+    if (idx == n)
+      for (size_t i = 0; i < n; i++)
+        if (hostWildMatch(name, e->sni[i].host)) { idx = i; break; }
+    if (idx < n) SSL_set_SSL_CTX(ssl, e->sni_ctx[idx].get());
+  }
+  return SSL_TLSEXT_ERR_OK;
+}
+
 VqEngine *vq_engine_new(const VqConfig *cfg) {
   if (ngtcp2_crypto_ossl_init() != 0) return nullptr;
   auto e = std::make_unique<Engine>();
@@ -967,8 +1089,22 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   e->client_ca_pem = cfg->client_ca_pem ? cfg->client_ca_pem : "";
   e->cfg.tls_cipher_suites = nullptr;
   e->cfg.client_ca_file = e->cfg.client_ca_pem = nullptr;
+  for (size_t i = 0; i < cfg->sni_len; i++)
+    e->sni.push_back(materialOf(&cfg->sni[i]));
+  e->cfg.sni = nullptr;
+  e->cfg.sni_len = 0;
   e->ssl_ctx = makeCtx(cfg);
   if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
+  // Per-host certificates: a context each, selected by the servername callback
+  // on the default context. Without this the QUIC side had one context and one
+  // certificate per engine, so a client asking for an SNI host over h3 was
+  // served the default certificate and aborted, while the same request over TCP
+  // got the right one (#374).
+  if (!e->sni.empty()) {
+    if (!buildSniCtxs(e.get())) return nullptr;
+    SSL_CTX_set_tlsext_servername_callback(e->ssl_ctx.get(), servernameCb);
+    SSL_CTX_set_tlsext_servername_arg(e->ssl_ctx.get(), e.get());
+  }
   return reinterpret_cast<VqEngine *>(e.release());
 }
 
@@ -989,6 +1125,12 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
   // same encryption passphrase. loadKey never prompts on an encrypted key.
   if (ok && key_pem && key_pem[0])
     ok = ok && loadKey(e->ssl_ctx.get(), key_pem, nullptr, e->key_pw.c_str());
+  // Rebuild the per-host contexts from the material they were configured with,
+  // so a rotation that replaced the per-host certificate files on disk takes
+  // effect with the default certificate instead of leaving those hosts on the
+  // old material (#374). buildSniCtxs is all-or-nothing, and a failure here
+  // fails the reload with every context left as it was.
+  if (ok && !e->sni.empty()) ok = buildSniCtxs(e);
   return ok ? 0 : -1;
 }
 
