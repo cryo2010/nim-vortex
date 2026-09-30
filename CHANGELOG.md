@@ -176,6 +176,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a system `openssl.cnf` and does not exist in a pre-3.0 libssl, which the
   Linux dynlib pattern can still resolve. TLS 1.3 has no renegotiation and is
   unaffected. (#376)
+- TLS: `reloadTls` is now serialised by a lock, so two threads reloading at
+  once (a SIGHUP loop plus an admin endpoint, say) can no longer interleave the
+  bookkeeping that retires the displaced `SSL_CTX`. Both could claim the same
+  retire slot, which either freed one context twice (memory corruption) or
+  dropped the other thread's entry and leaked it. The documented contract
+  ("call from an ordinary thread") always implied concurrent calls were fine;
+  now they are. (#360)
 
 ## [0.5.0] - 2026-09-24
 

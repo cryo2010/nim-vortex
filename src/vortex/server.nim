@@ -326,7 +326,9 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## staple, and the h3 reload signal below stays cert/key-only.
   ##
   ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
-  ## inside a raw signal handler. Covers HTTP/1.1, HTTP/2, and (when enabled)
+  ## inside a raw signal handler. Two threads may call it at once (a SIGHUP
+  ## loop plus an admin endpoint, say): the reloads serialise internally.
+  ## Covers HTTP/1.1, HTTP/2, and (when enabled)
   ## HTTP/3: each h3 loop updates its own QUIC ctx in place on its next tick, so
   ## new h3 handshakes use the new certificate while in-flight ones keep theirs.
   when defined(plainHttp):

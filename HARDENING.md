@@ -115,7 +115,10 @@ refreshed staple, `clearOcsp = true` drops it, and a bare `reloadTls()` re-reads
 a configured `ocspFile` so a certbot renewal picks up a refreshed staple too.
 Staple rotation applies to the default certificate (SNI and HTTP/3 do not
 staple), and OpenSSL only sends a staple whose serial matches the served
-certificate, so rotate the cert and its staple together.
+certificate, so rotate the cert and its staple together. Reload from any
+ordinary thread, and from two at once if that is how your renewal plumbing is
+built (concurrent reloads serialise internally); not from inside a raw signal
+handler, since the call takes a lock and reads files.
 
 ## Deployment recipes
 

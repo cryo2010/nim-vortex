@@ -276,6 +276,10 @@ type
                              ## so a certificate hot-reload can swap it in
     retired: array[ctxRetireSlots, SslCtxPtr]   ## displaced ctxs pending free
     retiredAt: array[ctxRetireSlots, MonoTime]  ## when each was displaced
+    reloadLock: Lock         ## serialises reloadTlsConfig. The retire ring and
+                             ## the material/OCSP fields below are read-modify-
+                             ## written across the call, so two reloads running
+                             ## at once would double-free or leak an SSL_CTX
     protos: string           ## ALPN preference list, wire format
     meth: pointer            ## method the ctx was built with (rebuild on reload)
     material: TlsMaterial    ## the default cert/key source (reloaded in place)
@@ -599,6 +603,7 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
                         minProtoVersion, maxProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
+  initLock(result.reloadLock)
   result.ctx = ctx
   result.protos = protos
   result.meth = meth
@@ -647,12 +652,17 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## renewal must not be blocked by a stale staple). `ocspResponse`/`ocspFile`
   ## together with `clearOcsp` is contradictory and rejected.
   ##
-  ## Lock-free and safe: loop threads read `cfg.ctx` with an atomic load in
-  ## `newTlsSession`; the displaced ctx is not freed now but retired and freed
-  ## at the *next* reload. That gives any thread mid-`SSL_new` an effectively
-  ## unbounded grace window (reloads are seconds/hours apart, SSL_new is
-  ## microseconds), while capping retained ctxs at one. Call from a normal
-  ## thread, not a raw signal handler.
+  ## Callable from any ordinary thread, including several at once: the whole
+  ## body runs under `cfg.reloadLock`, so concurrent reloads serialise instead
+  ## of interleaving their retire-ring bookkeeping (two threads claiming the
+  ## same slot double-free or leak an SSL_CTX) or tearing the stored
+  ## material/OCSP fields, which are read at the top and rewritten at the
+  ## bottom. Loop threads never take that lock: they read `cfg.ctx` with an
+  ## atomic load in `newTlsSession`, and the displaced ctx is retired rather
+  ## than freed here, so a thread mid-`SSL_new` keeps a valid pointer. Not
+  ## callable from a raw signal handler (it takes a lock and reads files).
+  acquire(cfg.reloadLock)
+  defer: release(cfg.reloadLock)
   # Explicit file paths override any stored in-memory/PKCS#12 material; empty
   # means "reuse what was last loaded" (files, PEM, or p12).
   var m = cfg.material
@@ -846,6 +856,7 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.cipherSuites = ""
   cfg.ocsp = ""
   cfg.ocspFile = ""
+  deinitLock(cfg.reloadLock)
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =
