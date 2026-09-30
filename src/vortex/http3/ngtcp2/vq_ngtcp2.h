@@ -124,6 +124,16 @@ typedef struct {
    * the TLS <= 1.2 cipher *list*, which can never apply to a QUIC handshake. */
   const char *tls_cipher_suites;
   int max_tls_version;
+  /* Client-certificate verification (mTLS), mirrored from the TCP listener so a
+   * verifyClient policy is not bypassable by taking the Alt-Svc h3 upgrade
+   * (#351). verify_client is the OpenSSL SSL_VERIFY_* bitmask (0 = off, 1 =
+   * PEER, 3 = PEER | FAIL_IF_NO_PEER_CERT). The client CA comes from
+   * client_ca_pem (in-memory PEM, preferred) or client_ca_file, matching the
+   * TCP path's precedence; neither is required, in which case OpenSSL's default
+   * trust store applies. */
+  int verify_client;
+  const char *client_ca_file;
+  const char *client_ca_pem;
 } VqConfig;
 
 /* Create/destroy the per-loop engine. Returns NULL on failure (bad cert etc.).*/
@@ -194,6 +204,12 @@ void vq_conn_close_graceful(VqConn *conn, uint64_t app_error);
 /* Peer IP (numeric, no port) of a connection; empty string if unavailable.
  * Returned pointer is owned by the shim and valid until the conn closes. */
 const char *vq_conn_peer_ip(VqConn *conn);
+
+/* The connection's OpenSSL SSL object (as void*, so this header stays plain C
+ * with no openssl dependency for the Nim importer), or NULL if there is none.
+ * Owned by the shim and valid until on_conn_close fires. vortex reads the peer
+ * (client) certificate through it for req.clientCertSubject over h3 (#351). */
+void *vq_conn_ssl(VqConn *conn);
 
 #ifdef __cplusplus
 }

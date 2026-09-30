@@ -109,6 +109,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   together with `http3 = true` is now rejected at startup, naming
   `http3 = false` as the fix, instead of applying the ceiling on TCP and
   ignoring it on HTTP/3. (#359)
+- HTTP/3: `verifyClient` (mTLS) is now enforced on QUIC. The engine never
+  called `SSL_CTX_set_verify`, so a server that required client certificates
+  advertised `h3` via Alt-Svc and then completed the QUIC handshake with a
+  client that presented none: the mTLS requirement held on TCP and was absent
+  on HTTP/3. The client CA (`clientCaFile` / `clientCaPem`) is loaded the same
+  way as on the TCP path, and an in-memory bundle that is truncated or damaged
+  fails the configuration instead of installing a partial trust store.
+  `req.clientCertSubject` now also reports the client certificate over h3
+  (it was always ""), and the QUIC connection teardown clears the SSL's app
+  data before `SSL_free` as ngtcp2's OpenSSL backend requires, which a
+  handshake rejected for a missing client certificate would otherwise turn into
+  a use-after-free. (#351)
 
 ### Changed
 

@@ -66,6 +66,9 @@ type
     conn_recv_window: uint64
     tls_cipher_suites: cstring
     max_tls_version: cint
+    verify_client: cint
+    client_ca_file: cstring
+    client_ca_pem: cstring
 
 {.push header: "vq_ngtcp2.h", cdecl.}
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
@@ -93,6 +96,7 @@ proc vqConnGoaway(conn: ptr VqConn) {.importc: "vq_conn_goaway".}
 proc vqConnShutdown(conn: ptr VqConn) {.importc: "vq_conn_shutdown".}
 proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
 proc vqConnCloseGraceful(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close_graceful".}
+proc vqConnSsl(conn: ptr VqConn): pointer {.importc: "vq_conn_ssl".}
 {.pop.}
 
 # --- H3 state (codec-compatible surface) ------------------------------------
@@ -126,8 +130,11 @@ type
 
   H3Conn* = ref object of RootObj
     core*: ptr LoopCore
-    ssl*: pointer            ## always nil: the shim owns the TLS handle; kept
-                             ## for the H3Conn shape request.nim expects
+    ssl*: pointer            ## the shim's SSL* for this connection (it owns the
+                             ## handle; borrowed here, nil once the connection
+                             ## closes). Read-only: request.nim reads the peer
+                             ## certificate through it (req.clientCertSubject
+                             ## over h3, #351)
     remoteAddr*: string
     slot*: int
     vq: ptr VqConn
@@ -193,6 +200,7 @@ proc cbAccept(user: pointer, conn: ptr VqConn, peerIp: cstring): pointer {.cdecl
     core.h3slots.add H3SlotEntry()
     idx = core.h3slots.len - 1
   let h3c = H3Conn(core: core, vq: conn, slot: idx,
+                   ssl: vqConnSsl(conn),
                    remoteAddr: (if peerIp != nil: $peerIp else: ""))
   core.h3slots[idx].conn = h3c
   cast[pointer](h3c)
@@ -473,9 +481,12 @@ proc cbConnClose(user, connUd: pointer) {.cdecl.} =
   let h3c = cast[H3Conn](connUd)
   if h3c != nil:
     # The shim frees the VqConn immediately after this returns, so drop our
-    # dangling pointer to it now: h3Free and the response procs must not touch
-    # a freed VqConn (use-after-free otherwise).
+    # dangling pointers to it now: h3Free and the response procs must not touch
+    # a freed VqConn (use-after-free otherwise), and the SSL handle borrowed
+    # from it goes the same way (~Conn calls SSL_free), so a later
+    # req.clientCertSubject reads nil instead of freed memory.
     h3c.vq = nil
+    h3c.ssl = nil
     if h3c.slot >= 0 and h3c.slot < h3c.core.h3slots.len:
       h3c.core.h3slots[h3c.slot].closeReq = true
 
@@ -501,11 +512,14 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               pkcs12File = "", pkcs12 = "",
               streamRecvWindow = 0, connRecvWindow = 0,
               maxConnections = 0, maxResetStreams = 0,
-              tlsCipherSuites = "", maxTlsVersion = 0): bool =
+              tlsCipherSuites = "", maxTlsVersion = 0,
+              verifyClient = 0, clientCaFile = "", clientCaPem = ""): bool =
   ## Build this loop's QUIC engine. tlsCipherSuites / maxTlsVersion carry the
   ## operator's TLS policy onto the QUIC side (#359); maxTlsVersion is an
   ## OpenSSL version constant (0 = no cap) and anything below TLS 1.3 makes the
   ## engine refuse to start, since QUIC cannot negotiate below 1.3.
+  ## verifyClient is the OpenSSL SSL_VERIFY_* bitmask for mTLS, enforced on h3
+  ## exactly as on the TCP listener (#351).
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
@@ -536,6 +550,9 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.conn_recv_window = uint64(connRecvWindow)
   cfg.tls_cipher_suites = tlsCipherSuites.cstring
   cfg.max_tls_version = cint(maxTlsVersion)
+  cfg.verify_client = cint(verifyClient)
+  cfg.client_ca_file = clientCaFile.cstring
+  cfg.client_ca_pem = clientCaPem.cstring
   gEngine = vqEngineNew(addr cfg)
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))

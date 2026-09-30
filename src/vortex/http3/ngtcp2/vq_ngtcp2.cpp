@@ -135,7 +135,20 @@ struct Conn {
     if (h3) nghttp3_conn_del(h3);
     if (conn) ngtcp2_conn_del(conn);
     if (ossl) ngtcp2_crypto_ossl_ctx_del(ossl);
-    if (ssl) SSL_free(ssl);
+    if (ssl) {
+      // ngtcp2's ossl backend requires the SSL's app data to be cleared before
+      // SSL_free whenever the ngtcp2_conn does not outlive the SSL (which it
+      // does not here: it is deleted two lines up). SSL_free can still invoke
+      // the QUIC record-layer callbacks -- release_rcd for crypto data OpenSSL
+      // never consumed, which is exactly what a handshake rejected for a
+      // missing client certificate leaves behind -- and those resolve the
+      // conn_ref in app data to reach the ngtcp2_conn and its ossl ctx. With a
+      // stale conn_ref that is a use-after-free (it aborted in
+      // crypto_ossl_ctx_release_crypto_data); nulling it makes the callbacks
+      // return without touching anything, as the backend documents.
+      SSL_set_app_data(ssl, nullptr);
+      SSL_free(ssl);
+    }
   }
 };
 
@@ -144,6 +157,7 @@ struct Engine {
   SslCtxPtr ssl_ctx;                   // RAII: freed when the Engine is deleted
   std::string key_pw;   // owns the passphrase (cfg.key_password char* may dangle)
   std::string cipher_suites;  // ditto for the TLS 1.3 suite list (#359)
+  std::string client_ca_file, client_ca_pem;   // ... and the mTLS CA (#351)
   // Every CID that routes to a conn (our SCIDs + the client's original DCID).
   std::unordered_map<std::string, Conn *> byCid;
   std::vector<std::unique_ptr<Conn>> conns;
@@ -836,6 +850,49 @@ static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
   return ok;
 }
 
+// Add PEM CA certificate(s) from memory to the ctx's trust store: the anchors
+// for client-certificate verification. Mirrors the TCP path's loadCaMem,
+// including its error-queue discipline (#368): a null from PEM_read_bio_X509 is
+// clean end of data only when the queue's last reason is PEM_R_NO_START_LINE.
+// Any other reason (a truncated or damaged bundle) must fail the configuration
+// rather than install a partial trust store, which would reject every client
+// issued by a CA past the damage with nothing logged.
+static bool loadCaMem(SSL_CTX *ctx, const char *pem) {
+  X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+  if (!store || !pem || !pem[0]) return false;
+  BioPtr b(BIO_new_mem_buf(pem, -1));
+  if (!b) return false;
+  int added = 0;
+  for (;;) {
+    X509Ptr x(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
+    if (!x) {
+      const bool eof =
+          ERR_GET_REASON(ERR_peek_last_error()) == PEM_R_NO_START_LINE;
+      ERR_clear_error();
+      if (!eof) return false;
+      break;
+    }
+    if (X509_STORE_add_cert(store, x.get()) != 1) return false;  // up-refs x
+    ++added;
+  }
+  return added > 0;
+}
+
+// Configure mTLS: load the client-cert CA (if any) and set the verify mode.
+// Same shape and precedence as the TCP path's applyClientVerify, so a
+// verifyClient policy means the same thing on QUIC (#351).
+static bool applyClientVerify(SSL_CTX *ctx, const VqConfig *cfg) {
+  if (cfg->verify_client == 0) return true;   // SSL_VERIFY_NONE
+  if (cfg->client_ca_pem && cfg->client_ca_pem[0]) {
+    if (!loadCaMem(ctx, cfg->client_ca_pem)) return false;
+  } else if (cfg->client_ca_file && cfg->client_ca_file[0]) {
+    if (SSL_CTX_load_verify_locations(ctx, cfg->client_ca_file, nullptr) != 1)
+      return false;
+  }
+  SSL_CTX_set_verify(ctx, cfg->verify_client, nullptr);  // null cb: default check
+  return true;
+}
+
 static SslCtxPtr makeCtx(const VqConfig *cfg) {
   SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
   if (!ctx) return nullptr;
@@ -885,6 +942,10 @@ static SslCtxPtr makeCtx(const VqConfig *cfg) {
   // accepts, so h3 would be advertised via Alt-Svc yet every handshake would
   // fail. check_private_key returns 1 only when both are set and they match.
   if (ok) ok = SSL_CTX_check_private_key(ctx.get()) == 1;
+  // Client-certificate policy last, like the TCP path's buildTlsCtx. Fail
+  // closed: a verifyClient config whose CA material will not load must not
+  // yield an engine that accepts unauthenticated connections (#351).
+  if (ok) ok = applyClientVerify(ctx.get(), cfg);
   if (!ok) { ERR_clear_error(); return nullptr; }  // unique_ptr frees the ctx
   return ctx;
 }
@@ -900,9 +961,12 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   e->cfg.pkcs12_file = nullptr;
   e->cfg.pkcs12 = nullptr;
   e->cfg.pkcs12_len = 0;
-  // Same for the cipher-suite list: makeCtx below reads the caller's copy.
+  // Same for the TLS policy strings: makeCtx below reads the caller's copies.
   e->cipher_suites = cfg->tls_cipher_suites ? cfg->tls_cipher_suites : "";
+  e->client_ca_file = cfg->client_ca_file ? cfg->client_ca_file : "";
+  e->client_ca_pem = cfg->client_ca_pem ? cfg->client_ca_pem : "";
   e->cfg.tls_cipher_suites = nullptr;
+  e->cfg.client_ca_file = e->cfg.client_ca_pem = nullptr;
   e->ssl_ctx = makeCtx(cfg);
   if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
   return reinterpret_cast<VqEngine *>(e.release());
@@ -1181,6 +1245,11 @@ void vq_conn_close_graceful(VqConn *conn, uint64_t app_error) {
 const char *vq_conn_peer_ip(VqConn *conn) {
   auto *c = reinterpret_cast<Conn *>(conn);
   return c->peer_ip.c_str();
+}
+
+void *vq_conn_ssl(VqConn *conn) {
+  auto *c = reinterpret_cast<Conn *>(conn);
+  return c->ssl;
 }
 
 }  // extern "C"

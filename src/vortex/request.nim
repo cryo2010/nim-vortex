@@ -454,8 +454,9 @@ proc clientCertSubject*(req: Request): string =
   ## The client certificate's subject DN for an mTLS connection, or "" if none
   ## was presented. Needs `settings.verifyClient = ClientVerify.Optional`/`ClientVerify.Require`; in
   ## those modes OpenSSL has already validated a presented cert during the
-  ## handshake, so a non-empty result is a trusted client cert. Always "" over
-  ## plaintext (or a -d:plainHttp build).
+  ## handshake, so a non-empty result is a trusted client cert. Works over
+  ## HTTP/1.1, HTTP/2 and HTTP/3 (#351). Always "" over plaintext (or a
+  ## -d:plainHttp build).
   if req.snap != nil: return req.snap.clientSubject
   when not defined(plainHttp):
     if req.fd < 0:

@@ -296,9 +296,10 @@ against a CA. `verifyClient = ClientVerify.Optional` accepts connections with no
 validates any that is presented; `ClientVerify.Require` refuses the handshake without a
 valid one. Either mode needs a CA: a `verifyClient` other than `None` with no
 `clientCaFile`/`clientCaPem` is rejected at startup, because it would verify
-against an empty trust store and reject every client certificate. Inside a
-handler, `req.clientCertSubject` gives the verified client's subject DN ("" if
-none):
+against an empty trust store and reject every client certificate. The policy
+covers HTTP/1.1, HTTP/2 and HTTP/3 alike, so a client cannot skip it by taking
+the Alt-Svc upgrade to QUIC. Inside a handler, `req.clientCertSubject` gives the
+verified client's subject DN ("" if none), on h3 too:
 
 ```nim
 initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
