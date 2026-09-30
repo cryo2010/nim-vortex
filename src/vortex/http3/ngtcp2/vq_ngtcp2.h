@@ -114,6 +114,16 @@ typedef struct {
    * window); conn_recv_window is initial_max_data (connection aggregate). */
   uint64_t stream_recv_window;
   uint64_t conn_recv_window;
+  /* TLS policy mirrored from the TCP listener, so an operator's configuration is
+   * in force on QUIC too (#359). tls_cipher_suites is the TLS 1.3 suite list
+   * (SSL_CTX_set_ciphersuites format); NULL/empty keeps OpenSSL's default.
+   * max_tls_version is an OpenSSL version constant (0 = no cap): below TLS 1.3
+   * it makes vq_engine_new fail rather than negotiate outside the policy, since
+   * QUIC mandates TLS 1.3 (RFC 9001 4.2). The configured *minimum* needs no
+   * field: that same mandate clamps it up to TLS 1.3 unconditionally. Nor does
+   * the TLS <= 1.2 cipher *list*, which can never apply to a QUIC handshake. */
+  const char *tls_cipher_suites;
+  int max_tls_version;
 } VqConfig;
 
 /* Create/destroy the per-loop engine. Returns NULL on failure (bad cert etc.).*/

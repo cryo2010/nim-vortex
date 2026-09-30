@@ -147,14 +147,21 @@ type
     clientCaPem*: string      ## CA (in-memory PEM) to verify client certs against
     sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname
     http3*: bool              ## serve HTTP/3 over QUIC (requires certFile)
-    minTlsVersion*: TlsVersion  ## lowest accepted TLS version (TCP; QUIC is always 1.3)
-    maxTlsVersion*: TlsVersion  ## highest accepted TLS version (TCP; default = no cap)
+    minTlsVersion*: TlsVersion  ## lowest accepted TLS version (QUIC clamps it up
+                                ## to 1.3, which is all QUIC can negotiate)
+    maxTlsVersion*: TlsVersion  ## highest accepted TLS version (default = no
+                                ## cap). `V12` requires `http3 = false`: QUIC
+                                ## cannot negotiate below TLS 1.3, so the pair
+                                ## is rejected instead of being applied on TCP
+                                ## and ignored on HTTP/3
     ocspFile*: string         ## DER OCSP response to staple (file; default cert;
                               ## rotate at runtime via reloadTls(ocspFile = ...))
     ocspResponse*: string     ## DER OCSP response to staple (in-memory bytes;
                               ## rotate at runtime via reloadTls(ocspResponse=...))
-    tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default)
-    tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default)
+    tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default).
+                              ## TCP only: a QUIC handshake is never TLS 1.2
+    tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default).
+                              ## Applies to HTTP/1.1, HTTP/2 and HTTP/3
 
 proc initVortexConfig*(
     port = Port(8080),

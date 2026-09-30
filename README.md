@@ -320,7 +320,10 @@ initVortexConfig(certFile = "default.pem", keyFile = "default.key",
 
 **TLS version range**: `minTlsVersion` (default `TlsVersion.V12`) floors it; `maxTlsVersion`
 (default `TlsVersion.None` = no cap) ceils it, e.g. `maxTlsVersion = TlsVersion.V12` to keep
-a client on 1.2. (QUIC/HTTP/3 is always 1.3.)
+a client on 1.2. QUIC/HTTP/3 is always 1.3, so a 1.2 floor is raised to 1.3 there, and a 1.2
+*ceiling* needs `http3 = false` (the combination is refused rather than quietly ignored on
+HTTP/3). `tlsCipherSuites` (TLS 1.3) applies to both transports; `tlsCipherList` is TLS 1.2
+only, so HTTP/3 never consults it.
 
 **OCSP stapling**: hand clients a cached OCSP response in the handshake so they
 don't query the responder. Provide the DER bytes; vortex doesn't fetch OCSP

@@ -64,6 +64,8 @@ type
     max_field_section_size: cint
     stream_recv_window: uint64
     conn_recv_window: uint64
+    tls_cipher_suites: cstring
+    max_tls_version: cint
 
 {.push header: "vq_ngtcp2.h", cdecl.}
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
@@ -498,7 +500,12 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               certPem = "", keyPem = "", keyPassword = "",
               pkcs12File = "", pkcs12 = "",
               streamRecvWindow = 0, connRecvWindow = 0,
-              maxConnections = 0, maxResetStreams = 0): bool =
+              maxConnections = 0, maxResetStreams = 0,
+              tlsCipherSuites = "", maxTlsVersion = 0): bool =
+  ## Build this loop's QUIC engine. tlsCipherSuites / maxTlsVersion carry the
+  ## operator's TLS policy onto the QUIC side (#359); maxTlsVersion is an
+  ## OpenSSL version constant (0 = no cap) and anything below TLS 1.3 makes the
+  ## engine refuse to start, since QUIC cannot negotiate below 1.3.
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
@@ -527,6 +534,8 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.max_field_section_size = cint(maxFieldSection)
   cfg.stream_recv_window = uint64(streamRecvWindow)
   cfg.conn_recv_window = uint64(connRecvWindow)
+  cfg.tls_cipher_suites = tlsCipherSuites.cstring
+  cfg.max_tls_version = cint(maxTlsVersion)
   gEngine = vqEngineNew(addr cfg)
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))

@@ -318,7 +318,9 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
                  streamRecvWindow = settings.h3StreamWindow,
                  connRecvWindow = settings.h3ConnWindow,
                  maxConnections = settings.maxConnections,
-                 maxResetStreams = settings.maxResetStreams):
+                 maxResetStreams = settings.maxResetStreams,
+                 tlsCipherSuites = settings.tlsCipherSuites,
+                 maxTlsVersion = int(tlsMaxVer(settings.maxTlsVersion))):
         result.udpFd = int(udpFd)
         result.selector.registerHandle(int(udpFd), {Event.Read}, fkQuic)
         result.core.altSvc = "h3=\":" & $int(settings.port) & "\"; ma=86400"

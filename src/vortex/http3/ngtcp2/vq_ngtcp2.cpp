@@ -143,6 +143,7 @@ struct Engine {
   VqConfig cfg{};
   SslCtxPtr ssl_ctx;                   // RAII: freed when the Engine is deleted
   std::string key_pw;   // owns the passphrase (cfg.key_password char* may dangle)
+  std::string cipher_suites;  // ditto for the TLS 1.3 suite list (#359)
   // Every CID that routes to a conn (our SCIDs + the client's original DCID).
   std::unordered_map<std::string, Conn *> byCid;
   std::vector<std::unique_ptr<Conn>> conns;
@@ -838,8 +839,25 @@ static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
 static SslCtxPtr makeCtx(const VqConfig *cfg) {
   SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
   if (!ctx) return nullptr;
+  // Protocol versions. QUIC mandates TLS 1.3 (RFC 9001 4.2), so both ends stay
+  // pinned there: that clamps a configured minTlsVersion of TLS 1.2 up instead
+  // of honoring it. A configured maxTlsVersion *below* 1.3 cannot be honored at
+  // all, so it is refused: returning nullptr fails vq_engine_new, which leaves
+  // h3 off and unadvertised rather than negotiating outside the operator's
+  // policy. That combination is also rejected at config time (#359); this is
+  // the fail-closed backstop.
+  if (cfg->max_tls_version != 0 && cfg->max_tls_version < TLS1_3_VERSION)
+    return nullptr;
   SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
   SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
+  // TLS 1.3 cipher suites: the operator's list, or OpenSSL's default when
+  // unset. The TLS <= 1.2 cipher list has no counterpart here (no QUIC
+  // connection ever negotiates TLS 1.2), so it is not applied.
+  if (cfg->tls_cipher_suites && cfg->tls_cipher_suites[0] &&
+      SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1) {
+    ERR_clear_error();
+    return nullptr;
+  }
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);
@@ -882,6 +900,9 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   e->cfg.pkcs12_file = nullptr;
   e->cfg.pkcs12 = nullptr;
   e->cfg.pkcs12_len = 0;
+  // Same for the cipher-suite list: makeCtx below reads the caller's copy.
+  e->cipher_suites = cfg->tls_cipher_suites ? cfg->tls_cipher_suites : "";
+  e->cfg.tls_cipher_suites = nullptr;
   e->ssl_ctx = makeCtx(cfg);
   if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
   return reinterpret_cast<VqEngine *>(e.release());

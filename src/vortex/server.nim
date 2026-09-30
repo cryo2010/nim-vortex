@@ -95,6 +95,14 @@ proc validateConfig(s: VortexConfig) =
   if s.minTlsVersion == TlsVersion.V13 and s.maxTlsVersion == TlsVersion.V12:
     raise newException(CatchableError,
       "maxTlsVersion (TLS 1.2) is below minTlsVersion (TLS 1.3).")
+  if hasCert and s.http3 and s.maxTlsVersion == TlsVersion.V12:
+    # QUIC mandates TLS 1.3 (RFC 9001 4.2), so h3 cannot honor a TLS 1.2
+    # ceiling. Serving it anyway would apply the policy on TCP and silently
+    # break it on every HTTP/3 connection (#359), so make the operator choose.
+    raise newException(CatchableError,
+      "maxTlsVersion (TLS 1.2) cannot be served over HTTP/3, which requires " &
+      "TLS 1.3. Set http3 = false to keep the TLS 1.2 ceiling, or raise " &
+      "maxTlsVersion.")
   # Report the first offending field by name rather than a bare "a setting is
   # negative", and add new numeric settings here as they appear.
   for (name, val) in [

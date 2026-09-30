@@ -100,6 +100,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection on it. The poisoned connection is now freed on the spot, the
   callback fails so ngtcp2 abandons the datagram, and the CONNECTION_CLOSE
   still carries the HTTP/3 error code. (#362)
+- HTTP/3: `tlsCipherSuites` now applies to QUIC. The engine hardcoded TLS 1.3
+  and never called `SSL_CTX_set_ciphersuites`, so a suite restriction held on
+  HTTP/1.1 and HTTP/2 and was silently ignored on every HTTP/3 connection,
+  which negotiated whatever OpenSSL's defaults allowed. `tlsCipherList` stays
+  TCP-only by definition (no QUIC handshake is TLS 1.2), and `minTlsVersion` is
+  clamped up to TLS 1.3 for QUIC as before. `maxTlsVersion = TlsVersion.V12`
+  together with `http3 = true` is now rejected at startup, naming
+  `http3 = false` as the fix, instead of applying the ceiling on TCP and
+  ignoring it on HTTP/3. (#359)
 
 ### Changed
 
