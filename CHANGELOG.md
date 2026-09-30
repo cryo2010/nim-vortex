@@ -139,6 +139,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass: a client that stalls its handshake there pinned a loop thread at 100%
   CPU (0.98 s of CPU per second, measured) for the whole `headerTimeout`
   window, starving every other connection on that thread. (#365)
+- TLS: the `SSL_write` `WANT_READ` arm of the response flush now drops write
+  interest and notifies the producers parked on the write buffer. It returned
+  with write interest still armed from the preceding `WANT_WRITE`, so a
+  writable socket re-entered the flush on every selector pass (the same
+  level-triggered spin as the handshake case above), and it skipped the
+  WebSocket backpressure signal and the HTTP/2 buffer-drain resume that both
+  neighbouring stall arms perform. The write-stall deadline
+  (`writeTimeout`) is kept, since such a flush is stalled rather than
+  finished. (#371)
 
 ### Changed
 

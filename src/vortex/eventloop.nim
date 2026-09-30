@@ -471,14 +471,20 @@ proc setInterest(loop: Loop, c: ptr Connection, events: set[Event]) =
     loop.selector.updateHandle(int(c.fd), events)
   c.writeArmed = Event.Write in events
 
-proc armWrite(loop: Loop, c: ptr Connection) =
+proc armWriteDeadline(loop: Loop, c: ptr Connection) {.inline.} =
   # The socket could not take all pending output: arm a write-stall deadline so a
   # slow-reading client that never drains the response is closed (writeTimeout).
   # Idle (re-armed each time we block on write), so a response that keeps making
   # progress is never cut off; independent of c.deadline so it doesn't clobber a
   # request/idle/response deadline. sweepTimeouts enforces it. (No-op if off.)
+  # Separate from armWrite because a flush can stall on something other than
+  # writability (an SSL_write that must consume TLS input first): that must not
+  # watch the socket for writability, but it must still be reaped.
   if loop.settings.writeTimeout > 0:
     c.writeDeadline = loop.core.nowSec + int64(loop.settings.writeTimeout)
+
+proc armWrite(loop: Loop, c: ptr Connection) =
+  loop.armWriteDeadline(c)
   if not c.registered:
     # Re-arm a connection unregistered while it waited half-closed for a deferred
     # response (see disarmForResponse): there is output to flush now. Read
@@ -590,7 +596,22 @@ proc flushOut(loop: Loop, c: ptr Connection) =
               drainResume()
             return
           of tlsWantRead:
-            return               # retried after the next read event
+            # SSL_write has TLS input it must consume before it can emit more
+            # application data (a renegotiation handshake in flight). Drop write
+            # interest: the socket is writable (that is why we are here) and the
+            # selector is level-triggered, so leaving it armed re-enters flushOut
+            # on every pass and burns a core until the write deadline (#371).
+            # Read interest remains and handleRead's tail re-enters flushOut once
+            # the peer's bytes arrive; the write-stall deadline is re-armed by
+            # hand because this flush *is* stalled, disarmWrite's "fully flushed"
+            # meaning does not apply. The parked producers are notified exactly as
+            # the WANT_WRITE arm does: to them this is the same stall.
+            if c.ws != nil: wsBackpressure(c)
+            loop.disarmWrite(c)
+            loop.armWriteDeadline(c)
+            if c.h2 != nil and c.pendingOut < respHighWater:
+              drainResume()
+            return
           of tlsClosed, tlsError:
             loop.closeConn(c)
             return

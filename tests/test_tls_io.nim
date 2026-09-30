@@ -118,3 +118,44 @@ suite "TLS handshake selector interest":
       check spent < 0.3
       # The stalled handshake is still reaped by headerTimeout.
       check s.waitForClose(tries = 12, stepMs = 500)
+
+# --- #371: flushOut must not hold write interest on SSL_write WANT_READ ------
+
+const bigLen = 4 * 1024 * 1024
+
+proc bigHandler(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, repeat('x', bigLen))
+
+proc sslDrain(s: Socket, want: int): int =
+  ## Read up to `want` bytes over TLS; stops at EOF, at a receive timeout (which
+  ## std/net surfaces as an SSL "not enough data" error) or at `want`.
+  var buf = newString(64 * 1024)
+  while result < want:
+    var n = 0
+    try: n = s.recv(addr buf[0], buf.len)
+    except CatchableError: break
+    if n <= 0: break
+    result += n
+
+suite "TLS write-path stalls":
+  ## flushOut arms write interest when the socket cannot take the rest of a
+  ## response. While the peer stops reading, the loop must sit on that armed
+  ## write without spinning, and the flush must resume the moment the peer
+  ## drains. (The SSL_write WANT_READ arm fixed alongside this cannot be driven
+  ## from a client: see the commit message for #371.)
+  test "a peer that stops reading stalls the flush without spinning the loop":
+    let cfg = initVortexConfig(numThreads = 1, certFile = cert, keyFile = key)
+    withServer(RequestHandler(bigHandler), cfg, srv):
+      let ctx = newContext(verifyMode = CVerifyNone)
+      let s = newSocket(buffered = false)
+      defer: s.close()
+      s.connect("127.0.0.1", srv.port)
+      ctx.wrapConnectedSocket(s, handshakeAsClient, "localhost")
+      s.send("GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+      sleep(400)                 # the response fills the socket: write armed
+      let t0 = cpuSeconds()
+      sleep(1000)
+      check cpuSeconds() - t0 < 0.3
+      # The stalled flush resumes as soon as we read again.
+      s.setRecvTimeout(3000)
+      check s.sslDrain(bigLen) > 1024 * 1024
