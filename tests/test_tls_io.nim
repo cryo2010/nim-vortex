@@ -1,0 +1,120 @@
+## Event-loop TLS I/O regressions: selector interest around a stalled
+## handshake, a blocked SSL_write, and an SSL_read that needs the socket
+## writable.
+##
+## These are liveness/CPU bugs rather than protocol ones, so the assertions are
+## process CPU time (getrusage over an otherwise idle window: the test's own
+## thread sleeps, so whatever is spent belongs to the loop thread) and request
+## completion, not response bytes.
+
+import std/[unittest, net, posix, os, strutils, httpcore]
+import vortex/[settings, request, server]
+import ./helper
+
+when defined(plainHttp):
+  echo "SKIP: -d:plainHttp has no TLS"
+  quit 0
+
+if findExe("openssl").len == 0:
+  echo "SKIP: need openssl to mint a certificate"
+  quit 0
+
+let (cert, key) = makeCertPair("vortex_tlsio_")
+
+# A deliberately fat certificate chain: the leaf repeated until the server's
+# first handshake flight is far larger than a socket send buffer, so
+# SSL_do_handshake really does hit WANT_WRITE (a ~2 KiB flight always fits in
+# the kernel buffer and would never exercise the armed-write path). OpenSSL
+# sends the extra chain certificates verbatim; nothing here verifies them.
+let fatCert = cert.parentDir / "fatchain.pem"
+writeFile(fatCert, repeat(readFile(cert), 3000))
+
+proc handler(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, "ok")
+
+# --- helpers ------------------------------------------------------------------
+
+proc secs(tv: Timeval): float =
+  float(clong(tv.tv_sec)) + float(tv.tv_usec) / 1e6
+
+proc cpuSeconds(): float =
+  ## User + system CPU consumed by this process (all threads) so far.
+  var ru: Rusage
+  discard getrusage(RUSAGE_SELF, addr ru)
+  ru.ru_utime.secs + ru.ru_stime.secs
+
+proc u16(v: int): string =
+  char((v shr 8) and 0xff) & char(v and 0xff)
+
+proc clientHello(): string =
+  ## A hand-built TLS 1.2 ClientHello: enough for the server to send its whole
+  ## flight (ServerHello .. ServerHelloDone) and then wait for a second flight
+  ## that this "client" never sends. A real OpenSSL client cannot be stopped
+  ## there, which is why the bytes are assembled by hand.
+  const host = "localhost"
+  var ext = ""
+  ext.add u16(0x0000) & u16(host.len + 5) & u16(host.len + 3) & "\x00" &
+          u16(host.len) & host                       # server_name
+  ext.add u16(0x000a) & u16(4) & u16(2) & "\x00\x17" # supported_groups: secp256r1
+  ext.add u16(0x000b) & u16(2) & "\x01\x00"          # ec_point_formats
+  ext.add u16(0x000d) & u16(8) & u16(6) &
+          "\x04\x01\x08\x04\x05\x01"                 # signature_algorithms
+  var hello = "\x03\x03"                             # client_version: TLS 1.2
+  hello.add repeat('\x2a', 32)                       # random
+  hello.add "\x00"                                   # session_id: empty
+  hello.add u16(4) & "\xc0\x2f\xc0\x30"              # ECDHE-RSA-AES128/256-GCM
+  hello.add "\x01\x00"                               # compression: null
+  hello.add u16(ext.len) & ext
+  let hs = "\x01" & char((hello.len shr 16) and 0xff) & u16(hello.len) & hello
+  "\x16\x03\x01" & u16(hs.len) & hs
+
+proc drainAll(s: Socket, quietMs = 300): int =
+  ## Read until the peer goes quiet for quietMs; returns the byte count.
+  s.setRecvTimeout(quietMs)
+  var buf = newString(4096)
+  while true:
+    let n = recv(s.getFd, addr buf[0], buf.len, cint(0))
+    if n <= 0: break
+    result += int(n)
+
+proc tinyRecvSocket(port: Port, rcvBytes = 1024): Socket =
+  ## A connected socket with a deliberately tiny receive buffer, so the peer's
+  ## first write blocks long before the whole flight fits.
+  result = newSocket(buffered = false)
+  var rcv = cint(rcvBytes)
+  discard setsockopt(result.getFd, SOL_SOCKET, SO_RCVBUF, addr rcv,
+                     SockLen(sizeof(rcv)))
+  result.connect("127.0.0.1", port)
+
+# --- #365: driveHandshake must drop write interest on WANT_READ ---------------
+
+suite "TLS handshake selector interest":
+  ## A handshake that blocked on a full socket send buffer (WANT_WRITE -> write
+  ## interest armed) and then went back to waiting for the peer must stop
+  ## watching writability. The selector is level-triggered and every event on a
+  ## handshaking connection re-enters driveHandshake, so a writable socket
+  ## otherwise spins the loop thread for the whole headerTimeout window (#365).
+  test "a handshake stalled after a blocked flight does not spin the loop":
+    let cfg = initVortexConfig(numThreads = 1, certFile = fatCert, keyFile = key,
+                               headerTimeout = 5)
+    withServer(RequestHandler(handler), cfg, srv):
+      let s = tinyRecvSocket(srv.port)
+      defer: s.close()
+      s.send(clientHello())
+      # Let the server's flight fill the socket send buffer while nothing reads
+      # it: SSL_do_handshake blocks on WANT_WRITE and arms write interest.
+      sleep(300)
+      # Drain the server's flight: that re-opens our receive window, so the
+      # server's socket is writable again while the handshake waits on the
+      # client key exchange we will never send.
+      # The flight is far larger than any socket buffer, so the server really
+      # did block mid-flight; on a platform whose buffers could swallow it whole
+      # the assertion below degrades to a no-op rather than flaking.
+      check s.drainAll() > 1024 * 1024
+      let t0 = cpuSeconds()
+      sleep(1000)
+      let spent = cpuSeconds() - t0
+      # Idle: one 1 s tick. Spinning: a full core (~1.0 s of CPU per second).
+      check spent < 0.3
+      # The stalled handshake is still reaped by headerTimeout.
+      check s.waitForClose(tries = 12, stepMs = 500)

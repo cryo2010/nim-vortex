@@ -1329,7 +1329,15 @@ when not defined(plainHttp):
       loop.disarmWrite(c)
       loop.handleRead(c)       # first request may already be buffered
     of tlsWantRead:
-      discard                  # wait for the next read event
+      # Wait for the peer's next flight, and stop watching writability while we
+      # do. A handshake that passed through a WANT_WRITE has write interest
+      # armed; the selector is level-triggered and the dispatcher routes every
+      # event on a handshaking connection back here, so leaving it armed on a
+      # writable socket re-enters driveHandshake on every selector pass and
+      # spins the loop thread for the whole handshake (#365). This also clears
+      # the write-stall deadline armWrite installed: the flight it was watching
+      # has drained, so the handshake is no longer blocked on the socket.
+      loop.disarmWrite(c)
     of tlsWantWrite:
       loop.armWrite(c)
     of tlsClosed, tlsError:

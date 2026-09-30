@@ -131,6 +131,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the servername callback switches to it: an exact host wins over a wildcard,
   matched case-insensitively. A certificate reload rebuilds the per-host
   contexts from their own material, and they are freed with the engine. (#374)
+- TLS: a handshake that blocked on a full socket send buffer (`WANT_WRITE`) and
+  then went back to waiting for the peer now drops write interest. The
+  handshake driver's `WANT_READ` arm left it armed, and since the selector is
+  level-triggered and every event on a handshaking connection re-enters the
+  driver, a writable socket re-entered `SSL_do_handshake` on every selector
+  pass: a client that stalls its handshake there pinned a loop thread at 100%
+  CPU (0.98 s of CPU per second, measured) for the whole `headerTimeout`
+  window, starving every other connection on that thread. (#365)
 
 ### Changed
 
