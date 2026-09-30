@@ -86,6 +86,12 @@ proc validateConfig(s: VortexConfig) =
       "Set both (file or PEM) to enable TLS, or neither for plain HTTP.")
   if hasCert and not hasKey:
     raise newException(CatchableError, "a certificate is set but no private key.")
+  if s.verifyClient != ClientVerify.None and
+     s.clientCaFile.len == 0 and s.clientCaPem.len == 0:
+    raise newException(CatchableError,
+      "verifyClient is set but no client CA is: client certificates would be " &
+      "verified against an empty trust store, so every one of them would be " &
+      "rejected. Set clientCaFile or clientCaPem, or verifyClient = None.")
   if s.minTlsVersion == TlsVersion.V13 and s.maxTlsVersion == TlsVersion.V12:
     raise newException(CatchableError,
       "maxTlsVersion (TLS 1.2) is below minTlsVersion (TLS 1.3).")

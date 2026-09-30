@@ -458,12 +458,24 @@ proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
 
 proc applyClientVerify(ctx: SslCtxPtr, verify: cint,
                        caFile, caPem: string): bool =
-  ## Configure mTLS: load the client-cert CA (if any) and set the verify mode.
+  ## Configure mTLS: load the client-cert CA and set the verify mode. Client
+  ## verification without a CA source is refused (see below).
   if verify == SSL_VERIFY_NONE: return true
   if caPem.len > 0:
     if not loadCaMem(ctx, caPem): return false
   elif caFile.len > 0:
     if SSL_CTX_load_verify_locations(ctx, caFile.cstring, nil) != 1: return false
+  else:
+    # Arming SSL_CTX_set_verify with no trust source verifies client certs
+    # against a completely empty X509_STORE: OpenSSL 3 does not populate a new
+    # ctx's store and we never call SSL_CTX_set_default_verify_paths, so every
+    # presented certificate fails with "unable to get local issuer
+    # certificate". Under Require that rejects 100% of connections; under
+    # Optional it is worse, because a client that sends no certificate still
+    # connects and the deployment looks healthy while client-cert auth is
+    # non-functional. Fail the ctx build instead. validateConfig catches this
+    # earlier with a named error; this covers direct TlsConfig users too.
+    return false
   SSL_CTX_set_verify(ctx, verify, nil)   # nil cb: OpenSSL's default chain check
   true
 

@@ -292,8 +292,11 @@ initVortexConfig(pkcs12File = "server.p12", keyPassword = "…")   # or pkcs12 =
 **mTLS (client certificates)**: request or require a client cert and verify it
 against a CA. `verifyClient = ClientVerify.Optional` accepts connections with no cert but
 validates any that is presented; `ClientVerify.Require` refuses the handshake without a
-valid one. Inside a handler, `req.clientCertSubject` gives the verified client's
-subject DN ("" if none):
+valid one. Either mode needs a CA: a `verifyClient` other than `None` with no
+`clientCaFile`/`clientCaPem` is rejected at startup, because it would verify
+against an empty trust store and reject every client certificate. Inside a
+handler, `req.clientCertSubject` gives the verified client's subject DN ("" if
+none):
 
 ```nim
 initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",

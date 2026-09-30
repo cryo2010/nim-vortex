@@ -2,6 +2,7 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import vortex/transport/tls as tlstransport
 import ./helper
 
 when defined(plainHttp):
@@ -81,6 +82,32 @@ suite "mTLS":
       $srv.port & "/whoami")
     check rc == 0
     check o.strip() == "-"
+
+  test "require without a client CA is rejected at startup":
+    # No CA source means verifying against an empty X509_STORE, i.e. rejecting
+    # every client certificate. validateConfig names the missing setting.
+    expect CatchableError:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = cert, keyFile = key,
+        verifyClient = ClientVerify.Require)).start(0)
+      srv.close()
+
+  test "optional without a client CA is rejected at startup too":
+    # Optional is the worse case: clients that send no certificate connect, so
+    # the deployment looks healthy while client-cert auth does nothing.
+    expect CatchableError:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = cert, keyFile = key,
+        verifyClient = ClientVerify.Optional)).start(0)
+      srv.close()
+
+  test "the TLS context itself refuses verification with no CA":
+    # Belt and braces behind validateConfig: a direct TlsConfig user (and any
+    # rebuild, e.g. a reload) must fail closed as well.
+    expect CatchableError:
+      let cfg = tlstransport.newTlsConfig(cert, key,
+                                          verify = tlstransport.TlsVerifyRequire)
+      tlstransport.freeTlsConfig(cfg)
 
 suite "SNI":
   test "servername selects the matching per-host certificate":

@@ -141,6 +141,8 @@ type
     pkcs12File*: string       ## PKCS#12 (.pfx) bundle file (cert + key + chain)
     pkcs12*: string           ## PKCS#12 bundle bytes (in-memory)
     verifyClient*: ClientVerify   ## mTLS: request/require a client certificate
+                                  ## (needs clientCaFile or clientCaPem; a
+                                  ## non-None mode without one is rejected)
     clientCaFile*: string     ## CA (PEM file) to verify client certs against
     clientCaPem*: string      ## CA (in-memory PEM) to verify client certs against
     sni*: seq[SniCertEntry]   ## additional certs selected by SNI hostname

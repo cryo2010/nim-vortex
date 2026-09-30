@@ -77,7 +77,7 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `tlsCipherList` | "" | OpenSSL cipher list for TLS 1.2 ("" keeps OpenSSL's default) |
 | `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default) |
 | `verifyClient` | `None` | mTLS: `None` / `Optional` / `Require` client-cert policy |
-| `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (needed when `verifyClient != None`) |
+| `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (**required** when `verifyClient != None`: a config with neither is rejected at startup, since it would verify against an empty trust store) |
 | `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported) |
 | `ocspFile` / `ocspResponse` | "" | DER OCSP response to staple (rotate at runtime via `reloadTls(ocspFile = ...)`) |
 | `http3` | `true` | Serve HTTP/3 over QUIC (requires a cert; ignored without TLS) |

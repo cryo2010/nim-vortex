@@ -136,6 +136,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alert, with no startup failure to correlate against. A trust-anchor set is now
   accepted only when the whole bundle was consumed cleanly and held at least one
   CA. (#368)
+- TLS: `verifyClient` other than `None` with neither `clientCaFile` nor
+  `clientCaPem` is now rejected at startup instead of arming client-certificate
+  verification against an empty trust store (OpenSSL 3 does not populate a new
+  context's store, and the system trust store is never loaded). Under `Require`
+  that rejected every connection with "unable to get local issuer certificate";
+  under `Optional` clients that sent no certificate still connected, so the
+  deployment looked healthy while client-cert auth was non-functional and
+  `clientCertSubject` was always "". `validateConfig` names the missing setting,
+  and the context build refuses it too, so direct `TlsConfig` users and rebuilds
+  fail closed as well. (#369)
 
 ## [0.5.0] - 2026-09-24
 
