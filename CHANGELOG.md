@@ -148,6 +148,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neighbouring stall arms perform. The write-stall deadline
   (`writeTimeout`) is kept, since such a flush is stalled rather than
   finished. (#371)
+- TLS: an `SSL_read` that returns `WANT_WRITE` is now retried from the write
+  event. OpenSSL's contract is that the same call is repeated once the socket
+  is writable, because the bytes it must emit first (a TLS 1.3 KeyUpdate
+  answer, a renegotiation flight, an alert) live in the SSL object's own write
+  buffer, not in the connection's. The loop instead ran the response flush,
+  which found nothing pending, dropped write interest and never touched the
+  SSL object, so the record was stranded until the connection timed out. The
+  flush also no longer drops the write interest that such a retry depends
+  on. (#372)
 
 ### Changed
 

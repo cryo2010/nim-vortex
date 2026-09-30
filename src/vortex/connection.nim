@@ -216,6 +216,15 @@ type
                               ## that stalls the write is closed (writeTimeout)
                               ## without clobbering the request/idle deadline.
     writeArmed*: bool         ## selector currently watching writability
+    sslReadWantsWrite*: bool  ## TLS: the last SSL_read returned WANT_WRITE, so
+                              ## OpenSSL owes the *same* call a retry once the
+                              ## socket is writable (the bytes it must emit --
+                              ## a TLS 1.3 KeyUpdate answer, a renegotiation
+                              ## flight, an alert -- live in the SSL object's
+                              ## write buffer, not in wbuf, so flushOut cannot
+                              ## push them). The loop keeps write interest armed
+                              ## and routes the write event into handleRead
+                              ## while this is set (#372). Loop thread only.
     registered*: bool         ## fd registered with the selector
     pins*: PinSet
                               ## outstanding worker tasks by pin kind; the slot
@@ -766,6 +775,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.deadline = 0
   c.dlKind = dkNone
   c.writeArmed = false
+  c.sslReadWantsWrite = false
   # A recycled slot must never inherit pin residue (R4): leftover counts would
   # make totalPins/inputPausePins lie for the next occupant -- input running
   # under a live worker (UAF) or a permanently-paused fresh connection. A

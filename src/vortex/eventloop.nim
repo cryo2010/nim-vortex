@@ -632,7 +632,12 @@ proc flushOut(loop: Loop, c: ptr Connection) =
         return
     c.wbuf.setLen(0)
     c.wpos = 0
-    loop.disarmWrite(c)          # no-op once already disarmed, so looping is free
+    if not c.sslReadWantsWrite:
+      # No-op once already disarmed, so looping is free. Held while the SSL
+      # layer owes a write-driven SSL_read retry: that retry is what flushes
+      # OpenSSL's own write buffer, and it only runs while the loop still
+      # watches writability (#372). Always false on a plaintext connection.
+      loop.disarmWrite(c)
     if c.closeAfterFlush:
       # Close gracefully after writing a response on a plaintext HTTP/1 connection:
       # a bare close() while the kernel still holds untransmitted response bytes and
@@ -1265,6 +1270,9 @@ proc handleRead(loop: Loop, c: ptr Connection) =
       if c.ssl != nil:
         # SSL buffers internally, so keep reading until WANT_READ; a
         # level-triggered fd event won't refire for buffered TLS data.
+        # This call is the retry the write event may have been armed for, so
+        # the debt is settled here and re-taken below if it repeats (#372).
+        c.sslReadWantsWrite = false
         let (n, st) = tlsRead(c.ssl, addr c.rbuf[c.rlen], wanted)
         case st
         of tlsOk:
@@ -1273,6 +1281,14 @@ proc handleRead(loop: Loop, c: ptr Connection) =
         of tlsWantRead:
           break
         of tlsWantWrite:
+          # OpenSSL must emit a record (a TLS 1.3 KeyUpdate answer, a
+          # renegotiation flight, an alert) before this read can proceed, and
+          # its contract is that the *same* call is retried once the socket is
+          # writable. Those bytes are in the SSL object's write buffer, not in
+          # c.wbuf, so the write event must come back here: flushOut would find
+          # pendingOut == 0, disarm write and never touch the SSL object,
+          # stranding the record until the connection timed out (#372).
+          c.sslReadWantsWrite = true
           loop.armWrite(c)
           break
         of tlsClosed, tlsError:
@@ -2208,6 +2224,11 @@ proc run*(loop: Loop) =
             loop.driveHandshake(c)
             continue
         if Event.Write in key.events:
+          when not defined(plainHttp):
+            if c.sslReadWantsWrite:
+              loop.handleRead(c)     # retry the SSL_read that wanted the write
+              if c.state == csFree:
+                continue
           loop.flushOut(c)
           if c.state == csFree:
             continue
