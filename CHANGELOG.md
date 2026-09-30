@@ -90,6 +90,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/2 stream-level error scope and racing-frame tolerance (#239), the HTTP/2
   conformance follow-ups (#240), and the HTTP/1 streaming read-ahead bound for
   async `req.read()` consumers (#271).
+- TLS: an in-memory certificate chain (`certPem`, and the same bytes on the
+  HTTP/3 side) that does not parse in full is now rejected instead of loaded
+  up to the point of damage. `PEM_read_bio_X509` returns nil for every failure,
+  not only end-of-data, so a mangled or truncated block after the leaf left a
+  silently leaf-only chain: the server started, `reloadTls` returned true, and
+  clients without the intermediate cached failed the handshake with "unable to
+  get local issuer certificate". The loaders now read the OpenSSL error queue
+  and accept the stop only on PEM's benign "no start line", exactly as
+  OpenSSL's own `SSL_CTX_use_certificate_chain_file` does. (#367)
+- TLS: a `clientCaPem` bundle must now parse in full. The loader treated any
+  read failure as clean end-of-data and reported success whenever at least one
+  CA had loaded, so a bundle truncated or corrupted part-way through (a
+  ConfigMap or Vault render, a non-atomic `curl` fetch) silently installed a
+  partial trust store: the server started healthy and every client issued by a
+  CA after the damage was rejected at handshake time with an unable-to-get-issuer
+  alert, with no startup failure to correlate against. A trust-anchor set is now
+  accepted only when the whole bundle was consumed cleanly and held at least one
+  CA. (#368)
+- TLS: `verifyClient` other than `None` with neither `clientCaFile` nor
+  `clientCaPem` is now rejected at startup instead of arming client-certificate
+  verification against an empty trust store (OpenSSL 3 does not populate a new
+  context's store, and the system trust store is never loaded). Under `Require`
+  that rejected every connection with "unable to get local issuer certificate";
+  under `Optional` clients that sent no certificate still connected, so the
+  deployment looked healthy while client-cert auth was non-functional and
+  `clientCertSubject` was always "". `validateConfig` names the missing setting,
+  and the context build refuses it too, so direct `TlsConfig` users and rebuilds
+  fail closed as well. (#369)
+- TLS: an ALPN offer that overlaps nothing the server supports now gets the
+  fatal `no_application_protocol` alert RFC 7301 3.2 requires, instead of
+  completing the handshake with no ALPN extension. The callback returned
+  `SSL_TLSEXT_ERR_NOACK`, which OpenSSL implements as "behave as if no callback
+  were set", so an HTTP/3-only or legacy client that reached the TCP port got a
+  successful handshake, was framed as HTTP/1, and answered 400 or hung until the
+  idle timeout. The QUIC shim already alerted; the two paths now agree. A client
+  that sends no ALPN extension at all is unaffected (OpenSSL does not invoke the
+  callback for it) and still gets HTTP/1.1. (#370)
+- TLS: `reloadTls(keyFile = ...)` against a server whose certificate came from
+  a PKCS#12 bundle now returns false instead of reporting a rotation that never
+  happened. The `keyFile` branch did not clear `pkcs12`/`pkcs12File` the way the
+  `certFile` branch does, and `loadCertKey` gives a bundle unconditional
+  precedence, so the context was rebuilt from the old bundle, the cert/key
+  consistency check passed (they match each other), and an operator rotating a
+  disclosed key got positive confirmation while the server kept presenting it. A
+  lone key cannot apply to a bundle that carries both halves, so the call is
+  rejected outright, and the ignored path is no longer recorded in the stored
+  material (which used to let a later cert-only reload pair a new certificate
+  with it). Rotate both halves together. (#363)
+- TLS: every context is now built with `SSL_OP_NO_RENEGOTIATION`, so
+  renegotiation is refused as this server's own policy rather than inherited
+  from a library default. A renegotiation is a full ECDHE key agreement plus a
+  server signature run inline on the loop thread for a few hundred bytes of
+  client effort, unmetered (the CVE-2011-1473 shape). OpenSSL 3.0 already
+  refuses client-initiated renegotiation unless
+  `SSL_OP_ALLOW_CLIENT_RENEGOTIATION` is set, but that default can be flipped by
+  a system `openssl.cnf` and does not exist in a pre-3.0 libssl, which the
+  Linux dynlib pattern can still resolve. TLS 1.3 has no renegotiation and is
+  unaffected. (#376)
+- TLS: `reloadTls` is now serialised by a lock, so two threads reloading at
+  once (a SIGHUP loop plus an admin endpoint, say) can no longer interleave the
+  bookkeeping that retires the displaced `SSL_CTX`. Both could claim the same
+  retire slot, which either freed one context twice (memory corruption) or
+  dropped the other thread's entry and leaked it. The documented contract
+  ("call from an ordinary thread") always implied concurrent calls were fine;
+  now they are. (#360)
+- TLS: a certificate hot-reload now releases the displaced `SSL_CTX` right
+  away and `newTlsSession` holds a reference to the context it hands to
+  `SSL_new`, replacing the four-slot retire ring and its 5 s grace window. The
+  ring had to evict, and free, a context once a fifth reload arrived inside the
+  window, which by construction is the moment every retained context was still
+  within its grace period: a renewal hook or config-file watcher firing a few
+  times in a few seconds could free a context a loop thread had loaded but not
+  yet up-ref'd, along with the OCSP staple attached to it. A reference per
+  session makes a displaced context live exactly as long as the last connection
+  using it, so both the slot cap and the window are gone. (#364)
 - HTTP/3: a connection error from nghttp3 is now terminal for nghttp3 before
   control returns to ngtcp2. The QUIC shim deleted nothing and reported success
   when `nghttp3_conn_read_stream` failed, so ngtcp2 kept decoding the rest of
@@ -207,81 +282,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moving is never cut off; set it to 0 to restore the old behaviour. The
   `maxHeaderCount` limit is documented as answering 431, not 400, and as
   HTTP/1 only. (#249)
-- TLS: an in-memory certificate chain (`certPem`, and the same bytes on the
-  HTTP/3 side) that does not parse in full is now rejected instead of loaded
-  up to the point of damage. `PEM_read_bio_X509` returns nil for every failure,
-  not only end-of-data, so a mangled or truncated block after the leaf left a
-  silently leaf-only chain: the server started, `reloadTls` returned true, and
-  clients without the intermediate cached failed the handshake with "unable to
-  get local issuer certificate". The loaders now read the OpenSSL error queue
-  and accept the stop only on PEM's benign "no start line", exactly as
-  OpenSSL's own `SSL_CTX_use_certificate_chain_file` does. (#367)
-- TLS: a `clientCaPem` bundle must now parse in full. The loader treated any
-  read failure as clean end-of-data and reported success whenever at least one
-  CA had loaded, so a bundle truncated or corrupted part-way through (a
-  ConfigMap or Vault render, a non-atomic `curl` fetch) silently installed a
-  partial trust store: the server started healthy and every client issued by a
-  CA after the damage was rejected at handshake time with an unable-to-get-issuer
-  alert, with no startup failure to correlate against. A trust-anchor set is now
-  accepted only when the whole bundle was consumed cleanly and held at least one
-  CA. (#368)
-- TLS: `verifyClient` other than `None` with neither `clientCaFile` nor
-  `clientCaPem` is now rejected at startup instead of arming client-certificate
-  verification against an empty trust store (OpenSSL 3 does not populate a new
-  context's store, and the system trust store is never loaded). Under `Require`
-  that rejected every connection with "unable to get local issuer certificate";
-  under `Optional` clients that sent no certificate still connected, so the
-  deployment looked healthy while client-cert auth was non-functional and
-  `clientCertSubject` was always "". `validateConfig` names the missing setting,
-  and the context build refuses it too, so direct `TlsConfig` users and rebuilds
-  fail closed as well. (#369)
-- TLS: an ALPN offer that overlaps nothing the server supports now gets the
-  fatal `no_application_protocol` alert RFC 7301 3.2 requires, instead of
-  completing the handshake with no ALPN extension. The callback returned
-  `SSL_TLSEXT_ERR_NOACK`, which OpenSSL implements as "behave as if no callback
-  were set", so an HTTP/3-only or legacy client that reached the TCP port got a
-  successful handshake, was framed as HTTP/1, and answered 400 or hung until the
-  idle timeout. The QUIC shim already alerted; the two paths now agree. A client
-  that sends no ALPN extension at all is unaffected (OpenSSL does not invoke the
-  callback for it) and still gets HTTP/1.1. (#370)
-- TLS: `reloadTls(keyFile = ...)` against a server whose certificate came from
-  a PKCS#12 bundle now returns false instead of reporting a rotation that never
-  happened. The `keyFile` branch did not clear `pkcs12`/`pkcs12File` the way the
-  `certFile` branch does, and `loadCertKey` gives a bundle unconditional
-  precedence, so the context was rebuilt from the old bundle, the cert/key
-  consistency check passed (they match each other), and an operator rotating a
-  disclosed key got positive confirmation while the server kept presenting it. A
-  lone key cannot apply to a bundle that carries both halves, so the call is
-  rejected outright, and the ignored path is no longer recorded in the stored
-  material (which used to let a later cert-only reload pair a new certificate
-  with it). Rotate both halves together. (#363)
-- TLS: every context is now built with `SSL_OP_NO_RENEGOTIATION`, so
-  renegotiation is refused as this server's own policy rather than inherited
-  from a library default. A renegotiation is a full ECDHE key agreement plus a
-  server signature run inline on the loop thread for a few hundred bytes of
-  client effort, unmetered (the CVE-2011-1473 shape). OpenSSL 3.0 already
-  refuses client-initiated renegotiation unless
-  `SSL_OP_ALLOW_CLIENT_RENEGOTIATION` is set, but that default can be flipped by
-  a system `openssl.cnf` and does not exist in a pre-3.0 libssl, which the
-  Linux dynlib pattern can still resolve. TLS 1.3 has no renegotiation and is
-  unaffected. (#376)
-- TLS: `reloadTls` is now serialised by a lock, so two threads reloading at
-  once (a SIGHUP loop plus an admin endpoint, say) can no longer interleave the
-  bookkeeping that retires the displaced `SSL_CTX`. Both could claim the same
-  retire slot, which either freed one context twice (memory corruption) or
-  dropped the other thread's entry and leaked it. The documented contract
-  ("call from an ordinary thread") always implied concurrent calls were fine;
-  now they are. (#360)
-- TLS: a certificate hot-reload now releases the displaced `SSL_CTX` right
-  away and `newTlsSession` holds a reference to the context it hands to
-  `SSL_new`, replacing the four-slot retire ring and its 5 s grace window. The
-  ring had to evict, and free, a context once a fifth reload arrived inside the
-  window, which by construction is the moment every retained context was still
-  within its grace period: a renewal hook or config-file watcher firing a few
-  times in a few seconds could free a context a loop thread had loaded but not
-  yet up-ref'd, along with the OCSP staple attached to it. A reference per
-  session makes a displaced context live exactly as long as the last connection
-  using it, so both the slot cap and the window are gone. (#364)
 
 ## [0.5.0] - 2026-09-24
 
