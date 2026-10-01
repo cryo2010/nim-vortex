@@ -23,7 +23,8 @@ stress and stop.
 ## 1. Parse the prompt into a cell matrix
 
 Read `$prompt` and pick exactly one workload task, then only the `VORTEX_*` knobs the prompt
-actually names. Rely on harness defaults for everything unnamed (do not invent values).
+actually names. If the provide task specifies a time, it is intended as the time per stress run
+cell and not the total time of all cells. Rely on harness defaults for everything unnamed (do not invent values).
 
 **Workload → nimble task** (first keyword match wins):
 
