@@ -1994,6 +1994,24 @@ proc sweepTimeouts(loop: Loop) =
       # 0 for a mid-stream or active-h2 connection).
       loop.closeConn(c)
       continue
+    if c.deadline == 0 and c.state == csActive and c.h2 != nil and
+        c.inputPausePins == 0 and h2BlockedOnPeerWindow(c):
+      # Nothing to time, yet a stream owes response bytes it cannot send because
+      # a peer send window is shut: the #236 stall, armed from the sweep because
+      # the stall can begin outside the input path. h2Input's deadline tail runs
+      # only on an inbound event, and a streamed sendFile parks its bytes from
+      # the outbox instead (a chunk read holds pkFileChunk, which deliberately
+      # does not pause input, and its release re-processes input only when bytes
+      # are buffered -- a silent client has none). So a download to a client that
+      # absorbed the initial window and went quiet reached this loop with
+      # deadline 0 and was pinned for the life of the process.
+      #
+      # Same predicate h2Deadline uses, so this can arm nothing that an inbound
+      # frame would not have armed; it just does not need one. The gate is
+      # inputPausePins rather than totalPins, as h2Input's own is: a file-chunk
+      # worker never touches the h2 stream table, so reading its counters here
+      # cannot race one.
+      c.setDeadline(loop, dkBody)
     if c.deadline == 0 or c.deadline > loop.core.nowSec:
       continue
     if c.dlKind == dkWsPing:

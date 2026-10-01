@@ -9,14 +9,25 @@
 ##     refused (RST_STREAM(REFUSED_STREAM), retryable) instead of letting 256
 ##     trickled POSTs pin maxBodySize each.
 ##
+##   * #236: a connection whose every stream has END_STREAM seen, while the
+##     server still owes response bytes parked on an exhausted peer send window,
+##     has nothing left to time: the read-idle deadline does not apply (the
+##     client owes nothing) and writeTimeout does not either (the owed bytes are
+##     in pendingBody, not in the write buffer, so the socket is not stalled).
+##     "Response bytes owed but blocked on the peer's window" now arms the body
+##     deadline, so a client that absorbs the initial window and goes silent is
+##     cut off instead of pinning the fd, the connection slot and the parked
+##     buffers forever.
+##
 ## The client here is frame level and flow-control aware: it tracks the credit
 ## the server grants (connection-level and per-stream WINDOW_UPDATEs) and never
 ## overruns it, so a refusal in these tests is always the memory cap talking and
 ## never a FLOW_CONTROL_ERROR.
 
-import std/[unittest, net, posix, tables, httpcore, strutils]
-import vortex/[settings, request, server]
+import std/[unittest, net, posix, os, times, tables, httpcore, strutils]
+import vortex/[settings, request, server, staticfiles]
 import vortex/http2/frames
+import ./helper
 import ./h2client
 
 const
@@ -226,5 +237,133 @@ suite "HTTP/2 buffered-body memory cap (#235)":
     check fr.goawayError() == -1
     u.c.close()
 
+
+# --- #236: a response stalled on the peer's flow-control window --------------
+
+const
+  peerWindow = 16 * 1024      ## SETTINGS_INITIAL_WINDOW_SIZE the client offers
+                              ## (also the max frame size, so one DATA frame
+                              ## fills it exactly)
+  stallBody = 128 * 1024      ## eight windows of response body
+  stallStreams = 3            ## 3 * peerWindow stays inside the default 64 KiB
+                              ## connection window, so each stream blocks on its
+                              ## OWN send window
+  stallFileBytes = 2 * 1024 * 1024
+                              ## large enough that sendFile streams it in chunks
+                              ## (its first chunk lands through the outbox, after
+                              ## the input pass that would have armed a deadline)
+  stallTimeout = 2            ## bodyTimeout on the stall server
+  grantPauseMs = 400          ## gap between the honest client's WINDOW_UPDATEs
+
+let stallFile = getTempDir() / ("vortex_h2_stall_" & $getCurrentProcessId())
+block:
+  writeFile(stallFile, 'f'.repeat(stallFileBytes))
+
+proc stallRoutes(path: string): RequestHandler =
+  ## Closure over the file path (as tests/test_http2_download.nim does): a gcsafe
+  ## handler may not reach a GC'd global.
+  proc (req: Request, res: Response) {.gcsafe.} =
+    if req.path == "/file": res.sendFile(path)
+    else: res.send(Http200, 'b'.repeat(stallBody))
+
+# writeTimeout is off on purpose: the owed bytes never reach the write buffer, so
+# only the #236 deadline can end these connections. bodyTimeout is the deadline
+# under test.
+var stallSrv = newVortex(stallRoutes(stallFile),
+                         initVortexConfig(numThreads = 1,
+                                          bodyTimeout = stallTimeout,
+                                          writeTimeout = 0)).start(0)
+
+proc get(path: string): seq[(string, string)] =
+  @[(":method", "GET"), (":scheme", "http"), (":path", path),
+    (":authority", "localhost")]
+
+proc sendAll(c: var H2TestConn, data: string) =
+  var off = 0
+  while off < data.len:
+    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
+    if n <= 0: return
+    off += n
+
+proc dataBytes(frames: seq[Frame]): int =
+  for f in frames:
+    if f.typ == uint8(ftData): result += f.payload.len
+
+proc goSilent(path: string, streams = 1):
+    tuple[served: int, goaway: int, closed: bool] =
+  ## Request `streams` large responses, absorb the first window of each, then
+  ## never send another byte. A server that does not time the stall holds the
+  ## connection (and the parked response buffers) until process exit.
+  var c = newH2TestConn(stallSrv.port)
+  var f = ""
+  f.addSettingFrame(setInitialWindowSize, uint32(peerWindow))
+  var sid = 1'u32
+  for i in 0 ..< streams:
+    f.addRequest(sid, get(path), endStream = true)
+    sid += 2
+  c.sendAll(f)
+  let first = c.readFrames(3000, until = proc(fr: seq[Frame]): bool =
+    fr.count(ftData) >= streams)
+  result.served = first.dataBytes
+  # Silent from here: no WINDOW_UPDATE, no PING, nothing.
+  let late = c.readFrames((stallTimeout + 4) * 1000,
+    until = proc(fr: seq[Frame]): bool = fr.goawayError() != -1)
+  result.goaway = late.goawayError()
+  result.closed = c.sock.waitForClose(tries = 8, stepMs = 500)
+  c.close()
+
+suite "HTTP/2 zero-window response stall (#236)":
+  test "a silent zero-window reader is cut off, with a GOAWAY":
+    # Every stream has END_STREAM seen, so no read-side deadline applies, and the
+    # owed bytes sit in pendingBody rather than the write buffer, so no write-side
+    # one does either. Only the #236 arm ends this.
+    let r = goSilent("/big", stallStreams)
+    check r.served >= stallStreams * peerWindow - 1   # the windows were absorbed
+    check r.served < stallStreams * stallBody         # and the rest is still owed
+    check r.goaway == int(errNoError)   # a timeout, not a fault: retryable (#342)
+    check r.closed                      # fd and connection slot released
+
+  test "a sendFile download stalls the same way":
+    # The chunk that fills pendingBody arrives through the outbox, not through an
+    # input event, so the deadline tail in h2Input never runs for it. The sweep
+    # has to notice the stall on its own.
+    let r = goSilent("/file")
+    check r.served >= peerWindow - 1
+    check r.served < stallFileBytes
+    check r.goaway == int(errNoError)
+    check r.closed
+
+  test "a client that keeps granting window is not closed":
+    # The same stall shape, except the client returns credit every grantPauseMs:
+    # the whole download takes several times bodyTimeout, so a deadline that did
+    # not re-arm on progress (or one armed as a total-duration cap) would kill it.
+    var c = newH2TestConn(stallSrv.port)
+    var f = ""
+    f.addSettingFrame(setInitialWindowSize, uint32(peerWindow))
+    f.addRequest(1, get("/big"), endStream = true)
+    c.sendAll(f)
+    var seen: seq[Frame]
+    var got = 0
+    var rounds = 0
+    let started = epochTime()
+    while got < stallBody and rounds < 40:
+      for x in c.readFrames(1000,
+          until = proc(fr: seq[Frame]): bool = fr.count(ftData) >= 1):
+        seen.add x
+        if x.typ == uint8(ftData) and x.streamId == 1: got += x.payload.len
+      if seen.goawayError() != -1: break
+      var w = ""
+      w.addWindowUpdate(1, peerWindow)
+      w.addWindowUpdate(0, peerWindow)
+      c.sendAll(w)
+      sleep(grantPauseMs)
+      inc rounds
+    check got == stallBody                               # the download completed
+    check epochTime() - started > float(stallTimeout)    # past the deadline
+    check seen.goawayError() == -1                       # no false positive
+    c.close()
+
+stallSrv.close()
+removeFile(stallFile)
 srv.close()
 echo "http2 backpressure ok"

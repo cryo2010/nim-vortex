@@ -59,7 +59,7 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `headerTimeout` | 10 s | First byte to end of headers (slowloris); 0 disables |
-| `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. 0 disables |
+| `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. On HTTP/2 it also bounds the reverse stall: a connection whose requests have all finished while the server still owes response bytes parked on an exhausted peer send window, which no read-side or write-side timeout would otherwise cover (the zero-window slow read). 0 disables |
 | `keepAliveTimeout` | 60 s | Idle time between requests; 0 disables |
 | `responseTimeout` | 0 (off) | End of request to first response byte (stuck handler) |
 | `writeTimeout` | 30 s | Idle time the socket may stay unwritable with output pending (slow-read client that never drains its response); re-armed on every partial write, so a response that keeps moving is never cut off; 0 disables |

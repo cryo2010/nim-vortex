@@ -335,6 +335,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from a full stream scan too, so a teardown path that forgets to release a
   reservation fails the test suite instead of permanently shrinking what the
   connection will accept. (#235)
+- HTTP/2: a response stalled on the peer's flow-control window is now timed out
+  from the timeout sweep as well as from the input path. #242 made "response
+  bytes owed but blocked on a peer send window" arm the body deadline, but the
+  classification runs only in the deadline tail of an inbound-frame pass, and a
+  streamed `sendFile` parks its bytes from the outbox instead: a chunk read holds
+  a file-chunk pin, which deliberately does not pause input, and its release
+  re-processes input only when bytes are already buffered, which a silent client
+  never has. So a download to a client that absorbed its initial window and then
+  stopped sending WINDOW_UPDATEs reached the loop with no deadline armed at all
+  and pinned the fd, the connection slot and the parked chunks until the process
+  exited: zero traffic, no timeout. The sweep now arms the same deadline from the
+  same predicate (one O(1) counter read per connection per second), so the stall
+  is bounded whichever path parked the bytes, and the close still sends
+  GOAWAY(NO_ERROR) first so the client can tell it from a network fault. A client
+  that keeps returning credit re-arms the deadline on every pass and is never cut
+  off. Covered by tests/test_http2_backpressure.nim for a buffered response and
+  for a streamed `sendFile`. (#236)
 
 ### Changed
 
