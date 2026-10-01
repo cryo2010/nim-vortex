@@ -286,6 +286,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (RFC 9113 8.1.1) before anything reaches the handler, and the h3 backend
   takes the same early check (RFC 9114 4.1.2). Buffered routes are unchanged:
   they never see a partial body. (#237)
+- h2, h3: a `content-length` field in a request *trailer* section is now
+  rejected (stream PROTOCOL_ERROR / H3_MESSAGE_ERROR) instead of being stored
+  in `req.trailers`. The rest of the trailer-field validation was already in
+  place: the shared rule checks the name and value bytes exactly as for the
+  request head and rejects pseudo-headers and the connection-specific fields,
+  but it was built on the response-side forbidden-field set, which excludes
+  `content-length` on purpose. In a trailer section that is not a
+  response-generation concern but the framing field RFC 9110 6.5.1 names
+  first, the one the h1 parser already drops, so a handler that logged or
+  relayed `req.trailers` could emit a second Content-Length for the same
+  message. Regression coverage for the whole trailer rule set (CR/LF/NUL and
+  edge-whitespace values, uppercase and non-token names, pseudo-headers,
+  `connection` / `proxy-connection` / `keep-alive` / `transfer-encoding` /
+  `upgrade` / `te`, one bad field poisoning the whole block, and the
+  `maxHeaderSize` bound on the block) now lives in
+  `tests/test_http2_request_body.nim`. (#238)
 
 ### Changed
 

@@ -121,9 +121,17 @@ func validTrailerField*(name, val: string): bool =
   ## drops a wider RFC 9110 6.5.1 superset (framing / routing / auth / control
   ## fields) from the trailer section rather than rejecting the message, a
   ## stricter but lenient model, so it keeps its own list.
+  ##
+  ## content-length is rejected here even though isForbiddenResponseField
+  ## deliberately excludes it (see there): in a trailer section it is not a
+  ## response-generation concern but the framing field RFC 9110 6.5.1 names
+  ## first, and the one the h1 parser already drops. Storing it would let a
+  ## handler that logs or relays req.trailers emit a second Content-Length for
+  ## the same message (#238).
   name.len > 0 and name[0] != ':' and
     validFieldName(name) and validFieldValue(val) and
-    not isForbiddenResponseField(name, trailer = true)
+    not isForbiddenResponseField(name, trailer = true) and
+    name != "content-length"
 
 type RequestHeadClass* = enum
   rhInvalid    ## malformed: reject the request / reset the stream

@@ -280,4 +280,127 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
     check fs.bodyOf(1) == "buffered:4"
     c.close()
 
+proc sendTrailers(c: var H2TestConn, sid: uint32,
+                  trailers: openArray[(string, string)],
+                  path = "/buffered"): seq[Frame] =
+  ## A complete request whose END_STREAM rides on a trailing HEADERS block:
+  ## request head, one DATA frame, then `trailers`. HPACK is length-prefixed, so
+  ## names and values reach the server's validator byte for byte.
+  var f = ""
+  f.addRequest(sid, head(path, [("content-length", "4")]), endStream = false)
+  f.addData(sid, "body", endStream = false)
+  f.addRequest(sid, trailers, endStream = true)
+  c.sendAll(f)
+  c.settle(sid)
+
+proc rejects(trailers: openArray[(string, string)]): bool =
+  ## True when the trailer section is answered with RST_STREAM(PROTOCOL_ERROR),
+  ## no response reaches the client, and the handler never ran: a rejected block
+  ## must never surface through req.trailers, not even its leading valid fields.
+  var c = newH2TestConn(srv.port)
+  discard c.readFrames(300)
+  let ran = bufDone.load()
+  let fs = c.sendTrailers(1, trailers)
+  result = fs.rstError(1) == int(errProtocol) and not fs.hasResponse(1) and
+           bufDone.load() == ran and fs.goawayError() == -1
+  c.close()
+
+suite "HTTP/2 request trailer field validation (#238)":
+  test "a valid trailer is delivered through req.trailers":
+    var c = newH2TestConn(srv.port)
+    discard c.readFrames(300)
+    let fs = c.sendTrailers(1, @[("x-checksum", "abc")])
+    check fs.rstError(1) == -1
+    check fs.bodyOf(1) == "buffered:4|x-checksum=abc"
+    c.close()
+
+  test "CR/LF in a trailer value is rejected (response splitting)":
+    check rejects(@[("x-bad", "a\r\nSet-Cookie: pwn=1")])
+
+  test "a bare CR or LF in a trailer value is rejected":
+    check rejects(@[("x-bad", "a\rb")])
+    check rejects(@[("x-bad", "a\nb")])
+
+  test "NUL in a trailer value is rejected":
+    check rejects(@[("x-bad", "a\x00b")])
+
+  test "leading or trailing whitespace in a trailer value is rejected":
+    check rejects(@[("x-bad", " abc")])
+    check rejects(@[("x-bad", "abc\t")])
+
+  test "an uppercase trailer name is rejected":
+    check rejects(@[("X-Bad", "v")])
+
+  test "a non-token trailer name is rejected":
+    check rejects(@[("x bad", "v")])        # SP
+    check rejects(@[("x(bad)", "v")])       # RFC 9110 5.6.2 separators
+    check rejects(@[("x\x01bad", "v")])     # control byte
+
+  test "a pseudo-header in the trailer section is rejected":
+    check rejects(@[(":status", "200")])
+    check rejects(@[(":method", "GET")])
+
+  test "an empty trailer name is rejected":
+    check rejects(@[("", "v")])
+
+  test "connection-specific fields are rejected in a trailer section":
+    check rejects(@[("connection", "close")])
+    check rejects(@[("proxy-connection", "close")])
+    check rejects(@[("keep-alive", "timeout=5")])
+    check rejects(@[("transfer-encoding", "chunked")])
+    check rejects(@[("upgrade", "websocket")])
+
+  test "te is rejected in a trailer section even with the allowed value":
+    # RFC 9113 8.2.2: te is permitted in the request head with exactly
+    # "trailers", and forbidden outright in a trailer section.
+    check rejects(@[("te", "trailers")])
+
+  test "content-length is rejected in a trailer section":
+    # RFC 9110 6.5.1: a framing field in the trailer section is the smuggling
+    # case the h1 parser already drops. Storing it would let a handler that
+    # relays req.trailers upstream emit a second Content-Length.
+    check rejects(@[("content-length", "4")])
+
+  test "a rejected field poisons the whole block, not just itself":
+    check rejects(@[("x-good", "1"), ("x-bad", "a\r\nb")])
+    check rejects(@[("x-bad", "a\r\nb"), ("x-good", "1")])
+
+  test "a valid trailer reaches a streaming route's sink too":
+    var c = newH2TestConn(srv.port)
+    discard c.readFrames(300)
+    let fs = c.sendTrailers(1, @[("x-checksum", "abc")], path = "/stream")
+    check fs.rstError(1) == -1
+    check fs.bodyOf(1) == "done:4|x-checksum=abc"
+    c.close()
+
+  test "an invalid trailer resets a streaming route's stream":
+    var c = newH2TestConn(srv.port)
+    discard c.readFrames(300)
+    let fs = c.sendTrailers(1, @[("x-bad", "a\r\nb")], path = "/stream")
+    check fs.rstError(1) == int(errProtocol)
+    check not fs.hasResponse(1)
+    c.close()
+
+  test "the trailer block is bounded by maxHeaderSize":
+    # The decoded field-list cap applies to a trailer block as well, so trailers
+    # cannot be used to park unbounded memory on a stream. Over the cap the
+    # HPACK decoder fails, which is a connection COMPRESSION_ERROR (the dynamic
+    # table is no longer in sync at that point, so the connection cannot
+    # continue).
+    var c = newH2TestConn(srv.port)
+    discard c.readFrames(300)
+    var huge: seq[(string, string)]
+    for _ in 0 ..< 150: huge.add ("x-p", 'v'.repeat(100))
+    var f = ""
+    f.addRequest(1, head("/buffered", [("content-length", "4")]),
+                 endStream = false)
+    f.addData(1, "body", endStream = false)
+    f.addRequest(1, huge, endStream = true)
+    c.sendAll(f)
+    let fs = c.readFrames(1500,
+      until = proc(fs: seq[Frame]): bool = fs.goawayError() >= 0)
+    check fs.goawayError() == int(errCompression)
+    check not fs.hasResponse(1)
+    c.close()
+
 echo "http2 request body ok"
