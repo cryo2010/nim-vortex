@@ -2051,8 +2051,9 @@ proc response*(s: SseStream): Response = s.res
 
 proc sseSanitize(s: string): string =
   ## SSE field values are single-line; drop CR/LF so a value can't inject a
-  ## second field or terminate the event early. NUL goes with them: the wire
-  ## format cannot carry it either. The WHATWG EventSource rules make a client
+  ## second field or terminate the event early. NUL goes with them for the
+  ## field values this is applied to (`id`, `event`, a comment), not for
+  ## `data`, where a client just appends it. The WHATWG EventSource rules make a client
   ## that sees U+0000 anywhere in an `id` value *ignore the whole field* rather
   ## than reject the byte, so emitting it verbatim left `Last-Event-ID` stuck at
   ## whatever the previous event set, and the resume after a reconnect replayed
@@ -2086,7 +2087,10 @@ proc send*(s: SseStream, data: string, event = "", id = "",
   ## `id` and `event` are single-line field values, so CR, LF and NUL are
   ## removed from both before they go on the wire (a comment's text too): the
   ## format has no escape for any of them, and a client that finds a NUL in an
-  ## `id` ignores the field outright instead of resuming from it. An `id` that
+  ## `id` ignores the field outright instead of resuming from it. So an `id`
+  ## does not round-trip byte for byte (`"abc\0def"` comes back as
+  ## `req.lastEventId == "abcdef"`); encode it (base64, or JSON) when it must.
+  ## `data` is not stripped: a NUL there is payload to a client. An `id` that
   ## sanitizes to empty is not sent at all, because an empty `id:` field means
   ## "reset Last-Event-ID" to a client, which is not what a caller passing
   ## `"\r\n"` or `"\0"` asked for. The default `id = ""` is "no id field", so

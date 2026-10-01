@@ -30,7 +30,7 @@ reference below.
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `maxConnections` | 65536 | Live connections per loop thread; excess is accepted then dropped |
+| `maxConnections` | 65536 | Live connections per loop thread; excess is accepted then dropped. The fd-indexed connection table behind it grows in 1024-slot blocks (~712 KiB each) up to the highest fd a loop thread sees, so its worst case is loop threads x ceil(fd rlimit / 1024) x 712 KiB, bounded by the fd rlimit rather than by this cap |
 | `maxConcurrentStreams` | 256 | Open HTTP/2 and HTTP/3 streams per connection |
 | `maxResetStreams` | 512 | HTTP/2 and HTTP/3 peer resets before the connection is torn down (rapid reset); 0 disables |
 | `maxControlFrames` | 1000 | HTTP/2 overhead frames (PING and SETTINGS including their ACKs, PRIORITY, received GOAWAY, CONTINUATION, unknown types, and every RST_STREAM we send in reply to one) between stream progress; SETTINGS is charged per entry; decays on accepted requests and on response body bytes sent, and WINDOW_UPDATEs that unblock nothing (connection-level, closed-stream, or an open stream the server owes no bytes on) spend credit earned by body bytes sent (one per 256 bytes) before they count; 0 disables |

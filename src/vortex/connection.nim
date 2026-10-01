@@ -316,6 +316,14 @@ type
     ## `addr blocks[0][3]`, 40 further `blocks.add` left both that address and
     ## the slot's value (a string field included) identical.
     ##
+    ## The flip side is that the outer `blocks` header and payload now move at
+    ## arbitrary moments on the loop thread, where the old flat table stayed
+    ## put for as long as any slot was pinned. So the table is loop-thread
+    ## only in a stricter sense than "never copy it": another thread must not
+    ## even read `len` or index it, because growth can free the block list
+    ## under that read. Workers get a `ReqSnapshot` value or route through the
+    ## outbox, never a live lookup; `conn` asserts the rule in debug builds.
+    ##
     ## Loop-thread only, and loop-owned: never copy a ConnTable (that would
     ## deep-copy the payloads and leave every outstanding pointer aimed at the
     ## original), which is what the disabled `=copy` below enforces.
@@ -461,6 +469,7 @@ const connBlockDefault* = 1024
   ## and only the growth test has a reason to shrink it.
 
 const connBlockConfigured {.intdefine: "vortexConnBlock".} = connBlockDefault
+static: doAssert connBlockConfigured >= 1, "-d:vortexConnBlock must be >= 1"
 
 proc `=copy`*(dst: var ConnTable, src: ConnTable) {.error:
   "a ConnTable is loop-owned and must never be copied: copying it would " &
@@ -651,8 +660,21 @@ proc unpackResponseInto*(data: string, contentType: var string,
     headers[i][1].setSlice(data, pos, vl); pos += vl
   result = pos
 
+var pinThreadId {.threadvar.}: int
+
+proc onOwnLoopThread(core: ptr LoopCore): bool {.inline.} =
+  ## Same cached-getThreadId pattern as request.currentThreadId (a syscall on
+  ## Linux; caching matters on per-chunk paths).
+  if pinThreadId == 0: pinThreadId = getThreadId()
+  pinThreadId == core.threadId
+
 proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
-  ## Resolve a (fd, gen) handle; nil if the connection is gone.
+  ## Resolve a (fd, gen) handle; nil if the connection is gone. Loop-thread
+  ## only: the table's block list reallocates on growth (see `ConnTable`), so
+  ## an off-thread read of it races a free. Every off-thread entry point checks
+  ## the thread or reads a snapshot before getting here; this is the backstop.
+  assert core.onOwnLoopThread(),
+    "conn() resolves the loop-owned connection table and is loop-thread only (#343)"
   if fd < 0 or int(fd) >= core.conns.len: return nil
   result = core.conns.at(int(fd))
   if result.gen != gen or result.state == csFree: return nil
@@ -700,14 +722,6 @@ func pinKindOf*(r: PinRelease): PinKind =
   of prFileChunk: pkFileChunk
   of prWsBlocking: pkWsBlocking
   of prNone: raiseAssert "prNone names no pin kind"
-
-var pinThreadId {.threadvar.}: int
-
-proc onOwnLoopThread(core: ptr LoopCore): bool {.inline.} =
-  ## Same cached-getThreadId pattern as request.currentThreadId (a syscall on
-  ## Linux; caching matters on per-chunk paths).
-  if pinThreadId == 0: pinThreadId = getThreadId()
-  pinThreadId == core.threadId
 
 proc acquirePin*(core: ptr LoopCore, c: ptr Connection, k: PinKind) {.inline.} =
   ## Pin `c` for one worker task of kind `k`. Loop thread only, by API

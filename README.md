@@ -958,8 +958,11 @@ for byte.
 
 `id`, `event` and a comment's text are single-line field values, so CR, LF and
 NUL are stripped from each before it goes on the wire: none of the three can be
-escaped, and a client that finds a NUL in an `id` ignores that field outright
-instead of resuming from it. An `id` left empty by that stripping (`"\r\n"`,
+escaped there, and a client that finds a NUL in an `id` ignores that field
+outright instead of resuming from it. That means an `id` does not round-trip
+byte for byte (`"abc\0def"` comes back as `req.lastEventId == "abcdef"`), so
+encode it the same way as `data` when it must. `data` itself is not stripped
+of NUL: a client appends it to the payload. An `id` left empty by that stripping (`"\r\n"`,
 `"\0"`) emits no `id:` field at all, because an empty `id:` means "reset
 `Last-Event-ID`" to a client and the caller asked for no such thing. Since the
 default `id = ""` already means "no `id` field", an explicit reset is not

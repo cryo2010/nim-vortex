@@ -347,8 +347,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and pinned the fd, the connection slot and the parked chunks until the process
   exited: zero traffic, no timeout. The sweep now arms the same deadline from the
   same predicate (one O(1) counter read per connection per second), so the stall
-  is bounded whichever path parked the bytes, and the close still sends
-  GOAWAY(NO_ERROR) first so the client can tell it from a network fault. A client
+  is bounded whichever path parked the bytes, and the close sends
+  GOAWAY(NO_ERROR) first so the client can tell it from a network fault (unless
+  the deadline lands while a file-chunk read is in flight, when the deferred
+  close is a bare FIN). A client
   that keeps returning credit re-arms the deadline on every pass and is never cut
   off. Covered by tests/test_http2_backpressure.nim for a buffered response and
   for a streamed `sendFile`. (#236)
