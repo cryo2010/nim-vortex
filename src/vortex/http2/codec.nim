@@ -470,8 +470,11 @@ const
 
 proc noteControlFrame(h2: H2Conn, c: ptr Connection, n = 1) =
   ## Budget control/overhead frames (PING incl. ACK, SETTINGS per entry,
-  ## WINDOW_UPDATE / PRIORITY / GOAWAY / unknown types, and every RST_STREAM we
-  ## emit in reply to a flood). `n` charges an amplifying frame per unit of work
+  ## WINDOW_UPDATE / PRIORITY / GOAWAY / unknown types). The charge lands
+  ## before the reply a frame forces, so an RST_STREAM we emit in answer is
+  ## paid for by the frame that caused it, not charged a second time (the one
+  ## exception is the CONTINUATION refusal, which charges its own reply). `n`
+  ## charges an amplifying frame per unit of work
   ## it forces (e.g. SETTINGS charges per entry). A real request only *decays*
   ## the counter (noteControlProgress), so a genuine few-frames-per-request ratio
   ## never trips while a flood with negligible real progress does.

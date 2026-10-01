@@ -1,7 +1,7 @@
 ## Frame-level regression suite for the HTTP/2 control-frame budget (#234).
 ##
 ## `maxControlFrames` is the cap on overhead frames a peer may push through a
-## connection per unit of real work. The audit of #234 found eight ways to
+## connection per unit of real work. The audit of #234 found ten ways to
 ## generate unbounded server work around it: PING ACKs and SETTINGS ACKs that
 ## returned before the charge, a received GOAWAY, unknown frame types, stream
 ## and connection WINDOW_UPDATEs, a self-dependent PRIORITY whose RST_STREAM
