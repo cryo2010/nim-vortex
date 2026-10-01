@@ -101,7 +101,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 
 | Test | Verifies |
 |------|----------|
-| `test_http3.nim` | HTTP/3 integration over QUIC (via an HTTP/3-capable curl; skips if absent) |
+| `test_http3.nim` | HTTP/3 integration over QUIC (via an HTTP/3-capable curl; skips if absent), including a streaming route's declared `content-length` against the body received |
 
 ### WebSockets
 

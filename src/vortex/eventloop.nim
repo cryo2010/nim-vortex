@@ -1677,6 +1677,20 @@ when not defined(plainHttp):
       if slot < loop.core.h3slots.len and
           loop.core.h3slots[slot].gen == gen and
           loop.core.h3slots[slot].conn != nil:
+        # The entry was queued while the engine parsed the request head; the rest
+        # of that read batch may have invalidated it. A stream the backend reset
+        # and removed (an oversize pre-accept WebSocket handshake) is gone from
+        # the table, and one reset for a content-length mismatch stays in the
+        # table only so its flow-control credit can be returned, flagged
+        # rejected. Either way the request was already refused on the wire, so
+        # running the handler now would give a rejected request its side effects
+        # (the h2 twin returns before adding the stream to its ready list, in
+        # finishHeaders). Mirrors the h3StreamAlive check the post-accept
+        # WebSocket pump below makes (#237).
+        let ready = h3ConnOf(addr loop.core, h3SlotFd(slot), gen)
+        if ready == nil or not h3StreamAlive(ready, sid) or
+            h3StreamRejected(ready, sid):
+          continue
         let req = Request(core: addr loop.core, fd: h3SlotFd(slot),
                           gen: gen, stream: uint32(sid))
         try:

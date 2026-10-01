@@ -313,8 +313,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already desynchronized that h1 connection (request smuggling) by the time
   the mismatch was noticed. Both now fail the stream with PROTOCOL_ERROR
   (RFC 9113 8.1.1) before anything reaches the handler, and the h3 backend
-  takes the same early check (RFC 9114 4.1.2). Buffered routes are unchanged:
-  they never see a partial body. (#237)
+  takes the same early check (RFC 9114 4.1.2). On h3 the reset by itself was
+  not enough. A streaming route is queued for dispatch while its HEADERS are
+  parsed and the handler runs only once the whole engine pump is done, and both
+  reconciliation sites deliberately leave the rejected stream in the table so
+  its flow-control credit can be returned when it closes, so a request whose
+  head, body and FIN were parsed in one read batch (out-of-order delivery
+  flushes a buffered DATA frame together with the HEADERS that precede it) was
+  still handed to the handler afterwards, with all of its side effects. The
+  ready-list consumer now skips a stream the backend rejected or has already
+  dropped, which is what h2 gets from reconciling before it enqueues, and a
+  rejected stream also stops accumulating body bytes it will never deliver.
+  Buffered routes are unchanged: they never see a partial body. (#237)
 - h2, h3: a `content-length` field in a request *trailer* section is now
   rejected (stream PROTOCOL_ERROR / H3_MESSAGE_ERROR) instead of being stored
   in `req.trailers`. The rest of the trailer-field validation was already in
