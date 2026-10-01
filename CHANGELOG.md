@@ -90,6 +90,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/2 stream-level error scope and racing-frame tolerance (#239), the HTTP/2
   conformance follow-ups (#240), and the HTTP/1 streaming read-ahead bound for
   async `req.read()` consumers (#271).
+- TLS: an in-memory certificate chain (`certPem`, and the same bytes on the
+  HTTP/3 side) that does not parse in full is now rejected instead of loaded
+  up to the point of damage. `PEM_read_bio_X509` returns nil for every failure,
+  not only end-of-data, so a mangled or truncated block after the leaf left a
+  silently leaf-only chain: the server started, `reloadTls` returned true, and
+  clients without the intermediate cached failed the handshake with "unable to
+  get local issuer certificate". The loaders now read the OpenSSL error queue
+  and accept the stop only on PEM's benign "no start line", exactly as
+  OpenSSL's own `SSL_CTX_use_certificate_chain_file` does. (#367)
+- TLS: a `clientCaPem` bundle must now parse in full. The loader treated any
+  read failure as clean end-of-data and reported success whenever at least one
+  CA had loaded, so a bundle truncated or corrupted part-way through (a
+  ConfigMap or Vault render, a non-atomic `curl` fetch) silently installed a
+  partial trust store: the server started healthy and every client issued by a
+  CA after the damage was rejected at handshake time with an unable-to-get-issuer
+  alert, with no startup failure to correlate against. A trust-anchor set is now
+  accepted only when the whole bundle was consumed cleanly and held at least one
+  CA. (#368)
+- TLS: `verifyClient` other than `None` with neither `clientCaFile` nor
+  `clientCaPem` is now rejected at startup instead of arming client-certificate
+  verification against an empty trust store (OpenSSL 3 does not populate a new
+  context's store, and the system trust store is never loaded). Under `Require`
+  that rejected every connection with "unable to get local issuer certificate";
+  under `Optional` clients that sent no certificate still connected, so the
+  deployment looked healthy while client-cert auth was non-functional and
+  `clientCertSubject` was always "". `validateConfig` names the missing setting,
+  and the context build refuses it too, so direct `TlsConfig` users and rebuilds
+  fail closed as well. (#369)
+- TLS: an ALPN offer that overlaps nothing the server supports now gets the
+  fatal `no_application_protocol` alert RFC 7301 3.2 requires, instead of
+  completing the handshake with no ALPN extension. The callback returned
+  `SSL_TLSEXT_ERR_NOACK`, which OpenSSL implements as "behave as if no callback
+  were set", so an HTTP/3-only or legacy client that reached the TCP port got a
+  successful handshake, was framed as HTTP/1, and answered 400 or hung until the
+  idle timeout. The QUIC shim already alerted; the two paths now agree. A client
+  that sends no ALPN extension at all is unaffected (OpenSSL does not invoke the
+  callback for it) and still gets HTTP/1.1. (#370)
+- TLS: `reloadTls(keyFile = ...)` against a server whose certificate came from
+  a PKCS#12 bundle now returns false instead of reporting a rotation that never
+  happened. The `keyFile` branch did not clear `pkcs12`/`pkcs12File` the way the
+  `certFile` branch does, and `loadCertKey` gives a bundle unconditional
+  precedence, so the context was rebuilt from the old bundle, the cert/key
+  consistency check passed (they match each other), and an operator rotating a
+  disclosed key got positive confirmation while the server kept presenting it. A
+  lone key cannot apply to a bundle that carries both halves, so the call is
+  rejected outright, and the ignored path is no longer recorded in the stored
+  material (which used to let a later cert-only reload pair a new certificate
+  with it). Rotate both halves together. (#363)
+- TLS: every context is now built with `SSL_OP_NO_RENEGOTIATION`, so
+  renegotiation is refused as this server's own policy rather than inherited
+  from a library default. A renegotiation is a full ECDHE key agreement plus a
+  server signature run inline on the loop thread for a few hundred bytes of
+  client effort, unmetered (the CVE-2011-1473 shape). OpenSSL 3.0 already
+  refuses client-initiated renegotiation unless
+  `SSL_OP_ALLOW_CLIENT_RENEGOTIATION` is set, but that default can be flipped by
+  a system `openssl.cnf` and does not exist in a pre-3.0 libssl, which the
+  Linux dynlib pattern can still resolve. TLS 1.3 has no renegotiation and is
+  unaffected. (#376)
+- TLS: `reloadTls` is now serialised by a lock, so two threads reloading at
+  once (a SIGHUP loop plus an admin endpoint, say) can no longer interleave the
+  bookkeeping that retires the displaced `SSL_CTX`. Both could claim the same
+  retire slot, which either freed one context twice (memory corruption) or
+  dropped the other thread's entry and leaked it. The documented contract
+  ("call from an ordinary thread") always implied concurrent calls were fine;
+  now they are. (#360)
+- TLS: a certificate hot-reload now releases the displaced `SSL_CTX` right
+  away and `newTlsSession` holds a reference to the context it hands to
+  `SSL_new`, replacing the four-slot retire ring and its 5 s grace window. The
+  ring had to evict, and free, a context once a fifth reload arrived inside the
+  window, which by construction is the moment every retained context was still
+  within its grace period: a renewal hook or config-file watcher firing a few
+  times in a few seconds could free a context a loop thread had loaded but not
+  yet up-ref'd, along with the OCSP staple attached to it. A reference per
+  session makes a displaced context live exactly as long as the last connection
+  using it, so both the slot cap and the window are gone. (#364)
+- HTTP/3: a connection error from nghttp3 is now terminal for nghttp3 before
+  control returns to ngtcp2. The QUIC shim deleted nothing and reported success
+  when `nghttp3_conn_read_stream` failed, so ngtcp2 kept decoding the rest of
+  the datagram and every remaining STREAM frame, stream close, ack and window
+  update re-entered a connection the library documents as usable only for
+  `nghttp3_conn_del`: one hostile datagram (a malformed frame sequence on one
+  stream, any bytes on a second) could crash the loop thread and every
+  connection on it. The poisoned connection is now freed on the spot, the
+  callback fails so ngtcp2 abandons the datagram, and the CONNECTION_CLOSE
+  still carries the HTTP/3 error code. (#362)
+- HTTP/3: `tlsCipherSuites` now applies to QUIC. The engine hardcoded TLS 1.3
+  and never called `SSL_CTX_set_ciphersuites`, so a suite restriction held on
+  HTTP/1.1 and HTTP/2 and was silently ignored on every HTTP/3 connection,
+  which negotiated whatever OpenSSL's defaults allowed. `tlsCipherList` stays
+  TCP-only by definition (no QUIC handshake is TLS 1.2), and `minTlsVersion` is
+  clamped up to TLS 1.3 for QUIC as before. `maxTlsVersion = TlsVersion.V12`
+  together with `http3 = true` is now rejected at startup, naming
+  `http3 = false` as the fix, instead of applying the ceiling on TCP and
+  ignoring it on HTTP/3. (#359)
+- HTTP/3: `verifyClient` (mTLS) is now enforced on QUIC. The engine never
+  called `SSL_CTX_set_verify`, so a server that required client certificates
+  advertised `h3` via Alt-Svc and then completed the QUIC handshake with a
+  client that presented none: the mTLS requirement held on TCP and was absent
+  on HTTP/3. The client CA (`clientCaFile` / `clientCaPem`) is loaded the same
+  way as on the TCP path, and an in-memory bundle that is truncated or damaged
+  fails the configuration instead of installing a partial trust store.
+  `req.clientCertSubject` now also reports the client certificate over h3
+  (it was always ""), and the QUIC connection teardown clears the SSL's app
+  data before `SSL_free` as ngtcp2's OpenSSL backend requires, which a
+  handshake rejected for a missing client certificate would otherwise turn into
+  a use-after-free. (#351)
+- HTTP/3: `sni` (per-hostname certificates) is now served over QUIC. The engine
+  had one `SSL_CTX` and one certificate per loop and no servername callback at
+  all, so a browser that followed the server's own Alt-Svc advertisement for an
+  SNI host was handed the *default* certificate and aborted with a name
+  mismatch, while the identical request over TCP got the right certificate. Each
+  host now gets its own QUIC context, built through the same path as the default
+  one (so it inherits the verify mode, cipher suites and TLS 1.3 pinning), and
+  the servername callback switches to it: an exact host wins over a wildcard,
+  matched case-insensitively. A certificate reload rebuilds the per-host
+  contexts from their own material, and they are freed with the engine. (#374)
+- TLS: a handshake that blocked on a full socket send buffer (`WANT_WRITE`) and
+  then went back to waiting for the peer now drops write interest. The
+  handshake driver's `WANT_READ` arm left it armed, and since the selector is
+  level-triggered and every event on a handshaking connection re-enters the
+  driver, a writable socket re-entered `SSL_do_handshake` on every selector
+  pass: a client that stalls its handshake there pinned a loop thread at 100%
+  CPU (0.98 s of CPU per second, measured) for the whole `headerTimeout`
+  window, starving every other connection on that thread. (#365)
+- TLS: the `SSL_write` `WANT_READ` arm of the response flush now drops write
+  interest and notifies the producers parked on the write buffer. It returned
+  with write interest still armed from the preceding `WANT_WRITE`, so a
+  writable socket re-entered the flush on every selector pass (the same
+  level-triggered spin as the handshake case above), and it skipped the
+  WebSocket backpressure signal and the HTTP/2 buffer-drain resume that both
+  neighbouring stall arms perform. The write-stall deadline
+  (`writeTimeout`) is kept, since such a flush is stalled rather than
+  finished. (#371)
+- TLS: an `SSL_read` that returns `WANT_WRITE` is now retried from the write
+  event. OpenSSL's contract is that the same call is repeated once the socket
+  is writable, because the bytes it must emit first (a TLS 1.3 KeyUpdate
+  answer, a renegotiation flight, an alert) live in the SSL object's own write
+  buffer, not in the connection's. The loop instead ran the response flush,
+  which found nothing pending, dropped write interest and never touched the
+  SSL object, so the record was stranded until the connection timed out. The
+  flush also no longer drops the write interest that such a retry depends
+  on. (#372)
+- TLS: decrypted plaintext left inside OpenSSL is no longer stranded. The
+  receive loop's early exits (a streaming body parked at the read-ahead
+  high-water, a `blocking:` worker that forbids growing the receive buffer)
+  assumed the bytes not taken were still in the kernel, waiting as TCP
+  backpressure for the next readable event. Under TLS a read with a small
+  `wanted` returns that much and keeps the rest of the record decrypted inside
+  OpenSSL with the socket already drained, and a level-triggered fd never
+  reports readable for those bytes again: an HTTPS upload to an
+  `await req.read()` handler could stall until `bodyTimeout`, and a pipelined
+  HTTPS request behind a worker was never answered. Such connections are now
+  queued and re-driven by the loop (re-checked when the body ack or the worker
+  unpin lifts the block), and the selector does not wait while any are
+  queued. (#366)
+- TLS: a connection that asked for a lingering close now gets one. It was
+  exempted on the grounds that "TLS has its own close_notify", but close_notify
+  is a TLS-layer record and does nothing to stop the kernel sending RST instead
+  of FIN when `close()` runs with unread data still in the receive queue, and
+  that RST discards the whole send queue: the error response the client had not
+  read yet, and the close_notify with it (the truncated upstream response a
+  reverse proxy reports). HTTPS now takes the same sequence as plaintext,
+  close_notify then `shutdown(SHUT_WR)` then drain to the peer's FIN or the
+  drain deadline, and the session is shut down and freed exactly once. (#373)
 
 ### Changed
 

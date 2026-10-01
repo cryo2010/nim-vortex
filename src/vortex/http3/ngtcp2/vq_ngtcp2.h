@@ -90,6 +90,22 @@ typedef struct {
 } VqCallbacks;
 
 /* ---- engine config -------------------------------------------------------- */
+
+/* One per-hostname certificate for SNI (#374). The material comes from the same
+ * sources, with the same precedence, as the default cert/key fields of VqConfig:
+ * a PKCS#12 bundle wins, then in-memory PEM, then PEM files. */
+typedef struct {
+  const char *host;           /* exact host, or "*.example.com" (one label) */
+  const char *cert_file;
+  const char *key_file;
+  const char *cert_pem;
+  const char *key_pem;
+  const char *key_password;
+  const char *pkcs12_file;
+  const uint8_t *pkcs12;
+  size_t pkcs12_len;
+} VqSniCert;
+
 typedef struct {
   void *user;                 /* engine context (loop core) passed to callbacks */
   VqCallbacks cb;
@@ -114,13 +130,42 @@ typedef struct {
    * window); conn_recv_window is initial_max_data (connection aggregate). */
   uint64_t stream_recv_window;
   uint64_t conn_recv_window;
+  /* TLS policy mirrored from the TCP listener, so an operator's configuration is
+   * in force on QUIC too (#359). tls_cipher_suites is the TLS 1.3 suite list
+   * (SSL_CTX_set_ciphersuites format); NULL/empty keeps OpenSSL's default.
+   * max_tls_version is an OpenSSL version constant (0 = no cap): below TLS 1.3
+   * it makes vq_engine_new fail rather than negotiate outside the policy, since
+   * QUIC mandates TLS 1.3 (RFC 9001 4.2). The configured *minimum* needs no
+   * field: that same mandate clamps it up to TLS 1.3 unconditionally. Nor does
+   * the TLS <= 1.2 cipher *list*, which can never apply to a QUIC handshake. */
+  const char *tls_cipher_suites;
+  int max_tls_version;
+  /* Client-certificate verification (mTLS), mirrored from the TCP listener so a
+   * verifyClient policy is not bypassable by taking the Alt-Svc h3 upgrade
+   * (#351). verify_client is the OpenSSL SSL_VERIFY_* bitmask (0 = off, 1 =
+   * PEER, 3 = PEER | FAIL_IF_NO_PEER_CERT). The client CA comes from
+   * client_ca_pem (in-memory PEM, preferred) or client_ca_file, matching the
+   * TCP path's precedence; neither is required, in which case OpenSSL's default
+   * trust store applies. */
+  int verify_client;
+  const char *client_ca_file;
+  const char *client_ca_pem;
+  /* Per-host certificates selected by SNI (#374): sni_len entries, each getting
+   * its own SSL_CTX built like the default one (so the verify mode, cipher
+   * suites and version pinning above apply to them too). Borrowed for the
+   * vq_engine_new call only; the shim copies what it keeps. */
+  const VqSniCert *sni;
+  size_t sni_len;
 } VqConfig;
 
 /* Create/destroy the per-loop engine. Returns NULL on failure (bad cert etc.).*/
 VqEngine *vq_engine_new(const VqConfig *cfg);
 void      vq_engine_free(VqEngine *e);
 
-/* Swap the TLS certificate/key in place (hot reload; PEM blobs). 0 on success. */
+/* Swap the TLS certificate/key in place (hot reload; PEM blobs). 0 on success.
+ * Any per-host (SNI) contexts are rebuilt from the material they were
+ * configured with, so a rotation of on-disk per-host certificates is picked up
+ * with the default one; a failure there leaves every context as it was. */
 int vq_engine_reload_cert(VqEngine *e, const char *cert_pem, const char *key_pem);
 
 /* Feed one received datagram. peer/local are sockaddr pointers (the shim copies
@@ -184,6 +229,12 @@ void vq_conn_close_graceful(VqConn *conn, uint64_t app_error);
 /* Peer IP (numeric, no port) of a connection; empty string if unavailable.
  * Returned pointer is owned by the shim and valid until the conn closes. */
 const char *vq_conn_peer_ip(VqConn *conn);
+
+/* The connection's OpenSSL SSL object (as void*, so this header stays plain C
+ * with no openssl dependency for the Nim importer), or NULL if there is none.
+ * Owned by the shim and valid until on_conn_close fires. vortex reads the peer
+ * (client) certificate through it for req.clientCertSubject over h3 (#351). */
+void *vq_conn_ssl(VqConn *conn);
 
 #ifdef __cplusplus
 }

@@ -216,6 +216,15 @@ type
                               ## that stalls the write is closed (writeTimeout)
                               ## without clobbering the request/idle deadline.
     writeArmed*: bool         ## selector currently watching writability
+    sslReadWantsWrite*: bool  ## TLS: the last SSL_read returned WANT_WRITE, so
+                              ## OpenSSL owes the *same* call a retry once the
+                              ## socket is writable (the bytes it must emit --
+                              ## a TLS 1.3 KeyUpdate answer, a renegotiation
+                              ## flight, an alert -- live in the SSL object's
+                              ## write buffer, not in wbuf, so flushOut cannot
+                              ## push them). The loop keeps write interest armed
+                              ## and routes the write event into handleRead
+                              ## while this is set (#372). Loop thread only.
     registered*: bool         ## fd registered with the selector
     pins*: PinSet
                               ## outstanding worker tasks by pin kind; the slot
@@ -250,6 +259,9 @@ type
     awaitingResponse*: bool   ## handler deferred; parsing is paused
     closeAfterFlush*: bool
     lingerClose*: bool        ## drain peer before close (reliable error delivery)
+    tlsCloseNotified*: bool   ## TLS close_notify already handed to OpenSSL by the
+                              ## lingering close, so closeConn must not run a
+                              ## second SSL_shutdown over a half-closed socket
     peerHalfClosed*: bool     ## peer sent FIN (half-close): no more requests,
                               ## but a buffered one still gets its response
     # HTTP/1-only streaming state; the shared flags/callbacks live in `rs`.
@@ -260,6 +272,14 @@ type
                               ## onBody but not yet ackBody'd. Bounds read-ahead
                               ## so an async pull-reader (await req.read) can't
                               ## buffer the whole upload faster than it hashes.
+    sslPending*: bool         ## TLS: OpenSSL still holds decrypted plaintext that
+                              ## the recv loop stopped consuming (it broke at the
+                              ## read-ahead high-water, or under a pinned worker
+                              ## that forbids growing rbuf). The socket itself is
+                              ## drained, so a level-triggered fd never reports
+                              ## readable for those bytes again: the loop owes
+                              ## this connection another read once the block
+                              ## clears (see eventloop sslReady, #366).
     bodyReadPaused*: bool     ## reads paused: bodyUnacked hit the high-water, so
                               ## the socket recv loop stops pulling (kernel holds
                               ## the rest as TCP backpressure) until ackBody drains
@@ -766,6 +786,8 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.deadline = 0
   c.dlKind = dkNone
   c.writeArmed = false
+  c.sslReadWantsWrite = false
+  c.sslPending = false
   # A recycled slot must never inherit pin residue (R4): leftover counts would
   # make totalPins/inputPausePins lie for the next occupant -- input running
   # under a live worker (UAF) or a permanently-paused fresh connection. A
@@ -777,6 +799,7 @@ proc clear*(c: var Connection, initialBufSize: int) =
   c.closeRequested = false
   c.closeAfterFlush = false
   c.lingerClose = false
+  c.tlsCloseNotified = false
   c.peerHalfClosed = false
   c.requestCount = 0
   c.resetRequestState()

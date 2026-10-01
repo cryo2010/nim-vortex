@@ -12,6 +12,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/pemerr.h>
 #include <openssl/pkcs12.h>
 
 #include <arpa/inet.h>
@@ -134,14 +135,44 @@ struct Conn {
     if (h3) nghttp3_conn_del(h3);
     if (conn) ngtcp2_conn_del(conn);
     if (ossl) ngtcp2_crypto_ossl_ctx_del(ossl);
-    if (ssl) SSL_free(ssl);
+    if (ssl) {
+      // ngtcp2's ossl backend requires the SSL's app data to be cleared before
+      // SSL_free whenever the ngtcp2_conn does not outlive the SSL (which it
+      // does not here: it is deleted two lines up). SSL_free can still invoke
+      // the QUIC record-layer callbacks -- release_rcd for crypto data OpenSSL
+      // never consumed, which is exactly what a handshake rejected for a
+      // missing client certificate leaves behind -- and those resolve the
+      // conn_ref in app data to reach the ngtcp2_conn and its ossl ctx. With a
+      // stale conn_ref that is a use-after-free (it aborted in
+      // crypto_ossl_ctx_release_crypto_data); nulling it makes the callbacks
+      // return without touching anything, as the backend documents.
+      SSL_set_app_data(ssl, nullptr);
+      SSL_free(ssl);
+    }
   }
+};
+
+// An owned copy of one certificate's material. The caller's VqConfig /
+// VqSniCert strings are borrowed for the vq_engine_new call only, and a per-host
+// context must stay rebuildable on a certificate reload, so the engine keeps its
+// own copies. Same sources and precedence as VqConfig's default cert fields.
+struct Material {
+  std::string host;   // "" for the default certificate
+  std::string cert_file, key_file, cert_pem, key_pem, key_password, pkcs12_file;
+  std::string pkcs12;  // PKCS#12 DER bytes
 };
 
 struct Engine {
   VqConfig cfg{};
   SslCtxPtr ssl_ctx;                   // RAII: freed when the Engine is deleted
   std::string key_pw;   // owns the passphrase (cfg.key_password char* may dangle)
+  std::string cipher_suites;  // ditto for the TLS 1.3 suite list (#359)
+  std::string client_ca_file, client_ca_pem;   // ... and the mTLS CA (#351)
+  // Per-host certificates (SNI, #374): the material and the contexts built from
+  // it, parallel arrays. The contexts are freed with the Engine; a connection
+  // that already switched to one keeps it alive through its own reference.
+  std::vector<Material> sni;
+  std::vector<SslCtxPtr> sni_ctx;
   // Every CID that routes to a conn (our SCIDs + the client's original DCID).
   std::unordered_map<std::string, Conn *> byCid;
   std::vector<std::unique_ptr<Conn>> conns;
@@ -158,9 +189,25 @@ ngtcp2_conn *getConnFromRef(ngtcp2_crypto_conn_ref *ref) {
   return static_cast<Conn *>(ref->user_data)->conn;
 }
 
-// Schedule an HTTP/3/QPACK CONNECTION_CLOSE carrying the app error code inferred
-// from an nghttp3 error (so h3spec sees the right code); emitted by writeConn.
+// Terminal handling for a connection error reported by nghttp3: delete the
+// poisoned nghttp3_conn, then schedule an HTTP/3/QPACK CONNECTION_CLOSE carrying
+// the app error code inferred from the nghttp3 error (so h3spec sees the right
+// code); the close itself is emitted by writeConn.
+//
+// Deleting c->h3 here is what makes the failure terminal (#362). nghttp3
+// documents that once nghttp3_conn_read_stream or nghttp3_conn_writev_stream
+// return a negative code the connection is in error and "calling nghttp3 API
+// other than nghttp3_conn_del causes undefined behavior" -- yet the rest of the
+// datagram ngtcp2_conn_read_pkt is already parsing (further STREAM frames,
+// stream closes, acks, window updates) would keep calling into it, as would a
+// response submitted from the Nim side before the next pump reaps the conn.
+// Every nghttp3 call site is guarded by `if (c->h3)`, so a null h3 turns them
+// all into no-ops, and ~Conn skips the (already done) nghttp3_conn_del.
 void failConn(Conn *c, int nghttp3_rv) {
+  if (c->h3) {
+    nghttp3_conn_del(c->h3);
+    c->h3 = nullptr;
+  }
   if (c->wantClose || c->closed) return;
   ngtcp2_ccerr_set_application_error(
       &c->ccerr, nghttp3_err_infer_quic_app_error_code(nghttp3_rv), nullptr, 0);
@@ -376,6 +423,10 @@ int setupHttpConn(Conn *c) {
 
 int cbHandshakeCompleted(ngtcp2_conn *, void *user_data) {
   auto *c = static_cast<Conn *>(user_data);
+  // A connection whose nghttp3_conn failConn already deleted must never get a
+  // fresh one: a null h3 with a close scheduled means HTTP/3 is over for this
+  // connection (#362).
+  if (c->wantClose || c->closed) return 0;
   if (!c->h3 && setupHttpConn(c) != 0) return NGTCP2_ERR_CALLBACK_FAILURE;
   return 0;
 }
@@ -389,8 +440,11 @@ int cbStreamOpen(ngtcp2_conn *, int64_t stream_id, void *user_data) {
     s->id = stream_id;
     s->conn_ud = c->conn_ud;
     c->streams[stream_id] = std::move(s);
-    nghttp3_conn_set_stream_user_data(c->h3, stream_id,
-                                      c->streams[stream_id].get());
+    // h3 can be absent here: a stream may open before the handshake completes,
+    // or after failConn deleted the nghttp3_conn (#362).
+    if (c->h3)
+      nghttp3_conn_set_stream_user_data(c->h3, stream_id,
+                                        c->streams[stream_id].get());
   }
   return 0;
 }
@@ -406,9 +460,14 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   if (n < 0) {
     // nghttp3 detected an HTTP/3/QPACK protocol error: close the connection
     // with the corresponding application error code (RFC 9114/9204), not a
-    // generic transport failure.
+    // generic transport failure. failConn deletes the now-poisoned
+    // nghttp3_conn, and returning CALLBACK_FAILURE (instead of 0) makes
+    // ngtcp2_conn_read_pkt abandon the remaining frames of this packet and the
+    // packets coalesced behind it, rather than driving more callbacks from the
+    // same datagram (#362). vq_engine_recv turns that error into the terminal
+    // CONNECTION_CLOSE, keeping the h3 ccerr failConn just set.
     failConn(c, static_cast<int>(n));
-    return 0;
+    return NGTCP2_ERR_CALLBACK_FAILURE;
   }
   // nghttp3 tells us via deferred_consume how much QPACK-blocked data it kept;
   // the bytes it did consume are extended here.
@@ -596,6 +655,23 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
 
 // --- egress -----------------------------------------------------------------
 
+// Emit the pending CONNECTION_CLOSE(ccerr) and mark the conn for reaping: the
+// terminal packet ngtcp2 documents for every error path other than DRAINING,
+// DROP_CONN and an idle close.
+void sendConnClose(Conn *c, uint64_t now_ns) {
+  uint8_t buf[kMaxUdpPayload];
+  ngtcp2_path_storage ps;
+  ngtcp2_path_storage_zero(&ps);
+  ngtcp2_pkt_info pi{};
+  ngtcp2_ssize nw = ngtcp2_conn_write_connection_close(
+      c->conn, &ps.path, &pi, buf, sizeof buf, &c->ccerr, now_ns);
+  auto &send = c->engine->cfg.cb.on_send;
+  if (nw > 0 && send)
+    send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
+         static_cast<size_t>(nw), ps.path.remote.addr, ps.path.remote.addrlen);
+  c->closed = true;
+}
+
 void writeConn(Conn *c, uint64_t now_ns) {
   if (!c->conn || c->closed) return;
   uint8_t buf[kMaxUdpPayload];
@@ -607,12 +683,7 @@ void writeConn(Conn *c, uint64_t now_ns) {
   // A pending HTTP/3/QPACK error: emit one CONNECTION_CLOSE with the app error
   // code, then reap the connection.
   if (c->wantClose) {
-    ngtcp2_ssize nw = ngtcp2_conn_write_connection_close(
-        c->conn, &ps.path, &pi, buf, sizeof buf, &c->ccerr, now_ns);
-    if (nw > 0 && send)
-      send(c->engine->cfg.user, reinterpret_cast<VqConn *>(c), buf,
-           static_cast<size_t>(nw), ps.path.remote.addr, ps.path.remote.addrlen);
-    c->closed = true;
+    sendConnClose(c, now_ns);
     return;
   }
 
@@ -623,7 +694,17 @@ void writeConn(Conn *c, uint64_t now_ns) {
     nghttp3_ssize vcnt = 0;
     if (c->h3 && ngtcp2_conn_get_max_data_left(c->conn)) {
       vcnt = nghttp3_conn_writev_stream(c->h3, &sid, &fin, vec, 16);
-      if (vcnt < 0) { c->closed = true; return; }
+      if (vcnt < 0) {
+        // Same nghttp3 contract as the read path: the connection is in error
+        // and only nghttp3_conn_del may still be called. Dropping the Conn
+        // silently (the old behaviour) left c->h3 alive and reachable from
+        // vq_stream_write / vq_submit_response until the next pump reaped it
+        // (#362). failConn deletes it and sets the h3 error code; emit the
+        // terminal CONNECTION_CLOSE instead of going silent (R15).
+        failConn(c, static_cast<int>(vcnt));
+        sendConnClose(c, now_ns);
+        return;
+      }
     }
     ngtcp2_ssize ndatalen = 0;
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
@@ -720,14 +801,29 @@ static bool loadKey(SSL_CTX *ctx, const char *pem, const char *file,
 }
 
 // Load the leaf cert (+ any following chain certs) into `ctx` from a PEM blob.
+// A chain that does not parse in full is rejected: PEM_read_bio_X509 returns
+// null for every failure, not only end-of-data, so the error queue is what
+// distinguishes a clean EOF (PEM's benign "no start line") from a mangled or
+// truncated block. Clearing it unconditionally would install a silently
+// truncated, leaf-only chain. Mirrors OpenSSL's own
+// SSL_CTX_use_certificate_chain_file and the TCP path's loadCertChainMem.
 static bool loadCertChain(SSL_CTX *ctx, const char *pem) {
   BioPtr b(BIO_new_mem_buf(pem, -1));
   if (!b) return false;
+  ERR_clear_error();   // so the peek below sees only our own errors
   X509Ptr leaf(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
   bool ok = leaf && SSL_CTX_use_certificate(ctx, leaf.get()) == 1;
   while (ok) {
     X509Ptr x(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
-    if (!x) { ERR_clear_error(); break; }   // expected: end of PEM data
+    if (!x) {
+      const unsigned long e = ERR_peek_last_error();
+      if (ERR_GET_LIB(e) == ERR_LIB_PEM &&
+          ERR_GET_REASON(e) == PEM_R_NO_START_LINE)
+        ERR_clear_error();               // end of PEM data
+      else
+        ok = false;                      // a real parse error: reject
+      break;
+    }
     // add0 takes ownership on success, so release; on failure the unique_ptr frees.
     if (SSL_CTX_add0_chain_cert(ctx, x.get()) != 1) ok = false;
     else (void)x.release();
@@ -769,11 +865,71 @@ static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
   return ok;
 }
 
+// Add PEM CA certificate(s) from memory to the ctx's trust store: the anchors
+// for client-certificate verification. Mirrors the TCP path's loadCaMem,
+// including its error-queue discipline (#368): a null from PEM_read_bio_X509 is
+// clean end of data only when the queue's last reason is PEM_R_NO_START_LINE.
+// Any other reason (a truncated or damaged bundle) must fail the configuration
+// rather than install a partial trust store, which would reject every client
+// issued by a CA past the damage with nothing logged.
+static bool loadCaMem(SSL_CTX *ctx, const char *pem) {
+  X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+  if (!store || !pem || !pem[0]) return false;
+  BioPtr b(BIO_new_mem_buf(pem, -1));
+  if (!b) return false;
+  int added = 0;
+  for (;;) {
+    X509Ptr x(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
+    if (!x) {
+      const bool eof =
+          ERR_GET_REASON(ERR_peek_last_error()) == PEM_R_NO_START_LINE;
+      ERR_clear_error();
+      if (!eof) return false;
+      break;
+    }
+    if (X509_STORE_add_cert(store, x.get()) != 1) return false;  // up-refs x
+    ++added;
+  }
+  return added > 0;
+}
+
+// Configure mTLS: load the client-cert CA (if any) and set the verify mode.
+// Same shape and precedence as the TCP path's applyClientVerify, so a
+// verifyClient policy means the same thing on QUIC (#351).
+static bool applyClientVerify(SSL_CTX *ctx, const VqConfig *cfg) {
+  if (cfg->verify_client == 0) return true;   // SSL_VERIFY_NONE
+  if (cfg->client_ca_pem && cfg->client_ca_pem[0]) {
+    if (!loadCaMem(ctx, cfg->client_ca_pem)) return false;
+  } else if (cfg->client_ca_file && cfg->client_ca_file[0]) {
+    if (SSL_CTX_load_verify_locations(ctx, cfg->client_ca_file, nullptr) != 1)
+      return false;
+  }
+  SSL_CTX_set_verify(ctx, cfg->verify_client, nullptr);  // null cb: default check
+  return true;
+}
+
 static SslCtxPtr makeCtx(const VqConfig *cfg) {
   SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
   if (!ctx) return nullptr;
+  // Protocol versions. QUIC mandates TLS 1.3 (RFC 9001 4.2), so both ends stay
+  // pinned there: that clamps a configured minTlsVersion of TLS 1.2 up instead
+  // of honoring it. A configured maxTlsVersion *below* 1.3 cannot be honored at
+  // all, so it is refused: returning nullptr fails vq_engine_new, which leaves
+  // h3 off and unadvertised rather than negotiating outside the operator's
+  // policy. That combination is also rejected at config time (#359); this is
+  // the fail-closed backstop.
+  if (cfg->max_tls_version != 0 && cfg->max_tls_version < TLS1_3_VERSION)
+    return nullptr;
   SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
   SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
+  // TLS 1.3 cipher suites: the operator's list, or OpenSSL's default when
+  // unset. The TLS <= 1.2 cipher list has no counterpart here (no QUIC
+  // connection ever negotiates TLS 1.2), so it is not applied.
+  if (cfg->tls_cipher_suites && cfg->tls_cipher_suites[0] &&
+      SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1) {
+    ERR_clear_error();
+    return nullptr;
+  }
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);
@@ -801,8 +957,119 @@ static SslCtxPtr makeCtx(const VqConfig *cfg) {
   // accepts, so h3 would be advertised via Alt-Svc yet every handshake would
   // fail. check_private_key returns 1 only when both are set and they match.
   if (ok) ok = SSL_CTX_check_private_key(ctx.get()) == 1;
+  // Client-certificate policy last, like the TCP path's buildTlsCtx. Fail
+  // closed: a verifyClient config whose CA material will not load must not
+  // yield an engine that accepts unauthenticated connections (#351).
+  if (ok) ok = applyClientVerify(ctx.get(), cfg);
   if (!ok) { ERR_clear_error(); return nullptr; }  // unique_ptr frees the ctx
   return ctx;
+}
+
+// --- SNI: one context per host, switched by the servername callback (#374) ---
+
+static Material materialOf(const VqSniCert *s) {
+  auto str = [](const char *p) { return std::string(p ? p : ""); };
+  Material m;
+  m.host = str(s->host);
+  m.cert_file = str(s->cert_file);
+  m.key_file = str(s->key_file);
+  m.cert_pem = str(s->cert_pem);
+  m.key_pem = str(s->key_pem);
+  m.key_password = str(s->key_password);
+  m.pkcs12_file = str(s->pkcs12_file);
+  if (s->pkcs12 && s->pkcs12_len)
+    m.pkcs12.assign(reinterpret_cast<const char *>(s->pkcs12), s->pkcs12_len);
+  return m;
+}
+
+// A VqConfig view over the engine's retained TLS policy plus `m`'s certificate
+// material: what makeCtx needs to build a per-host context, or rebuild one after
+// the caller's pointers are gone. Going through makeCtx is the point -- a host
+// context inherits the client verification, cipher suites and TLS 1.3 pinning of
+// the default one instead of drifting from it.
+static VqConfig ctxConfig(const Engine *e, const Material &m) {
+  VqConfig c = e->cfg;    // policy fields (its string pointers were cleared)
+  c.tls_cipher_suites = e->cipher_suites.c_str();
+  c.client_ca_file = e->client_ca_file.c_str();
+  c.client_ca_pem = e->client_ca_pem.c_str();
+  c.cert_file = m.cert_file.c_str();
+  c.key_file = m.key_file.c_str();
+  c.cert_pem = m.cert_pem.c_str();
+  c.key_pem = m.key_pem.c_str();
+  c.key_password = m.key_password.c_str();
+  c.pkcs12_file = m.pkcs12_file.c_str();
+  c.pkcs12 = m.pkcs12.empty()
+                 ? nullptr
+                 : reinterpret_cast<const uint8_t *>(m.pkcs12.data());
+  c.pkcs12_len = m.pkcs12.size();
+  c.sni = nullptr;
+  c.sni_len = 0;
+  return c;
+}
+
+// (Re)build every per-host context from the stored material. All or nothing: on
+// any failure the engine keeps the contexts it had, so a broken per-host
+// certificate cannot quietly drop that host back to the default certificate.
+static bool buildSniCtxs(Engine *e) {
+  std::vector<SslCtxPtr> built;
+  built.reserve(e->sni.size());
+  for (const auto &m : e->sni) {
+    VqConfig c = ctxConfig(e, m);
+    SslCtxPtr hc = makeCtx(&c);
+    if (!hc) return false;
+    built.push_back(std::move(hc));
+  }
+  e->sni_ctx = std::move(built);
+  return true;
+}
+
+static inline char lcAscii(char c) {
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+// Compare a NUL-terminated SNI name to a configured host, case-insensitively:
+// DNS names are case-insensitive and a client may send any casing. (The TCP
+// path's matching is byte-exact today, which is issue #358.)
+static bool hostEq(const char *name, const std::string &host) {
+  size_t i = 0;
+  for (; i < host.size(); i++)
+    if (name[i] == '\0' || lcAscii(name[i]) != lcAscii(host[i])) return false;
+  return name[i] == '\0';
+}
+
+// `*.example.com` matches exactly one leading label: foo.example.com yes,
+// example.com no, a.b.example.com no. Mirrors the TCP path's wildMatch.
+static bool hostWildMatch(const char *name, const std::string &pat) {
+  if (pat.size() < 3 || pat[0] != '*' || pat[1] != '.') return false;
+  size_t dot = 0;
+  while (name[dot] != '\0' && name[dot] != '.') ++dot;
+  if (dot == 0 || name[dot] != '.') return false;   // need a label then a dot
+  size_t i = dot, j = 1;                            // both include the dot
+  for (; j < pat.size(); ++i, ++j)
+    if (name[i] == '\0' || lcAscii(name[i]) != lcAscii(pat[j])) return false;
+  return name[i] == '\0';
+}
+
+// Switch the connection to the context whose host matches the requested server
+// name (an exact match wins over a wildcard); no match keeps the default
+// context. SSL_set_SSL_CTX replaces the certificate and the context-level
+// settings only: the QUIC record-layer callbacks and transport parameters
+// ngtcp2_crypto_ossl_configure_server_session installed live on the SSL, so
+// they survive the switch.
+static int servernameCb(SSL *ssl, int * /*al*/, void *arg) {
+  auto *e = static_cast<Engine *>(arg);
+  const char *name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+  if (name) {
+    size_t n = e->sni_ctx.size();
+    size_t idx = n;
+    for (size_t i = 0; i < n; i++)
+      if (hostEq(name, e->sni[i].host)) { idx = i; break; }
+    if (idx == n)
+      for (size_t i = 0; i < n; i++)
+        if (hostWildMatch(name, e->sni[i].host)) { idx = i; break; }
+    if (idx < n) SSL_set_SSL_CTX(ssl, e->sni_ctx[idx].get());
+  }
+  return SSL_TLSEXT_ERR_OK;
 }
 
 VqEngine *vq_engine_new(const VqConfig *cfg) {
@@ -816,8 +1083,28 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   e->cfg.pkcs12_file = nullptr;
   e->cfg.pkcs12 = nullptr;
   e->cfg.pkcs12_len = 0;
+  // Same for the TLS policy strings: makeCtx below reads the caller's copies.
+  e->cipher_suites = cfg->tls_cipher_suites ? cfg->tls_cipher_suites : "";
+  e->client_ca_file = cfg->client_ca_file ? cfg->client_ca_file : "";
+  e->client_ca_pem = cfg->client_ca_pem ? cfg->client_ca_pem : "";
+  e->cfg.tls_cipher_suites = nullptr;
+  e->cfg.client_ca_file = e->cfg.client_ca_pem = nullptr;
+  for (size_t i = 0; i < cfg->sni_len; i++)
+    e->sni.push_back(materialOf(&cfg->sni[i]));
+  e->cfg.sni = nullptr;
+  e->cfg.sni_len = 0;
   e->ssl_ctx = makeCtx(cfg);
   if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
+  // Per-host certificates: a context each, selected by the servername callback
+  // on the default context. Without this the QUIC side had one context and one
+  // certificate per engine, so a client asking for an SNI host over h3 was
+  // served the default certificate and aborted, while the same request over TCP
+  // got the right one (#374).
+  if (!e->sni.empty()) {
+    if (!buildSniCtxs(e.get())) return nullptr;
+    SSL_CTX_set_tlsext_servername_callback(e->ssl_ctx.get(), servernameCb);
+    SSL_CTX_set_tlsext_servername_arg(e->ssl_ctx.get(), e.get());
+  }
   return reinterpret_cast<VqEngine *>(e.release());
 }
 
@@ -838,6 +1125,12 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
   // same encryption passphrase. loadKey never prompts on an encrypted key.
   if (ok && key_pem && key_pem[0])
     ok = ok && loadKey(e->ssl_ctx.get(), key_pem, nullptr, e->key_pw.c_str());
+  // Rebuild the per-host contexts from the material they were configured with,
+  // so a rotation that replaced the per-host certificate files on disk takes
+  // effect with the default certificate instead of leaving those hosts on the
+  // old material (#374). buildSniCtxs is all-or-nothing, and a failure here
+  // fails the reload with every context left as it was.
+  if (ok && !e->sni.empty()) ok = buildSniCtxs(e);
   return ok ? 0 : -1;
 }
 
@@ -1094,6 +1387,11 @@ void vq_conn_close_graceful(VqConn *conn, uint64_t app_error) {
 const char *vq_conn_peer_ip(VqConn *conn) {
   auto *c = reinterpret_cast<Conn *>(conn);
   return c->peer_ip.c_str();
+}
+
+void *vq_conn_ssl(VqConn *conn) {
+  auto *c = reinterpret_cast<Conn *>(conn);
+  return c->ssl;
 }
 
 }  // extern "C"

@@ -105,7 +105,7 @@ resource is bounded.
 | Handler bug taking down the server | A handler exception becomes a 500 and the loop survives; an unexpected exception in a connection's processing closes only that connection, never the loop thread; HTTP/2 and HTTP/3 protocol errors send GOAWAY / stream resets rather than crashing | `test_graceful_shutdown`, `test_security_dos` |
 | Cross-thread memory corruption | A `req.blocking:` worker reads a value-only request snapshot, never live loop memory; regressed under ThreadSanitizer | `test_blocking_race`, `test_thread_race` (CI `testrace`) |
 | Path traversal (static files) | `res.sendFile` resolves within the configured root and rejects traversal | `test_static_files` |
-| Truncated error delivery | Lingering close: on a mid-stream rejection (for example an oversized header) vortex half-closes and drains the peer to its FIN before closing, so the 4xx is delivered instead of being lost to a TCP RST; bounded by a deadline and the connection cap | `test_http1_server` |
+| Truncated error delivery | Lingering close: on a mid-stream rejection (for example an oversized header) vortex half-closes and drains the peer to its FIN before closing, so the 4xx is delivered instead of being lost to a TCP RST; bounded by a deadline and the connection cap. HTTPS takes the same path, with `close_notify` queued ahead of the FIN: close_notify is a TLS record and does not stop the kernel sending RST | `test_http1_server`, `test_tls_io` |
 
 ## Out of scope
 
@@ -150,7 +150,9 @@ Security behavior is covered at several levels.
   rejected; stalled requests time out; connections past the cap dropped);
   `test_security_headers*`, `test_ratelimit`, `test_ws_origin`,
   `test_proxy_protocol`, and `test_tls_*` cover the SEC1-SEC5 hardening features;
-  `test_http1_server` confirms the lingering close delivers a 431 before closing.
+  `test_http1_server` confirms the lingering close delivers a 431 before closing,
+  and `test_tls_io` that an HTTPS connection takes the same path (a FIN, never a
+  RST that would discard the response).
 - **Conformance.** HTTP/2 passes `h2spec` (145 passed, 1 skipped, 0 failed
   against a TLS server; the skip is TLS-only and does not apply to the cleartext
   run). HTTP/3 passes `h3spec`'s HTTP/3-servers group (15 examples, 0 failures),

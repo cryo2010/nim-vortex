@@ -5,12 +5,7 @@
 ## Build with -d:plainHttp to exclude TLS (and the libssl runtime
 ## requirement) entirely.
 
-import std/[locks, monotimes, times]
-
-const
-  ctxRetireSlots = 4     ## displaced SSL_CTXs kept during their grace window
-  ctxGraceSec = 5        ## free a retired ctx only this long after it was
-                         ## displaced (a thread mid-SSL_new keeps it valid)
+import std/locks
 
 const sslLibName {.strdefine.} =
   when defined(macosx):
@@ -58,6 +53,7 @@ const
   SSL_MODE_ENABLE_PARTIAL_WRITE = clong(1)
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
   SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
+  SSL_OP_NO_RENEGOTIATION = uint64(1) shl 30   # <openssl/ssl.h> SSL_OP_BIT(30)
   SSL_SESS_CACHE_SERVER = clong(0x0002)
   CRYPTO_EX_INDEX_SSL_CTX = cint(1)   # ex_data class for SSL_CTX (crypto/ex_data)
 
@@ -66,6 +62,7 @@ const
   TLS1_2_VERSION* = clong(0x0303)
   TLS1_3_VERSION* = clong(0x0304)
   SSL_TLSEXT_ERR_OK = cint(0)
+  SSL_TLSEXT_ERR_ALERT_FATAL = cint(2)
   SSL_TLSEXT_ERR_NOACK = cint(3)
   OPENSSL_NPN_NEGOTIATED = cint(1)
 
@@ -79,6 +76,7 @@ type
 proc TLS_server_method(): pointer
 proc SSL_CTX_new(m: pointer): SslCtxPtr
 proc SSL_CTX_free(ctx: SslCtxPtr)
+proc SSL_CTX_up_ref(ctx: SslCtxPtr): cint
 proc SSL_CTX_use_certificate_chain_file(ctx: SslCtxPtr, file: cstring): cint
 proc SSL_CTX_use_certificate(ctx: SslCtxPtr, x: pointer): cint   # up-refs x
 proc SSL_CTX_use_PrivateKey(ctx: SslCtxPtr, pkey: pointer): cint # up-refs pkey
@@ -87,6 +85,8 @@ proc SSL_CTX_set_session_id_context(ctx: SslCtxPtr, sid: cstring,
                                     len: cuint): cint
 proc SSL_CTX_ctrl(ctx: SslCtxPtr, cmd: cint, larg: clong,
                   parg: pointer): clong
+proc SSL_CTX_set_options(ctx: SslCtxPtr, op: uint64): uint64
+proc SSL_CTX_get_options(ctx: SslCtxPtr): uint64
 proc SSL_CTX_set_cipher_list(ctx: SslCtxPtr, str: cstring): cint
 proc SSL_CTX_set_ciphersuites(ctx: SslCtxPtr, str: cstring): cint
 proc SSL_CTX_set_alpn_select_cb(ctx: SslCtxPtr,
@@ -123,6 +123,7 @@ proc SSL_CTX_set_ex_data(ctx: SslCtxPtr, idx: cint, arg: pointer): cint
 {.push importc, cdecl, dynlib: cryptoLibName.}
 proc ERR_clear_error()
 proc ERR_get_error(): culong
+proc ERR_peek_last_error(): culong
 proc ERR_error_string(e: culong, buf: cstring): cstring
 proc X509_get_subject_name(x: pointer): pointer          # X509_NAME* (borrowed)
 proc X509_NAME_oneline(name: pointer, buf: cstring, size: cint): cstring
@@ -158,8 +159,50 @@ proc passwdCb(buf: cstring, size: cint, rwflag: cint,
   if n > 0: copyMem(buf, u, n)
   cint(n)
 
+const
+  # OpenSSL error-code layout (<openssl/err.h>) and the one PEM reason that
+  # means "clean end of PEM data" (<openssl/pemerr.h>). ERR_GET_LIB and
+  # ERR_GET_REASON are static inlines in the header, so they cannot be
+  # imported; errGetLib/errGetReason below mirror them exactly.
+  ERR_LIB_SYS = cint(2)
+  ERR_LIB_PEM = cint(9)
+  ERR_SYSTEM_FLAG = culong(0x80000000)   # (unsigned int)INT_MAX + 1
+  ERR_SYSTEM_MASK = culong(0x7FFFFFFF)   # (unsigned int)INT_MAX
+  ERR_LIB_OFFSET = 23
+  ERR_LIB_MASK = culong(0xFF)
+  ERR_REASON_MASK = culong(0x7FFFFF)
+  PEM_R_NO_START_LINE = cint(108)
+
+proc errGetLib(e: culong): cint =
+  ## ERR_GET_LIB from <openssl/err.h>, including its system-error special case.
+  if (e and ERR_SYSTEM_FLAG) != 0: ERR_LIB_SYS
+  else: cint((e shr ERR_LIB_OFFSET) and ERR_LIB_MASK)
+
+proc errGetReason(e: culong): cint =
+  ## ERR_GET_REASON from <openssl/err.h>, including its system-error case.
+  if (e and ERR_SYSTEM_FLAG) != 0: cint(e and ERR_SYSTEM_MASK)
+  else: cint(e and ERR_REASON_MASK)
+
+proc pemReadEndedCleanly(): bool =
+  ## Did the PEM read loop that just stopped stop at end-of-data, or on a real
+  ## parse error? `PEM_read_bio_X509` returns nil for *every* failure (bad
+  ## base64, a truncated block, an ASN.1 decode failure, out of memory), so the
+  ## error queue is the only thing that distinguishes them: a clean EOF leaves
+  ## PEM's benign "no start line", anything else is genuine corruption. Clears
+  ## the queue on a clean EOF and leaves the real error in place otherwise, so
+  ## the caller's failure is reported with its cause. This is exactly what
+  ## OpenSSL's own SSL_CTX_use_certificate_chain_file does.
+  let e = ERR_peek_last_error()
+  if errGetLib(e) == ERR_LIB_PEM and errGetReason(e) == PEM_R_NO_START_LINE:
+    ERR_clear_error()
+    true
+  else:
+    false
+
 proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
   ## Load a PEM certificate chain (leaf first, then intermediates) from memory.
+  ## Rejects a chain that does not parse in full (see pemReadEndedCleanly).
+  ERR_clear_error()     # so pemReadEndedCleanly sees only our own errors
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
   defer: discard BIO_free(bio)
@@ -170,13 +213,14 @@ proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
   while true:
     let extra = PEM_read_bio_X509(bio, nil, nil, nil)
     if extra == nil:
-      ERR_clear_error()          # expected: end of PEM data
-      break
+      # Not necessarily end-of-data: a mangled or truncated block after the
+      # leaf reads as nil too. Accept the stop only on a clean PEM EOF, so a
+      # corrupt chain is rejected instead of silently served leaf-only.
+      return pemReadEndedCleanly()
     # SSL_CTX_add_extra_chain_cert takes ownership; do not free on success.
     if SSL_CTX_ctrl(ctx, SSL_CTRL_EXTRA_CHAIN_CERT, 0, extra) != 1:
       X509_free(extra)
       return false
-  true
 
 proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   ## Load a PEM private key from memory, decrypting with `password` if set.
@@ -216,18 +260,24 @@ type
     ## An immutable DER OCSP response owned by one SSL_CTX. Allocated with
     ## `allocShared` (loop threads read it lock-free in `statusCb`) and freed by
     ## OpenSSL through the ctx's ex_data destructor `ocspExFree`, so its lifetime
-    ## is exactly the ctx's: no retire-ring involvement (an SSL on a displaced
-    ## ctx can outlive the grace window, which would be a use-after-free).
+    ## is exactly the ctx's, and the ctx is refcounted: one displaced by a reload
+    ## lives until the last SSL created on it is freed, so a handshake thread can
+    ## never read a blob whose ctx a reload has released.
     len: int
     data: UncheckedArray[byte]
 
   TlsConfig* = object
     ## One per server; SSL_CTX is thread-safe for SSL_new. Lives in shared
     ## memory so loop threads can use it via pointer.
-    ctx*: SslCtxPtr          ## active SSL_CTX; loop threads load it atomically
-                             ## so a certificate hot-reload can swap it in
-    retired: array[ctxRetireSlots, SslCtxPtr]   ## displaced ctxs pending free
-    retiredAt: array[ctxRetireSlots, MonoTime]  ## when each was displaced
+    ctx*: SslCtxPtr          ## active SSL_CTX; readers load it and take a
+                             ## reference in one step (acquireCtx), so a
+                             ## hot-reload can swap and release it underneath
+    ctxLock: Lock            ## held only across {load ctx, up-ref it} and
+                             ## {swap ctx, release the old one}: see acquireCtx
+    reloadLock: Lock         ## serialises reloadTlsConfig. The material/OCSP
+                             ## fields below are read-modify-written across the
+                             ## call, so two reloads running at once would tear
+                             ## them
     protos: string           ## ALPN preference list, wire format
     meth: pointer            ## method the ctx was built with (rebuild on reload)
     material: TlsMaterial    ## the default cert/key source (reloaded in place)
@@ -265,7 +315,15 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
     outLen[] = chosenLen
     SSL_TLSEXT_ERR_OK
   else:
-    SSL_TLSEXT_ERR_NOACK      # no overlap: proceed without ALPN (=> h1)
+    # No overlap between the client's list and ours. RFC 7301 3.2 requires a
+    # fatal no_application_protocol alert here, and that is what OpenSSL's
+    # ALERT_FATAL means for this callback. NOACK would instead behave as if no
+    # callback were set: the handshake completes with no ALPN extension, the
+    # connection is framed as HTTP/1, and a client entitled to assume its offer
+    # was honoured misreads the result. OpenSSL does not invoke this callback
+    # at all when the client sent no ALPN extension, so the no-ALPN case still
+    # gets plain HTTP/1 rather than an alert.
+    SSL_TLSEXT_ERR_ALERT_FATAL
 
 proc cstrEq(cs: cstring, s: string): bool =
   ## Compare a NUL-terminated C string to a Nim string without allocating (the
@@ -309,8 +367,9 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
 proc ocspExFree(parent, p: pointer, ad: pointer, idx: cint,
                 argl: clong, argp: pointer) {.cdecl.} =
   ## CRYPTO_EX_free for the ctx's OcspBlob: OpenSSL calls this exactly when the
-  ## SSL_CTX is destroyed (ring free, freeTlsConfig, or last SSL_free), which is
-  ## the only safe point to free a blob a handshake thread may still be reading.
+  ## SSL_CTX is destroyed, i.e. once the config's reference and every session's
+  ## reference are gone, which is the only safe point to free a blob a handshake
+  ## thread may still be reading.
   if p != nil: deallocShared(p)
 
 let ocspExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL_CTX, 0, nil,
@@ -389,8 +448,14 @@ proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
 
 proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
   ## Add PEM CA cert(s) from memory to the ctx trust store (client verification).
+  ## The whole bundle must parse: this is the trust-anchor set for client-cert
+  ## verification, so a bundle that is truncated or corrupt part-way through is
+  ## rejected rather than installed up to the damage (which would reject every
+  ## client issued by a CA that came after it, at handshake time, with nothing
+  ## in the config or the logs to point at the cause).
   let store = SSL_CTX_get_cert_store(ctx)
   if store == nil or pem.len == 0: return false
+  ERR_clear_error()     # so pemReadEndedCleanly sees only our own errors
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
   defer: discard BIO_free(bio)
@@ -398,22 +463,34 @@ proc loadCaMem(ctx: SslCtxPtr, pem: string): bool =
   while true:
     let x = PEM_read_bio_X509(bio, nil, nil, nil)
     if x == nil:
-      ERR_clear_error()
-      break
+      # A real parse error reads as nil just like end-of-data; only a clean PEM
+      # EOF after at least one CA counts as a fully consumed bundle.
+      return pemReadEndedCleanly() and added > 0
     let ok = X509_STORE_add_cert(store, x) == 1     # up-refs x
     X509_free(x)
     if not ok: return false
     inc added
-  added > 0
 
 proc applyClientVerify(ctx: SslCtxPtr, verify: cint,
                        caFile, caPem: string): bool =
-  ## Configure mTLS: load the client-cert CA (if any) and set the verify mode.
+  ## Configure mTLS: load the client-cert CA and set the verify mode. Client
+  ## verification without a CA source is refused (see below).
   if verify == SSL_VERIFY_NONE: return true
   if caPem.len > 0:
     if not loadCaMem(ctx, caPem): return false
   elif caFile.len > 0:
     if SSL_CTX_load_verify_locations(ctx, caFile.cstring, nil) != 1: return false
+  else:
+    # Arming SSL_CTX_set_verify with no trust source verifies client certs
+    # against a completely empty X509_STORE: OpenSSL 3 does not populate a new
+    # ctx's store and we never call SSL_CTX_set_default_verify_paths, so every
+    # presented certificate fails with "unable to get local issuer
+    # certificate". Under Require that rejects 100% of connections; under
+    # Optional it is worse, because a client that sends no certificate still
+    # connects and the deployment looks healthy while client-cert auth is
+    # non-functional. Fail the ctx build instead. validateConfig catches this
+    # earlier with a named error; this covers direct TlsConfig users too.
+    return false
   SSL_CTX_set_verify(ctx, verify, nil)   # nil cb: OpenSSL's default chain check
   true
 
@@ -453,6 +530,17 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
+  # Refuse renegotiation outright (TLS 1.2 and below; TLS 1.3 has no such
+  # mechanism). Each renegotiation costs a full ECDHE key agreement plus a
+  # server signature, run synchronously on the loop thread inside tlsRead /
+  # tlsWrite, against a few hundred bytes of client effort, with no counter and
+  # no cap: the CVE-2011-1473 shape. OpenSSL 3.0 already refuses
+  # *client*-initiated renegotiation unless SSL_OP_ALLOW_CLIENT_RENEGOTIATION
+  # is set, but that is a library default a system openssl.cnf can flip and one
+  # a pre-3.0 libssl does not have, so state the policy here rather than
+  # inherit it. OpenSSL answers a renegotiation attempt with a warning-level
+  # no_renegotiation alert, leaving the connection usable.
+  discard SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION)
   if minProtoVersion != 0:
     if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION,
                     minProtoVersion, nil) != 1:
@@ -514,6 +602,8 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
                         minProtoVersion, maxProtoVersion, cipherList, cipherSuites)
   result = createShared(TlsConfig)
+  initLock(result.ctxLock)
+  initLock(result.reloadLock)
   result.ctx = ctx
   result.protos = protos
   result.meth = meth
@@ -542,6 +632,26 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                                   cast[pointer](servernameCb))
     discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, result)
 
+# --- active SSL_CTX lifetime -------------------------------------------------
+#
+# A reload swaps `cfg.ctx` while loop threads are creating sessions on it, and
+# releases the displaced ctx immediately afterwards, so no reader may hold a
+# bare pointer across the swap. Readers take `cfg.ctxLock` for exactly as long
+# as it takes to up-ref what they loaded: that gives them a reference of their
+# own, which turns the reload's release into a decrement and keeps the ctx alive
+# until they are done with it. The work itself (SSL_new, reading the cert) then
+# runs outside the lock, so a handshake never waits on another thread's session
+# setup, and a reload never waits on a handshake.
+
+proc acquireCtx(cfg: ptr TlsConfig): SslCtxPtr =
+  ## The active SSL_CTX, with a reference held on the caller's behalf. Pair
+  ## every call with an `SSL_CTX_free` once the caller (or an object it handed
+  ## the ctx to, like the SSL from `SSL_new`) has taken its own reference.
+  acquire(cfg.ctxLock)
+  result = atomicLoadN(addr cfg.ctx, ATOMIC_ACQUIRE)
+  discard SSL_CTX_up_ref(result)   # only fails without a live reference to it
+  release(cfg.ctxLock)
+
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                       ocspFile = "", ocspResponse = "",
                       clearOcsp = false): bool =
@@ -550,7 +660,9 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## in-place renewal) and atomically install it, so subsequent TLS handshakes
   ## present the new certificate while in-flight connections keep the old one.
   ## Returns false and leaves the running ctx untouched if the new material is
-  ## missing/invalid/mismatched.
+  ## missing/invalid/mismatched, including a `keyFile`-only reload of a server
+  ## whose current material is a PKCS#12 bundle (rotate both halves, or supply
+  ## a new bundle by reconfiguring). Nothing is persisted on a rejection.
   ##
   ## The stapled OCSP response rotates on the same swap: `ocspResponse` supplies
   ## bytes, `ocspFile` a path read now, `clearOcsp` drops the staple; all empty
@@ -560,19 +672,34 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## renewal must not be blocked by a stale staple). `ocspResponse`/`ocspFile`
   ## together with `clearOcsp` is contradictory and rejected.
   ##
-  ## Lock-free and safe: loop threads read `cfg.ctx` with an atomic load in
-  ## `newTlsSession`; the displaced ctx is not freed now but retired and freed
-  ## at the *next* reload. That gives any thread mid-`SSL_new` an effectively
-  ## unbounded grace window (reloads are seconds/hours apart, SSL_new is
-  ## microseconds), while capping retained ctxs at one. Call from a normal
-  ## thread, not a raw signal handler.
+  ## Callable from any ordinary thread, including several at once: the whole
+  ## body runs under `cfg.reloadLock`, so concurrent reloads serialise instead
+  ## of tearing the stored material/OCSP fields, which are read at the top and
+  ## rewritten at the bottom. Loop threads never take that lock; they take
+  ## `cfg.ctxLock` only to up-ref the ctx they load (see acquireCtx above), so
+  ## the ctx displaced here is released rather than destroyed and survives
+  ## until the last session created on it is freed: in-flight connections keep
+  ## the certificate they handshook with, however many reloads follow. Not
+  ## callable from a raw signal handler (it takes locks and reads files).
+  acquire(cfg.reloadLock)
+  defer: release(cfg.reloadLock)
   # Explicit file paths override any stored in-memory/PKCS#12 material; empty
   # means "reuse what was last loaded" (files, PEM, or p12).
   var m = cfg.material
+  let p12Sourced = m.pkcs12.len > 0 or m.pkcs12File.len > 0
   if certFile.len > 0:
     m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   if keyFile.len > 0:
-    m.keyFile = keyFile; m.keyPem = ""
+    # A key-only rotation cannot apply to a PKCS#12-sourced certificate: the
+    # bundle carries both halves and loadCertKey gives it unconditional
+    # precedence, so leaving pkcs12/pkcs12File set would rebuild the *old*
+    # cert and key, pass the consistency check because they match each other,
+    # and report success while the new key was never opened. Reject it (a lone
+    # key against a p12 certificate is meaningless) rather than silently
+    # no-op, and clear the bundle fields either way so the branches are
+    # symmetric with certFile's.
+    if certFile.len == 0 and p12Sourced: return false
+    m.keyFile = keyFile; m.keyPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   # Resolve the staple for the new ctx *before* buildTlsCtx, so any rejection
   # leaves the running ctx (and its staple) completely untouched. newOcsp is the
   # bytes to attach; newOcspFile the path to remember for future re-reads.
@@ -605,27 +732,18 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile
+  # Publish the new ctx and drop the config's reference to the old one, with the
+  # swap under the same lock readers up-ref beneath: a reader either loaded
+  # `old` before the swap and holds a reference of its own, so the free below is
+  # a decrement, or it loads `newCtx` after it. `old` therefore lives exactly as
+  # long as the sessions on it, which is what the retire ring this replaces only
+  # approximated: with a fixed number of slots and a time-based grace window, a
+  # burst of reloads had to evict (and free) a ctx a thread could still be
+  # holding between its load and SSL_new.
+  acquire(cfg.ctxLock)
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
-  # Retire `old` with a time-based grace rather than freeing the previous
-  # retirement outright: freeing at the *next* reload alone is unsafe if two
-  # reloads land within a thread's load->SSL_new window (the ctx it loaded could
-  # be freed before it up-refs). Free only ctxs displaced at least ctxGraceSec
-  # ago; keep the rest in a small fixed ring.
-  let now = getMonoTime()
-  for i in 0 ..< ctxRetireSlots:
-    if cfg.retired[i] != nil and (now - cfg.retiredAt[i]).inSeconds >= ctxGraceSec:
-      SSL_CTX_free(cfg.retired[i]); cfg.retired[i] = nil
-  var placed = false
-  for i in 0 ..< ctxRetireSlots:
-    if cfg.retired[i] == nil:
-      cfg.retired[i] = old; cfg.retiredAt[i] = now; placed = true; break
-  if not placed:
-    # Ring full (many reloads within the grace window): evict the oldest.
-    var oldest = 0
-    for i in 1 ..< ctxRetireSlots:
-      if cfg.retiredAt[i] < cfg.retiredAt[oldest]: oldest = i
-    SSL_CTX_free(cfg.retired[oldest])
-    cfg.retired[oldest] = old; cfg.retiredAt[oldest] = now
+  release(cfg.ctxLock)
+  SSL_CTX_free(old)       # the config's reference; sessions keep their own
   true
 
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
@@ -695,12 +813,19 @@ proc ctxCertSubject*(cfg: ptr TlsConfig): string =
   ## The subject line of the certificate currently installed on `cfg.ctx`, for
   ## tests/introspection: proves an in-place reload actually reached the ctx.
   ## "" if no certificate is set.
-  let x = SSL_CTX_get0_certificate(cfg.ctx)
+  let ctx = acquireCtx(cfg)          # a concurrent reload must not release it
+  defer: SSL_CTX_free(ctx)           # under the borrowed X509 below
+  let x = SSL_CTX_get0_certificate(ctx)
   if x == nil: return ""
   var buf = newString(512)
   let s = X509_NAME_oneline(X509_get_subject_name(x), buf.cstring, 512)
   if s == nil: return ""
   $s
+
+proc ctxRefusesRenegotiation*(cfg: ptr TlsConfig): bool =
+  ## Is renegotiation refused on the active ctx (SSL_OP_NO_RENEGOTIATION)? For
+  ## tests/introspection, like ctxCertSubject above.
+  (SSL_CTX_get_options(cfg.ctx) and SSL_OP_NO_RENEGOTIATION) != 0
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0, cipherList = "", cipherSuites = "",
@@ -730,9 +855,10 @@ proc peerCertSubject*(ssl: SslPtr): string =
   if s == nil: "" else: $s
 
 proc freeTlsConfig*(cfg: ptr TlsConfig) =
+  # Releases the config's references; a ctx with sessions still open on it is
+  # destroyed by their last SSL_free. Loop threads are joined before this runs,
+  # so no acquireCtx can be in flight.
   SSL_CTX_free(cfg.ctx)
-  for i in 0 ..< ctxRetireSlots:
-    if cfg.retired[i] != nil: SSL_CTX_free(cfg.retired[i])
   for c in cfg.sniCtx: SSL_CTX_free(c)
   cfg.sniCtx = @[]
   cfg.sniHosts = @[]
@@ -744,11 +870,17 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.cipherSuites = ""
   cfg.ocsp = ""
   cfg.ocspFile = ""
+  deinitLock(cfg.reloadLock)
+  deinitLock(cfg.ctxLock)
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =
-  # Atomic load: a concurrent certificate hot-reload may swap cfg.ctx.
-  let ctx = atomicLoadN(addr cfg.ctx, ATOMIC_ACQUIRE)
+  # A concurrent hot-reload may swap cfg.ctx and release the old one, so take a
+  # reference to what we loaded (acquireCtx) instead of carrying a bare pointer
+  # into SSL_new, which up-refs the ctx itself once it gets there. Ours is
+  # dropped on the way out; the SSL keeps the ctx alive for its own lifetime.
+  let ctx = acquireCtx(cfg)
+  defer: SSL_CTX_free(ctx)
   result = SSL_new(ctx)
   if result == nil: return nil
   if SSL_set_fd(result, fd) != 1:

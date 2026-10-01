@@ -86,9 +86,23 @@ proc validateConfig(s: VortexConfig) =
       "Set both (file or PEM) to enable TLS, or neither for plain HTTP.")
   if hasCert and not hasKey:
     raise newException(CatchableError, "a certificate is set but no private key.")
+  if s.verifyClient != ClientVerify.None and
+     s.clientCaFile.len == 0 and s.clientCaPem.len == 0:
+    raise newException(CatchableError,
+      "verifyClient is set but no client CA is: client certificates would be " &
+      "verified against an empty trust store, so every one of them would be " &
+      "rejected. Set clientCaFile or clientCaPem, or verifyClient = None.")
   if s.minTlsVersion == TlsVersion.V13 and s.maxTlsVersion == TlsVersion.V12:
     raise newException(CatchableError,
       "maxTlsVersion (TLS 1.2) is below minTlsVersion (TLS 1.3).")
+  if hasCert and s.http3 and s.maxTlsVersion == TlsVersion.V12:
+    # QUIC mandates TLS 1.3 (RFC 9001 4.2), so h3 cannot honor a TLS 1.2
+    # ceiling. Serving it anyway would apply the policy on TCP and silently
+    # break it on every HTTP/3 connection (#359), so make the operator choose.
+    raise newException(CatchableError,
+      "maxTlsVersion (TLS 1.2) cannot be served over HTTP/3, which requires " &
+      "TLS 1.3. Set http3 = false to keep the TLS 1.2 ceiling, or raise " &
+      "maxTlsVersion.")
   # Report the first offending field by name rather than a bare "a setting is
   # negative", and add new numeric settings here as they appear.
   for (name, val) in [
@@ -307,6 +321,9 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## after certbot renewed them in place). Returns false if TLS is not enabled,
   ## or the new cert/key is missing/invalid/mismatched -- in which case the
   ## running certificate is kept, so a bad renewal never takes the server down.
+  ## A `keyFile`-only call against a server whose current material is a PKCS#12
+  ## bundle is one such rejection: the bundle carries both halves, so rotate
+  ## both (`certFile` + `keyFile`) rather than the key alone.
   ##
   ## The stapled OCSP response rotates on the same call: `ocspResponse` supplies
   ## DER bytes, `ocspFile` a path read now (an unreadable one rejects the reload
@@ -317,7 +334,9 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## staple, and the h3 reload signal below stays cert/key-only.
   ##
   ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
-  ## inside a raw signal handler. Covers HTTP/1.1, HTTP/2, and (when enabled)
+  ## inside a raw signal handler. Two threads may call it at once (a SIGHUP
+  ## loop plus an admin endpoint, say): the reloads serialise internally.
+  ## Covers HTTP/1.1, HTTP/2, and (when enabled)
   ## HTTP/3: each h3 loop updates its own QUIC ctx in place on its next tick, so
   ## new h3 handshakes use the new certificate while in-flight ones keep theirs.
   when defined(plainHttp):

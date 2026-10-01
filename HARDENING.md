@@ -73,12 +73,12 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `certPem` / `keyPem` | "" | In-memory PEM alternative |
 | `pkcs12File` / `pkcs12` / `keyPassword` | "" | PKCS#12 bundle and passphrase |
 | `minTlsVersion` | `V12` | Lowest accepted TLS version (`V12` or `V13`); 1.0/1.1 always refused; QUIC is always 1.3 |
-| `maxTlsVersion` | `None` (no cap) | Highest accepted TLS version |
-| `tlsCipherList` | "" | OpenSSL cipher list for TLS 1.2 ("" keeps OpenSSL's default) |
-| `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default) |
-| `verifyClient` | `None` | mTLS: `None` / `Optional` / `Require` client-cert policy |
-| `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (needed when `verifyClient != None`) |
-| `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported) |
+| `maxTlsVersion` | `None` (no cap) | Highest accepted TLS version; `V12` requires `http3 = false` (QUIC cannot negotiate below 1.3) |
+| `tlsCipherList` | "" | OpenSSL cipher list for TLS 1.2 ("" keeps OpenSSL's default); TCP only, no TLS 1.2 on QUIC |
+| `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default); applies to HTTP/1.1, HTTP/2 and HTTP/3 |
+| `verifyClient` | `None` | mTLS: `None` / `Optional` / `Require` client-cert policy; enforced on HTTP/1.1, HTTP/2 and HTTP/3 |
+| `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (**required** when `verifyClient != None`: a config with neither is rejected at startup, since it would verify against an empty trust store) |
+| `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported); served on HTTP/1.1, HTTP/2 and HTTP/3 |
 | `ocspFile` / `ocspResponse` | "" | DER OCSP response to staple (rotate at runtime via `reloadTls(ocspFile = ...)`) |
 | `http3` | `true` | Serve HTTP/3 over QUIC (requires a cert; ignored without TLS) |
 
@@ -93,6 +93,20 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | `decompressRequest` | `false` | Decode gzip/br/zstd request bodies, bounded by `maxBodySize` |
 | `compress` | `false` | gzip/brotli-compress eligible responses |
 
+TLS renegotiation is refused on every context (`SSL_OP_NO_RENEGOTIATION`), and
+there is no setting to allow it. A renegotiation is a full ECDHE key agreement
+plus a server signature, run inline on the event-loop thread, for a few hundred
+bytes of client effort, and OpenSSL neither counts nor rate-limits it: the
+CVE-2011-1473 shape. A client that asks gets a warning-level
+`no_renegotiation` alert and keeps its connection. This is a TLS 1.2 and below
+mechanism; TLS 1.3 has no renegotiation (its KeyUpdate is a separate and much
+cheaper thing) and QUIC is TLS 1.3 only.
+
+The TLS listener offers ALPN `h2` and `http/1.1`. A client that advertises an
+ALPN list overlapping neither is refused with a fatal `no_application_protocol`
+alert (RFC 7301 3.2) rather than being handed a no-ALPN connection that it would
+misframe; a client that advertises no ALPN at all still gets HTTP/1.1.
+
 Certificates can be rotated at runtime with `server.reloadTls(certFile, keyFile)`
 (TCP and h3), which validates the new material and swaps it in without dropping
 connections. The same call rotates the stapled OCSP response:
@@ -101,7 +115,13 @@ refreshed staple, `clearOcsp = true` drops it, and a bare `reloadTls()` re-reads
 a configured `ocspFile` so a certbot renewal picks up a refreshed staple too.
 Staple rotation applies to the default certificate (SNI and HTTP/3 do not
 staple), and OpenSSL only sends a staple whose serial matches the served
-certificate, so rotate the cert and its staple together.
+certificate, so rotate the cert and its staple together. Reload from any
+ordinary thread, and from two at once if that is how your renewal plumbing is
+built (concurrent reloads serialise internally); not from inside a raw signal
+handler, since the call takes a lock and reads files. On the HTTP/3 side the
+reload also rebuilds the per-host (SNI) contexts from the material they were
+configured with, so per-host certificate *files* replaced by the same renewal
+are picked up even though `reloadTls` names only the default pair.
 
 ## Deployment recipes
 

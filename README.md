@@ -258,7 +258,9 @@ nim c -d:httpBrotli -d:httpGzip -d:httpZstd --passL:"-lbrotlienc -lbrotlicommon"
 #### Transport Layer Security (TLS)
 
 Providing a certificate turns on TLS, which enables HTTP/2 (via ALPN) and
-HTTP/3 (over QUIC):
+HTTP/3 (over QUIC). The TLS listener offers `h2` and `http/1.1`; a client that
+offers no ALPN gets HTTP/1.1, and one whose offer overlaps neither is refused
+with the fatal `no_application_protocol` alert RFC 7301 requires:
 
 ```nim
 app.serve(8443, config = initVortexConfig(
@@ -292,8 +294,12 @@ initVortexConfig(pkcs12File = "server.p12", keyPassword = "…")   # or pkcs12 =
 **mTLS (client certificates)**: request or require a client cert and verify it
 against a CA. `verifyClient = ClientVerify.Optional` accepts connections with no cert but
 validates any that is presented; `ClientVerify.Require` refuses the handshake without a
-valid one. Inside a handler, `req.clientCertSubject` gives the verified client's
-subject DN ("" if none):
+valid one. Either mode needs a CA: a `verifyClient` other than `None` with no
+`clientCaFile`/`clientCaPem` is rejected at startup, because it would verify
+against an empty trust store and reject every client certificate. The policy
+covers HTTP/1.1, HTTP/2 and HTTP/3 alike, so a client cannot skip it by taking
+the Alt-Svc upgrade to QUIC. Inside a handler, `req.clientCertSubject` gives the
+verified client's subject DN ("" if none), on h3 too:
 
 ```nim
 initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
@@ -305,7 +311,9 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
 default cert is the fallback; `sni` adds host-specific certs (each from files,
 PEM, or PKCS#12). A `host` of `*.example.com` matches a single leading label
 (`api.example.com`, not `example.com` or `a.b.example.com`); an exact host wins
-over a wildcard:
+over a wildcard. Per-host certificates are served over HTTP/3 as well, so a
+browser that follows the Alt-Svc upgrade to QUIC gets the same certificate it
+got over TCP:
 
 ```nim
 initVortexConfig(certFile = "default.pem", keyFile = "default.key",
@@ -315,7 +323,10 @@ initVortexConfig(certFile = "default.pem", keyFile = "default.key",
 
 **TLS version range**: `minTlsVersion` (default `TlsVersion.V12`) floors it; `maxTlsVersion`
 (default `TlsVersion.None` = no cap) ceils it, e.g. `maxTlsVersion = TlsVersion.V12` to keep
-a client on 1.2. (QUIC/HTTP/3 is always 1.3.)
+a client on 1.2. QUIC/HTTP/3 is always 1.3, so a 1.2 floor is raised to 1.3 there, and a 1.2
+*ceiling* needs `http3 = false` (the combination is refused rather than quietly ignored on
+HTTP/3). `tlsCipherSuites` (TLS 1.3) applies to both transports; `tlsCipherList` is TLS 1.2
+only, so HTTP/3 never consults it.
 
 **OCSP stapling**: hand clients a cached OCSP response in the handshake so they
 don't query the responder. Provide the DER bytes; vortex doesn't fetch OCSP

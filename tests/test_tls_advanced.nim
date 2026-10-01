@@ -2,6 +2,7 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import vortex/transport/tls as tlstransport
 import ./helper
 
 when defined(plainHttp):
@@ -58,6 +59,33 @@ suite "PKCS#12":
     let (o, rc) = curlGet(srv.port)
     check rc == 0 and o == "ok"
 
+suite "PKCS#12 reload":
+  test "a key-only reload is rejected and the running bundle keeps serving":
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(
+      numThreads = 1, pkcs12File = dir / "bundle.p12",
+      keyPassword = "p12pass")).start(0)
+    defer: srv.close()
+    proc subject(): string =
+      execCmdEx("echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " 2>/dev/null | " & opensslBin &
+        " x509 -noout -subject")[0].strip()
+    check "localhost" in subject()
+    genCert(dir / "rot.pem", dir / "rotkey.pem", "rotated.vortex")
+    # A PKCS#12 bundle carries cert and key together, so a lone key cannot
+    # apply to it: this must fail closed, not report a rotation that did not
+    # happen.
+    check not srv.reloadTls(keyFile = dir / "rotkey.pem")
+    check "localhost" in subject()                 # old bundle still presented
+    check "rotated.vortex" notin subject()
+    # The rejected call must not have persisted its keyFile either: a cert-only
+    # reload now has no key to pair with and fails, rather than quietly using
+    # the key recorded during the ignored call.
+    check not srv.reloadTls(certFile = dir / "rot.pem")
+    check "localhost" in subject()
+    # Rotating both halves replaces the bundle and does take effect.
+    check srv.reloadTls(certFile = dir / "rot.pem", keyFile = dir / "rotkey.pem")
+    check "rotated.vortex" in subject()
+
 suite "mTLS":
   test "require: connection without a client cert is refused":
     var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, verifyClient = ClientVerify.Require, clientCaFile = dir / "ca.pem")).start(0)
@@ -81,6 +109,32 @@ suite "mTLS":
       $srv.port & "/whoami")
     check rc == 0
     check o.strip() == "-"
+
+  test "require without a client CA is rejected at startup":
+    # No CA source means verifying against an empty X509_STORE, i.e. rejecting
+    # every client certificate. validateConfig names the missing setting.
+    expect CatchableError:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = cert, keyFile = key,
+        verifyClient = ClientVerify.Require)).start(0)
+      srv.close()
+
+  test "optional without a client CA is rejected at startup too":
+    # Optional is the worse case: clients that send no certificate connect, so
+    # the deployment looks healthy while client-cert auth does nothing.
+    expect CatchableError:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = cert, keyFile = key,
+        verifyClient = ClientVerify.Optional)).start(0)
+      srv.close()
+
+  test "the TLS context itself refuses verification with no CA":
+    # Belt and braces behind validateConfig: a direct TlsConfig user (and any
+    # rebuild, e.g. a reload) must fail closed as well.
+    expect CatchableError:
+      let cfg = tlstransport.newTlsConfig(cert, key,
+                                          verify = tlstransport.TlsVerifyRequire)
+      tlstransport.freeTlsConfig(cfg)
 
 suite "SNI":
   test "servername selects the matching per-host certificate":

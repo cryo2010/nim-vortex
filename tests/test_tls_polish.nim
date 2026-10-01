@@ -57,7 +57,10 @@ suite "wildcard SNI":
 
 suite "max TLS version":
   test "cap at 1.2 negotiates 1.2, refuses 1.3":
-    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, maxTlsVersion = TlsVersion.V12)).start(0)
+    # http3 = false is now required with a TLS 1.2 ceiling: QUIC cannot
+    # negotiate below TLS 1.3, so the combination is rejected rather than
+    # applied on TCP and silently ignored on h3 (#359).
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key, http3 = false, maxTlsVersion = TlsVersion.V12)).start(0)
     defer: srv.close()
     check "TLSv1.2" in negotiatedProto(srv.port)
     check not tls13Establishes(srv.port)                          # 1.3 refused
