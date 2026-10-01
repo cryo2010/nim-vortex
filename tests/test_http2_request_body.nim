@@ -19,7 +19,7 @@
 ## a suspended handler resumes (#232), but by then the stream is gone and that
 ## reply is discarded.
 
-import std/[unittest, net, posix, httpcore, strutils, atomics, os]
+import std/[unittest, net, httpcore, strutils, atomics, os]
 import vortex/[settings, request, server, routing]
 import vortex/http2/frames
 import ./h2client
@@ -67,15 +67,12 @@ proc head(path: string,
              (":authority", "localhost")]
   for kv in extra: result.add kv
 
-proc sendAll(c: var H2TestConn, data: string) =
-  ## posix send with correct partial-write handling: std/net's `send` re-sends
-  ## from offset 0 after a partial write (duplicating bytes on the wire) and then
-  ## spins forever if the peer has gone.
-  var off = 0
-  while off < data.len:
-    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
-    if n <= 0: return
-    off += n
+proc drainHello(c: var H2TestConn) =
+  ## Consume the server preface (its SETTINGS) deterministically instead of
+  ## sleeping out a quiet period per connection; anything that arrives after it
+  ## stays buffered for the next readFrames.
+  discard c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+    fs.count(ftSettings) >= 1)
 
 proc waitFor(cond: proc(): bool {.gcsafe.}, ms = 2000): bool =
   ## Poll a loop-thread side effect for up to `ms` milliseconds.
@@ -115,7 +112,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
     # message hands all 1000 bytes to the sink (and never resets the stream at
     # all while the client keeps it open).
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)               # drain the server hello
+    c.drainHello()
     let fed = c.openStream(1, "10")
     var d = ""
     d.addData(1, 'x'.repeat(1000), endStream = false)
@@ -129,7 +126,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "DATA longer than content-length with END_STREAM is rejected":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let fed = c.openStream(1, "10")
     var d = ""
     d.addData(1, 'x'.repeat(1000), endStream = true)
@@ -142,7 +139,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "DATA shorter than content-length is rejected at END_STREAM":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let fed = c.openStream(1, "10")
     var d = ""
     d.addData(1, "ab", endStream = false)  # relayed on arrival, as it must be
@@ -158,7 +155,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "DATA matching content-length is delivered and answered":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     discard c.openStream(1, "10")
     var d = ""
     d.addData(1, "0123456789", endStream = true)
@@ -171,7 +168,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "a mismatch revealed by a trailer section is rejected":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     discard c.openStream(1, "10")
     var d = ""
     d.addData(1, "ab", endStream = false)  # END_STREAM arrives on the trailers
@@ -184,7 +181,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "a matching body ended by a trailer section still completes":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     discard c.openStream(1, "4")
     var d = ""
     d.addData(1, "body", endStream = false)
@@ -200,7 +197,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
     # reconciliation sites runs; the handler must not even be dispatched, since
     # registering onBody would immediately flush a clean last=true.
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let opened = sinkOpen.load()
     var f = ""
     f.addRequest(1, head("/stream", [("content-length", "10")]),
@@ -214,7 +211,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "content-length: 0 with END_STREAM on the HEADERS completes":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     var f = ""
     f.addRequest(1, head("/stream", [("content-length", "0")]),
                  endStream = true)
@@ -226,7 +223,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "content-length: 0 followed by DATA never reaches the sink":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let fed = c.openStream(1, "0")
     var d = ""
     d.addData(1, "xx", endStream = false)
@@ -242,7 +239,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
     # without firing onBody(last=true): a handler suspended in await req.read()
     # would never resume and its reader entry would leak (#232).
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let eofs = sinkEof.load()
     discard c.openStream(1, "10")
     var d = ""
@@ -254,7 +251,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "a buffered route reconciles the same way (the #237 asymmetry)":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let ran = bufDone.load()
     var f = ""
     f.addRequest(1, head("/buffered", [("content-length", "10")]),
@@ -269,7 +266,7 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
 
   test "a buffered route with a matching body still succeeds":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     var f = ""
     f.addRequest(1, head("/buffered", [("content-length", "4")]),
                  endStream = false)
@@ -298,7 +295,7 @@ proc rejects(trailers: openArray[(string, string)]): bool =
   ## no response reaches the client, and the handler never ran: a rejected block
   ## must never surface through req.trailers, not even its leading valid fields.
   var c = newH2TestConn(srv.port)
-  discard c.readFrames(300)
+  c.drainHello()
   let ran = bufDone.load()
   let fs = c.sendTrailers(1, trailers)
   result = fs.rstError(1) == int(errProtocol) and not fs.hasResponse(1) and
@@ -308,7 +305,7 @@ proc rejects(trailers: openArray[(string, string)]): bool =
 suite "HTTP/2 request trailer field validation (#238)":
   test "a valid trailer is delivered through req.trailers":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let fs = c.sendTrailers(1, @[("x-checksum", "abc")])
     check fs.rstError(1) == -1
     check fs.bodyOf(1) == "buffered:4|x-checksum=abc"
@@ -367,7 +364,7 @@ suite "HTTP/2 request trailer field validation (#238)":
 
   test "a valid trailer reaches a streaming route's sink too":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let fs = c.sendTrailers(1, @[("x-checksum", "abc")], path = "/stream")
     check fs.rstError(1) == -1
     check fs.bodyOf(1) == "done:4|x-checksum=abc"
@@ -375,7 +372,7 @@ suite "HTTP/2 request trailer field validation (#238)":
 
   test "an invalid trailer resets a streaming route's stream":
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     let fs = c.sendTrailers(1, @[("x-bad", "a\r\nb")], path = "/stream")
     check fs.rstError(1) == int(errProtocol)
     check not fs.hasResponse(1)
@@ -388,7 +385,7 @@ suite "HTTP/2 request trailer field validation (#238)":
     # table is no longer in sync at that point, so the connection cannot
     # continue).
     var c = newH2TestConn(srv.port)
-    discard c.readFrames(300)
+    c.drainHello()
     var huge: seq[(string, string)]
     for _ in 0 ..< 150: huge.add ("x-p", 'v'.repeat(100))
     var f = ""
@@ -403,4 +400,5 @@ suite "HTTP/2 request trailer field validation (#238)":
     check not fs.hasResponse(1)
     c.close()
 
+srv.close()
 echo "http2 request body ok"

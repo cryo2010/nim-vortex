@@ -278,13 +278,6 @@ proc get(path: string): seq[(string, string)] =
   @[(":method", "GET"), (":scheme", "http"), (":path", path),
     (":authority", "localhost")]
 
-proc sendAll(c: var H2TestConn, data: string) =
-  var off = 0
-  while off < data.len:
-    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
-    if n <= 0: return
-    off += n
-
 proc dataBytes(frames: seq[Frame]): int =
   for f in frames:
     if f.typ == uint8(ftData): result += f.payload.len
