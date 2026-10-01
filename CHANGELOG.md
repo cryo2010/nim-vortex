@@ -321,6 +321,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resume point is never cleared by characters that never reached the wire. An
   `event` name that sanitizes away is likewise dropped rather than sent as an
   empty type, which dispatches as the default "message" anyway. (#265)
+- HTTP/2: regression coverage for the per-connection cap on un-dispatched
+  buffered request-body bytes (added in #242, never covered by a test). A
+  buffered body is retained until END_STREAM dispatch and its flow-control bytes
+  are credited on receipt, so `h2ConnWindow` cannot bound it: the new suite
+  trickles 32 concurrent POST streams past the cap and asserts the connection
+  never pins more than `max(h2ConnWindow, maxBodySize)` (verified at 3 MiB with
+  the cap check removed), that the stream which crosses it is reset with
+  REFUSED_STREAM so the client may retry, that a cancelled stream gives its
+  reservation back for a later upload, and that a single upload up to
+  `maxBodySize` still succeeds across a smaller connection window because the
+  credit stays eager. The debug-only counter audit now re-derives the aggregate
+  from a full stream scan too, so a teardown path that forgets to release a
+  reservation fails the test suite instead of permanently shrinking what the
+  connection will accept. (#235)
 
 ### Changed
 

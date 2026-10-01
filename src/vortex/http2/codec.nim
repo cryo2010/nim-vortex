@@ -1981,26 +1981,33 @@ proc h2BlockedOnPeerWindow*(c: ptr Connection): bool =
     (h2.connSendWindow <= 0 and h2.backlogStreams > 0)
 
 proc h2CheckCounters*(c: ptr Connection) =
-  ## Debug-only audit of the #339 deadline counters against a full scan. Compiled
-  ## out of release builds; the loop calls it wherever it used to scan, so any
-  ## mutation site that forgets syncSendState / noteEndStream / dropStreamCounters
-  ## trips an assertion in the test suite rather than silently mis-arming a
-  ## timeout in production.
+  ## Debug-only audit of the per-connection aggregates against a full scan: the
+  ## #339 deadline counters, plus the un-dispatched buffered-body total that caps
+  ## per-connection memory (#235). Compiled out of release builds; the loop calls
+  ## it wherever it used to scan, so any mutation site that forgets
+  ## syncSendState / noteEndStream / dropStreamCounters, or a teardown path that
+  ## forgets to release a buffered-body reservation, trips an assertion in the
+  ## test suite rather than silently mis-arming a timeout (or permanently
+  ## shrinking what the connection will still accept) in production.
   when not defined(release):
     if c.h2 == nil: return
     let h2 = h2Conn(c)
     var awaiting, backlogged, blocked = 0
+    var buffered = 0
     for sid, st in h2.streams.mpairs:   # mpairs: no per-stream value copy
       if not st.endStreamSeen: inc awaiting
       if st.pendingBody.len > st.pendingPos:
         inc backlogged
         if st.sendWindow <= 0: inc blocked
+      buffered += st.bufferedCounted
     assert awaiting == h2.awaitingClientStreams,
       "h2 awaitingClientStreams drift: " & $h2.awaitingClientStreams & " vs " & $awaiting
     assert backlogged == h2.backlogStreams,
       "h2 backlogStreams drift: " & $h2.backlogStreams & " vs " & $backlogged
     assert blocked == h2.windowBlockedStreams,
       "h2 windowBlockedStreams drift: " & $h2.windowBlockedStreams & " vs " & $blocked
+    assert buffered == h2.bufferedBytes,
+      "h2 bufferedBytes drift: " & $h2.bufferedBytes & " vs " & $buffered
 
 proc h2StreamAlive*(c: ptr Connection, sid: uint32): bool =
   c.h2 != nil and sid in h2Conn(c).streams
