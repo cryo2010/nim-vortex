@@ -71,9 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the read was still paused leaked the count and pinned that loop thread
   at the 2 ms paused-body selector cadence for good; a debug build now audits
   the count every second. (#344)
-- A connection refused because the connection table cannot grow while a
-  `blocking:` worker pins a slot is now counted and logged (rate-limited), not
-  dropped silently. (#343)
+- A connection whose fd lands beyond the connection table is now served rather
+  than refused. The table was one flat `seq[Connection]`, so growing it moved
+  every slot and would have dangled the `addr conns[fd]` a running `blocking:`
+  worker holds; `handleAccept` therefore scanned for a pinned slot and, on
+  finding one, accepted the connection and immediately closed it, which from the
+  client is an empty connect error indistinguishable from a network fault or a
+  stalled loop. It is now a segmented table: fixed-size blocks (1024 slots,
+  ~712 KiB each) that are never resized or moved once allocated, so growth
+  appends a block and leaves every outstanding `ptr Connection` valid. The pinned
+  scan, the refusal and its drop counter are gone, growth is unconditional, and
+  the fd rlimit remains the real bound on the table (the accept path still backs
+  off on EMFILE/ENFILE). `maxConnections` is unchanged. (#343)
 - HTTP/3 WebSockets: frames the client pipelines with the Extended CONNECT
   handshake are handed to the accepted WebSocket instead of being lost; a
   client that half-closes before the handler accepts now gets `onClose`
@@ -254,6 +263,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse proxy reports). HTTPS now takes the same sequence as plaintext,
   close_notify then `shutdown(SHUT_WR)` then drain to the peer's FIN or the
   drain deadline, and the session is shut down and freed exactly once. (#373)
+- HTTP/2: the remaining ways to push overhead frames past the
+  `maxControlFrames` budget are charged. A SETTINGS ACK returned before the
+  charge, exactly as a PING ACK once did (we send our SETTINGS once, so every
+  ACK past the first is pure overhead); a zero-increment WINDOW_UPDATE naming a
+  stream we have seen answered with a RST_STREAM before the charge, and on an
+  already-closed id it tore nothing down, so the peer could repeat it forever;
+  and a stream-level WINDOW_UPDATE was never charged at all, which left the
+  cheapest flood of them all (13 bytes a frame against an open stream the server
+  owes no bytes on, so the scheduler pass it forces emits nothing). A
+  stream-level update that unblocks nothing now goes through the same
+  credit-then-charge path as the connection-level and closed-stream ones, so
+  flow control from a client that consumed response DATA still rides the credit
+  those bytes earned. Charging only the updates that unblock *nothing* left the
+  issue's headline vector free, since an increment of 1 always unblocks exactly
+  one byte: after `SETTINGS_INITIAL_WINDOW_SIZE=0`, a flood of
+  `WINDOW_UPDATE(sid, 1)` still bought one 1-byte DATA frame and one full
+  scheduler pass per 13-byte frame. An update that merely dribbles (an increment
+  below 256 bytes that leaves the window it credits below 256 bytes while bytes
+  are waiting on that window, at either level) is now charged straight to the
+  budget and never to the credit pool, because the 1-byte frames it forces would
+  otherwise bank exactly the credit that pays for it. No correct client asks for
+  more data in pieces that small while holding the window under 256 bytes; that
+  is the CVE-2019-9511 data-dribble shape. Conversely, the credit response DATA
+  earns now has a floor of two per DATA frame emitted on top of the one per 256
+  bytes: the server chooses the frame size, and one stream-level plus one
+  connection-level WINDOW_UPDATE per frame is the finest acknowledgement a
+  correct client can send, so a streaming handler writing 1500 16-byte events to
+  such a client used to be torn down with GOAWAY(ENHANCE_YOUR_CALM) after about
+  1070 of them. DATA on a closed stream no longer answers with a RST_STREAM
+  after the GOAWAY its own charge triggered, like the other charged replies. The
+  budget's bypasses are covered by a frame-level regression suite (PING ACK,
+  SETTINGS ACK, received GOAWAY, unknown frame types, WINDOW_UPDATE,
+  self-dependent PRIORITY including the RFC 9113 5.1 rule against resetting an
+  idle stream, closed-stream DATA, per-entry SETTINGS charging, and a
+  one-request-per-burst interleave against the per-request reset), together with
+  the dribble vector at both the stream and the connection level and the two
+  correct clients that must survive it: a small-frame producer acked per frame on
+  both levels, and a 200 KiB download acked in 4096-byte increments. (#234)
+- h2, h3: a streaming (`onBody`) route now reconciles the declared
+  `content-length` against the DATA actually received on every path a request
+  can end on, and as soon as the running tally passes the declared length
+  rather than only at the end. Two gaps remained: `content-length: 10` with
+  END_STREAM on the request HEADERS themselves (no DATA frame and no trailer
+  section, so neither end-of-message check ran) dispatched the handler and
+  flushed it a clean, complete, empty body; and excess DATA was handed to the
+  sink chunk by chunk, with the reset only following the terminating frame, so
+  a route relaying the body upstream under the declared Content-Length had
+  already desynchronized that h1 connection (request smuggling) by the time
+  the mismatch was noticed. Both now fail the stream with PROTOCOL_ERROR
+  (RFC 9113 8.1.1) before anything reaches the handler, and the h3 backend
+  takes the same early check (RFC 9114 4.1.2). On h3 the reset by itself was
+  not enough. A streaming route is queued for dispatch while its HEADERS are
+  parsed and the handler runs only once the whole engine pump is done, and both
+  reconciliation sites deliberately leave the rejected stream in the table so
+  its flow-control credit can be returned when it closes, so a request whose
+  head, body and FIN were parsed in one read batch (out-of-order delivery
+  flushes a buffered DATA frame together with the HEADERS that precede it) was
+  still handed to the handler afterwards, with all of its side effects. The
+  ready-list consumer now skips a stream the backend rejected or has already
+  dropped, which is what h2 gets from reconciling before it enqueues, and a
+  rejected stream also stops accumulating body bytes it will never deliver.
+  Buffered routes are unchanged: they never see a partial body. (#237)
+- h2, h3: a `content-length` field in a request *trailer* section is now
+  rejected (stream PROTOCOL_ERROR / H3_MESSAGE_ERROR) instead of being stored
+  in `req.trailers`. The rest of the trailer-field validation was already in
+  place: the shared rule checks the name and value bytes exactly as for the
+  request head and rejects pseudo-headers and the connection-specific fields,
+  but it was built on the response-side forbidden-field set, which excludes
+  `content-length` on purpose. In a trailer section that is not a
+  response-generation concern but the framing field RFC 9110 6.5.1 names
+  first, the one the h1 parser already drops, so a handler that logged or
+  relayed `req.trailers` could emit a second Content-Length for the same
+  message. Regression coverage for the whole trailer rule set (CR/LF/NUL and
+  edge-whitespace values, uppercase and non-token names, pseudo-headers,
+  `connection` / `proxy-connection` / `keep-alive` / `transfer-encoding` /
+  `upgrade` / `te`, one bad field poisoning the whole block, and the
+  `maxHeaderSize` bound on the block) now lives in
+  `tests/test_http2_request_body.nim`. The outbound direction is closed with
+  it: a `res.trailers` entry named `content-length` or `te` is now dropped on
+  every protocol instead of going out in the trailer section. The three writers
+  had drifted (h1's chunked trailer dropped `content-length` but not `te`, h2's
+  trailing HEADERS emitted both, h3 dropped `te` but not `content-length`), so a
+  handler relaying an upstream's trailers verbatim could hand a client a second,
+  later Content-Length for a message it had already framed, which is the same
+  smuggling primitive in the other direction, or a `te` RFC 9113 8.2.2 forbids
+  on a response outright. They now share one predicate
+  (`fieldrules.forbiddenResponseTrailerField`, also the inbound rule's forbidden
+  set), and h2 and h3 drop a non-token or pseudo-header trailer name and a
+  CR/LF/NUL value there too, as h3's value check already did. (#238)
+- SSE: an `id` can no longer break `Last-Event-ID` resume. NUL joins CR and LF
+  in the field sanitizer, so no SSE field value (`id`, `event`, a comment's
+  text) can carry a byte the wire format has no escape for; a NUL in an `id`
+  used to go out verbatim, and the WHATWG EventSource rules make a client ignore
+  such a field entirely, leaving `Last-Event-ID` stuck on the previous event. An
+  `id` that the sanitizer empties (`"\r\n"`, `"\0"`) now emits no `id:` field at
+  all instead of the empty one that *resets* the client's `Last-Event-ID`, so a
+  resume point is never cleared by characters that never reached the wire. An
+  `event` name that sanitizes away is likewise dropped rather than sent as an
+  empty type, which dispatches as the default "message" anyway. (#265)
+- HTTP/2: regression coverage for the per-connection cap on un-dispatched
+  buffered request-body bytes (added in #242, never covered by a test). A
+  buffered body is retained until END_STREAM dispatch and its flow-control bytes
+  are credited on receipt, so `h2ConnWindow` cannot bound it: the new suite
+  trickles 32 concurrent POST streams past the cap and asserts the connection
+  never pins more than `max(h2ConnWindow, maxBodySize)`, and never less than
+  the 64 KiB default receive window (verified at 3 MiB with
+  the cap check removed), that the stream which crosses it is reset with
+  REFUSED_STREAM so the client may retry, that a cancelled stream gives its
+  reservation back for a later upload, and that a single upload up to
+  `maxBodySize` still succeeds across a smaller connection window because the
+  credit stays eager. The debug-only counter audit now re-derives the aggregate
+  from a full stream scan too, so a teardown path that forgets to release a
+  reservation fails the test suite instead of permanently shrinking what the
+  connection will accept. (#235)
+- HTTP/2: a response stalled on the peer's flow-control window is now timed out
+  from the timeout sweep as well as from the input path. #242 made "response
+  bytes owed but blocked on a peer send window" arm the body deadline, but the
+  classification runs only in the deadline tail of an inbound-frame pass, and a
+  streamed `sendFile` parks its bytes from the outbox instead: a chunk read holds
+  a file-chunk pin, which deliberately does not pause input, and its release
+  re-processes input only when bytes are already buffered, which a silent client
+  never has. So a download to a client that absorbed its initial window and then
+  stopped sending WINDOW_UPDATEs reached the loop with no deadline armed at all
+  and pinned the fd, the connection slot and the parked chunks until the process
+  exited: zero traffic, no timeout. The sweep now arms the same deadline from the
+  same predicate (one O(1) counter read per connection per second), so the stall
+  is bounded whichever path parked the bytes, and the close sends
+  GOAWAY(NO_ERROR) first so the client can tell it from a network fault (unless
+  the deadline lands while a file-chunk read is in flight, when the deferred
+  close is a bare FIN). A client
+  that keeps returning credit re-arms the deadline on every pass and is never cut
+  off. Covered by tests/test_http2_backpressure.nim for a buffered response and
+  for a streamed `sendFile`. (#236)
 
 ### Changed
 

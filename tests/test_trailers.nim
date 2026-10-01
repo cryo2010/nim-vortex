@@ -1,7 +1,9 @@
 ## Request trailers (req.trailers): the header fields a client may send after a
-## chunked/streamed body. Covers HTTP/1.1 (raw chunked framing with a trailer
-## section) and HTTP/2 (a trailing HEADERS frame with END_STREAM). The response
-## side (res.trailers) is exercised in test_streaming.nim.
+## chunked/streamed body, and the filtering a RESPONSE trailer section
+## (res.trailers) takes on its way out. Covers HTTP/1.1 (raw chunked framing with
+## a trailer section) and HTTP/2 (a trailing HEADERS frame with END_STREAM); the
+## h3 twin of the outbound half is in test_http3.nim, and test_streaming.nim
+## covers the ordinary res.trailers delivery.
 
 import std/[unittest, net, strutils, httpcore]
 import vortex/[settings, request, server, routing]
@@ -18,8 +20,20 @@ proc echoTrailers(req: Request, res: Response) {.gcsafe.} =
     $("x-checksum" in req.trailers) & "|" &
     $req.trailers.len & "|" & names.join(","))
 
+proc respTrailers(req: Request, res: Response) {.gcsafe.} =
+  ## A streamed response whose handler puts framing fields in the trailer
+  ## section, the shape of a route relaying an upstream's trailers verbatim.
+  res.sendHead(Http200, "text/plain")
+  res.write("body")
+  res.trailers["Content-Length"] = "999"
+  res.trailers["TE"] = "trailers"
+  res.trailers["Transfer-Encoding"] = "chunked"
+  res.trailers["X-Checksum"] = "abc"
+  res.finish()
+
 let rt = newRouter()
 rt.post("/echo", echoTrailers)
+rt.get("/rtrailer", respTrailers)
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 let port = srv.port
 
@@ -93,6 +107,56 @@ suite "req.trailers over HTTP/2 (trailing HEADERS)":
     c.sendRaw(f)
     let frames = c.readFrames(1000)
     check rstError(frames, 3) != 0                      # stream reset, not 200
+    c.close()
+
+suite "res.trailers: the framing fields a trailer section must not carry (#238)":
+  ## RFC 9110 6.5.1 forbids generating Content-Length in a trailer section (the
+  ## recipient has already framed the message, so a second value is a smuggling
+  ## primitive for an intermediary that believes the later one), and RFC 9113
+  ## 8.2.2 / RFC 9114 4.2 forbid `te` on a response at all. h1 dropped
+  ## content-length but not te; h2 emitted both; h3 dropped te but not
+  ## content-length. All three now share one predicate, so the same set goes
+  ## nowhere and only x-checksum survives.
+  test "HTTP/1.1: only x-checksum reaches the chunked trailer section":
+    let s = newSocket()
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.send("GET /rtrailer HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    var resp: string
+    var chunk = s.recv(65536, timeout = 2000)
+    while chunk.len > 0:
+      resp.add chunk
+      chunk = s.recv(65536, timeout = 2000)
+    let i = resp.find("\r\n0\r\n")        # the last chunk opens the trailer section
+    check i >= 0
+    let section = resp[i + 5 .. ^1].toLowerAscii
+    check "x-checksum: abc" in section
+    check "content-length" notin section
+    check "te:" notin section
+    check "transfer-encoding" notin section
+
+  test "HTTP/2: only x-checksum reaches the trailing HEADERS frame":
+    var c = newH2TestConn(port)
+    discard c.readFrames(300)
+    var f = ""
+    f.addRequest(1, [(":method", "GET"), (":path", "/rtrailer"),
+                     (":scheme", "http"), (":authority", "x")],
+                 endStream = true)
+    c.sendRaw(f)
+    # The trailing HEADERS carries END_STREAM, so wait for the second block.
+    let frames = c.readFrames(1500,
+      until = proc(fr: seq[Frame]): bool =
+        var heads = 0
+        for x in fr:
+          if x.typ == uint8(ftHeaders) and x.streamId == 1: inc heads
+        heads >= 2)
+    var blocks: seq[seq[(string, string)]]
+    for x in frames:
+      if x.typ == uint8(ftHeaders) and x.streamId == 1:
+        blocks.add decodeHeaders(x.payload)
+    check blocks.len == 2
+    if blocks.len == 2:
+      check blocks[1] == @[("x-checksum", "abc")]
     c.close()
 
 srv.close()

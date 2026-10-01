@@ -318,11 +318,13 @@ jobs:
         # (reusePort load-balances across threads on Linux). -d:plainHttp keeps
         # OpenSSL out of the report; -d:useMalloc lets TSan see all allocations.
         # Built/run directly (not `nimble testrace`) so a failure is not masked
-        # by nim-lang/nimble#1802.
+        # by nim-lang/nimble#1802. test_conn_table is the one suite that grows
+        # the segmented connection table while a worker holds a slot (#343),
+        # so the cross-thread half of that claim runs under TSan too.
         env:
           TSAN_OPTIONS: halt_on_error=1:abort_on_error=1
         run: |
-          for t in test_thread_race test_blocking_race test_blocking_args test_router_race; do
+          for t in test_thread_race test_blocking_race test_blocking_args test_router_race test_conn_table; do
             nim c -r --mm:orc --threads:on -d:plainHttp -d:useMalloc \
               --passC:-fsanitize=thread --passL:-fsanitize=thread \
               --debugger:native -p:src -o:tests/$t tests/$t.nim

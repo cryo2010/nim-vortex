@@ -110,6 +110,24 @@ func isForbiddenResponseField*(name: string, trailer = false): bool =
   eqIgnoreAsciiCase(name, "upgrade") or
   (trailer and eqIgnoreAsciiCase(name, "te"))
 
+func forbiddenResponseTrailerField*(name: string): bool =
+  ## The field names a RESPONSE trailer section must never carry, on any
+  ## protocol: the connection-specific / hop-by-hop set (which in a trailer
+  ## section includes `te`, forbidden on a response outright by RFC 9113 8.2.2 /
+  ## RFC 9114 4.2) plus content-length, which RFC 9110 6.5.1 forbids generating
+  ## in a trailer section -- it is framing the recipient has already acted on, so
+  ## a second, later value is a smuggling primitive for an intermediary deciding
+  ## which of the two to believe. Case-insensitive and allocation-free.
+  ##
+  ## isForbiddenResponseField deliberately excludes content-length (see there)
+  ## because on the response head h1 generates it and the h1 codec forbids it
+  ## separately as a framing concern. A trailer section is neither case, which is
+  ## why this is its own predicate; it is also the one the h1 chunked trailer
+  ## writer, the h2 trailing HEADERS and the h3 trailer submission all share, so
+  ## the three cannot drop different sets (#238).
+  isForbiddenResponseField(name, trailer = true) or
+    eqIgnoreAsciiCase(name, "content-length")
+
 func validTrailerField*(name, val: string): bool =
   ## Whether a decoded h2/h3 request trailer field may be stored in req.trailers.
   ## RFC 9113 8.1 / RFC 9114 4.1-4.2: a trailer is a field, so it must be a valid
@@ -121,9 +139,14 @@ func validTrailerField*(name, val: string): bool =
   ## drops a wider RFC 9110 6.5.1 superset (framing / routing / auth / control
   ## fields) from the trailer section rather than rejecting the message, a
   ## stricter but lenient model, so it keeps its own list.
+  ##
+  ## The forbidden set is forbiddenResponseTrailerField's, the one the outbound
+  ## trailer writers share, so content-length is rejected here too: storing it
+  ## would let a handler that logs or relays req.trailers emit a second
+  ## Content-Length for the same message (#238).
   name.len > 0 and name[0] != ':' and
     validFieldName(name) and validFieldValue(val) and
-    not isForbiddenResponseField(name, trailer = true)
+    not forbiddenResponseTrailerField(name)
 
 type RequestHeadClass* = enum
   rhInvalid    ## malformed: reject the request / reset the stream

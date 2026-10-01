@@ -138,6 +138,10 @@ type
     dispatched: bool
     finSeen: bool
     bodyManualAck: bool
+    rejected: bool           ## the stream was reset for a malformed body length
+                             ## but deliberately kept in the table so
+                             ## cbStreamClose can return its flow-control
+                             ## credit: it must never be dispatched (#237)
     contentLength: int64     ## declared content-length (-1 = absent); reconciled
                              ## against bodyReceived at stream end (#257)
     bodyReceived: int64      ## cumulative DATA payload bytes received
@@ -195,6 +199,14 @@ proc h3StreamPtr*(conn: H3Conn, sid: uint64): ptr H3Stream =
   if sid in conn.streams: addr conn.streams[sid] else: nil
 
 proc h3StreamAlive*(conn: H3Conn, sid: uint64): bool = sid in conn.streams
+proc h3StreamRejected*(conn: H3Conn, sid: uint64): bool =
+  ## True when this stream has been reset for a malformed request-body length but
+  ## is still in the table (so cbStreamClose can return its flow-control credit).
+  ## The dispatcher checks it before running a handler the ready list still
+  ## carries from cbEndHeaders: the reset happens inside the engine pump, which
+  ## finishes before the ready list is drained, so without this a request the
+  ## server already rejected would still reach a streaming route (#237).
+  sid in conn.streams and conn.streams[sid].rejected
 proc h3StreamCount*(conn: H3Conn): int = conn.streams.len
 
 # --- header validation (RFC 9114 pseudo-header rules; pure) -----------------
@@ -317,6 +329,13 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
   let usid = uint64(sid)
   if usid notin h3c.streams: return
   template st: H3Stream = h3c.streams[usid]
+  if st.rejected:
+    # Reset for a content-length mismatch already; the stream only lingers in the
+    # table so cbStreamClose can settle its flow-control credit. Keep counting
+    # the bytes still in flight as uncredited so creditRemainder hands them back,
+    # but never buffer them and never offer them to a sink (#237).
+    if st.rs.reqStreaming: st.uncredited += int(len)
+    return
   if st.ws != nil:
     # RFC 9220 tunnel: DATA payload is WebSocket framing.
     if len > 0 and h3c.vq != nil:
@@ -388,6 +407,25 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     # returns them to the connection window at teardown (see creditRemainder);
     # deliverBody's auto-ack and h3AckBody decrement this as they credit.
     st.uncredited += int(len)
+    if st.contentLength >= 0 and st.bodyReceived > st.contentLength:
+      # Already past the declared content-length: malformed now, not only at
+      # cbStreamEnd. A streaming route relays each chunk as it arrives, so an
+      # end-of-stream-only check lets the excess bytes reach an h1 upstream
+      # under the declared length before the reset (request smuggling), the h3
+      # twin of the h2 guard in http2/codec.nim (#237). Reset and let
+      # cbStreamClose clean up; creditRemainder returns these uncredited bytes
+      # to the connection window, so nothing leaks.
+      #
+      # Mark the stream rejected so the dispatcher skips the entry cbEndHeaders
+      # already queued on the ready list: head, body and FIN can all arrive in
+      # one read batch, in which case this runs before the handler exists and
+      # only the flag stops it running afterwards. Drop what was buffered too --
+      # the sink does not exist yet on that path, so the bytes would otherwise
+      # sit in st.body until cbStreamClose.
+      st.rejected = true
+      st.body.setLen(0)
+      if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)  # H3_MESSAGE_ERROR
+      return
     deliverBody(h3c, usid, false)
   elif len > 0 and h3c.vq != nil:
     # Buffered request body (#220): nghttp3_conn_read_stream does not credit
@@ -421,7 +459,13 @@ proc cbStreamEnd(user, connUd: pointer, sid: int64) {.cdecl.} =
   elif st.contentLength >= 0 and st.bodyReceived != st.contentLength:
     # Declared content-length disagrees with the DATA received: malformed request
     # (RFC 9110 8.6). Reset the stream; cbStreamClose delivers EOF to a suspended
-    # handler and cleans up (#257). Do not dispatch/deliver a clean completion.
+    # handler and cleans up (#257). Do not dispatch/deliver a clean completion:
+    # a streaming route was queued on the ready list back in cbEndHeaders and
+    # the handler has not necessarily run yet (everything up to the FIN can
+    # arrive in one read batch), so flag the stream and let the dispatcher drop
+    # the queued entry (#237).
+    st.rejected = true
+    st.body.setLen(0)
     if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)   # H3_MESSAGE_ERROR
   elif st.rs.reqStreaming:
     deliverBody(h3c, usid, true)
@@ -729,14 +773,19 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
   # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
   if trailers.len > 0:
     # Validate handler-supplied response trailers before submission: drop a
-    # pseudo/connection-specific name or a value with CR/LF/NUL, so a handler
+    # pseudo-header or non-token name, or a value with CR/LF/NUL, so a handler
     # concatenating untrusted data into a trailer can't split the response on an
-    # h1 relay (#257). Build the wire list from only the accepted entries.
+    # h1 relay (#257). The forbidden set is the one h1's chunked trailer writer
+    # and h2's trailing HEADERS share (fieldrules.forbiddenResponseTrailerField):
+    # the connection-specific fields plus `te`, and content-length, which RFC
+    # 9110 6.5.1 forbids generating in a trailer section (#238). Build the wire
+    # list from only the accepted entries.
     var lower: seq[(string, string)]
     for (name, val) in trailers:
       let ln = name.toLowerAscii
-      if ln.len == 0 or ln[0] == ':' or not validFieldValue(val): continue
-      if isForbiddenResponseField(ln, trailer = true): continue  # trailers also ban te
+      if ln.len == 0 or ln[0] == ':' or not validFieldName(ln) or
+          not validFieldValue(val): continue
+      if forbiddenResponseTrailerField(ln): continue
       lower.add (ln, val)
     if lower.len > 0:
       var tv = newSeq[VqHeader](lower.len)

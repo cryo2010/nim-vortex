@@ -88,8 +88,11 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_http2.nim` | HTTP/2 integration (h2c prior knowledge, via curl) |
 | `test_http2_flowcontrol.nim` | Flow-control regression for h2spec 6.9.2 (SETTINGS_INITIAL_WINDOW_SIZE change) |
 | `test_http2_malformed.nim` | Malformed HEADERS answered with RST_STREAM(PROTOCOL_ERROR): bad/duplicate Content-Length (RFC 9113 8.1.1), NUL/CR/LF in field names/values (8.2.1). Plus the #240 conformance follow-ups that are visible on the wire: any frame on a permanently idle even stream id (5.1), the 1*DIGIT Content-Length grammar and the field-value whitespace rule (8.2.1), unknown and non-token `:method` values, the CONNECT pseudo-header rules (8.5), connection-specific response fields (8.2.2), the HPACK dynamic-table-size update (RFC 7541 4.2), and the GOAWAY length check (4.2/6.8) |
+| `test_http2_request_body.nim` | Request-body `content-length` reconciliation on a streaming (`onBody`) route (#237): DATA past the declared length rejected on arrival rather than after the terminating frame, a short body and a mismatch revealed by the trailer section rejected at END_STREAM, `content-length` with END_STREAM on the request HEADERS rejected before the handler is dispatched, `content-length: 0` with DATA rejected, matching bodies (with and without trailers) still answered, and a rejected stream still terminating the sink so a suspended handler cannot leak (#232). Plus request trailer-field validation (#238): CR/LF/NUL and edge-whitespace values, uppercase and non-token names, pseudo-headers, the connection-specific and framing fields forbidden in a trailer section (RFC 9113 8.2.2 / RFC 9110 6.5.1), one bad field poisoning the whole block, a valid trailer still reaching `req.trailers` on a buffered and a streaming route, and the `maxHeaderSize` bound on the trailer block |
 | `test_http2_stream_errors.nim` | Stream-level conditions stay stream-level instead of GOAWAY-ing the connection (#239): trailers without END_STREAM (RFC 9113 8.1), HEADERS on a half-closed(remote) stream (5.1), and DATA/trailers racing the server's own early final response (5.1 closed-stream tolerance) |
 | `test_http2_download.nim` | Streaming-download regressions: the per-stream `pendingBody` buffer stays bounded while the backlog never reaches zero (#331); benign connection-level WINDOW_UPDATEs during a long download do not trip the control-frame budget (#335); a single write larger than the peer window arrives byte-exact across the direct-emit / parked-remainder seam, and a wide window still frames one full-sized DATA per producer chunk (#334); a sendFile download against a small peer window keeps the per-stream backlog within the read-ahead budget plus two chunks and still completes byte-exact (#340) |
+| `test_http2_budget.nim` | The `maxControlFrames` budget has no bypass (#234): a flood of PING ACKs, SETTINGS ACKs, received GOAWAYs, unknown frame types, stream-level WINDOW_UPDATEs, self-dependent PRIORITY on a used stream, or DATA on a closed stream ends in GOAWAY(ENHANCE_YOUR_CALM); a self-dependency on an idle stream id is a connection error and never a RST_STREAM (RFC 9113 5.1); SETTINGS entries are charged per entry, not per frame; and a one-GET-per-burst interleave still trips the budget (it used to reset it). The converse too: a few control frames or window updates per request are answered normally |
+| `test_http2_backpressure.nim` | The two per-connection backpressure caps (#242, untested until now): un-dispatched buffered request bodies cannot pin more than `max(h2ConnWindow, maxBodySize)` (never below the 64 KiB default receive window) across concurrently trickled POST streams (the stream that crosses it is reset with REFUSED_STREAM, a cancelled stream gives its reservation back, and a single upload up to `maxBodySize` still succeeds because credit stays eager) (#235); and a connection whose requests have all finished while the server owes response bytes parked on an exhausted peer window is closed with a GOAWAY within `bodyTimeout` instead of being pinned, for a buffered response and for a streamed `sendFile` alike, while a client that keeps returning credit is never cut off (#236) |
 | `test_http2_priority.nim` | RFC 9218 prioritization: urgency ordering, incremental interleaving, PRIORITY_UPDATE, `res.setPriority` override |
 | `test_connect_disconnect.nim` | Half-open stream closed by the read-idle deadline (slowloris, #201); two-step GOAWAY on graceful shutdown (RFC 9113 6.8, #208) |
 | `test_http2_websocket.nim` | HTTP/2 Extended CONNECT WebSockets (RFC 8441), frame level; a close queued behind an exhausted send window drains on the next WINDOW_UPDATE instead of RST_STREAM(CANCEL) (#240.9) |
@@ -98,7 +101,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 
 | Test | Verifies |
 |------|----------|
-| `test_http3.nim` | HTTP/3 integration over QUIC (via an HTTP/3-capable curl; skips if absent) |
+| `test_http3.nim` | HTTP/3 integration over QUIC (via an HTTP/3-capable curl; skips if absent), including a streaming route's declared `content-length` against the body received |
 
 ### WebSockets
 
@@ -154,14 +157,14 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_multipart.nim` | multipart/form-data (RFC 7578): pure parser plus `req.form` / `req.files` end-to-end with a real curl `-F` upload |
 | `test_response_headers.nim` | `res.headers` pending headers (middleware/handler) merged into the eventual send; the send call's headers win per name |
 | `test_early_hints.nim` | 103 Early Hints (`res.earlyHints` / `res.informational`) before the final response, over HTTP/1.1 and HTTP/2 |
-| `test_trailers.nim` | Request trailers (`req.trailers`) over h1 chunked framing and an h2 trailing HEADERS frame (response side: `test_streaming.nim`) |
+| `test_trailers.nim` | Request trailers (`req.trailers`) over h1 chunked framing and an h2 trailing HEADERS frame, plus the framing fields a `res.trailers` section must never carry on either (delivery: `test_streaming.nim`) |
 
 ### Streaming & static files
 
 | Test | Verifies |
 |------|----------|
 | `test_streaming.nim` | Response body streaming (`res.sendHead` / `write` / `finish`) |
-| `test_sse_streaming.nim` | Streaming API end-to-end over HTTP/1.1 (SSE pattern) |
+| `test_sse_streaming.nim` | Streaming API end-to-end over HTTP/1.1 (SSE pattern); `id` / `event` / comment sanitization (CR, LF, NUL) and the empty-`id` rule, asserted against the exact wire bytes (#265) |
 | `test_streaming_request.nim` | Streaming request bodies via a `router.stream` route |
 | `test_streaming_read.nim` | Pull-based request-body streaming (asyncdispatch adapter) |
 | `test_streaming_drain.nim` | Awaitable outbound backpressure (producer yields on a full buffer) |
@@ -176,6 +179,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_blocking_args.nim` | `req.blocking(a, b, ...)`: values moved into the worker, usable by name in the block (the refcount race only shows under `nimble testrace` / TSan) |
 | `test_blocking_guard.nim` | Compile-time guard on `req.blocking` captures: value data allowed, ref/ptr/closure rejected, `isolate(...)` may cross |
 | `test_blocking_pool.nim` | Worker-pool load shedding: a saturated pool answers 503 (`maxBlockingQueue`); `close()` detaches a wedged worker after `shutdownHardTimeout` (#204) |
+| `test_conn_table.nim` | Growth-stable connection table: a slot keeps its address across growth, and a high fd arriving while a `blocking:` worker pins a slot is served instead of silently dropped (#343). Built with `-d:vortexConnBlock=8` from its sibling `tests/test_conn_table.nims` so the growth path needs only a couple of dozen connections |
 | `test_graceful_shutdown.nim` | `requestShutdown()` drains in-flight requests, frees the port |
 | `test_multi_server.nim` | Multiple `Server` instances in one process are independent |
 | `test_remote_address.nim` | `req.remoteAddress` (peer IP) and `req.forwardedFor` (SEC1) |

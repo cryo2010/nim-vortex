@@ -292,6 +292,45 @@ type
                               ## reconciled against respBodyWritten at finish()
     respBodyWritten*: int64   ## body bytes written so far on that stream (#248)
 
+  ConnTable* = object
+    ## The fd-indexed connection slots of one loop thread, held in fixed-size
+    ## blocks so that growing the table never moves a `Connection`.
+    ##
+    ## That property is the whole point. A `blocking:` worker runs with
+    ## `addr conns[fd]` in hand for the length of its handler, and the loop
+    ## thread goes on accepting while it does. With one flat `seq[Connection]`
+    ## those two facts could not both hold: an accepted fd past the end forces a
+    ## realloc, a realloc moves every element, and the worker's pointer dangles
+    ## into freed memory. The loop therefore had to refuse the connection
+    ## whenever any slot was pinned, which is a silent drop of a perfectly good
+    ## connection (#343).
+    ##
+    ## Blocks remove the conflict. Each block is a `seq[Connection]` sized once,
+    ## at creation, and never resized or dropped for the loop's lifetime; only
+    ## the outer `blocks` seq grows. A Nim seq is a (length, payload pointer)
+    ## header whose elements live in a separately heap-allocated payload, and
+    ## growing a `seq[seq[T]]` reallocates just the outer buffer: the inner
+    ## headers are byte-copied to a new address and every payload pointer in them
+    ## survives untouched. So a `ptr Connection` taken into a block stays valid
+    ## across any number of later growths. Verified: with a slot held by
+    ## `addr blocks[0][3]`, 40 further `blocks.add` left both that address and
+    ## the slot's value (a string field included) identical.
+    ##
+    ## The flip side is that the outer `blocks` header and payload now move at
+    ## arbitrary moments on the loop thread, where the old flat table stayed
+    ## put for as long as any slot was pinned. So the table is loop-thread
+    ## only in a stricter sense than "never copy it": another thread must not
+    ## even read `len` or index it, because growth can free the block list
+    ## under that read. Workers get a `ReqSnapshot` value or route through the
+    ## outbox, never a live lookup; `conn` asserts the rule in debug builds.
+    ##
+    ## Loop-thread only, and loop-owned: never copy a ConnTable (that would
+    ## deep-copy the payloads and leave every outstanding pointer aimed at the
+    ## original), which is what the disabled `=copy` below enforces.
+    blocks: seq[seq[Connection]]
+    shift: int                ## log2 of the block size, so index -> block is a shift
+    mask: int                 ## block size - 1, so index -> offset is an AND
+
   H3SlotEntry* = object
     ## HTTP/3 connections aren't fd-backed; they live in per-loop slots.
     ## A Request handle encodes slot i as fd = -(i+2); see h3SlotFd/h3SlotOf.
@@ -372,7 +411,7 @@ type
     ## The part of an event loop's state that `Request` handles must reach:
     ## connection slots plus per-loop cached strings. Lives inside the Loop
     ## object (stable address for the server's lifetime).
-    conns*: seq[Connection]
+    conns*: ConnTable
     h3slots*: seq[H3SlotEntry]
     altSvc*: string           ## advertised on h1/h2 responses when h3 is on
     dateStr*: string          ## cached RFC 7231 date, refreshed once/second
@@ -413,6 +452,69 @@ type
       ## races the worker would orphan the future + its suspended continuation
       ## (the response releases the connection pin one message before
       ## `omBlockingDone`, so the connection count alone can hit 0 too early).
+
+# --- the connection table ---------------------------------------------------
+#
+# A growth-stable, fd-indexed slot table. See the ConnTable docstring for why it
+# is segmented. These are the only ways in, and deliberately there is no
+# value-returning `[]`: a slot is always reached as a `ptr Connection`, so the
+# one way to hold onto one is the way that stays valid across growth.
+
+const connBlockDefault* = 1024
+  ## Slots per block, and so the initial table size: large enough that a server
+  ## under normal fd pressure never grows the table at all, small enough that a
+  ## loop thread's table costs well under a megabyte (712 B per Connection, so
+  ## ~712 KiB a block). Rounded up to a power of two by `initConnTable`.
+  ## Overridable at compile time with `-d:vortexConnBlock=N` (N >= 1): internal,
+  ## and only the growth test has a reason to shrink it.
+
+const connBlockConfigured {.intdefine: "vortexConnBlock".} = connBlockDefault
+static: doAssert connBlockConfigured >= 1, "-d:vortexConnBlock must be >= 1"
+
+proc `=copy`*(dst: var ConnTable, src: ConnTable) {.error:
+  "a ConnTable is loop-owned and must never be copied: copying it would " &
+  "duplicate the slot payloads and leave every ptr Connection a worker holds " &
+  "pointing at the original".}
+
+proc initConnTable*(blockSize = connBlockConfigured): ConnTable =
+  ## One block of `blockSize` slots, ready for the usual fd range. `blockSize` is
+  ## rounded up to a power of two so the index split is a shift plus an AND.
+  var size = 1
+  var shift = 0
+  while size < blockSize:
+    size = size shl 1
+    inc shift
+  result.shift = shift
+  result.mask = size - 1
+  result.blocks = @[newSeq[Connection](size)]
+
+func len*(t: ConnTable): int {.inline.} =
+  ## Number of slots, i.e. one past the highest fd the table can index.
+  t.blocks.len shl t.shift
+
+func blockSize*(t: ConnTable): int {.inline.} = t.mask + 1
+
+proc at*(t: var ConnTable, i: int): ptr Connection {.inline.} =
+  ## The slot for fd `i`. The pointer stays valid for the table's lifetime: the
+  ## block it points into is never resized, moved or freed.
+  addr t.blocks[i shr t.shift][i and t.mask]
+
+proc grow*(t: var ConnTable, fd: int) =
+  ## Append whole blocks until `fd` is a valid index. Existing blocks are left
+  ## exactly where they are, so this is safe to call while workers hold pointers
+  ## into them, which is the entire reason the table is shaped this way. There is
+  ## no ceiling: `fd` is a file descriptor, so the fd rlimit already bounds the
+  ## table, and the accept path backs off on EMFILE/ENFILE rather than coming
+  ## here with an unbounded index.
+  while fd >= t.len:
+    t.blocks.add newSeq[Connection](t.mask + 1)
+
+iterator slots*(t: var ConnTable): ptr Connection =
+  ## Every slot in fd order, free ones included (the scans filter on `state`).
+  ## Replaces `for i in 0 ..< conns.len: addr conns[i]`.
+  for b in 0 ..< t.blocks.len:
+    for i in 0 ..< t.blocks[b].len:
+      yield addr t.blocks[b][i]
 
 proc hasStreamRoute*(core: ptr LoopCore): bool {.inline.} =
   ## True when a streaming predicate is configured (see streamRouteRaw).
@@ -558,10 +660,23 @@ proc unpackResponseInto*(data: string, contentType: var string,
     headers[i][1].setSlice(data, pos, vl); pos += vl
   result = pos
 
+var pinThreadId {.threadvar.}: int
+
+proc onOwnLoopThread(core: ptr LoopCore): bool {.inline.} =
+  ## Same cached-getThreadId pattern as request.currentThreadId (a syscall on
+  ## Linux; caching matters on per-chunk paths).
+  if pinThreadId == 0: pinThreadId = getThreadId()
+  pinThreadId == core.threadId
+
 proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
-  ## Resolve a (fd, gen) handle; nil if the connection is gone.
+  ## Resolve a (fd, gen) handle; nil if the connection is gone. Loop-thread
+  ## only: the table's block list reallocates on growth (see `ConnTable`), so
+  ## an off-thread read of it races a free. Every off-thread entry point checks
+  ## the thread or reads a snapshot before getting here; this is the backstop.
+  assert core.onOwnLoopThread(),
+    "conn() resolves the loop-owned connection table and is loop-thread only (#343)"
   if fd < 0 or int(fd) >= core.conns.len: return nil
-  result = addr core.conns[int(fd)]
+  result = core.conns.at(int(fd))
   if result.gen != gen or result.state == csFree: return nil
 
 # --- typed pin accounting ---------------------------------------------------
@@ -577,9 +692,10 @@ proc reset*(ps: var PinSet) {.inline.} =
   for k in PinKind: ps.counts[k] = 0
 
 func totalPins*(c: Connection): int32 {.inline.} =
-  ## Any outstanding worker task: the slot must not recycle, `conns` must not
-  ## realloc, and the loop must not touch the carrier's ORC-counted protocol
-  ## refs. Replaces every former `pinned > 0` gate.
+  ## Any outstanding worker task: the slot must not recycle and the loop must
+  ## not touch the carrier's ORC-counted protocol refs. Replaces every former
+  ## `pinned > 0` gate. Table growth is no longer one of the things a pin has to
+  ## hold off: a ConnTable grows by appending a block, which moves nothing (#343).
   c.pins.total
 
 func totalPins*(c: ptr Connection): int32 {.inline.} = totalPins(c[])
@@ -606,14 +722,6 @@ func pinKindOf*(r: PinRelease): PinKind =
   of prFileChunk: pkFileChunk
   of prWsBlocking: pkWsBlocking
   of prNone: raiseAssert "prNone names no pin kind"
-
-var pinThreadId {.threadvar.}: int
-
-proc onOwnLoopThread(core: ptr LoopCore): bool {.inline.} =
-  ## Same cached-getThreadId pattern as request.currentThreadId (a syscall on
-  ## Linux; caching matters on per-chunk paths).
-  if pinThreadId == 0: pinThreadId = getThreadId()
-  pinThreadId == core.threadId
 
 proc acquirePin*(core: ptr LoopCore, c: ptr Connection, k: PinKind) {.inline.} =
   ## Pin `c` for one worker task of kind `k`. Loop thread only, by API

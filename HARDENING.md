@@ -30,10 +30,10 @@ reference below.
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `maxConnections` | 65536 | Live connections per loop thread; excess is accepted then dropped |
+| `maxConnections` | 65536 | Live connections per loop thread; excess is accepted then dropped. The fd-indexed connection table behind it grows in 1024-slot blocks (~712 KiB each) up to the highest fd a loop thread sees, so its worst case is loop threads x ceil(fd rlimit / 1024) x 712 KiB, bounded by the fd rlimit rather than by this cap |
 | `maxConcurrentStreams` | 256 | Open HTTP/2 and HTTP/3 streams per connection |
 | `maxResetStreams` | 512 | HTTP/2 and HTTP/3 peer resets before the connection is torn down (rapid reset); 0 disables |
-| `maxControlFrames` | 1000 | HTTP/2 PING/SETTINGS/PRIORITY between stream progress; decays on accepted requests and on response body bytes sent, and WINDOW_UPDATEs that unblock nothing spend credit earned by body bytes sent (one per 256 bytes) before they count; 0 disables |
+| `maxControlFrames` | 1000 | HTTP/2 overhead frames (PING and SETTINGS including their ACKs, PRIORITY, received GOAWAY, CONTINUATION, unknown types) between stream progress, each charged before the reply it forces, so an RST_STREAM sent in answer is paid for by the frame that caused it; SETTINGS is charged per entry; decays on accepted requests and on response body bytes sent, and WINDOW_UPDATEs that unblock nothing (connection-level, closed-stream, or an open stream the server owes no bytes on) spend credit earned by response DATA before they count: one credit per 256 bytes plus a floor of two per DATA frame emitted, so a small-frame producer acked on both levels per frame is never charged. A WINDOW_UPDATE that only dribbles (increment under 256 bytes, window still under 256 bytes after it, bytes waiting on that window) is charged straight to this budget instead, because the 1-byte DATA frames it forces would otherwise earn the credit for it; 0 disables |
 | `maxRequestsPerSocket` | 0 (off) | HTTP/1 keep-alive requests before the connection is closed |
 | `maxBlockingQueue` | 0 (unbounded) | `blocking:` tasks that may queue for a free worker; past it new dispatches fail fast (503 / `PoolSaturatedError`) instead of queuing behind slow or stuck work |
 | `maxHeaderSize` | 16 KiB | Request line + headers (431); also caps HPACK decoded size |
@@ -41,7 +41,8 @@ reference below.
 | `maxBodySize` | 8 MiB | Request body (413); per stream on HTTP/2 and HTTP/3; also caps a decompressed body |
 | `maxWsMessageSize` | 1 MiB | Largest inbound WebSocket message (close 1009) |
 | `h2StreamWindow` | 1 MiB | HTTP/2 per-stream receive window (upload flow control) |
-| `h2ConnWindow` | 1 MiB | HTTP/2 per-connection cap on total un-consumed upload buffer across streams (bounds memory regardless of stream count, like Go's `MaxUploadBufferPerConnection`) |
+| `h2ConnWindow` | 1 MiB | HTTP/2 per-connection cap on total un-consumed upload buffer across streams (bounds memory regardless of stream count, like Go's `MaxUploadBufferPerConnection`). It bounds *streaming* routes directly, through flow control; a buffered route is bounded by the aggregate below |
+| (buffered bodies) | `max(h2ConnWindow, maxBodySize)` | HTTP/2 cap on total *un-dispatched buffered* request-body bytes across a connection's streams, independent of the receive window: a buffered body is retained until END_STREAM and its flow-control bytes are credited on receipt (a body larger than the window must be, or it could never arrive), so the window cannot bound it. Never below `maxBodySize`, so any single upload still fits, and never below the 64 KiB protocol default receive window; the stream that crosses it is reset with REFUSED_STREAM (retryable) |
 | `h3StreamWindow` | 1 MiB | HTTP/3 per-stream receive window (upload flow control) |
 | `h3ConnWindow` | 4 MiB | HTTP/3 per-connection receive window (aggregate cap on buffered uploads) |
 
@@ -58,7 +59,7 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `headerTimeout` | 10 s | First byte to end of headers (slowloris); 0 disables |
-| `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. 0 disables |
+| `bodyTimeout` | 30 s | Idle time during the body (re-armed on every read that carries body bytes), so an actively-transferring upload on a slow link is never cut off; only a genuine stall fires. `maxBodySize` still bounds the total. On HTTP/2 it also bounds the reverse stall: a connection whose requests have all finished while the server still owes response bytes parked on an exhausted peer send window, which no read-side or write-side timeout would otherwise cover (the zero-window slow read). 0 disables |
 | `keepAliveTimeout` | 60 s | Idle time between requests; 0 disables |
 | `responseTimeout` | 0 (off) | End of request to first response byte (stuck handler) |
 | `writeTimeout` | 30 s | Idle time the socket may stay unwritable with output pending (slow-read client that never drains its response); re-armed on every partial write, so a response that keeps moving is never cut off; 0 disables |

@@ -120,7 +120,9 @@ type
     maxHeaderList*: int
     activeStreams*: int
     # DoS budgets (0 disables). rstStreamCount / controlFrameCount are
-    # per-connection cumulative; controlFrameCount resets on stream progress.
+    # per-connection cumulative; controlFrameCount only decays (partially) on
+    # real progress, so it is a cap over the connection's life, not a per-request
+    # ratio (#234).
     maxConcurrentStreams*: int
     maxResetStreams*: int
     maxControlFrames*: int
@@ -453,17 +455,26 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
 
 const
   windowCreditBytes = 256
-    ## Response DATA bytes that earn one uncharged no-progress WINDOW_UPDATE.
-    ## Real clients return credit per tens of KiB; 256 leaves a 100x margin for
-    ## odd ones while an attacker still gets only a few frames per KiB we sent.
+    ## Response DATA bytes that earn one uncharged no-progress WINDOW_UPDATE,
+    ## on top of the per-frame floor noteDataProgress grants. Real clients
+    ## return credit per tens of KiB; 256 leaves a 100x margin for odd ones
+    ## while an attacker still gets only a few frames per KiB we sent. It is
+    ## also the threshold below which an increment counts as a dribble (see
+    ## isWindowDribble): the server picks the DATA frame size, so bytes alone
+    ## cannot decide what a correct client owes us, but no correct client asks
+    ## for more data in sub-256-byte pieces while holding the window it is
+    ## crediting under 256 bytes.
   windowCreditCap = 4
     ## windowCredit is capped at this many times maxControlFrames, so a long
     ## quiet download cannot bank an unbounded flood allowance.
 
 proc noteControlFrame(h2: H2Conn, c: ptr Connection, n = 1) =
   ## Budget control/overhead frames (PING incl. ACK, SETTINGS per entry,
-  ## WINDOW_UPDATE / PRIORITY / GOAWAY / unknown types, and every RST_STREAM we
-  ## emit in reply to a flood). `n` charges an amplifying frame per unit of work
+  ## WINDOW_UPDATE / PRIORITY / GOAWAY / unknown types). The charge lands
+  ## before the reply a frame forces, so an RST_STREAM we emit in answer is
+  ## paid for by the frame that caused it, not charged a second time (the one
+  ## exception is the CONTINUATION refusal, which charges its own reply). `n`
+  ## charges an amplifying frame per unit of work
   ## it forces (e.g. SETTINGS charges per entry). A real request only *decays*
   ## the counter (noteControlProgress), so a genuine few-frames-per-request ratio
   ## never trips while a flood with negligible real progress does.
@@ -480,7 +491,7 @@ proc noteControlProgress(h2: H2Conn) =
   let forgive = max(1, h2.maxControlFrames div 10)
   h2.controlFrameCount = max(0, h2.controlFrameCount - forgive)
 
-proc noteDataProgress(h2: H2Conn, n: int) {.inline.} =
+proc noteDataProgress(h2: H2Conn, n: int, frames = 1) {.inline.} =
   ## Outbound DATA is real progress too, so decay the control-frame budget on
   ## it as well as on accepted requests (#335). A 1 GiB download makes a
   ## legitimate client emit tens of thousands of WINDOW_UPDATEs while few or no
@@ -489,14 +500,27 @@ proc noteDataProgress(h2: H2Conn, n: int) {.inline.} =
   ## respHighWater of body sent keeps the ratio the budget is really about --
   ## overhead frames per unit of useful work -- while a flood that produces no
   ## response bytes still decays nothing and trips as before.
+  ##
+  ## `n` is the body bytes just emitted and `frames` the number of DATA frames
+  ## they went out in, so the caller must pass both honestly: h2WriteDirect
+  ## emits a whole run of frames in one call.
   if h2.maxControlFrames <= 0 or n <= 0: return
   # Earn credit for the no-progress WINDOW_UPDATEs this DATA will provoke (see
   # noteIdleWindowUpdate). Credit survives a zero counter, unlike the decay
   # below: the updates for these bytes arrive AFTER we send them, typically in
   # a burst while the counter is still zero, and they must not be charged then.
+  #
+  # Every frame earns a floor of two credits on top of the per-windowCreditBytes
+  # rate: one stream-level and one connection-level WINDOW_UPDATE per DATA frame
+  # is the finest acknowledgement granularity a correct client can have, and WE
+  # choose the frame size. An SSE producer flushing 16-byte events used to earn
+  # credit per 256 bytes while spending it per frame acked, so a perfectly
+  # behaved client was torn down after ~1000 events; the floor makes the credit
+  # track frames, which is what the peer's reply rate actually follows.
   h2.windowCreditBytes += n
-  let earned = h2.windowCreditBytes div windowCreditBytes
+  var earned = h2.windowCreditBytes div windowCreditBytes
   h2.windowCreditBytes -= earned * windowCreditBytes
+  earned += 2 * max(frames, 1)
   h2.windowCredit = min(h2.windowCredit + earned, windowCreditCap * h2.maxControlFrames)
   if h2.controlFrameCount == 0:
     h2.dataSinceDecay = 0          # nothing owed: don't carry decay forward
@@ -519,11 +543,37 @@ proc noteIdleWindowUpdate(h2: H2Conn, c: ptr Connection) =
   ## that holds a stream open and floods 13-byte updates while we send it
   ## nothing therefore still trips ENHANCE_YOUR_CALM after maxControlFrames,
   ## exactly as before #335, while a client returning credit in pieces as small
-  ## as windowCreditBytes never does.
+  ## as windowCreditBytes never does, nor does one acking every DATA frame we
+  ## emit on both the stream and the connection (noteDataProgress earns two
+  ## credits per frame for exactly that shape).
+  ##
+  ## This is the charge for an update that unblocked nothing. An update that
+  ## unblocks a *sliver* is charged by isWindowDribble instead, straight to the
+  ## budget.
   if h2.windowCredit > 0:
     dec h2.windowCredit
   else:
     h2.noteControlFrame(c)
+
+func isWindowDribble(inc, window: int, waiting: bool): bool {.inline.} =
+  ## Is this WINDOW_UPDATE a data dribble: a sub-windowCreditBytes increment
+  ## that leaves the window it credits still under windowCreditBytes while bytes
+  ## are waiting on that window? `inc` is the increment, `window` the resulting
+  ## window, `waiting` whether anything is actually blocked on it (a stream
+  ## backlog at stream level, a stream blocked on the connection window at
+  ## connection level).
+  ##
+  ## That is the CVE-2019-9511 data-dribble shape, and the headline vector of
+  ## #234: after SETTINGS_INITIAL_WINDOW_SIZE=0, WINDOW_UPDATE(sid, 1) forces a
+  ## 1-byte DATA frame plus a full scheduler pass per 13-byte frame. It unblocks
+  ## a send, so neither the idle-update charge nor the credit pool sees it. A
+  ## real client never asks for more data in pieces this small while holding the
+  ## window under 256 bytes: it either has a real window to offer or none at
+  ## all. The caller therefore charges a dribble to the control-frame budget
+  ## DIRECTLY, not to the credit pool -- the 1-byte frames it forces would
+  ## otherwise bank (two credits each, see noteDataProgress) exactly the credit
+  ## that pays for it.
+  waiting and inc < windowCreditBytes and window < windowCreditBytes
 
 # --- response serialization ------------------------------------------------
 
@@ -543,6 +593,29 @@ proc encodeExtraHeader(hb: var string, name, val: string) =
     return
   if isLowerAscii(name): encodeHeader(hb, name, val)
   else: encodeHeader(hb, name.toLowerAscii, val)
+
+proc encodeTrailerField(hb: var string, name, val: string) =
+  ## Encode one handler-supplied response TRAILER field. A trailer section drops
+  ## more than a header section does: the shared predicate
+  ## (fieldrules.forbiddenResponseTrailerField, also h1's chunked trailer writer
+  ## and h3's trailer submission) adds `te`, which RFC 9113 8.2.2 forbids on a
+  ## response at all, and content-length, which RFC 9110 6.5.1 forbids generating
+  ## in a trailer section: framing the client has already acted on, and a
+  ## primitive for an intermediary that believes the later value. Dropping them
+  ## matters most where a handler relays an upstream's trailers verbatim.
+  ##
+  ## A pseudo-header name, a non-token name and a CR/LF/NUL (or edge-whitespace)
+  ## value go the same way, as they already do on h3 (#257): HPACK carries them
+  ## with no complaint, so it is a relay re-serializing the trailer section to h1
+  ## that would see a split response. Names go out lowercase, as HPACK requires.
+  if name.len == 0 or name[0] == ':': return
+  if forbiddenResponseTrailerField(name): return
+  if not validFieldValue(val): return
+  if isLowerAscii(name):
+    if validFieldName(name): encodeHeader(hb, name, val)
+  else:
+    let ln = name.toLowerAscii
+    if validFieldName(ln): encodeHeader(hb, ln, val)
 
 proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
   ## Prepend a pending HPACK dynamic-table-size-update instruction (RFC 7541
@@ -582,7 +655,7 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   var hb = ""
   h2.emitTableSizeUpdate(hb)
   for (name, val) in st.respTrailers:
-    encodeExtraHeader(hb, name, val)
+    encodeTrailerField(hb, name, val)
   emitHeaderBlock(h2, c, sid, hb, flagEndStream)
   h2.teardownStream(c, sid)
 
@@ -819,6 +892,7 @@ proc h2WriteDirect(h2: H2Conn, c: ptr Connection, sid: uint32,
   if st.pendingBody.len > st.pendingPos: return 0    # queued bytes go first
   if h2.h2NextUrgency() >= 0: return 0               # another stream's turn
   var off = 0
+  var frames = 0
   while off < data.len and h2.connSendWindow > 0 and st.sendWindow > 0 and
         pendingOut(c) < respHighWater:
     var chunk = min(data.len - off, h2.peerMaxFrame)
@@ -831,8 +905,12 @@ proc h2WriteDirect(h2: H2Conn, c: ptr Connection, sid: uint32,
     st.sendWindow -= int32(chunk)
     h2.connSendWindow -= int32(chunk)
     off += chunk
+    inc frames
   if off > 0:
-    h2.noteDataProgress(off)   # outbound progress decays the flood budget (#335)
+    # frames, not just bytes: the per-frame credit floor is only honest if the
+    # count is (#234, #335). A small-chunk producer flushing through this path
+    # provokes one client WINDOW_UPDATE pair per frame, like any other.
+    h2.noteDataProgress(off, frames)
     h2.syncSendState(st)       # the send window moved (#339)
   off
 
@@ -1379,6 +1457,17 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
   elif st.rs.reqStreaming and not st.dispatched:
     # Streaming route: run the handler now so it can register req.onBody; the
     # body is delivered as DATA frames arrive.
+    if st.endStreamSeen and st.contentLength >= 0 and
+        st.bodyReceived != st.contentLength:
+      # END_STREAM on the request HEADERS themselves: no DATA frame and no
+      # trailer section will ever arrive, so neither of the other two
+      # reconciliation sites runs and a declared non-zero content-length with
+      # an empty body would reach the handler as a clean, complete body
+      # (RFC 9113 8.1.1 malformed, #237). h2SetOnBody flushes last=true
+      # immediately for an already-half-closed stream, so this must be caught
+      # before the handler is dispatched, not after.
+      h2.streamError(c, sid, errProtocol)
+      return
     st.dispatched = true
     ready.add sid
   elif st.endStreamSeen and not st.dispatched:
@@ -1432,9 +1521,11 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       not h2.streams[sid].headersDone:
     # DATA on a closed / half-closed(remote) / never-headered stream: each
     # small frame elicits a RST_STREAM reply, so budget it as overhead (a
-    # non-reading peer would otherwise grow wbuf without bound) -- #234.
+    # non-reading peer would otherwise grow wbuf without bound) -- #234. The
+    # frame that trips the budget must not also emit its RST after the GOAWAY.
     h2.noteControlFrame(c)
-    h2.streamError(c, sid, errStreamClosed)
+    if c.state != csClosing:
+      h2.streamError(c, sid, errStreamClosed)
   else:
     var dataStart = payloadPos
     var dataLen = fh.length
@@ -1466,9 +1557,10 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       if (fh.flags and flagEndStream) != 0:
         h2.noteEndStream(st)
     elif st.rs.reqStreaming:
-      # Inbound streaming: hand DATA to onBody and clear (bounded memory);
-      # no content-length reconciliation since the body is not retained. The
-      # stream AND connection flow-control windows are replenished on consume
+      # Inbound streaming: hand DATA to onBody and clear (bounded memory). The
+      # body is not retained, so content-length is reconciled against the
+      # running bodyReceived tally instead of st.body.len. The stream AND
+      # connection flow-control windows are replenished on consume
       # (h2DeliverBody / ackBody), not here, so a slow consumer throttles the
       # peer and the connection window caps total un-consumed buffer; padding
       # is discarded now, so credit its flow-control bytes now.
@@ -1477,23 +1569,33 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       streamingConnDefer = dataLen    # connection credit deferred to consume
       st.connDeferred += dataLen      # owed back on consume / at teardown (#231)
       st.bodyReceived += dataLen      # for content-length reconciliation (#237)
-      if dataLen > 0:
-        let old = st.body.len
-        st.body.setLen(old + dataLen)
-        copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
-      let endS = (fh.flags and flagEndStream) != 0
-      if endS:
-        h2.noteEndStream(st)
-        # A streaming route does not retain the body, but the declared
-        # content-length must still match the DATA received (RFC 9113 8.1.1):
-        # a mismatch desynchronizes an h1 upstream if the request is forwarded
-        # (smuggling). Fail the stream instead of delivering a clean last=true.
-        if st.contentLength >= 0 and st.bodyReceived != st.contentLength:
-          h2.streamError(c, sid, errProtocol)
-        else:
-          h2.h2DeliverBody(c, sid, true)
+      if st.contentLength >= 0 and st.bodyReceived > st.contentLength:
+        # Already past the declared length: malformed now, not only at
+        # END_STREAM (RFC 9113 8.1.1 constrains the whole message, and 8.1
+        # lets us reset as soon as we know). Checking only at the end is not
+        # enough for a streaming route: it relays each chunk as it arrives, so
+        # by the time the terminating frame reveals the mismatch the excess
+        # bytes have already gone to an h1 upstream under the declared length
+        # and desynchronized that connection (smuggling, #237). Reject before
+        # the bytes reach the sink. teardownStream returns connDeferred, which
+        # includes this frame, so the connection window is not leaked (#231).
+        h2.streamError(c, sid, errProtocol)
       else:
-        h2.h2DeliverBody(c, sid, false)
+        if dataLen > 0:
+          let old = st.body.len
+          st.body.setLen(old + dataLen)
+          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+        let endS = (fh.flags and flagEndStream) != 0
+        if endS:
+          h2.noteEndStream(st)
+          # A short body (fewer DATA bytes than declared) can only be known at
+          # the end. Fail the stream instead of delivering a clean last=true.
+          if st.contentLength >= 0 and st.bodyReceived != st.contentLength:
+            h2.streamError(c, sid, errProtocol)
+          else:
+            h2.h2DeliverBody(c, sid, true)
+        else:
+          h2.h2DeliverBody(c, sid, false)
     else:
       let old = st.body.len
       st.body.setLen(old + dataLen)
@@ -1657,7 +1759,13 @@ proc handleSettings(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
                     payloadPos: int) =
   if fh.streamId != 0: h2.connError(c, errProtocol); return
   if (fh.flags and flagAck) != 0:
-    if fh.length != 0: h2.connError(c, errFrameSize)
+    if fh.length != 0:
+      h2.connError(c, errFrameSize)
+    else:
+      # We send our SETTINGS once, so at most one ACK is ever solicited: the
+      # rest are pure overhead, exactly like the PING ACKs the ACK-only guard
+      # used to let through unbudgeted (#234).
+      h2.noteControlFrame(c)
     return
   if fh.length mod 6 != 0: h2.connError(c, errFrameSize); return
   # Charge per setting entry, not per frame: a single 16 KiB SETTINGS carries
@@ -1737,18 +1845,32 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     # id > lastStreamId GOAWAYs instead of RST-ing a stream that never existed.
     if fh.streamId == 0 or fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol)
-    else: h2.streamError(c, fh.streamId, errProtocol)
+    else:
+      # A 0-increment on a stream we have seen costs a 13-byte RST_STREAM reply,
+      # and on an already-closed id the stream error tears nothing down, so the
+      # peer can repeat it forever: budget it before answering (#234).
+      h2.noteControlFrame(c)
+      if c.state != csClosing:
+        h2.streamError(c, fh.streamId, errProtocol)
     return
   if fh.streamId == 0:
     if int64(h2.connSendWindow) + int64(inc32) > 0x7fffffff'i64:
       h2.connError(c, errFlowControl); return
     let wasBlocked = h2.connSendWindow <= 0
     h2.connSendWindow += int32(inc32)
+    # A sliver of connection window handed to a stream that is waiting on it is
+    # a data dribble: charge it to the budget before the scheduler pass it
+    # forces, so the 1-byte DATA frames cannot pay for themselves (#234).
+    let dribble = isWindowDribble(int(inc32), int(h2.connSendWindow),
+                                  h2.backlogStreams > 0)
+    if dribble:
+      h2.noteControlFrame(c)
+      if c.state == csClosing: return
     if h2.h2NextUrgency() >= 0 or (wasBlocked and h2.connSendWindow > 0):
       # The connection window moved: run a scheduler pass. The ready-queue
       # already holds the stream-sendable streams, so no scan is needed.
       h2.h2Schedule(c)
-    else:
+    elif not dribble:
       # Unblocked nothing: the normal shape of a legitimate client's flow
       # control on a long download (the connection window is wide open, so the
       # credit it returns never unblocks anything), but also the shape of a
@@ -1763,8 +1885,34 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.streamError(c, fh.streamId, errFlowControl); return
     st.sendWindow += int32(inc32)
     h2.syncSendState(st)                 # the send window moved (#339)
-    h2.h2Enqueue(fh.streamId)
-    h2.h2Schedule(c)
+    # A sliver of stream window against a stream that has a backlog is a data
+    # dribble: the #234 headline vector (one forced 1-byte DATA frame and one
+    # scheduler pass per 13-byte update). Charged to the budget before the pass
+    # it forces, never to the credit pool (isWindowDribble).
+    let dribble = isWindowDribble(int(inc32), int(st.sendWindow),
+                                  st.pendingBody.len > st.pendingPos)
+    h2.h2Enqueue(fh.streamId)            # a no-op unless the new credit made the
+                                         # stream sendable; h2Sendable ignores
+                                         # the connection window, so a stream
+                                         # queued here is what a later
+                                         # connection WINDOW_UPDATE finds ready
+    if dribble:
+      h2.noteControlFrame(c)
+      if c.state == csClosing: return
+    if h2.h2Sendable(st):
+      h2.h2Schedule(c)
+    else:
+      if not dribble:
+        # The credit unblocked nothing: this stream owes no bytes at all (its
+        # producer has not written yet, or the request body is still arriving),
+        # so the scheduler pass would emit nothing. A client that consumed
+        # response DATA legitimately sends these, so they ride the credit those
+        # bytes earned; past that they are the cheapest unbudgeted flood there
+        # was, 13 bytes per frame against an open stream, so charge them exactly
+        # like the connection-level and closed-stream updates (#234, #335).
+        h2.noteIdleWindowUpdate(c)
+        if c.state == csClosing: return
+      h2.h2ResumeProducers(c)            # the skipped pass would have run this
   elif fh.streamId > h2.lastStreamId:
     h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
   else:
@@ -1932,26 +2080,33 @@ proc h2BlockedOnPeerWindow*(c: ptr Connection): bool =
     (h2.connSendWindow <= 0 and h2.backlogStreams > 0)
 
 proc h2CheckCounters*(c: ptr Connection) =
-  ## Debug-only audit of the #339 deadline counters against a full scan. Compiled
-  ## out of release builds; the loop calls it wherever it used to scan, so any
-  ## mutation site that forgets syncSendState / noteEndStream / dropStreamCounters
-  ## trips an assertion in the test suite rather than silently mis-arming a
-  ## timeout in production.
+  ## Debug-only audit of the per-connection aggregates against a full scan: the
+  ## #339 deadline counters, plus the un-dispatched buffered-body total that caps
+  ## per-connection memory (#235). Compiled out of release builds; the loop calls
+  ## it wherever it used to scan, so any mutation site that forgets
+  ## syncSendState / noteEndStream / dropStreamCounters, or a teardown path that
+  ## forgets to release a buffered-body reservation, trips an assertion in the
+  ## test suite rather than silently mis-arming a timeout (or permanently
+  ## shrinking what the connection will still accept) in production.
   when not defined(release):
     if c.h2 == nil: return
     let h2 = h2Conn(c)
     var awaiting, backlogged, blocked = 0
+    var buffered = 0
     for sid, st in h2.streams.mpairs:   # mpairs: no per-stream value copy
       if not st.endStreamSeen: inc awaiting
       if st.pendingBody.len > st.pendingPos:
         inc backlogged
         if st.sendWindow <= 0: inc blocked
+      buffered += st.bufferedCounted
     assert awaiting == h2.awaitingClientStreams,
       "h2 awaitingClientStreams drift: " & $h2.awaitingClientStreams & " vs " & $awaiting
     assert backlogged == h2.backlogStreams,
       "h2 backlogStreams drift: " & $h2.backlogStreams & " vs " & $backlogged
     assert blocked == h2.windowBlockedStreams,
       "h2 windowBlockedStreams drift: " & $h2.windowBlockedStreams & " vs " & $blocked
+    assert buffered == h2.bufferedBytes,
+      "h2 bufferedBytes drift: " & $h2.bufferedBytes & " vs " & $buffered
 
 proc h2StreamAlive*(c: ptr Connection, sid: uint32): bool =
   c.h2 != nil and sid in h2Conn(c).streams

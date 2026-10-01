@@ -1,4 +1,4 @@
-import std/[unittest, net, httpcore, osproc, strutils, os]
+import std/[unittest, net, httpcore, osproc, strutils, os, atomics]
 import vortex/[settings, request, server, connection, staticfiles]
 import ./helper
 
@@ -6,6 +6,9 @@ import ./helper
 # helper.requireH3Curl prefers any system curl that advertises HTTP3 and falls
 # back to Homebrew's path.
 let h3curlBin = requireH3Curl()
+
+var upDispatched: Atomic[int]   ## streaming /up handlers that actually ran
+var upCleanEof: Atomic[int]     ## onBody(last = true) deliveries on /up
 
 let (certFile, keyFile) = makeCertPair("nhs_h3_certs_")
 let certDir = certFile.parentDir
@@ -61,16 +64,33 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.write("body")
     res.trailers["X-Checksum"] = "abc123"
     res.finish()
+  of "/trailerbad":
+    # A handler that puts framing fields in the trailer section (the shape of a
+    # route relaying an upstream's trailers verbatim): none of them may reach the
+    # wire, on any protocol (#238).
+    res.sendHead(Http200, "text/plain")
+    res.write("body")
+    res.trailers["Content-Length"] = "999"
+    res.trailers["TE"] = "trailers"
+    res.trailers["Transfer-Encoding"] = "chunked"
+    res.trailers["X-Checksum"] = "abc"
+    res.finish()
   of "/boom":
     res.stream(Http200, "text/plain"):
       res.write("partial")
       raise newException(ValueError, "boom mid-stream")
   of "/up":
-    # Streaming request body: consume via onBody, reply with the byte count.
+    # Streaming request body: consume via onBody, reply with the byte count. The
+    # counters stand in for a streaming route's real side effects (an upstream
+    # request, a database write): a request the server rejected for its declared
+    # length must never reach here (#237).
+    discard upDispatched.fetchAdd(1)
     let acc = new(int)
     req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
       acc[] += chunk.len
-      if last: res.send(Http200, "got " & $acc[])
+      if last:
+        discard upCleanEof.fetchAdd(1)
+        res.send(Http200, "got " & $acc[])
   of "/drain":
     # Streaming route that responds immediately WITHOUT reading the body. The
     # received-but-unread body bytes must be credited back to the connection
@@ -91,6 +111,40 @@ withServer(RequestHandler(handler),
   let base = "https://localhost:" & $srv.port
 
   proc h3curl(args: string): (string, int) = helper.h3curl(h3curlBin, args)
+
+  suite "HTTP/3 streaming route vs a declared content-length (#237)":
+    ## A streaming route is handed each chunk as it arrives, so a body that does
+    ## not match the content-length it declared must never produce a successful
+    ## response. Which layer refuses depends on the shape: nghttp3 fails the
+    ## message itself as soon as DATA passes the declared length, the backend
+    ## reconciles its own tally in cbBody and at the FIN (#237 / #257), and a
+    ## body the client never finishes simply never completes -- so these cases
+    ## pin the property that matters on the wire (never a 200) rather than the
+    ## layer. curl will not FIN a stream whose Content-Length it has not
+    ## satisfied, so two of the three shapes are a client left hanging: -m 2
+    ## overrides helper.h3curl's -m 10 to keep the suite quick.
+    test "10 bytes under content-length 5 is never answered":
+      let (output, rc) = h3curl("-m 2 -o /dev/null -w '%{http_code}' " &
+                                "-H 'Content-Length: 5' " &
+                                "--data-binary '0123456789' " & base & "/up")
+      check rc != 0
+      check output != "200"
+
+    test "10 bytes under content-length 64 is never answered":
+      let (output, rc) = h3curl("-m 2 -o /dev/null -w '%{http_code}' " &
+                                "-H 'Content-Length: 64' " &
+                                "--data-binary '0123456789' " & base & "/up")
+      check rc != 0
+      check output != "200"
+
+    test "no body at all under content-length 5 is never answered":
+      let (output, rc) = h3curl("-m 2 -o /dev/null -w '%{http_code}' -X POST " &
+                                "-H 'Content-Length: 5' " & base & "/up")
+      check rc != 0
+      check output != "200"
+
+    test "the server is still healthy after those three":
+      check h3curl(base & "/")[0] == "hello h3"
 
   suite "HTTP/3 (QUIC, via curl)":
     test "GET":
@@ -147,6 +201,23 @@ withServer(RequestHandler(handler),
       let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailer")
       check rc == 0
       check "x-checksum: abc123" in output.toLowerAscii
+
+    test "framing fields set as response trailers never reach the wire (#238)":
+      # Same shape as the h1/h2 cases in test_trailers.nim. -D dumps the response
+      # head and the trailing HEADERS together, and a streamed h3 response
+      # declares no content-length of its own, so a content-length anywhere in
+      # the dump would be the trailer leaking. curl's own h3 stack drops a
+      # content-length trailer as well, so what this case pins on h3 is that the
+      # shared predicate keeps te and transfer-encoding out while x-checksum is
+      # still delivered: the h2 case in test_trailers.nim is the one that sees a
+      # leaked content-length on the wire.
+      let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailerbad")
+      check rc == 0
+      let dump = output.toLowerAscii
+      check "x-checksum: abc" in dump
+      check "content-length" notin dump
+      check "te: trailers" notin dump
+      check "transfer-encoding" notin dump
 
     test "a mid-stream exception resets the h3 stream (client sees an error)":
       let (_, rc) = h3curl("-o /dev/null " & base & "/boom")
@@ -218,6 +289,19 @@ withServer(RequestHandler(handler),
       check codes.len == 10
       for c in codes:
         check c == "200"
+
+    test "a streaming upload matching its content-length still dispatches":
+      # The dispatch guard the ready-list consumer applies (a stream the backend
+      # reset for a malformed length stays in the table so its flow-control
+      # credit can be returned, and must not be handed to a handler afterwards,
+      # #237) must not cost the normal case its dispatch or its clean EOF.
+      upDispatched.store(0); upCleanEof.store(0)
+      let (output, rc) = h3curl(
+        "-H 'Content-Length: 10' --data-binary '0123456789' " & base & "/up")
+      check rc == 0
+      check output == "got 10"
+      check upDispatched.load() == 1
+      check upCleanEof.load() == 1
 
     test "remoteAddress reports the QUIC peer IP":
       # Over h3 the peer address comes from ngtcp2 (the connection path's remote
