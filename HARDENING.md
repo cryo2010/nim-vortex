@@ -42,7 +42,7 @@ reference below.
 | `maxWsMessageSize` | 1 MiB | Largest inbound WebSocket message (close 1009) |
 | `h2StreamWindow` | 1 MiB | HTTP/2 per-stream receive window (upload flow control) |
 | `h2ConnWindow` | 1 MiB | HTTP/2 per-connection cap on total un-consumed upload buffer across streams (bounds memory regardless of stream count, like Go's `MaxUploadBufferPerConnection`). It bounds *streaming* routes directly, through flow control; a buffered route is bounded by the aggregate below |
-| (buffered bodies) | `max(h2ConnWindow, maxBodySize)` | HTTP/2 cap on total *un-dispatched buffered* request-body bytes across a connection's streams, independent of the receive window: a buffered body is retained until END_STREAM and its flow-control bytes are credited on receipt (a body larger than the window must be, or it could never arrive), so the window cannot bound it. Never below `maxBodySize`, so any single upload still fits; the stream that crosses it is reset with REFUSED_STREAM (retryable) |
+| (buffered bodies) | `max(h2ConnWindow, maxBodySize)` | HTTP/2 cap on total *un-dispatched buffered* request-body bytes across a connection's streams, independent of the receive window: a buffered body is retained until END_STREAM and its flow-control bytes are credited on receipt (a body larger than the window must be, or it could never arrive), so the window cannot bound it. Never below `maxBodySize`, so any single upload still fits, and never below the 64 KiB protocol default receive window; the stream that crosses it is reset with REFUSED_STREAM (retryable) |
 | `h3StreamWindow` | 1 MiB | HTTP/3 per-stream receive window (upload flow control) |
 | `h3ConnWindow` | 4 MiB | HTTP/3 per-connection receive window (aggregate cap on buffered uploads) |
 

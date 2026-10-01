@@ -326,7 +326,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffered body is retained until END_STREAM dispatch and its flow-control bytes
   are credited on receipt, so `h2ConnWindow` cannot bound it: the new suite
   trickles 32 concurrent POST streams past the cap and asserts the connection
-  never pins more than `max(h2ConnWindow, maxBodySize)` (verified at 3 MiB with
+  never pins more than `max(h2ConnWindow, maxBodySize)`, and never less than
+  the 64 KiB default receive window (verified at 3 MiB with
   the cap check removed), that the stream which crosses it is reset with
   REFUSED_STREAM so the client may retry, that a cancelled stream gives its
   reservation back for a later upload, and that a single upload up to

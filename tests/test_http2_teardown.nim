@@ -13,7 +13,7 @@
 ## leaves every byte owed: exactly the state a browser-initiated cancel used to
 ## leak.
 
-import std/[unittest, net, posix, httpcore, strutils, atomics, os]
+import std/[unittest, net, httpcore, strutils, atomics, os]
 import vortex/[settings, request, server, streaming]
 import vortex/http2/frames
 import ./h2client

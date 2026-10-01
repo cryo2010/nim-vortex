@@ -12,7 +12,7 @@
 ## so a handful of connections force several growth events and the scenario is
 ## reachable without touching the fd rlimit.
 
-import std/[unittest, net, os, strutils, times, httpcore]
+import std/[unittest, net, os, strutils, times, httpcore, atomics]
 import vortex/[settings, request, server, routing, connection]
 import ./helper
 
@@ -23,10 +23,13 @@ const blockSlots {.intdefine: "vortexConnBlock".} = 1024
 # happen under a live pin rather than after the worker woke up.
 const pinMs = 5000
 
+var pinHeld: Atomic[int]          # bumped by the worker once it holds the pin
+
 proc slow(req: Request, res: Response) {.gcsafe.} =
   ## Pins its connection on a worker: the loop thread keeps accepting meanwhile,
   ## and the worker's `ptr Connection` must survive every growth that follows.
   req.blocking:
+    pinHeld.atomicInc()
     sleep(pinMs)
     res.send(Http200, "pinned-ok")
 
@@ -90,7 +93,11 @@ suite "a pinned slot no longer blocks connection-table growth (#343)":
       # 1. Take the pin: /slow dispatches to the worker pool and sleeps there.
       let pinned = connectTimeout(port, pinMs + 5000)
       pinned.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
-      sleep(300)                     # let the handler reach the worker
+      # Wait until the worker actually holds the pin, so the growth below is
+      # proven to happen under it rather than before the handler got there.
+      let waitStart = epochTime()
+      while pinHeld.load() == 0 and epochTime() - waitStart < 5.0: sleep(5)
+      check pinHeld.load() == 1
 
       # 2. With that pin held, open enough connections to walk the fd well past
       #    the 8-slot first block (several growth events). Every one of these is
@@ -110,7 +117,10 @@ suite "a pinned slot no longer blocks connection-table growth (#343)":
       let elapsed = epochTime() - t0
       check served == extra
       # The worker sleeps pinMs, so finishing inside that window is what makes
-      # the growth above concurrent with the pin rather than after it.
+      # the growth above concurrent with the pin rather than after it. The
+      # budget is deliberately the whole pin (seconds, against milliseconds of
+      # real work, even under ASan on a loaded host): it is an overlap proof,
+      # not a performance bound, so do not tighten it.
       check elapsed < float(pinMs) / 1000.0
 
       # 3. The pinned request still completes, and on its own connection: the
