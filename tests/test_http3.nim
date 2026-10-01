@@ -64,6 +64,17 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.write("body")
     res.trailers["X-Checksum"] = "abc123"
     res.finish()
+  of "/trailerbad":
+    # A handler that puts framing fields in the trailer section (the shape of a
+    # route relaying an upstream's trailers verbatim): none of them may reach the
+    # wire, on any protocol (#238).
+    res.sendHead(Http200, "text/plain")
+    res.write("body")
+    res.trailers["Content-Length"] = "999"
+    res.trailers["TE"] = "trailers"
+    res.trailers["Transfer-Encoding"] = "chunked"
+    res.trailers["X-Checksum"] = "abc"
+    res.finish()
   of "/boom":
     res.stream(Http200, "text/plain"):
       res.write("partial")
@@ -190,6 +201,23 @@ withServer(RequestHandler(handler),
       let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailer")
       check rc == 0
       check "x-checksum: abc123" in output.toLowerAscii
+
+    test "framing fields set as response trailers never reach the wire (#238)":
+      # Same shape as the h1/h2 cases in test_trailers.nim. -D dumps the response
+      # head and the trailing HEADERS together, and a streamed h3 response
+      # declares no content-length of its own, so a content-length anywhere in
+      # the dump would be the trailer leaking. curl's own h3 stack drops a
+      # content-length trailer as well, so what this case pins on h3 is that the
+      # shared predicate keeps te and transfer-encoding out while x-checksum is
+      # still delivered: the h2 case in test_trailers.nim is the one that sees a
+      # leaked content-length on the wire.
+      let (output, rc) = h3curl("-D - -o /dev/null -sS " & base & "/trailerbad")
+      check rc == 0
+      let dump = output.toLowerAscii
+      check "x-checksum: abc" in dump
+      check "content-length" notin dump
+      check "te: trailers" notin dump
+      check "transfer-encoding" notin dump
 
     test "a mid-stream exception resets the h3 stream (client sees an error)":
       let (_, rc) = h3curl("-o /dev/null " & base & "/boom")

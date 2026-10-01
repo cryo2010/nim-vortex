@@ -6,7 +6,8 @@
 import std/httpcore
 from std/strutils import cmpIgnoreCase
 from ../connection import bodilessStatus
-from ../fieldrules import eqIgnoreAsciiCase, isForbiddenResponseField
+from ../fieldrules import eqIgnoreAsciiCase, isForbiddenResponseField,
+  forbiddenResponseTrailerField
 
 proc addField*(wbuf: var string, s: string) =
   ## Append a handler-supplied header name or value with CR and LF removed,
@@ -244,7 +245,12 @@ proc appendLastChunk*(wbuf: var string,
   ## Terminate a chunked body: the zero-length chunk plus optional trailers.
   wbuf.add "0\r\n"
   for (name, val) in trailers:
-    if connSpecificField(name): continue    # never echo handler framing headers
+    # Never echo a handler-supplied framing field into the trailer section. The
+    # set is the one h2 and h3 drop from their trailer sections too
+    # (fieldrules.forbiddenResponseTrailerField): connSpecificField plus `te`,
+    # which RFC 9113 8.2.2 forbids on a response and 6.5.1 forbids in a trailer
+    # section on any protocol (#238).
+    if forbiddenResponseTrailerField(name): continue
     wbuf.addField name
     wbuf.add ": "
     wbuf.addField val

@@ -157,7 +157,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_multipart.nim` | multipart/form-data (RFC 7578): pure parser plus `req.form` / `req.files` end-to-end with a real curl `-F` upload |
 | `test_response_headers.nim` | `res.headers` pending headers (middleware/handler) merged into the eventual send; the send call's headers win per name |
 | `test_early_hints.nim` | 103 Early Hints (`res.earlyHints` / `res.informational`) before the final response, over HTTP/1.1 and HTTP/2 |
-| `test_trailers.nim` | Request trailers (`req.trailers`) over h1 chunked framing and an h2 trailing HEADERS frame (response side: `test_streaming.nim`) |
+| `test_trailers.nim` | Request trailers (`req.trailers`) over h1 chunked framing and an h2 trailing HEADERS frame, plus the framing fields a `res.trailers` section must never carry on either (delivery: `test_streaming.nim`) |
 
 ### Streaming & static files
 

@@ -773,14 +773,19 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
   # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
   if trailers.len > 0:
     # Validate handler-supplied response trailers before submission: drop a
-    # pseudo/connection-specific name or a value with CR/LF/NUL, so a handler
+    # pseudo-header or non-token name, or a value with CR/LF/NUL, so a handler
     # concatenating untrusted data into a trailer can't split the response on an
-    # h1 relay (#257). Build the wire list from only the accepted entries.
+    # h1 relay (#257). The forbidden set is the one h1's chunked trailer writer
+    # and h2's trailing HEADERS share (fieldrules.forbiddenResponseTrailerField):
+    # the connection-specific fields plus `te`, and content-length, which RFC
+    # 9110 6.5.1 forbids generating in a trailer section (#238). Build the wire
+    # list from only the accepted entries.
     var lower: seq[(string, string)]
     for (name, val) in trailers:
       let ln = name.toLowerAscii
-      if ln.len == 0 or ln[0] == ':' or not validFieldValue(val): continue
-      if isForbiddenResponseField(ln, trailer = true): continue  # trailers also ban te
+      if ln.len == 0 or ln[0] == ':' or not validFieldName(ln) or
+          not validFieldValue(val): continue
+      if forbiddenResponseTrailerField(ln): continue
       lower.add (ln, val)
     if lower.len > 0:
       var tv = newSeq[VqHeader](lower.len)

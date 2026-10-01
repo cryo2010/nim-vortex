@@ -594,6 +594,29 @@ proc encodeExtraHeader(hb: var string, name, val: string) =
   if isLowerAscii(name): encodeHeader(hb, name, val)
   else: encodeHeader(hb, name.toLowerAscii, val)
 
+proc encodeTrailerField(hb: var string, name, val: string) =
+  ## Encode one handler-supplied response TRAILER field. A trailer section drops
+  ## more than a header section does: the shared predicate
+  ## (fieldrules.forbiddenResponseTrailerField, also h1's chunked trailer writer
+  ## and h3's trailer submission) adds `te`, which RFC 9113 8.2.2 forbids on a
+  ## response at all, and content-length, which RFC 9110 6.5.1 forbids generating
+  ## in a trailer section: framing the client has already acted on, and a
+  ## primitive for an intermediary that believes the later value. Dropping them
+  ## matters most where a handler relays an upstream's trailers verbatim.
+  ##
+  ## A pseudo-header name, a non-token name and a CR/LF/NUL (or edge-whitespace)
+  ## value go the same way, as they already do on h3 (#257): HPACK carries them
+  ## with no complaint, so it is a relay re-serializing the trailer section to h1
+  ## that would see a split response. Names go out lowercase, as HPACK requires.
+  if name.len == 0 or name[0] == ':': return
+  if forbiddenResponseTrailerField(name): return
+  if not validFieldValue(val): return
+  if isLowerAscii(name):
+    if validFieldName(name): encodeHeader(hb, name, val)
+  else:
+    let ln = name.toLowerAscii
+    if validFieldName(ln): encodeHeader(hb, ln, val)
+
 proc emitTableSizeUpdate(h2: H2Conn, hb: var string) =
   ## Prepend a pending HPACK dynamic-table-size-update instruction (RFC 7541
   ## 4.2) to a response header block. Our encoder is static-only, but when the
@@ -632,7 +655,7 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   var hb = ""
   h2.emitTableSizeUpdate(hb)
   for (name, val) in st.respTrailers:
-    encodeExtraHeader(hb, name, val)
+    encodeTrailerField(hb, name, val)
   emitHeaderBlock(h2, c, sid, hb, flagEndStream)
   h2.teardownStream(c, sid)
 

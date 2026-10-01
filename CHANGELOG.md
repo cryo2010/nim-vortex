@@ -340,7 +340,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `connection` / `proxy-connection` / `keep-alive` / `transfer-encoding` /
   `upgrade` / `te`, one bad field poisoning the whole block, and the
   `maxHeaderSize` bound on the block) now lives in
-  `tests/test_http2_request_body.nim`. (#238)
+  `tests/test_http2_request_body.nim`. The outbound direction is closed with
+  it: a `res.trailers` entry named `content-length` or `te` is now dropped on
+  every protocol instead of going out in the trailer section. The three writers
+  had drifted (h1's chunked trailer dropped `content-length` but not `te`, h2's
+  trailing HEADERS emitted both, h3 dropped `te` but not `content-length`), so a
+  handler relaying an upstream's trailers verbatim could hand a client a second,
+  later Content-Length for a message it had already framed, which is the same
+  smuggling primitive in the other direction, or a `te` RFC 9113 8.2.2 forbids
+  on a response outright. They now share one predicate
+  (`fieldrules.forbiddenResponseTrailerField`, also the inbound rule's forbidden
+  set), and h2 and h3 drop a non-token or pseudo-header trailer name and a
+  CR/LF/NUL value there too, as h3's value check already did. (#238)
 - SSE: an `id` can no longer break `Last-Event-ID` resume. NUL joins CR and LF
   in the field sanitizer, so no SSE field value (`id`, `event`, a comment's
   text) can carry a byte the wire format has no escape for; a NUL in an `id`
