@@ -263,7 +263,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse proxy reports). HTTPS now takes the same sequence as plaintext,
   close_notify then `shutdown(SHUT_WR)` then drain to the peer's FIN or the
   drain deadline, and the session is shut down and freed exactly once. (#373)
-- HTTP/2: the last three ways to push overhead frames past the
+- HTTP/2: the remaining ways to push overhead frames past the
   `maxControlFrames` budget are charged. A SETTINGS ACK returned before the
   charge, exactly as a PING ACK once did (we send our SETTINGS once, so every
   ACK past the first is pure overhead); a zero-increment WINDOW_UPDATE naming a
@@ -275,12 +275,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream-level update that unblocks nothing now goes through the same
   credit-then-charge path as the connection-level and closed-stream ones, so
   flow control from a client that consumed response DATA still rides the credit
-  those bytes earned. The budget's other seven bypasses are covered by a new
-  frame-level regression suite (PING ACK, SETTINGS ACK, received GOAWAY, unknown
-  frame types, WINDOW_UPDATE, self-dependent PRIORITY including the RFC 9113 5.1
-  rule against resetting an idle stream, closed-stream DATA, per-entry SETTINGS
-  charging, and a one-request-per-burst interleave against the per-request
-  reset). (#234)
+  those bytes earned. Charging only the updates that unblock *nothing* left the
+  issue's headline vector free, since an increment of 1 always unblocks exactly
+  one byte: after `SETTINGS_INITIAL_WINDOW_SIZE=0`, a flood of
+  `WINDOW_UPDATE(sid, 1)` still bought one 1-byte DATA frame and one full
+  scheduler pass per 13-byte frame. An update that merely dribbles (an increment
+  below 256 bytes that leaves the window it credits below 256 bytes while bytes
+  are waiting on that window, at either level) is now charged straight to the
+  budget and never to the credit pool, because the 1-byte frames it forces would
+  otherwise bank exactly the credit that pays for it. No correct client asks for
+  more data in pieces that small while holding the window under 256 bytes; that
+  is the CVE-2019-9511 data-dribble shape. Conversely, the credit response DATA
+  earns now has a floor of two per DATA frame emitted on top of the one per 256
+  bytes: the server chooses the frame size, and one stream-level plus one
+  connection-level WINDOW_UPDATE per frame is the finest acknowledgement a
+  correct client can send, so a streaming handler writing 1500 16-byte events to
+  such a client used to be torn down with GOAWAY(ENHANCE_YOUR_CALM) after about
+  1070 of them. DATA on a closed stream no longer answers with a RST_STREAM
+  after the GOAWAY its own charge triggered, like the other charged replies. The
+  budget's bypasses are covered by a frame-level regression suite (PING ACK,
+  SETTINGS ACK, received GOAWAY, unknown frame types, WINDOW_UPDATE,
+  self-dependent PRIORITY including the RFC 9113 5.1 rule against resetting an
+  idle stream, closed-stream DATA, per-entry SETTINGS charging, and a
+  one-request-per-burst interleave against the per-request reset), together with
+  the dribble vector at both the stream and the connection level and the two
+  correct clients that must survive it: a small-frame producer acked per frame on
+  both levels, and a 200 KiB download acked in 4096-byte increments. (#234)
 - h2, h3: a streaming (`onBody`) route now reconciles the declared
   `content-length` against the DATA actually received on every path a request
   can end on, and as soon as the running tally passes the declared length

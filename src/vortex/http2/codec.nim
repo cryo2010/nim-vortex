@@ -455,9 +455,15 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
 
 const
   windowCreditBytes = 256
-    ## Response DATA bytes that earn one uncharged no-progress WINDOW_UPDATE.
-    ## Real clients return credit per tens of KiB; 256 leaves a 100x margin for
-    ## odd ones while an attacker still gets only a few frames per KiB we sent.
+    ## Response DATA bytes that earn one uncharged no-progress WINDOW_UPDATE,
+    ## on top of the per-frame floor noteDataProgress grants. Real clients
+    ## return credit per tens of KiB; 256 leaves a 100x margin for odd ones
+    ## while an attacker still gets only a few frames per KiB we sent. It is
+    ## also the threshold below which an increment counts as a dribble (see
+    ## isWindowDribble): the server picks the DATA frame size, so bytes alone
+    ## cannot decide what a correct client owes us, but no correct client asks
+    ## for more data in sub-256-byte pieces while holding the window it is
+    ## crediting under 256 bytes.
   windowCreditCap = 4
     ## windowCredit is capped at this many times maxControlFrames, so a long
     ## quiet download cannot bank an unbounded flood allowance.
@@ -482,7 +488,7 @@ proc noteControlProgress(h2: H2Conn) =
   let forgive = max(1, h2.maxControlFrames div 10)
   h2.controlFrameCount = max(0, h2.controlFrameCount - forgive)
 
-proc noteDataProgress(h2: H2Conn, n: int) {.inline.} =
+proc noteDataProgress(h2: H2Conn, n: int, frames = 1) {.inline.} =
   ## Outbound DATA is real progress too, so decay the control-frame budget on
   ## it as well as on accepted requests (#335). A 1 GiB download makes a
   ## legitimate client emit tens of thousands of WINDOW_UPDATEs while few or no
@@ -491,14 +497,27 @@ proc noteDataProgress(h2: H2Conn, n: int) {.inline.} =
   ## respHighWater of body sent keeps the ratio the budget is really about --
   ## overhead frames per unit of useful work -- while a flood that produces no
   ## response bytes still decays nothing and trips as before.
+  ##
+  ## `n` is the body bytes just emitted and `frames` the number of DATA frames
+  ## they went out in, so the caller must pass both honestly: h2WriteDirect
+  ## emits a whole run of frames in one call.
   if h2.maxControlFrames <= 0 or n <= 0: return
   # Earn credit for the no-progress WINDOW_UPDATEs this DATA will provoke (see
   # noteIdleWindowUpdate). Credit survives a zero counter, unlike the decay
   # below: the updates for these bytes arrive AFTER we send them, typically in
   # a burst while the counter is still zero, and they must not be charged then.
+  #
+  # Every frame earns a floor of two credits on top of the per-windowCreditBytes
+  # rate: one stream-level and one connection-level WINDOW_UPDATE per DATA frame
+  # is the finest acknowledgement granularity a correct client can have, and WE
+  # choose the frame size. An SSE producer flushing 16-byte events used to earn
+  # credit per 256 bytes while spending it per frame acked, so a perfectly
+  # behaved client was torn down after ~1000 events; the floor makes the credit
+  # track frames, which is what the peer's reply rate actually follows.
   h2.windowCreditBytes += n
-  let earned = h2.windowCreditBytes div windowCreditBytes
+  var earned = h2.windowCreditBytes div windowCreditBytes
   h2.windowCreditBytes -= earned * windowCreditBytes
+  earned += 2 * max(frames, 1)
   h2.windowCredit = min(h2.windowCredit + earned, windowCreditCap * h2.maxControlFrames)
   if h2.controlFrameCount == 0:
     h2.dataSinceDecay = 0          # nothing owed: don't carry decay forward
@@ -521,11 +540,37 @@ proc noteIdleWindowUpdate(h2: H2Conn, c: ptr Connection) =
   ## that holds a stream open and floods 13-byte updates while we send it
   ## nothing therefore still trips ENHANCE_YOUR_CALM after maxControlFrames,
   ## exactly as before #335, while a client returning credit in pieces as small
-  ## as windowCreditBytes never does.
+  ## as windowCreditBytes never does, nor does one acking every DATA frame we
+  ## emit on both the stream and the connection (noteDataProgress earns two
+  ## credits per frame for exactly that shape).
+  ##
+  ## This is the charge for an update that unblocked nothing. An update that
+  ## unblocks a *sliver* is charged by isWindowDribble instead, straight to the
+  ## budget.
   if h2.windowCredit > 0:
     dec h2.windowCredit
   else:
     h2.noteControlFrame(c)
+
+func isWindowDribble(inc, window: int, waiting: bool): bool {.inline.} =
+  ## Is this WINDOW_UPDATE a data dribble: a sub-windowCreditBytes increment
+  ## that leaves the window it credits still under windowCreditBytes while bytes
+  ## are waiting on that window? `inc` is the increment, `window` the resulting
+  ## window, `waiting` whether anything is actually blocked on it (a stream
+  ## backlog at stream level, a stream blocked on the connection window at
+  ## connection level).
+  ##
+  ## That is the CVE-2019-9511 data-dribble shape, and the headline vector of
+  ## #234: after SETTINGS_INITIAL_WINDOW_SIZE=0, WINDOW_UPDATE(sid, 1) forces a
+  ## 1-byte DATA frame plus a full scheduler pass per 13-byte frame. It unblocks
+  ## a send, so neither the idle-update charge nor the credit pool sees it. A
+  ## real client never asks for more data in pieces this small while holding the
+  ## window under 256 bytes: it either has a real window to offer or none at
+  ## all. The caller therefore charges a dribble to the control-frame budget
+  ## DIRECTLY, not to the credit pool -- the 1-byte frames it forces would
+  ## otherwise bank (two credits each, see noteDataProgress) exactly the credit
+  ## that pays for it.
+  waiting and inc < windowCreditBytes and window < windowCreditBytes
 
 # --- response serialization ------------------------------------------------
 
@@ -821,6 +866,7 @@ proc h2WriteDirect(h2: H2Conn, c: ptr Connection, sid: uint32,
   if st.pendingBody.len > st.pendingPos: return 0    # queued bytes go first
   if h2.h2NextUrgency() >= 0: return 0               # another stream's turn
   var off = 0
+  var frames = 0
   while off < data.len and h2.connSendWindow > 0 and st.sendWindow > 0 and
         pendingOut(c) < respHighWater:
     var chunk = min(data.len - off, h2.peerMaxFrame)
@@ -833,8 +879,12 @@ proc h2WriteDirect(h2: H2Conn, c: ptr Connection, sid: uint32,
     st.sendWindow -= int32(chunk)
     h2.connSendWindow -= int32(chunk)
     off += chunk
+    inc frames
   if off > 0:
-    h2.noteDataProgress(off)   # outbound progress decays the flood budget (#335)
+    # frames, not just bytes: the per-frame credit floor is only honest if the
+    # count is (#234, #335). A small-chunk producer flushing through this path
+    # provokes one client WINDOW_UPDATE pair per frame, like any other.
+    h2.noteDataProgress(off, frames)
     h2.syncSendState(st)       # the send window moved (#339)
   off
 
@@ -1445,9 +1495,11 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       not h2.streams[sid].headersDone:
     # DATA on a closed / half-closed(remote) / never-headered stream: each
     # small frame elicits a RST_STREAM reply, so budget it as overhead (a
-    # non-reading peer would otherwise grow wbuf without bound) -- #234.
+    # non-reading peer would otherwise grow wbuf without bound) -- #234. The
+    # frame that trips the budget must not also emit its RST after the GOAWAY.
     h2.noteControlFrame(c)
-    h2.streamError(c, sid, errStreamClosed)
+    if c.state != csClosing:
+      h2.streamError(c, sid, errStreamClosed)
   else:
     var dataStart = payloadPos
     var dataLen = fh.length
@@ -1780,11 +1832,19 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.connError(c, errFlowControl); return
     let wasBlocked = h2.connSendWindow <= 0
     h2.connSendWindow += int32(inc32)
+    # A sliver of connection window handed to a stream that is waiting on it is
+    # a data dribble: charge it to the budget before the scheduler pass it
+    # forces, so the 1-byte DATA frames cannot pay for themselves (#234).
+    let dribble = isWindowDribble(int(inc32), int(h2.connSendWindow),
+                                  h2.backlogStreams > 0)
+    if dribble:
+      h2.noteControlFrame(c)
+      if c.state == csClosing: return
     if h2.h2NextUrgency() >= 0 or (wasBlocked and h2.connSendWindow > 0):
       # The connection window moved: run a scheduler pass. The ready-queue
       # already holds the stream-sendable streams, so no scan is needed.
       h2.h2Schedule(c)
-    else:
+    elif not dribble:
       # Unblocked nothing: the normal shape of a legitimate client's flow
       # control on a long download (the connection window is wide open, so the
       # credit it returns never unblocks anything), but also the shape of a
@@ -1799,20 +1859,33 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.streamError(c, fh.streamId, errFlowControl); return
     st.sendWindow += int32(inc32)
     h2.syncSendState(st)                 # the send window moved (#339)
-    h2.h2Enqueue(fh.streamId)            # queue it regardless: a later
-                                         # connection WINDOW_UPDATE must find it
+    # A sliver of stream window against a stream that has a backlog is a data
+    # dribble: the #234 headline vector (one forced 1-byte DATA frame and one
+    # scheduler pass per 13-byte update). Charged to the budget before the pass
+    # it forces, never to the credit pool (isWindowDribble).
+    let dribble = isWindowDribble(int(inc32), int(st.sendWindow),
+                                  st.pendingBody.len > st.pendingPos)
+    h2.h2Enqueue(fh.streamId)            # a no-op unless the new credit made the
+                                         # stream sendable; h2Sendable ignores
+                                         # the connection window, so a stream
+                                         # queued here is what a later
+                                         # connection WINDOW_UPDATE finds ready
+    if dribble:
+      h2.noteControlFrame(c)
+      if c.state == csClosing: return
     if h2.h2Sendable(st):
       h2.h2Schedule(c)
     else:
-      # The credit unblocked nothing: this stream owes no bytes at all (its
-      # producer has not written yet, or the request body is still arriving), so
-      # the scheduler pass would emit nothing. A client that consumed response
-      # DATA legitimately sends these, so they ride the credit those bytes
-      # earned; past that they are the cheapest unbudgeted flood there was, 13
-      # bytes per frame against an open stream, so charge them exactly like the
-      # connection-level and closed-stream updates (#234, #335).
-      h2.noteIdleWindowUpdate(c)
-      if c.state == csClosing: return
+      if not dribble:
+        # The credit unblocked nothing: this stream owes no bytes at all (its
+        # producer has not written yet, or the request body is still arriving),
+        # so the scheduler pass would emit nothing. A client that consumed
+        # response DATA legitimately sends these, so they ride the credit those
+        # bytes earned; past that they are the cheapest unbudgeted flood there
+        # was, 13 bytes per frame against an open stream, so charge them exactly
+        # like the connection-level and closed-stream updates (#234, #335).
+        h2.noteIdleWindowUpdate(c)
+        if c.state == csClosing: return
       h2.h2ResumeProducers(c)            # the skipped pass would have run this
   elif fh.streamId > h2.lastStreamId:
     h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
