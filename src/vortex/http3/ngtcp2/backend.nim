@@ -388,6 +388,16 @@ proc cbBody(user, connUd: pointer, sid: int64, data: ptr uint8, len: csize_t) {.
     # returns them to the connection window at teardown (see creditRemainder);
     # deliverBody's auto-ack and h3AckBody decrement this as they credit.
     st.uncredited += int(len)
+    if st.contentLength >= 0 and st.bodyReceived > st.contentLength:
+      # Already past the declared content-length: malformed now, not only at
+      # cbStreamEnd. A streaming route relays each chunk as it arrives, so an
+      # end-of-stream-only check lets the excess bytes reach an h1 upstream
+      # under the declared length before the reset (request smuggling), the h3
+      # twin of the h2 guard in http2/codec.nim (#237). Reset and let
+      # cbStreamClose clean up; creditRemainder returns these uncredited bytes
+      # to the connection window, so nothing leaks.
+      if h3c.vq != nil: vqStreamReset(h3c.vq, sid, 0x0105)  # H3_MESSAGE_ERROR
+      return
     deliverBody(h3c, usid, false)
   elif len > 0 and h3c.vq != nil:
     # Buffered request body (#220): nghttp3_conn_read_stream does not credit

@@ -1381,6 +1381,17 @@ proc finishHeaders(h2: H2Conn, c: ptr Connection, sid: uint32,
   elif st.rs.reqStreaming and not st.dispatched:
     # Streaming route: run the handler now so it can register req.onBody; the
     # body is delivered as DATA frames arrive.
+    if st.endStreamSeen and st.contentLength >= 0 and
+        st.bodyReceived != st.contentLength:
+      # END_STREAM on the request HEADERS themselves: no DATA frame and no
+      # trailer section will ever arrive, so neither of the other two
+      # reconciliation sites runs and a declared non-zero content-length with
+      # an empty body would reach the handler as a clean, complete body
+      # (RFC 9113 8.1.1 malformed, #237). h2SetOnBody flushes last=true
+      # immediately for an already-half-closed stream, so this must be caught
+      # before the handler is dispatched, not after.
+      h2.streamError(c, sid, errProtocol)
+      return
     st.dispatched = true
     ready.add sid
   elif st.endStreamSeen and not st.dispatched:
@@ -1468,9 +1479,10 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       if (fh.flags and flagEndStream) != 0:
         h2.noteEndStream(st)
     elif st.rs.reqStreaming:
-      # Inbound streaming: hand DATA to onBody and clear (bounded memory);
-      # no content-length reconciliation since the body is not retained. The
-      # stream AND connection flow-control windows are replenished on consume
+      # Inbound streaming: hand DATA to onBody and clear (bounded memory). The
+      # body is not retained, so content-length is reconciled against the
+      # running bodyReceived tally instead of st.body.len. The stream AND
+      # connection flow-control windows are replenished on consume
       # (h2DeliverBody / ackBody), not here, so a slow consumer throttles the
       # peer and the connection window caps total un-consumed buffer; padding
       # is discarded now, so credit its flow-control bytes now.
@@ -1479,23 +1491,33 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       streamingConnDefer = dataLen    # connection credit deferred to consume
       st.connDeferred += dataLen      # owed back on consume / at teardown (#231)
       st.bodyReceived += dataLen      # for content-length reconciliation (#237)
-      if dataLen > 0:
-        let old = st.body.len
-        st.body.setLen(old + dataLen)
-        copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
-      let endS = (fh.flags and flagEndStream) != 0
-      if endS:
-        h2.noteEndStream(st)
-        # A streaming route does not retain the body, but the declared
-        # content-length must still match the DATA received (RFC 9113 8.1.1):
-        # a mismatch desynchronizes an h1 upstream if the request is forwarded
-        # (smuggling). Fail the stream instead of delivering a clean last=true.
-        if st.contentLength >= 0 and st.bodyReceived != st.contentLength:
-          h2.streamError(c, sid, errProtocol)
-        else:
-          h2.h2DeliverBody(c, sid, true)
+      if st.contentLength >= 0 and st.bodyReceived > st.contentLength:
+        # Already past the declared length: malformed now, not only at
+        # END_STREAM (RFC 9113 8.1.1 constrains the whole message, and 8.1
+        # lets us reset as soon as we know). Checking only at the end is not
+        # enough for a streaming route: it relays each chunk as it arrives, so
+        # by the time the terminating frame reveals the mismatch the excess
+        # bytes have already gone to an h1 upstream under the declared length
+        # and desynchronized that connection (smuggling, #237). Reject before
+        # the bytes reach the sink. teardownStream returns connDeferred, which
+        # includes this frame, so the connection window is not leaked (#231).
+        h2.streamError(c, sid, errProtocol)
       else:
-        h2.h2DeliverBody(c, sid, false)
+        if dataLen > 0:
+          let old = st.body.len
+          st.body.setLen(old + dataLen)
+          copyMem(addr st.body[old], addr c.rbuf[dataStart], dataLen)
+        let endS = (fh.flags and flagEndStream) != 0
+        if endS:
+          h2.noteEndStream(st)
+          # A short body (fewer DATA bytes than declared) can only be known at
+          # the end. Fail the stream instead of delivering a clean last=true.
+          if st.contentLength >= 0 and st.bodyReceived != st.contentLength:
+            h2.streamError(c, sid, errProtocol)
+          else:
+            h2.h2DeliverBody(c, sid, true)
+        else:
+          h2.h2DeliverBody(c, sid, false)
     else:
       let old = st.body.len
       st.body.setLen(old + dataLen)

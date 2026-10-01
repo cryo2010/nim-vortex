@@ -272,6 +272,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule against resetting an idle stream, closed-stream DATA, per-entry SETTINGS
   charging, and a one-request-per-burst interleave against the per-request
   reset). (#234)
+- h2, h3: a streaming (`onBody`) route now reconciles the declared
+  `content-length` against the DATA actually received on every path a request
+  can end on, and as soon as the running tally passes the declared length
+  rather than only at the end. Two gaps remained: `content-length: 10` with
+  END_STREAM on the request HEADERS themselves (no DATA frame and no trailer
+  section, so neither end-of-message check ran) dispatched the handler and
+  flushed it a clean, complete, empty body; and excess DATA was handed to the
+  sink chunk by chunk, with the reset only following the terminating frame, so
+  a route relaying the body upstream under the declared Content-Length had
+  already desynchronized that h1 connection (request smuggling) by the time
+  the mismatch was noticed. Both now fail the stream with PROTOCOL_ERROR
+  (RFC 9113 8.1.1) before anything reaches the handler, and the h3 backend
+  takes the same early check (RFC 9114 4.1.2). Buffered routes are unchanged:
+  they never see a partial body. (#237)
 
 ### Changed
 
