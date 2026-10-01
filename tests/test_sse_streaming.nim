@@ -87,6 +87,18 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     discard s.send("", event = "ping")
     discard s.send("")
     s.close()
+  of "/ids":
+    # #265: id/event field values are single-line, and an id that sanitizes to
+    # empty must not go out as the `id:` field that resets Last-Event-ID.
+    let s = res.sse()
+    discard s.send("ok", id = "abc")            # normal id: emitted as-is
+    discard s.send("nul", id = "x\0y")          # NUL stripped, never on the wire
+    discard s.send("crlf", id = "\r\n")         # sanitizes to "": no id field
+    discard s.send("zero", id = "\0")           # ditto
+    discard s.send("ev", event = "pi\0ng", id = "4")
+    discard s.send("evgone", event = "\r\n")    # type sanitizes away: no field
+    discard s.comment("be\0ep")
+    s.close()
   of "/upload":
     var total = 0
     req.stream(chunk, last):
@@ -165,6 +177,24 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
         "data: c\ndata: d\n\n" &     # "c\rd":   a bare CR breaks the line
         "data: e\ndata: f\n\n" &     # "e\nf":   plain LF
         "data: g\ndata: \n\n"        # "g\n":    trailing break -> empty tail
+
+    test "id and event field values are sanitized, and an empty id is not sent":
+      # A NUL in an `id` makes a client ignore the field entirely (WHATWG
+      # EventSource), so resume silently kept a stale Last-Event-ID; an `id` of
+      # only CR/LF reached the wire as the empty `id:` that *resets* it. Both are
+      # now impossible: CR/LF/NUL are stripped from every field value, and an id
+      # left empty by that stripping emits no field at all (#265).
+      let (_, body) = splitHeadBody(rawGet("/ids"))
+      let wire = dechunk(body)
+      check wire ==
+        "id: abc\ndata: ok\n\n" &            # ordinary id, untouched
+        "id: xy\ndata: nul\n\n" &            # "x\0y" -> "xy", never a NUL byte
+        "data: crlf\n\n" &                   # "\r\n"  -> "": no id: line
+        "data: zero\n\n" &                   # "\0"    -> "": no id: line
+        "id: 4\nevent: ping\ndata: ev\n\n" & # NUL out of the event name too
+        "data: evgone\n\n" &                 # event sanitized away: no field
+        ": beep\n\n"                         # comments share the sanitizer
+      check '\0' notin wire                  # the whole point: no NUL on the wire
 
     test "alive and bufferedAmount are loop-thread guarded":
       # Off-thread: false / 0 without touching loop state. On the loop thread

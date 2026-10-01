@@ -956,6 +956,15 @@ escape for a literal CR, so `s.send("a\r\nb")` is delivered as `"a\nb"`. Encode
 the payload (base64, or JSON, which escapes a CR) when it has to survive byte
 for byte.
 
+`id`, `event` and a comment's text are single-line field values, so CR, LF and
+NUL are stripped from each before it goes on the wire: none of the three can be
+escaped, and a client that finds a NUL in an `id` ignores that field outright
+instead of resuming from it. An `id` left empty by that stripping (`"\r\n"`,
+`"\0"`) emits no `id:` field at all, because an empty `id:` means "reset
+`Last-Event-ID`" to a client and the caller asked for no such thing. Since the
+default `id = ""` already means "no `id` field", an explicit reset is not
+expressible through this API.
+
 `res.withSse(s): body` is a block form that closes (or aborts on exception) for
 you:
 

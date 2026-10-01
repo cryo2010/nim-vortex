@@ -2051,8 +2051,13 @@ proc response*(s: SseStream): Response = s.res
 
 proc sseSanitize(s: string): string =
   ## SSE field values are single-line; drop CR/LF so a value can't inject a
-  ## second field or terminate the event early.
-  s.multiReplace(("\r", ""), ("\n", ""))
+  ## second field or terminate the event early. NUL goes with them: the wire
+  ## format cannot carry it either. The WHATWG EventSource rules make a client
+  ## that sees U+0000 anywhere in an `id` value *ignore the whole field* rather
+  ## than reject the byte, so emitting it verbatim left `Last-Event-ID` stuck at
+  ## whatever the previous event set, and the resume after a reconnect replayed
+  ## or skipped events with nothing on either side to show why (#265).
+  s.multiReplace(("\r", ""), ("\n", ""), ("\0", ""))
 
 proc sse*(res: Response, headers: openArray[(string, string)] = [],
           retry = 0): SseStream {.raises: [].} =
@@ -2077,6 +2082,16 @@ proc send*(s: SseStream, data: string, event = "", id = "",
   ## as the request header on reconnect), `retry` (ms) overrides the delay.
   ## Returns false when the write backlog is full (see `bufferedAmount` /
   ## `onDrain`); the producer should pause. A dead connection returns false.
+  ##
+  ## `id` and `event` are single-line field values, so CR, LF and NUL are
+  ## removed from both before they go on the wire (a comment's text too): the
+  ## format has no escape for any of them, and a client that finds a NUL in an
+  ## `id` ignores the field outright instead of resuming from it. An `id` that
+  ## sanitizes to empty is not sent at all, because an empty `id:` field means
+  ## "reset Last-Event-ID" to a client, which is not what a caller passing
+  ## `"\r\n"` or `"\0"` asked for. The default `id = ""` is "no id field", so
+  ## that reset is deliberately not expressible through this API: nothing here
+  ## sends a bare `id:`.
   ##
   ## An empty `data` still dispatches on the client. It goes on the wire as two
   ## empty `data:` fields rather than one: a client appends an LF to its data
@@ -2103,8 +2118,21 @@ proc send*(s: SseStream, data: string, event = "", id = "",
     "SseStream.send is loop-thread only; a worker cannot push events " &
     "(hand the payload to the loop thread and send it from there)"
   var f = ""
-  if id.len > 0:    f.add "id: " & sseSanitize(id) & "\n"
-  if event.len > 0: f.add "event: " & sseSanitize(event) & "\n"
+  if id.len > 0:
+    # A sanitized id can come back empty ("\r\n", "\0", any mix of the three
+    # characters the wire format drops). `id: ` with an empty value is not "no
+    # id" to a client, it is the field that *resets* Last-Event-ID, so emitting
+    # it would clear a resume point purely because of characters that never
+    # reached the wire. Skip the field instead and leave the client's buffer
+    # alone (#265).
+    let sid = sseSanitize(id)
+    if sid.len > 0: f.add "id: " & sid & "\n"
+  if event.len > 0:
+    # Same for the type: an empty `event:` leaves the client's event-type buffer
+    # empty, which dispatches as the default "message" anyway, so a name that
+    # sanitizes away is a field not worth putting on the wire.
+    let sev = sseSanitize(event)
+    if sev.len > 0: f.add "event: " & sev & "\n"
   if retry > 0:     f.add "retry: " & $retry & "\n"
   if data.len == 0:
     # Two empty fields, deliberately: see the docstring. One field ("data:\n")
@@ -2132,9 +2160,11 @@ proc send*(s: SseStream, data: string, event = "", id = "",
 proc comment*(s: SseStream, text = ""): bool {.discardable, raises: [].} =
   ## Emit a comment line (`: text`). Clients ignore it; use it as a heartbeat
   ## to keep idle connections and proxies from timing out. `s.comment()` is a
-  ## bare `:` ping. Loop-thread only and asserts off-thread, exactly like
-  ## `send`: a heartbeat that silently returns false stops keeping anything
-  ## warm, and the connection then dies on the idle timeout.
+  ## bare `:` ping. `text` is sanitized like a field value (CR, LF and NUL are
+  ## removed), so a comment cannot inject a field or end the event early.
+  ## Loop-thread only and asserts off-thread, exactly like `send`: a heartbeat
+  ## that silently returns false stops keeping anything warm, and the connection
+  ## then dies on the idle timeout.
   assert currentThreadId() == s.res.core.threadId,
     "SseStream.comment is loop-thread only; a worker cannot send a heartbeat " &
     "(schedule it on the loop thread instead)"

@@ -302,6 +302,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `upgrade` / `te`, one bad field poisoning the whole block, and the
   `maxHeaderSize` bound on the block) now lives in
   `tests/test_http2_request_body.nim`. (#238)
+- SSE: an `id` can no longer break `Last-Event-ID` resume. NUL joins CR and LF
+  in the field sanitizer, so no SSE field value (`id`, `event`, a comment's
+  text) can carry a byte the wire format has no escape for; a NUL in an `id`
+  used to go out verbatim, and the WHATWG EventSource rules make a client ignore
+  such a field entirely, leaving `Last-Event-ID` stuck on the previous event. An
+  `id` that the sanitizer empties (`"\r\n"`, `"\0"`) now emits no `id:` field at
+  all instead of the empty one that *resets* the client's `Last-Event-ID`, so a
+  resume point is never cleared by characters that never reached the wire. An
+  `event` name that sanitizes away is likewise dropped rather than sent as an
+  empty type, which dispatches as the default "message" anyway. (#265)
 
 ### Changed
 
