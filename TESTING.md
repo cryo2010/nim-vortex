@@ -178,6 +178,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_blocking_args.nim` | `req.blocking(a, b, ...)`: values moved into the worker, usable by name in the block (the refcount race only shows under `nimble testrace` / TSan) |
 | `test_blocking_guard.nim` | Compile-time guard on `req.blocking` captures: value data allowed, ref/ptr/closure rejected, `isolate(...)` may cross |
 | `test_blocking_pool.nim` | Worker-pool load shedding: a saturated pool answers 503 (`maxBlockingQueue`); `close()` detaches a wedged worker after `shutdownHardTimeout` (#204) |
+| `test_conn_table.nim` | Growth-stable connection table: a slot keeps its address across growth, and a high fd arriving while a `blocking:` worker pins a slot is served instead of silently dropped (#343). Built with `-d:vortexConnBlock=8` from its sibling `tests/test_conn_table.nims` so the growth path needs only a couple of dozen connections |
 | `test_graceful_shutdown.nim` | `requestShutdown()` drains in-flight requests, frees the port |
 | `test_multi_server.nim` | Multiple `Server` instances in one process are independent |
 | `test_remote_address.nim` | `req.remoteAddress` (peer IP) and `req.forwardedFor` (SEC1) |

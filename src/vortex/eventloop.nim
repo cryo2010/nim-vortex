@@ -142,14 +142,6 @@ type
                                  # deregistered after an fd/memory-exhaustion
                                  # accept() error (EMFILE/ENFILE/...), then
                                  # re-armed in tick(). 0 = listener armed.
-    pinnedGrowDrops: int         # connections refused because the connection table
-                                 # could not grow while a slot was pinned (see
-                                 # handleAccept). Counted and logged so the drop is
-                                 # never silent: from the client it is an empty
-                                 # connect error, indistinguishable from a network
-                                 # fault or a stalled loop (#343).
-    pinnedGrowLogSec: int64      # monotonic sec of the last drop log line; at most
-                                 # one a second, so a burst cannot flood the log
     sslReady: seq[(int32, uint32)]
                                  # TLS connections whose SSL object still holds
                                  # decrypted plaintext the recv loop stopped
@@ -318,12 +310,14 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
   result.core.pool = pool
   result.core.outbox = outbox
   result.core.loopPtr = cast[pointer](result)
-  # Modestly preallocate the connection table so the common fd range never
-  # reallocates it (growing it moves every Connection, which would dangle a
-  # `addr core.conns[fd]` a blocking: worker holds -- see handleAccept, which
-  # refuses to grow while any slot is pinned). A large fd rlimit is NOT used as
-  # the size: preallocating millions of slots wastes memory and startup time.
-  result.core.conns = newSeq[Connection](1024)
+  # The connection table starts at one block, which covers the common fd range
+  # without ever growing. Growth past it appends another block and leaves the
+  # existing ones in place, so a `addr core.conns[fd]` a blocking: worker holds
+  # keeps pointing at the same Connection (see the ConnTable docstring): the
+  # table can grow under a pinned slot, and handleAccept serves a high fd instead
+  # of refusing it (#343). A large fd rlimit is NOT used as the initial size:
+  # preallocating millions of slots wastes memory and startup time.
+  result.core.conns = initConnTable()
   result.refreshDate()
   result.selector.registerHandle(int(listenFd), {Event.Read}, fkListen)
   if outbox != nil:
@@ -398,8 +392,8 @@ proc checkBodyPause(loop: Loop) =
   ## wait for the life of the loop thread in production. Compiled out of release.
   when not defined(release):
     var paused = 0
-    for i in 0 ..< loop.core.conns.len:
-      if loop.core.conns[i].state != csFree and loop.core.conns[i].bodyReadPaused:
+    for c in loop.core.conns.slots:
+      if c.state != csFree and c.bodyReadPaused:
         inc paused
     assert paused == loop.bodyPausedConns,
       "bodyPausedConns drift: " & $loop.bodyPausedConns & " vs " & $paused
@@ -1559,36 +1553,15 @@ proc handleAccept(loop: Loop) =
       discard posix.close(client)
       continue
     if fd >= loop.core.conns.len:
-      # Grow the table for a higher fd, but only when nothing is pinned: a
-      # realloc moves every Connection, and a blocking: worker may hold
-      # `addr core.conns[oldFd]`. If a slot is pinned, refuse this connection
-      # rather than dangle that pointer (a use-after-free). Rare in practice: a
-      # new high fd must coincide with a running worker, and after warmup the
-      # table stops growing. The scan is O(len) but only runs on a growth event.
-      var pinnedAny = false
-      for i in 0 ..< loop.core.conns.len:
-        if loop.core.conns[i].totalPins > 0:
-          pinnedAny = true
-          break
-      if pinnedAny:
-        # Refused, not served: say so. The connection cap above is a configured
-        # policy the operator already knows about, but this drop is an internal
-        # limit (the table cannot move under a worker's `addr conns[fd]`), so it
-        # would otherwise look like a network fault to the client and like nothing
-        # at all here. Rate-limited to one line a second, carrying the running
-        # count so a burst is still visible (#343).
-        discard posix.close(client)
-        inc loop.pinnedGrowDrops
-        if loop.pinnedGrowLogSec != loop.core.nowSec:
-          loop.pinnedGrowLogSec = loop.core.nowSec
-          try: stderr.writeLine("vortex: refused a connection (fd " & $fd &
-            " is beyond the " & $loop.core.conns.len & "-slot connection table, " &
-            "which cannot grow while a blocking: worker holds a slot); " &
-            $loop.pinnedGrowDrops & " dropped so far on this loop thread")
-          except IOError, OSError: discard
-        continue
-      loop.core.conns.setLen(fd + 64)
-    let c = addr loop.core.conns[fd]
+      # Grow the table for a higher fd. Unconditional, and that is the fix for
+      # #343: the table is segmented, so growth appends a block and never moves
+      # an existing Connection, which leaves the `addr core.conns[oldFd]` a
+      # running blocking: worker holds valid. The flat seq this replaced had to
+      # scan for a pinned slot and, on finding one, accept the connection and
+      # immediately close it -- a drop the client could not tell from a network
+      # fault. A high fd arriving while a worker runs is now served.
+      loop.core.conns.grow(fd)
+    let c = loop.core.conns.at(fd)
     c.fd = int32(fd)
     c[].clear(loop.settings.initialBufferSize)
     # Record the peer IP for req.remoteAddress (access logging, rate limiting,
@@ -1805,7 +1778,7 @@ proc applyBlockingDone(loop: Loop, m: OutMsg, h3Touched: var bool) =
         if slot.closeReq and slot.totalPins == 0: loop.h3FreeSlot(idx)
         h3Touched = true
   elif int(m.fd) < loop.core.conns.len:
-    let c = addr loop.core.conns[int(m.fd)]
+    let c = loop.core.conns.at(int(m.fd))
     if not staleConn(c, m.gen):               # unpin/resume only if alive
       # releasePin's hook covers the deferred close, and also resumes buffered
       # input (e.g. pipelined h1 bytes after an awaitable body). That resume can
@@ -1879,7 +1852,7 @@ proc deferBatchFlush(loop: Loop, c: ptr Connection) =
 proc applyOutboxConn(loop: Loop, m: OutMsg) =
   ## Apply one non-blockingDone message on an h1/h2 connection (m.fd >= 0).
   if int(m.fd) >= loop.core.conns.len: return
-  let c = addr loop.core.conns[int(m.fd)]
+  let c = loop.core.conns.at(int(m.fd))
   if staleConn(c, m.gen): return
   if m.kind == omWs or m.kind == omWsClose:
     # A WebSocket frame from an off-loop sender (already serialized): route to the
@@ -2013,8 +1986,7 @@ proc sweepWsPing(loop: Loop, c: ptr Connection) =
   loop.flushOut(c)
 
 proc sweepTimeouts(loop: Loop) =
-  for i in 0 ..< loop.core.conns.len:
-    let c = addr loop.core.conns[i]
+  for c in loop.core.conns.slots:
     if c.state == csFree: continue
     if c.writeDeadline != 0 and c.writeDeadline <= loop.core.nowSec:
       # Output pending but the socket stayed unwritable past writeTimeout: a
@@ -2151,8 +2123,8 @@ proc beginDrain(loop: Loop) =
     except CatchableError: discard
     discard posix.close(cint(loop.listenFd))   # free the port for a replacement
     loop.listenFd = -1
-  for fd in 0 ..< loop.core.conns.len:
-    loop.markDrain(addr loop.core.conns[fd])
+  for c in loop.core.conns.slots:
+    loop.markDrain(c)
   when not defined(plainHttp):
     for i in 0 ..< loop.core.h3slots.len:
       let slot = addr loop.core.h3slots[i]
@@ -2165,8 +2137,7 @@ proc beginDrain(loop: Loop) =
 
 proc drainSweep(loop: Loop) =
   ## Close connections that finished their in-flight work this iteration.
-  for fd in 0 ..< loop.core.conns.len:
-    let c = addr loop.core.conns[fd]
+  for c in loop.core.conns.slots:
     if c.state != csActive: continue
     if c.totalPins > 0: continue
       # A pinned connection is not "finished" (a blocking: worker is running),
@@ -2214,8 +2185,7 @@ proc forceCloseAll(loop: Loop) =
   ## the protocol object we would free. The run loop keeps spinning (still
   ## processing the outbox) until those pins clear, so we never free a slot or
   ## the loop itself under a worker. Idempotent, so re-calling each tick is fine.
-  for fd in 0 ..< loop.core.conns.len:
-    let c = addr loop.core.conns[fd]
+  for c in loop.core.conns.slots:
     if c.state != csFree:
       # h2: GOAWAY(NO_ERROR) before the drop, as on the timeout paths. Idempotent
       # (h2Goaway is a no-op once goingAway), so re-calling each tick is fine.
@@ -2317,7 +2287,7 @@ proc run*(loop: Loop) =
         continue
       if key.fd >= loop.core.conns.len:
         continue
-      let c = addr loop.core.conns[key.fd]
+      let c = loop.core.conns.at(key.fd)
       if c.state == csFree:
         continue
       if c.state == csDraining:
@@ -2396,9 +2366,8 @@ proc run*(loop: Loop) =
         if not loop.warnedDrainStuck:
           loop.warnedDrainStuck = true
           var stuck = 0
-          for fd in 0 ..< loop.core.conns.len:
-            if loop.core.conns[fd].state != csFree and
-                loop.core.conns[fd].totalPins > 0: inc stuck
+          for c in loop.core.conns.slots:
+            if c.state != csFree and c.totalPins > 0: inc stuck
           try: stderr.writeLine("vortex: graceful shutdown is waiting on " &
             $stuck & " connection(s) held by a still-running blocking: " &
             "handler; the loop cannot exit until they return (a handler that " &

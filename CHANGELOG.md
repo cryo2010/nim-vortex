@@ -71,9 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while the read was still paused leaked the count and pinned that loop thread
   at the 2 ms paused-body selector cadence for good; a debug build now audits
   the count every second. (#344)
-- A connection refused because the connection table cannot grow while a
-  `blocking:` worker pins a slot is now counted and logged (rate-limited), not
-  dropped silently. (#343)
+- A connection whose fd lands beyond the connection table is now served rather
+  than refused. The table was one flat `seq[Connection]`, so growing it moved
+  every slot and would have dangled the `addr conns[fd]` a running `blocking:`
+  worker holds; `handleAccept` therefore scanned for a pinned slot and, on
+  finding one, accepted the connection and immediately closed it, which from the
+  client is an empty connect error indistinguishable from a network fault or a
+  stalled loop. It is now a segmented table: fixed-size blocks (1024 slots,
+  ~712 KiB each) that are never resized or moved once allocated, so growth
+  appends a block and leaves every outstanding `ptr Connection` valid. The pinned
+  scan, the refusal and its drop counter are gone, growth is unconditional, and
+  the fd rlimit remains the real bound on the table (the accept path still backs
+  off on EMFILE/ENFILE). `maxConnections` is unchanged. (#343)
 - HTTP/3 WebSockets: frames the client pipelines with the Extended CONNECT
   handshake are handed to the accepted WebSocket instead of being lost; a
   client that half-closes before the handler accepts now gets `onClose`
