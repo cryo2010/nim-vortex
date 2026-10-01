@@ -120,7 +120,9 @@ type
     maxHeaderList*: int
     activeStreams*: int
     # DoS budgets (0 disables). rstStreamCount / controlFrameCount are
-    # per-connection cumulative; controlFrameCount resets on stream progress.
+    # per-connection cumulative; controlFrameCount only decays (partially) on
+    # real progress, so it is a cap over the connection's life, not a per-request
+    # ratio (#234).
     maxConcurrentStreams*: int
     maxResetStreams*: int
     maxControlFrames*: int
@@ -1657,7 +1659,13 @@ proc handleSettings(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
                     payloadPos: int) =
   if fh.streamId != 0: h2.connError(c, errProtocol); return
   if (fh.flags and flagAck) != 0:
-    if fh.length != 0: h2.connError(c, errFrameSize)
+    if fh.length != 0:
+      h2.connError(c, errFrameSize)
+    else:
+      # We send our SETTINGS once, so at most one ACK is ever solicited: the
+      # rest are pure overhead, exactly like the PING ACKs the ACK-only guard
+      # used to let through unbudgeted (#234).
+      h2.noteControlFrame(c)
     return
   if fh.length mod 6 != 0: h2.connError(c, errFrameSize); return
   # Charge per setting entry, not per frame: a single 16 KiB SETTINGS carries
@@ -1737,7 +1745,13 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     # id > lastStreamId GOAWAYs instead of RST-ing a stream that never existed.
     if fh.streamId == 0 or fh.streamId > h2.lastStreamId:
       h2.connError(c, errProtocol)
-    else: h2.streamError(c, fh.streamId, errProtocol)
+    else:
+      # A 0-increment on a stream we have seen costs a 13-byte RST_STREAM reply,
+      # and on an already-closed id the stream error tears nothing down, so the
+      # peer can repeat it forever: budget it before answering (#234).
+      h2.noteControlFrame(c)
+      if c.state != csClosing:
+        h2.streamError(c, fh.streamId, errProtocol)
     return
   if fh.streamId == 0:
     if int64(h2.connSendWindow) + int64(inc32) > 0x7fffffff'i64:
@@ -1763,8 +1777,21 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.streamError(c, fh.streamId, errFlowControl); return
     st.sendWindow += int32(inc32)
     h2.syncSendState(st)                 # the send window moved (#339)
-    h2.h2Enqueue(fh.streamId)
-    h2.h2Schedule(c)
+    h2.h2Enqueue(fh.streamId)            # queue it regardless: a later
+                                         # connection WINDOW_UPDATE must find it
+    if h2.h2Sendable(st):
+      h2.h2Schedule(c)
+    else:
+      # The credit unblocked nothing: this stream owes no bytes at all (its
+      # producer has not written yet, or the request body is still arriving), so
+      # the scheduler pass would emit nothing. A client that consumed response
+      # DATA legitimately sends these, so they ride the credit those bytes
+      # earned; past that they are the cheapest unbudgeted flood there was, 13
+      # bytes per frame against an open stream, so charge them exactly like the
+      # connection-level and closed-stream updates (#234, #335).
+      h2.noteIdleWindowUpdate(c)
+      if c.state == csClosing: return
+      h2.h2ResumeProducers(c)            # the skipped pass would have run this
   elif fh.streamId > h2.lastStreamId:
     h2.connError(c, errProtocol)   # WINDOW_UPDATE on idle stream
   else:

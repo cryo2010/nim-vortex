@@ -254,6 +254,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse proxy reports). HTTPS now takes the same sequence as plaintext,
   close_notify then `shutdown(SHUT_WR)` then drain to the peer's FIN or the
   drain deadline, and the session is shut down and freed exactly once. (#373)
+- HTTP/2: the last three ways to push overhead frames past the
+  `maxControlFrames` budget are charged. A SETTINGS ACK returned before the
+  charge, exactly as a PING ACK once did (we send our SETTINGS once, so every
+  ACK past the first is pure overhead); a zero-increment WINDOW_UPDATE naming a
+  stream we have seen answered with a RST_STREAM before the charge, and on an
+  already-closed id it tore nothing down, so the peer could repeat it forever;
+  and a stream-level WINDOW_UPDATE was never charged at all, which left the
+  cheapest flood of them all (13 bytes a frame against an open stream the server
+  owes no bytes on, so the scheduler pass it forces emits nothing). A
+  stream-level update that unblocks nothing now goes through the same
+  credit-then-charge path as the connection-level and closed-stream ones, so
+  flow control from a client that consumed response DATA still rides the credit
+  those bytes earned. The budget's other seven bypasses are covered by a new
+  frame-level regression suite (PING ACK, SETTINGS ACK, received GOAWAY, unknown
+  frame types, WINDOW_UPDATE, self-dependent PRIORITY including the RFC 9113 5.1
+  rule against resetting an idle stream, closed-stream DATA, per-entry SETTINGS
+  charging, and a one-request-per-burst interleave against the per-request
+  reset). (#234)
 
 ### Changed
 

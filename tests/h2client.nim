@@ -26,6 +26,17 @@ proc setTimeout(c: var H2TestConn, ms: int) =
 proc sendRaw*(c: var H2TestConn, data: string) =
   if data.len > 0: c.sock.send(data)
 
+proc sendAll*(c: var H2TestConn, data: string) =
+  ## posix send with correct partial-write handling: std/net's `send` re-sends
+  ## from offset 0 after a partial write (duplicating bytes on the wire) and then
+  ## spins forever if the peer has gone. Use this for anything larger than a
+  ## frame or two, and for a flood the server may answer by closing mid-write.
+  var off = 0
+  while off < data.len:
+    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
+    if n <= 0: return
+    off += n
+
 proc sendAndDrain*(c: var H2TestConn, data: string, chunk = 4096) =
   ## Send `data` in chunks, draining any already-available response bytes into
   ## the read buffer between chunks. A single blocking send of a large request

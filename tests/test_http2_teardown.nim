@@ -79,16 +79,6 @@ proc addUpload(buf: var string, sid: uint32, frames = uploadFrames,
   for i in 0 ..< frames:
     buf.addData(sid, chunk, endStream = endStream and i == frames - 1)
 
-proc sendAll(c: var H2TestConn, data: string) =
-  ## posix send with correct partial-write handling: std/net's `send` re-sends
-  ## from offset 0 after a partial write (duplicating bytes on the wire) and then
-  ## spins forever if the peer has gone.
-  var off = 0
-  while off < data.len:
-    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
-    if n <= 0: return
-    off += n
-
 proc connCredit(frames: seq[Frame]): int =
   ## Total connection-level (stream 0) WINDOW_UPDATE credit in `frames`.
   for f in frames:
