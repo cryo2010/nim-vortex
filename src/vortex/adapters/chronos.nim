@@ -40,9 +40,13 @@
 ## operations are pending (chronos's own fds cannot wake our selector;
 ## this bounds completion latency instead). chronos's `poll()` would
 ## otherwise block until its next timer, so the pump keeps a pending
-## callback queued to force a zero-timeout backend poll. When the future
-## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
-## uncaught exception in the body responds 500.
+## callback queued to force a zero-timeout backend poll. The cap is
+## dropped again as soon as every outstanding future is parked on a
+## wakeup only this loop delivers (an inbound WebSocket message, a
+## request-body chunk): chronos has nothing to poll for then, so the loop
+## is free to sleep on its own selector. When the future finishes, the
+## deferred respond is flushed via LoopCore.hooks.kick. An uncaught
+## exception in the body responds 500.
 
 import pkg/chronos
 import pkg/chronos/selectors2 as chronosSelectors   # close(Selector) for teardown
@@ -59,6 +63,10 @@ export chronos
 # cross threads, so a plain threadvar (no atomics) is correct and lets
 # the pump know when to run and when to keep capping the loop timeout.
 var pendingOps {.threadvar.}: int
+# How many of those are parked on a wakeup only the vortex loop can deliver
+# (an inbound WebSocket message, a request-body chunk) rather than on anything
+# chronos itself drives. See trackParked and the pump's early exit.
+var parkedOps {.threadvar.}: int
 
 proc noop(arg: pointer) {.gcsafe, raises: [].} = discard
 
@@ -72,11 +80,33 @@ proc pump(): int {.nimcall, gcsafe.} =
     # forces a zero-timeout poll that runs ready work and checks ready
     # IO without ever blocking the loop.
     var spins = 0
-    while pendingOps > 0 and spins < 8:
+    while spins < 8:
       callSoon(noop)
       poll()
       inc spins
-    if pendingOps > 0: 5 else: -1
+      if pendingOps <= 0: return -1
+      # Every future still outstanding is parked on a wakeup that only this
+      # loop can deliver, so chronos has nothing of its own left to drive:
+      # stop spinning and let the loop block on its selector until that wakeup
+      # arrives. Nothing is starved by sleeping here -- the wakeup runs on the
+      # loop thread, chronos re-queues the resumed continuation as a callback,
+      # and the pump call at the end of THAT same loop iteration polls it.
+      #
+      # Without this the tally could never reach zero while a long-lived
+      # awaited future was open -- and every `ws.messages` / `await req.read()`
+      # handler is one -- so a server holding idle WebSocket or streaming
+      # connections spun eight chronos polls per loop iteration and pinned the
+      # selector wait at 5 ms forever, on every one of its loop threads. That
+      # is pure burn: it bought no latency (the wakeups come from our own
+      # selector) and cost the headroom a loop thread needs to accept and
+      # upgrade new connections on a busy host. Measured on one loop thread with
+      # four idle WebSockets open: 0.0527 s of CPU per 5 s idle with the spin,
+      # 0.0004 s without it. That is ~1% of a core per loop thread, paid for as
+      # long as any such connection is open and whether or not it carries
+      # traffic, so it scales with the countProcessors() loop threads a default
+      # server starts -- and the 5 ms cap kept every one of them from sleeping.
+      if parkedOps >= pendingOps: return -1
+    5
 
 proc teardown() {.nimcall, gcsafe.} =
   ## Release this loop thread's chronos dispatcher on exit. Without it the
@@ -104,6 +134,16 @@ proc trackPending() {.inline.} = inc pendingOps
   ## the loop timeout) until it completes. Paired with untrackPending.
 proc untrackPending() {.inline.} = dec pendingOps
   ## The completion half of trackPending.
+
+proc trackParked() {.inline.} = inc parkedOps
+  ## Contract shared with the asyncdispatch backend: one outstanding future has
+  ## parked on a wakeup that only the vortex loop delivers, so chronos has
+  ## nothing to poll for on its behalf. Once every outstanding future is parked
+  ## this way the pump stops spinning and lets the loop sleep (see pump). The
+  ## asyncdispatch backend needs no tally -- a bare parked Future registers no
+  ## fd, timer or callback, so its hasPendingOperations already reads false.
+proc untrackParked() {.inline.} = dec parkedOps
+  ## The unpark half of trackParked.
 
 template onCompleted(fut, body: untyped) =
   ## Contract shared with the asyncdispatch backend: run `body` when `fut`

@@ -2671,10 +2671,20 @@ proc emitFileStart*(res: Response, status: int, contentType: string,
     release: res.relKind))
   workerResponded = true
 
+const fileChunkFailed* = -1
+  ## `n` sentinel for emitFileChunk: this hop could not read the bytes the
+  ## response still owes its declared Content-Length, so the loop must ABORT the
+  ## body (applyFileChunk) instead of terminating it. A short read reported as
+  ## end-of-body would close a length-delimited response at a length that
+  ## contradicts the head already on the wire: over HTTP/2 that is END_STREAM
+  ## before content-length bytes (the peer's h2 stack raises), over HTTP/1 it
+  ## desyncs keep-alive framing.
+
 proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
                     reader: pointer, last: bool) =
   ## Worker-side: hand back a filled pool buffer (no data copy). `n` = bytes
-  ## read; the loop copies `buf[0..<n]` into the response and recycles `buf`.
+  ## read; the loop copies `buf[0..<n]` into the response and recycles `buf`, or
+  ## `fileChunkFailed` to abort the response (`last` must then be true).
   ## Always releases prFileChunk: chunk-read tasks are always pkFileChunk, and
   ## each emits exactly one omFileChunk (readChunkTramp).
   push(res.core.outbox, OutMsg(
@@ -2766,6 +2776,14 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## bytes, which is what the read-ahead was for. The gate then sees the backlog
   ## without this chunk, which is why the budget dropped to one chunk to keep the
   ## same ceiling (see fileReadAhead).
+  ##
+  ## `n == fileChunkFailed` means the read failed or came up short of what the
+  ## declared Content-Length still owes: abort (HTTP/1 closes the connection,
+  ## HTTP/2 and /3 reset the stream) so the peer sees a cut-short transfer,
+  ## rather than finish() claiming a complete body that is short of its length.
+  if n == fileChunkFailed:
+    res.abort()
+    return
   if not last:
     pullNext(res, nextRead, reader)
   if buf != nil and n > 0:

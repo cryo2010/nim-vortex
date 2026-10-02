@@ -82,6 +82,7 @@ type
     client_ca_pem: cstring
     sni: ptr VqSniCert
     sni_len: csize_t
+    max_idle_timeout_sec: uint64
 
   H3SniCert* = object
     ## Per-host certificate material for the QUIC SNI callback (#374). The same
@@ -186,7 +187,26 @@ var
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
 
-proc nowNs(): uint64 = getMonoTime().ticks.uint64
+proc ngNowNs*(): uint64 = getMonoTime().ticks.uint64
+  ## The one clock this loop thread hands ngtcp2 -- every entry point (recv,
+  ## pump, expiry, next-expiry) stamps its call with it, and ngtcp2 arms its idle,
+  ## keep-alive and loss-detection timers against it.
+  ##
+  ## It is the raw monotonic clock, with nothing withheld from it, and it must
+  ## stay that way: ngtcp2 checks on every entry that the stamp has not gone
+  ## behind one it was already given (`conn->log.last_ts <= ts`) and aborts the
+  ## process if it has. Crediting a loop-thread stall here -- subtracting the gap
+  ## the thread spent descheduled, the h3 analogue of the loop's creditStall --
+  ## does exactly that, and there is nowhere to put such a credit that does not:
+  ## run() drives h3 *before* it ticks, so the drive that follows a stall has
+  ## already handed ngtcp2 the full elapsed time before the loop has even measured
+  ## the gap, and crediting it afterwards can only rewind the clock.
+  ##
+  ## A stall must not make ngtcp2 reap a blameless peer, but that is bought at the
+  ## protocol level instead of by lying about the time: acceptConn advertises an
+  ## idle window as wide as the h1/h2 keepAliveTimeout and arms ngtcp2's
+  ## keep-alive PING at a third of it, so an ordinary stall fits inside the window
+  ## and a live-but-quiet connection keeps both ends' timers fed.
 
 proc h3ConnOf*(core: ptr LoopCore, fd: int32, gen: uint32): H3Conn =
   ## Resolve an h3 Request handle (fd = -(slot+2)); nil if gone.
@@ -581,7 +601,8 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxConnections = 0, maxResetStreams = 0,
               tlsCipherSuites = "", maxTlsVersion = 0,
               verifyClient = 0, clientCaFile = "", clientCaPem = "",
-              sni: openArray[H3SniCert] = []): bool =
+              sni: openArray[H3SniCert] = [],
+              maxIdleTimeout = 0): bool =
   ## Build this loop's QUIC engine. tlsCipherSuites / maxTlsVersion carry the
   ## operator's TLS policy onto the QUIC side (#359); maxTlsVersion is an
   ## OpenSSL version constant (0 = no cap) and anything below TLS 1.3 makes the
@@ -589,6 +610,9 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   ## verifyClient is the OpenSSL SSL_VERIFY_* bitmask for mTLS, enforced on h3
   ## exactly as on the TCP listener (#351). `sni` carries the per-host
   ## certificates, each getting its own QUIC context in the shim (#374).
+  ## maxIdleTimeout is the max_idle_timeout we advertise, in seconds (0 = the
+  ## shim default), which also caps the peer's idle timer and arms ngtcp2's
+  ## keep-alive at a third of it.
   gCore = core
   gUdpFd = udpFd
   gMaxBody = uint64(maxBody)
@@ -637,6 +661,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
       pkcs12_len: csize_t(sni[i].pkcs12.len))
   cfg.sni = (if sniC.len > 0: addr sniC[0] else: nil)
   cfg.sni_len = csize_t(sniC.len)
+  cfg.max_idle_timeout_sec = uint64(max(0, maxIdleTimeout))
   gEngine = vqEngineNew(addr cfg)
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))
@@ -654,12 +679,12 @@ proc ngReceive*() =
                         addr peer[0], addr plen)
     if n <= 0: break
     vqEngineRecv(gEngine, addr buf[0], csize_t(n), addr peer[0], csize_t(plen),
-                 addr gLocalSa[0], csize_t(gLocalLen), nowNs())
+                 addr gLocalSa[0], csize_t(gLocalLen), ngNowNs())
 
-proc ngPump*() = vqEnginePump(gEngine, nowNs())
-proc ngHandleExpiry*() = vqEngineHandleExpiry(gEngine, nowNs())
+proc ngPump*() = vqEnginePump(gEngine, ngNowNs())
+proc ngHandleExpiry*() = vqEngineHandleExpiry(gEngine, ngNowNs())
 proc ngTimeoutMs*(): int =
-  let now = nowNs()
+  let now = ngNowNs()
   let e = vqEngineNextExpiry(gEngine, now)
   if e == high(uint64): -1
   elif e <= now: 0

@@ -396,6 +396,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that keeps returning credit re-arms the deadline on every pass and is never cut
   off. Covered by tests/test_http2_backpressure.nim for a buffered response and
   for a streamed `sendFile`. (#236)
+- Static files: a streamed `res.sendFile` no longer ends its body early when a
+  file read comes up short. Each 256 KiB hop read through one buffered
+  `readBuffer` and the trampoline treated any shortfall as end of file, closing
+  the response with a clean terminator at a length contradicting the
+  `Content-Length` already on the wire. Both ways there are ordinary: `read(2)`
+  may legally return fewer bytes than asked for on a regular file, and
+  `readBuffer` raises on a short read whose stream has its error flag set,
+  discarding the bytes it had already copied, so a partially-satisfied hop
+  reported zero. Hops now `pread` in a loop until the buffer is full, which
+  makes a short result mean end of file and nothing else and a failure raise. A
+  hop that cannot deliver what the declared length still owes aborts the
+  response (RST_STREAM on HTTP/2 and /3, connection close on HTTP/1) instead of
+  completing it short, a mangled read continuation aborts rather than silently
+  restarting the body at offset 0, and a failed *initial* read answers 500,
+  since nothing has been sent and the length is still ours to retract. (#386)
+- Timeouts: a loop thread that did not get to run for several seconds no longer
+  charges that gap to the deadlines armed on its connections. It used to come
+  back and fire every deadline that fell inside the gap at once, at peers that
+  had done nothing wrong, and the phase a connection happened to be in decided
+  what the peer saw: a connection still in its TLS handshake was reset with no
+  alert, an HTTP/2 connection closed with no GOAWAY, an in-flight request or
+  response truncated -- an unexplained connect failure or read error from a
+  server that was otherwise healthy. Measured on an oversubscribed soak host
+  (HTTP/2, 14 loop threads, load ~20), ticks were missed by 2 to 33 seconds
+  against a 10 s `headerTimeout`. The armed deadlines are now pushed out by the
+  gap less its final second, so `headerTimeout`, `bodyTimeout`, `writeTimeout`,
+  `keepAliveTimeout` and the WebSocket keep-alive stamps measure a peer that has
+  gone quiet while the server could serve it, rather than the host's scheduler.
+  They stay finite and absolute, so a peer that is still silent once the loop
+  recovers is reaped one gap later, and a slowloris gains only the time the
+  server could not serve anyone at all. (#386)
+- chronos adapter: the pump no longer spins on futures that only the loop thread
+  can complete. Every awaited handler future counted toward `pendingOps`, and a
+  non-zero tally made the pump run eight `poll()` passes per loop iteration and
+  cap the selector wait at 5 ms. But a handler parked in `ws.messages` or
+  `await req.read()` waits on a core callback that runs on the loop thread:
+  chronos has no fd, timer or callback of its own for it and can never complete
+  it by polling, so a server holding long-lived WebSocket or streaming
+  connections never reached zero and every loop thread spun ~1600 chronos polls
+  a second forever without ever sleeping on its selector. Futures parked on a
+  core wakeup are now tracked separately and the spin (with the cap) ends once
+  every outstanding future is parked that way; anything chronos itself drives
+  keeps the old behaviour. On the soak's WebSocket cell (HTTP/1, 96 sockets, 14
+  loop threads) this was 150-374% CPU against 25-37% for the sync build at the
+  same 33k messages/s, and the missing headroom is what let individual
+  SO_REUSEPORT threads stall long enough to miss handshake deadlines. (#386)
+- HTTP/3: a live but quiet QUIC connection is no longer reaped as idle. RFC 9000
+  10.1 restarts an endpoint's idle timer only on a packet it receives, so a peer
+  waiting for a response never refreshes its own and any gap in application data
+  leaves the connection silent until one side tears it down and blames an "idle
+  timeout" on a server that is healthy and still serving its other connections.
+  Two things made that gap reachable: the shim advertised a hardcoded 30 s
+  `max_idle_timeout`, half the HTTP/1 and /2 budget and narrower than the h3
+  drain grace -- and, because QUIC takes `min(local, peer)`, that also talked
+  the *client's* timer down -- and ngtcp2's keep-alive was left at its disabled
+  default, so nothing ever filled a gap. The advertised window now comes from
+  `keepAliveTimeout`, so both protocols give a peer the same budget, and the
+  keep-alive PING is armed at a third of it (ack-eliciting, so it restarts the
+  timer at both ends, with room for two lost PINGs). ngtcp2's own idle and
+  loss-detection timers are absolute stamps on the clock the shim hands it and
+  are deliberately NOT given the loop's stall credit above: ngtcp2 asserts that
+  the clock never goes behind a stamp it has already seen, and the loop drives
+  h3 before it ticks, so crediting the gap aborted the process. (#386)
 
 ### Changed
 

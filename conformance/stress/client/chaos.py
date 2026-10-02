@@ -76,6 +76,19 @@ SLACK = 8
 # only reaped once that timer fires), so it needs the longer wait; TCP resets
 # reap promptly, so h1/h2 need far less.
 DRAIN = 40 if PROTO == "h3" else 15
+# Post-drain settle: how much longer to keep re-sampling while the count is still
+# above the pass threshold, before accepting it as the verdict. The drain above
+# covers OUR torn-down connections; this covers the one thing we cannot see from
+# in here -- the verified canary, whose window ends a few seconds after ours (it
+# is launched once we print our baseline, and its workers may overrun their own
+# deadline finishing an iteration). Sampling through that tail counted the
+# canary's live sockets as leaks. Waiting cannot hide a real leak: leaked
+# descriptors are never reclaimed, so this only ever converts a false failure
+# into a pass, at the cost of up to SETTLE seconds on a genuine one. Bounded well
+# inside run.sh's post-canary wait for us (VORTEX_CHAOS_DRAIN_SECONDS), which
+# only starts once the canary is gone -- at which point this loop exits on its
+# next sample.
+SETTLE = 60
 
 # Self-watchdog: chaos must never outlive the cell. SECONDS of work, DRAIN of
 # settle, plus 45 s of slack for connect/teardown latency; tripping it means a
@@ -679,6 +692,26 @@ async def sample_fds(retries=1, gap=0.0):
             if attempt + 1 < retries and gap > 0: await asyncio.sleep(gap)
     return None
 
+async def settle_fds(baseline):
+    """The final fd sample, but re-taken while the count is still above the pass
+    threshold, for up to SETTLE seconds. Returns the last sample (or None if
+    /stats could not be reached at all, which the caller treats as an incomplete
+    leak-check).
+
+    A single shot here is a race against the canary's tail (see SETTLE): the
+    first sample can land while another client still holds ~100 sockets open,
+    and there is no way to tell that apart from a leak in one reading -- but
+    there is in two, because a live socket closes and a leaked descriptor does
+    not. So stop at the first reading that would pass, and otherwise keep
+    looking until the budget runs out and report what we last saw."""
+    give_up = time.monotonic() + SETTLE
+    final = await sample_fds(retries=5, gap=1.0)
+    while (final is not None and final > baseline + SLACK
+           and time.monotonic() < give_up):
+        await asyncio.sleep(1.0)
+        final = await sample_fds(retries=5, gap=1.0)
+    return final
+
 _MISSING_FD = object()    # sentinel: connected, but /stats had no fd field
 
 async def sample_fds_strict(retries=1, gap=0.0):
@@ -772,8 +805,7 @@ async def warm_baseline():
 
 # --- main: baseline -> chaos -> drain -> final -> verdict ---------------------
 async def run(enabled):
-    start = time.monotonic()
-    deadline = start + SECONDS
+    launched = time.monotonic()
     # The pool line shows which targeted variants are live for this cell's
     # workload (requests / an unknown workload: generic-only).
     pool = build_pool(enabled)
@@ -804,8 +836,30 @@ async def run(enabled):
         print("chaos: /stats has no fd field (server too old); cannot leak-check",
               flush=True)
         return 2
-    # run.sh greps the prefix "chaos: baseline"; keep this line EXACT.
-    print(f"chaos: baseline fds={baseline}", flush=True)
+    # run.sh greps the prefix "chaos: baseline"; keep this line EXACT. The
+    # prelude length is appended because it is the one number that explains a
+    # phantom leak (see the clock note below) and it was invisible before.
+    prelude = time.monotonic() - launched
+    print(f"chaos: baseline fds={baseline} (prelude {int(prelude)}s)", flush=True)
+
+    # SECONDS of chaos measured from HERE -- not from process start. run.sh gates
+    # the verified canary on the "chaos: baseline" line above, so the canary's
+    # clock starts at this instant; charging the prelude (warm_baseline is up to
+    # 10 rounds of 64 CONCURRENT aborted 1 GiB /download reads, plus the
+    # retrying baseline sample -- 48 s measured on a loaded host) against our own
+    # window made the two clocks disagree by exactly that much. Two consequences,
+    # both bugs: we induced SECONDS-minus-prelude of chaos instead of SECONDS,
+    # and -- the one that actually broke a cell -- we stopped, drained and took
+    # the FINAL fd sample while the canary was still running at full load, so its
+    # CLIENTS*CONC (96 by default) live sockets counted as leaked descriptors.
+    # That is a measurement race, not a server defect: it fires whenever
+    # prelude + the canary's own launch lag exceeds DRAIN, which is why one h2
+    # cell reported "baseline 61, final 157" (61 + 96, to the descriptor) while
+    # every other cell -- same binary, shorter prelude -- passed 61 -> 61.
+    # Rebasing here aligns our window with the canary's to within its launch lag,
+    # which DRAIN then covers; settle_fds below is the belt to this braces.
+    start = time.monotonic()
+    deadline = start + SECONDS
 
     rep = asyncio.ensure_future(chaos_reporter(pool, start, deadline))
     try:
@@ -827,9 +881,11 @@ async def run(enabled):
           flush=True)
 
     # Drain: let the server reap our torn-down connections before the final
-    # sample. h3 must outlive the QUIC idle timeout (DRAIN reflects that).
+    # sample. h3 must outlive the QUIC idle timeout (DRAIN reflects that). Then
+    # settle: keep sampling while the count is still high, so the canary's tail
+    # cannot be read as a leak (see SETTLE / settle_fds).
     await asyncio.sleep(DRAIN)
-    final = await sample_fds(retries=5, gap=1.0)
+    final = await settle_fds(baseline)
 
     if connects[0] == 0:
         # Never opened a single transport across the whole run: a misconfigured
@@ -845,7 +901,12 @@ async def run(enabled):
         return 2
 
     if final > baseline + SLACK:
-        print(f"FAIL chaos: fd leak (baseline {baseline}, final {final}, "
+        # The elapsed stamp is here so a future disagreement between this clock
+        # and the canary's is legible from the log alone: a "leak" of exactly the
+        # canary's socket count, reported before the canary's own final line, is
+        # this sidecar sampling too early, not the server holding descriptors.
+        print(f"FAIL chaos: fd leak at t={int(time.monotonic() - start)}s "
+              f"(baseline {baseline}, final {final}, "
               f"slack {SLACK})", flush=True)
         return 1
     print(f"== chaos sidecar passed (fds {baseline} -> {final}) ==", flush=True)

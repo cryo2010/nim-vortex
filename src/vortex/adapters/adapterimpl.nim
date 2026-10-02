@@ -13,6 +13,9 @@
 # - `template onCompleted(fut, body)`: run `body` when `fut` completes,
 #   absorbing the backend's addCallback callback signature (and, for
 #   chronos, the pendingOps bookkeeping that drives its pump)
+# - `trackParked` / `untrackParked`: a future has parked on / woken from a
+#   wakeup only the vortex loop delivers (chronos counts these so its pump can
+#   stop spinning; asyncdispatch no-ops)
 # - `template runAsyncBody(body)`: an immediately-invoked async closure
 #   (the backends need different pragma spellings)
 
@@ -139,7 +142,30 @@ type
     closed: bool
     eofVal: T                      ## value handed out on/after end of stream
     waiter: Future[T]              ## a take() suspended on an empty queue
+    parked: bool                   ## `waiter` is counted in the backend's
+                                   ## parked-op tally (see park / unpark)
     onConsume: proc (item: T) {.gcsafe, raises: [].}
+
+proc park[T](r: AwaitableReader[T], fut: Future[T]) =
+  ## Suspend a take() on this reader. Only a core callback running on the loop
+  ## thread can ever complete the future handed back -- an inbound WebSocket
+  ## message, a request-body chunk -- never the async runtime's own dispatcher,
+  ## so tell the backend (trackParked): while every outstanding future is parked
+  ## like this its pump has nothing to poll for and the loop may sleep. The
+  ## `parked` flag keeps the tally idempotent, so re-parking over a waiter that
+  ## was cancelled rather than completed cannot double-count.
+  r.waiter = fut
+  if not r.parked:
+    r.parked = true
+    trackParked()
+
+proc unpark[T](r: AwaitableReader[T]) =
+  ## The take() is no longer parked: it just got its value, or the reader is
+  ## being dropped. Idempotent, so every drop site may call it unconditionally.
+  r.waiter = nil
+  if r.parked:
+    r.parked = false
+    untrackParked()
 
 proc dequeue[T](r: AwaitableReader[T]): T =
   result = r.queue.popFirst()
@@ -154,7 +180,7 @@ proc feed[T](r: AwaitableReader[T], item: sink T) =
   r.queue.addLast item
   if r.waiter != nil and not r.waiter.finished:
     let w = r.waiter
-    r.waiter = nil
+    r.unpark()
     w.complete(r.dequeue())
 
 proc markEof[T](r: AwaitableReader[T], eofVal: T) =
@@ -164,7 +190,7 @@ proc markEof[T](r: AwaitableReader[T], eofVal: T) =
   r.eofVal = eofVal
   if r.waiter != nil and not r.waiter.finished:
     let w = r.waiter
-    r.waiter = nil
+    r.unpark()
     w.complete(eofVal)
 
 proc drained[T](r: AwaitableReader[T]): bool {.inline.} =
@@ -184,7 +210,7 @@ proc take[T](r: AwaitableReader[T]): Future[T] =
   elif r.waiter != nil and not r.waiter.finished:
     result.fail(newException(ValueError, "concurrent read on one reader is unsupported"))
   else:
-    r.waiter = result
+    r.park(result)
 
 # --- pull-based request-body reading (await req.read) -----------------------
 
@@ -227,6 +253,10 @@ proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
         if last: r.markEof(""), manualAck = true)
       let fut = h(req, res)
       onCompleted(fut):
+        # unpark before dropping: if the handler unwound while a read was still
+        # parked, the tally would otherwise keep counting a reader nobody holds.
+        let stale = bodyReaders.getOrDefault(k)
+        if stale != nil: stale.unpark()
         bodyReaders.del(k)
       watch(req, fut)
 
@@ -366,14 +396,19 @@ proc installWsReader*(ws: WebSocket) {.raises: [].} =
       # Nothing left to hand out (no parked receive and no queued messages): drop
       # the reader now so its per-handle entry can't leak (R12). A non-empty queue
       # is left for receive() to drain, which reaps the entry once it hits eof.
-      if r.drained: wsReaders.del(key)
+      if r.drained:
+        r.unpark()               # markEof already answered a live waiter; this
+        wsReaders.del(key)       # only clears a cancelled one from the tally
   except Exception:
     discard
 
 proc clearWsReader*(ws: WebSocket) {.raises: [].} =
   ## Drop the reader and stop feeding it (run when a `messages` loop ends).
   try:
-    wsReaders.del((ws.fd, ws.gen, ws.stream))
+    let key = (ws.fd, ws.gen, ws.stream)
+    let r = wsReaders.getOrDefault(key)
+    if r != nil: r.unpark()     # never leave a dropped reader in the parked tally
+    wsReaders.del(key)
     ws.onMessage = nil
     ws.onClose = nil
   except Exception:

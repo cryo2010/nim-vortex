@@ -142,6 +142,26 @@ proc fileRoute(path: string): RequestHandler =
 rt.get("/file", fileRoute(filePath))
 rt.get("/peek", peekBacklogRoute)
 
+# --- a streamed file that cannot deliver its Content-Length ------------------
+
+const
+  shrinkBytes = 4 * 1024 * 1024   ## size stat sees, so the length the head declares
+  shrinkTo = 5 * fileChunkCap     ## size the file is truncated to mid-download
+  shrinkTrigger = 64 * 1024       ## bytes received before that truncation
+    ## The server runs ahead of the client by at most the read-ahead budget plus
+    ## two chunks (request.fileReadAhead) plus the 32 KiB stream window -- under
+    ## 900 KiB -- so truncating once shrinkTrigger bytes have arrived always
+    ## lands before the hop that reads past shrinkTo, which is the hop that then
+    ## cannot deliver what Content-Length already promised.
+
+let shrinkPath = getTempDir() / ("vortex_h2_shrink_" & $getCurrentProcessId())
+block:
+  var body = newString(shrinkBytes)
+  for i in 0 ..< shrinkBytes: body[i] = patternByte(i)
+  writeFile(shrinkPath, body)
+
+rt.get("/shrink", fileRoute(shrinkPath))
+
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 
 const budget = 100
@@ -358,6 +378,58 @@ proc fileDownload(port: Port): tuple[body: string, endStream: bool, peeks: int] 
     if outFrames.len > 0 and not c.rawSend(outFrames): break
   c.close()
 
+proc shrinkDownload(port: Port): tuple[body: string, endStream, rst: bool] =
+  ## Fetch /shrink and truncate the file under the server once the first bytes
+  ## have arrived. The head is already on the wire with Content-Length =
+  ## shrinkBytes (taken from stat), so the read hop that lands past shrinkTo can
+  ## no longer deliver what was promised. The server must cut the transfer short
+  ## VISIBLY -- RST_STREAM -- and never report the shortfall as the end of the
+  ## body: a clean END_STREAM there claims a complete response whose length
+  ## contradicts its own header, which is what the hour-long streamdownload soak
+  ## hit as `InvalidBodyLengthError: Expected 1073741824, received 20709376`.
+  var c = newH2TestConn(port)
+  var sndTimeout = Timeval(tv_sec: posix.Time(2), tv_usec: 0)
+  discard setsockopt(c.sock.getFd, SOL_SOCKET, SO_SNDTIMEO,
+                     addr sndTimeout, SockLen(sizeof(sndTimeout)))
+  var req = ""
+  var settings = ""
+  settings.addSetting(setInitialWindowSize, uint32(fileWindow))
+  req.addFrameHeader(settings.len, ftSettings, 0, 0)
+  req.add settings
+  req.addWindowUpdate(0, wideGrant)          # only the stream window throttles
+  req.addRequest(1, {":method": "GET", ":scheme": "http",
+                     ":path": "/shrink", ":authority": "localhost"},
+                 endStream = true)
+  c.sendRaw(req)
+  var shrunk = false
+  let deadline = epochTime() + 60.0
+  while not result.endStream and epochTime() < deadline:
+    let frames = c.readFrames(3000,
+      until = proc(f: seq[Frame]): bool = f.len >= 1)
+    if frames.len == 0: break
+    var consumed = 0
+    var gone = false
+    for f in frames:
+      if f.typ == uint8(ftData) and f.streamId == 1:
+        consumed += f.payload.len
+        result.body.add f.payload
+        if (f.flags and flagEndStream) != 0: result.endStream = true
+      elif f.typ == uint8(ftRstStream) and f.streamId == 1:
+        result.rst = true
+        gone = true
+      elif f.typ == uint8(ftGoaway):
+        gone = true
+    if not shrunk and result.body.len >= shrinkTrigger:
+      shrunk = true
+      doAssert posix.truncate(shrinkPath.cstring, posix.Off(shrinkTo)) == 0
+    if gone or result.endStream: break
+    if consumed > 0:
+      var wu = ""
+      wu.addWindowUpdate(0, consumed)
+      wu.addWindowUpdate(1, consumed)
+      if not c.rawSend(wu): break             # peer gone: report what we got
+  c.close()
+
 suite "HTTP/2 streaming download":
   test "pendingBody stays bounded while the backlog never reaches zero (#331)":
     peakPending.store(0)
@@ -492,7 +564,26 @@ suite "HTTP/2 streaming download":
     check peakBacklog.load() > 0              # and saw a real backlog
     check peakBacklog.load() <= fileReadAheadBound
 
+  test "a streamed file that cannot fill its Content-Length aborts, not END_STREAM":
+    # Class D of the stress soak: a read hop that comes up short (a failed read,
+    # or -- as here -- a file that shrank under the transfer) used to be reported
+    # as the end of the body, so finish() closed the stream with END_STREAM at a
+    # byte count that contradicted the Content-Length already sent. The server
+    # looked healthy and the client's HTTP/2 stack raised. It must reset instead.
+    let r = shrinkDownload(srv.port)
+    check not r.endStream                     # never claim a complete body...
+    check r.rst                               # ...say it was cut short
+    check r.body.len >= shrinkTrigger         # the truncation really raced a transfer
+    check r.body.len <= shrinkTo              # nothing past what the file holds
+    var mismatch = -1
+    for i in 0 ..< r.body.len:
+      if r.body[i] != patternByte(i):
+        mismatch = i
+        break
+    check mismatch == -1                      # what did arrive is still exact
+
 budgetSrv.close()
 srv.close()
 removeFile(filePath)
+removeFile(shrinkPath)
 echo "server shut down cleanly"

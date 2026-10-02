@@ -169,6 +169,19 @@ induces chaos, closes everything, waits a drain pause (15 s; **40 s on h3** to
 outlive the 30 s QUIC idle timeout), samples again, and fails on `final >
 baseline + slack` where `slack = 8` (a calibrated constant, not a knob).
 
+Two details keep that assertion from measuring the *canary* instead of the
+server. The sidecar's `SECONDS` of chaos is timed from the **baseline**, not from
+its own process start, because run.sh gates the canary on the baseline line -- so
+the two clocks agree to within the canary's launch lag. (Timing it from process
+start charged the pre-baseline prelude, up to ~50 s of `warm_baseline`, against
+the chaos window, which both under-delivered chaos *and* put the final sample
+inside the canary's still-running window: its `CLIENTS*CONC` live sockets then
+read as leaked descriptors, e.g. `baseline 61, final 157` = 61 + 96.) And the
+final sample **re-samples while the count is still above the threshold**, for up
+to 60 s, so the canary's tail drains before the verdict; a leaked descriptor is
+never reclaimed, so waiting can only clear a false failure, never hide a real
+one.
+
 **Degraded modes.** h3 `slowread` and `ws:slowread` are pacing-only: aioquic
 grants flow-control credit on receipt (and the h3 client queues unread frames
 locally, unbounded), so neither can exert true backpressure. h2 `vanish` and

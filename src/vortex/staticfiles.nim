@@ -20,6 +20,8 @@
 ## intentionally not used -- it does not compose with TLS or the readiness loop.
 
 import std/[os, times, strutils, uri, httpcore, options]
+from std/posix import nil          # qualified: its open/close would shadow File's
+from std/oserrors import osLastError
 import ./request
 from ./conditional import evalPreconditions, ifRangeApplies,
                           pcProceed, pcNotModified, pcFailed, httpDate,
@@ -112,53 +114,90 @@ proc resolveTail(raw: string): (bool, string) =
 
 proc notFound(res: Response) = res.send(Http404, "404 Not Found")
 
+proc serverError(res: Response) = res.send(Http500, "500 Internal Server Error")
+
+proc readAt(path: string, start: int64, buf: pointer, length: int): int
+           {.raises: [IOError].} =
+  ## Read `length` bytes of `path` at offset `start` into `buf` (a loop-owned
+  ## pool buffer). No allocation -- the read buffer IS the message.
+  ##
+  ## Fills the buffer: `pread` is retried until `length` bytes are in, so a
+  ## SHORT result means one thing only, end of file, and a failure raises. Both
+  ## of those distinctions are load-bearing (#248-style truncation, class D of
+  ## the stress soak). `read(2)` may legally return fewer bytes than asked for
+  ## on a regular file, and the previous single buffered `readBuffer` call
+  ## additionally RAISED on a short read whose stream had its error flag set --
+  ## discarding the bytes it had already copied. Either way the caller saw 0 or a
+  ## short count and could not tell "the file ended here" from "this read did not
+  ## finish", so it reported the shortfall as end-of-body and closed a
+  ## Content-Length-delimited response short of its declared length.
+  if buf == nil or length <= 0: return 0
+  let fd = posix.open(path.cstring, posix.O_RDONLY)
+  if fd < 0: raise newException(IOError, "cannot open: " & path)
+  try:
+    let p = cast[ptr UncheckedArray[byte]](buf)
+    while result < length:
+      let n = posix.pread(fd, addr p[result], length - result,
+                          posix.Off(start + int64(result)))
+      if n > 0: result += n
+      elif n == 0: break                             # genuine end of file
+      elif cint(osLastError()) == posix.EINTR: continue
+      else: raise newException(IOError, "read failed: " & path)
+  finally:
+    discard posix.close(fd)
+
 proc readSlice(path: string, start, length: int): string =
-  var f = open(path, fmRead)
-  defer: f.close()
-  if start > 0: f.setFilePos(start)
+  ## `length` bytes at `start`, short only at end of file (see readAt); a read
+  ## failure raises IOError, which every caller answers with a status code.
   result = newString(length)
   if length > 0:
-    let n = f.readBuffer(addr result[0], length)
+    let n = readAt(path, int64(start), addr result[0], length)
     result.setLen(n)
 
 const
   fileStreamChunk = 256 * 1024      ## bytes per worker read hop. Larger chunks
                                     ## amortize the per-hop open/lseek/close
-                                    ## (readInto reopens each hop): a 1 GiB file
+                                    ## (readAt reopens each hop): a 1 GiB file
                                     ## is ~4K hops, not ~8K (issue #274). MUST be
                                     ## <= connection.fileChunkCap (the pool
                                     ## buffer each hop fills); keep the two equal.
   fileStreamThreshold = 512 * 1024  ## stream full-file GETs larger than this
-
-proc readInto(path: string, start: int, buf: pointer, length: int): int =
-  ## Read up to `length` bytes at `start` directly into `buf` (a loop-owned pool
-  ## buffer); returns bytes read. No allocation -- the read buffer IS the message.
-  if buf == nil or length <= 0: return 0
-  var f = open(path, fmRead)
-  defer: f.close()
-  if start > 0: f.setFilePos(start)
-  result = f.readBuffer(buf, length)
 
 proc readChunkTramp(req: Request, res: Response, data: string)
                    {.nimcall, gcsafe.} =
   ## Worker: read the next chunk into the pool buffer whose pointer rides in
   ## `data` ("path\0offset\0remaining\0bufptr"), then hand the buffer back. The
   ## worker never allocates the payload -- it fills a buffer the loop owns.
+  ##
+  ## A hop that cannot deliver its `want` bytes reports `fileChunkFailed`, which
+  ## makes the loop ABORT the response (see request.applyFileChunk). It must
+  ## never report the shortfall as the end of the body: the head is already on
+  ## the wire with the Content-Length taken from stat, so a clean terminator here
+  ## claims a complete response that is short of its declared length -- over
+  ## HTTP/2 a client sees END_STREAM and raises (stress soak class D), and over
+  ## HTTP/1 keep-alive framing desyncs.
   let f = data.split('\0')
   var buf: pointer = nil
   if f.len >= 4:
     buf = cast[pointer](try: parseUInt(f[3]) except CatchableError: 0'u)
-  if f.len < 4:
-    emitFileChunk(res, buf, 0, "", cast[pointer](readChunkTramp), true); return
+  template giveUp =
+    emitFileChunk(res, buf, fileChunkFailed, "",
+                  cast[pointer](readChunkTramp), true)
+    return
+  if f.len < 4: giveUp
   let path = f[0]
-  let off = try: parseBiggestInt(f[1]) except CatchableError: 0'i64
-  let remaining = try: parseBiggestInt(f[2]) except CatchableError: 0'i64
+  let off = try: parseBiggestInt(f[1]) except CatchableError: -1'i64
+  let remaining = try: parseBiggestInt(f[2]) except CatchableError: -1'i64
+  if off < 0 or remaining <= 0: giveUp     # a hop is dispatched only with bytes
+                                           # left to read; anything else is a
+                                           # mangled continuation, not an EOF
   let want = int(min(int64(fileStreamChunk), remaining))
-  var got = 0
-  try: got = readInto(path, int(off), buf, want)
-  except CatchableError: got = 0
+  var got = -1
+  try: got = readAt(path, off, buf, want)
+  except CatchableError: got = -1
+  if got < want: giveUp                    # failed, or the file shrank under us
   let nextRemaining = remaining - int64(got)
-  let last = got == 0 or nextRemaining <= 0
+  let last = nextRemaining <= 0
   let nextRead = if last: ""
                  else: path & '\0' & $(off + int64(got)) & '\0' & $nextRemaining
   emitFileChunk(res, buf, got, nextRead, cast[pointer](readChunkTramp), last)
@@ -264,13 +303,19 @@ proc serveResolved(req: Request, res: Response, data: string)
   # never sits in memory at once (a partial range is NOT inherently small: e.g.
   # `Range: bytes=1-` on a multi-GB file). Only small responses are buffered.
   if respLen > fileStreamThreshold:
+    let want = int(min(int64(fileStreamChunk), respLen))
     var first: string
-    try: first = readSlice(real, int(startOff),
-                           int(min(int64(fileStreamChunk), respLen)))
+    try: first = readSlice(real, int(startOff), want)
     except CatchableError: notFound(res); return
+    if first.len < want:
+      # stat sized the window at respLen but the file cannot supply even the
+      # first `want` bytes of it, so the Content-Length about to be declared
+      # would be a lie. Nothing has been sent yet -- answer with a status code
+      # rather than opening a body that can only end short.
+      serverError(res); return
     let got = int64(first.len)
     let remaining = respLen - got
-    let last = got == 0 or remaining <= 0
+    let last = remaining <= 0
     let nextRead = if last: ""
                    else: real & '\0' & $(startOff + got) & '\0' & $remaining
     emitFileStart(res, status, mime, hdrs, respLen, first, nextRead,

@@ -156,6 +156,12 @@ typedef struct {
    * vq_engine_new call only; the shim copies what it keeps. */
   const VqSniCert *sni;
   size_t sni_len;
+  /* max_idle_timeout we advertise, in seconds (0 = shim default). QUIC gives
+   * each endpoint min(local, peer), so this also caps the *client's* idle timer:
+   * advertise less than the h1/h2 keep-alive budget and h3 connections are
+   * reaped where h1/h2 ones survive. The shim arms ngtcp2's keep-alive at a
+   * third of it so a live-but-quiet connection keeps both timers fed. */
+  uint64_t max_idle_timeout_sec;
 } VqConfig;
 
 /* Create/destroy the per-loop engine. Returns NULL on failure (bad cert etc.).*/

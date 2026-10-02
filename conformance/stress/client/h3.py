@@ -236,6 +236,17 @@ class H3Session:
 
     async def upload(self, path, headers, body_agen):
         sid, q = self.c._open("POST", path, headers or {}, end=False)
+        try:
+            return await self._upload_body(sid, q, body_agen)
+        finally:
+            # Mirror stream()'s cleanup. The streaming workload bounds an upload
+            # by the time left in the soak and cancels it at the deadline, so this
+            # coroutine really is abandoned mid-body -- without the finally that
+            # leaks a _queues entry per abandoned transfer and leaves a late event
+            # for this sid to be delivered to a queue nobody reads.
+            self.c._queues.pop(sid, None)
+
+    async def _upload_body(self, sid, q, body_agen):
         async for chunk in body_agen:
             self.c._http.send_data(sid, chunk, end_stream=False)
             self.c.transmit()
@@ -258,11 +269,9 @@ class H3Session:
         while True:
             kind, val = await q.get()
             if kind == "h": status = val[0]         # (status, enc, ct); status only
-            elif kind == "err":
-                self.c._queues.pop(sid, None); raise ConnectionError(val)
+            elif kind == "err": raise ConnectionError(val)
             elif kind == "end": break
-        self.c._queues.pop(sid, None)
-        return status
+        return status                            # upload()'s finally pops the queue
 
     async def ws_open(self, path="/ws", subprotocols=None):
         """Open an RFC 9220 Extended CONNECT WebSocket; returns an H3Ws tunnel."""
