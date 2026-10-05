@@ -585,6 +585,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contexts from its own configured material on the same reload (#374), so
   renewed per-host *files* rotate on both transports while new in-memory
   per-host material rotates on TCP alone. (#356)
+- TLS: a rejected certificate reload says why. `reloadTlsConfig` caught the
+  exception carrying the only diagnostic that existed and returned a bare
+  false, which `server.reloadTls` passed on with nothing written anywhere and
+  no accessor to ask, so an operator whose certbot deploy hook failed could not
+  tell an unreadable certificate from a mismatched key, a missing OCSP file or a
+  rejected cipher string. Every false return now records the reason on the
+  config under `reloadLock` and writes one `vortex: TLS reload failed: <reason>`
+  line to stderr, matching the convention `applyQuicReload` already follows, so
+  a hook that ignores the bool still leaves a trace. Read the reason back with
+  `server.lastTlsReloadError` / `vortex.lastTlsReloadError` (present and
+  constant under `-d:plainHttp`); a successful reload clears it. (#378)
 
 ### Changed
 

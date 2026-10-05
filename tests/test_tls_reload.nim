@@ -76,6 +76,37 @@ suite "TLS certificate hot-reload":
     check not srv.reloadTls(dir / "delta.pem", liveKey)  # cert + wrong key
     check "charlie.vortex" in servedCN()
 
+suite "a rejected reload records why":
+  # reloadTlsConfig used to catch the exception carrying the only diagnostic
+  # that existed and return a bare false, and reloadTls passed that on with
+  # nothing written anywhere, so an operator whose certbot deploy hook failed
+  # had no way to learn whether the cert was unreadable, the key mismatched,
+  # the OCSP file was missing or the cipher string was rejected (#378).
+  test "a missing cert file leaves the path or the OpenSSL reason":
+    check not srv.reloadTls(dir / "nope.pem", dir / "nope.key")
+    let reason = srv.lastTlsReloadError
+    check reason.len > 0
+    check "unknown TLS error" notin reason
+    check ("nope.pem" in reason or "No such file" in reason or
+           "no such file" in reason.toLowerAscii)
+
+  test "a cert/key mismatch names the mismatch":
+    check not srv.reloadTls(dir / "delta.pem", liveKey)
+    check "mismatch" in srv.lastTlsReloadError
+
+  test "contradictory OCSP arguments are named":
+    check not srv.reloadTls(clearOcsp = true, ocspResponse = "x")
+    check "clearOcsp" in srv.lastTlsReloadError
+
+  test "an unreadable explicit ocspFile names the path":
+    check not srv.reloadTls(ocspFile = dir / "nostaple.der")
+    check "nostaple.der" in srv.lastTlsReloadError
+
+  test "a successful reload clears the reason":
+    check srv.reloadTls(altCert, altKey)
+    check srv.lastTlsReloadError == ""
+    check "charlie.vortex" in servedCN()
+
 srv.close()
 removeDir(dir)
 
@@ -261,6 +292,7 @@ suite "per-host SNI certificates rotate on reload":
     check "extra.vortex" in sniSubject("extra.vortex")       # and the other host
     check "default2.vortex" in sniSubject("other.vortex")    # default unchanged
     check stillServesOn(sport)
+    check "alt.vortex" in ssrv.lastTlsReloadError            # names the host
 
   test "a per-host file that disappears rejects a bare reload too":
     removeFile(sdir / "extra.pem")

@@ -145,10 +145,19 @@ ordinary thread, and from two at once if that is how your renewal plumbing is
 built (concurrent reloads serialise internally); not from inside a raw signal
 handler, since the call takes a lock and reads files.
 
-Per-host (SNI) certificates rotate on the same call, on both transports: each
-per-host context is rebuilt from the material it was configured with, so
-per-host certificate *files* replaced by the same renewal are picked up even
-though `reloadTls` names only the default pair. The reload is all-or-nothing --
+A rejected reload says why. `server.lastTlsReloadError` (and
+`vortex.lastTlsReloadError`) returns the reason the most recent `reloadTls`
+returned false, "" after one that succeeded, and the same reason goes to stderr
+as a single `vortex: TLS reload failed: <reason>` line, so a deploy hook that
+ignores the bool still leaves a trace in the log. Every rejection is covered:
+unreadable or mismatched material, a key-only rotation against a PKCS#12
+bundle, contradictory OCSP arguments, an unreadable explicit `ocspFile`, and a
+per-host certificate that fails to build (which names the host).
+
+Per-host (SNI) certificates rotate on the same call: each per-host context is
+rebuilt from the material it was configured with, so per-host certificate
+*files* replaced by the same renewal are picked up even though `reloadTls` names
+only the default pair. The reload is all-or-nothing --
 one per-host certificate that fails to build rejects it and leaves the default
 certificate and every host exactly as they were, rather than half-rotating or
 silently dropping a host back to the default certificate, which the client
@@ -157,9 +166,9 @@ replaces the per-host material outright, so the host set may change; it is
 persisted only on success, and an empty `sni` means "keep what is configured".
 One asymmetry to know about: that override reaches the TCP listener only, while
 the HTTP/3 engine rebuilds its per-host contexts from *its* configured material
-(a file re-read) on the same reload. Renewed per-host files therefore rotate on
-both transports, but new in-memory per-host material supplied through `sni`
-rotates on TCP alone.
+(a file re-read) on the same reload. Renewed per-host files therefore reach both
+transports, but new in-memory per-host material supplied through `sni` reaches
+TCP alone.
 
 ## Deployment recipes
 

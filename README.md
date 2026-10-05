@@ -349,6 +349,11 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
 discard srv.reloadTls(ocspFile = "ocsp.der")   # rotate the staple
 ```
 
+A `reloadTls` that returns false records why: read it back with
+`srv.lastTlsReloadError`, and the same reason is written to stderr as one
+`vortex: TLS reload failed: <reason>` line so a deploy hook that ignores the
+bool still leaves a trace. A successful reload clears it.
+
 #### Request size limits
 
 Inbound requests are bounded so a malformed or hostile client can't exhaust

@@ -301,6 +301,9 @@ type
                              ## three are swapped together under `ctxLock`,
                              ## which is also what servernameCb holds while it
                              ## scans sniHosts and indexes sniCtx.
+    lastReloadError: string  ## why the last reloadTlsConfig returned false ("" =
+                             ## the last one succeeded). Written under
+                             ## `reloadLock`, read through lastTlsReloadError
 
   TlsIo* = enum
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
@@ -746,6 +749,31 @@ proc acquireCtx(cfg: ptr TlsConfig): SslCtxPtr =
   discard SSL_CTX_up_ref(result)   # only fails without a live reference to it
   release(cfg.ctxLock)
 
+proc reloadFailed(cfg: ptr TlsConfig, reason: string): bool =
+  ## Reject a reload *with* a reason: record it on the config for
+  ## `lastTlsReloadError` and write one line to stderr. Every `return false` in
+  ## reloadTlsConfig goes through here, because a bare false left the operator
+  ## nothing at all -- no way to tell an unreadable certificate from a
+  ## mismatched key, a missing OCSP file or a rejected cipher string -- and the
+  ## reload path's own silence is what made the rest hard to diagnose (#378).
+  ## The stderr line matches eventloop's applyQuicReload, so a certbot deploy
+  ## hook that ignores the bool still leaves a trace. The caller holds
+  ## `reloadLock`, which is also what the accessor takes to read the field.
+  cfg.lastReloadError = reason
+  try:
+    stderr.writeLine("vortex: TLS reload failed: " & reason)
+  except IOError, OSError: discard
+  false
+
+proc lastTlsReloadError*(cfg: ptr TlsConfig): string =
+  ## Why the most recent `reloadTlsConfig` returned false; "" when the last one
+  ## succeeded, or none has run. Takes `reloadLock` (so it blocks for the
+  ## duration of a reload running concurrently) because the field is a GC string
+  ## the reload thread rewrites.
+  acquire(cfg.reloadLock)
+  defer: release(cfg.reloadLock)
+  result = cfg.lastReloadError
+
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                       ocspFile = "", ocspResponse = "",
                       clearOcsp = false,
@@ -779,6 +807,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## rejects the whole reload; a failed empty-arg re-read does not (a cert
   ## renewal must not be blocked by a stale staple). `ocspResponse`/`ocspFile`
   ## together with `clearOcsp` is contradictory and rejected.
+  ##
+  ## Every false return records why on the config: read it back with
+  ## `lastTlsReloadError`, and it is also written to stderr as one
+  ## `vortex: TLS reload failed: <reason>` line. A successful reload clears it.
   ##
   ## Callable from any ordinary thread, including several at once: the whole
   ## body runs under `cfg.reloadLock`, so concurrent reloads serialise instead
@@ -818,7 +850,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
     # key against a p12 certificate is meaningless) rather than silently
     # no-op, and clear the bundle fields either way so the branches are
     # symmetric with certFile's.
-    if certFile.len == 0 and p12Sourced: return false
+    if certFile.len == 0 and p12Sourced:
+      return reloadFailed(cfg, "a keyFile-only reload cannot apply to a " &
+        "PKCS#12-sourced certificate: rotate certFile and keyFile together, " &
+        "or reconfigure with a new bundle")
     m.keyFile = keyFile; m.keyPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   # Resolve the staple for the new ctx *before* buildTlsCtx, so any rejection
   # leaves the running ctx (and its staple) completely untouched. newOcsp is the
@@ -826,14 +861,16 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   var newOcsp = cfg.ocsp
   var newOcspFile = cfg.ocspFile
   if clearOcsp and (ocspResponse.len > 0 or ocspFile.len > 0):
-    return false                             # contradictory request
+    return reloadFailed(cfg,                 # contradictory request
+      "clearOcsp cannot be combined with ocspResponse or ocspFile")
   elif clearOcsp:
     newOcsp = ""; newOcspFile = ""
   elif ocspResponse.len > 0:
     newOcsp = ocspResponse; newOcspFile = "" # in-memory bytes win, no source path
   elif ocspFile.len > 0:
     try: newOcsp = readFile(ocspFile)        # explicit path: unreadable rejects
-    except CatchableError: return false      # the reload (bad-material contract)
+    except CatchableError as e:              # the reload (bad-material contract)
+      return reloadFailed(cfg, "cannot read ocspFile \"" & ocspFile & "\": " & e.msg)
     newOcspFile = ocspFile
   elif cfg.ocspFile.len > 0:
     # Empty-arg reload with a stored path (certbot pattern): best-effort re-read;
@@ -845,8 +882,8 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
     newCtx = buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
                          cfg.clientCaPem, cfg.minProtoVersion,
                          cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
-  except CatchableError:
-    return false
+  except CatchableError as e:
+    return reloadFailed(cfg, e.msg)
   # The per-host ctxs, all or nothing with the default one: a host that fails to
   # build rejects the whole reload rather than leaving the server half-rotated
   # (new default certificate, stale per-host ones) or dropping that host back to
@@ -854,10 +891,11 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   var newSniCtx: seq[SslCtxPtr]
   try:
     newSniCtx = buildSniCtxs(cfg, newHosts, newSniMaterial)
-  except CatchableError:
+  except CatchableError as e:
     SSL_CTX_free(newCtx)   # nothing published yet; releases its OCSP blob too
-    return false
+    return reloadFailed(cfg, e.msg)
   installDefaultCbs(cfg, newCtx, newOcsp, newHosts.len > 0)
+  cfg.lastReloadError = ""      # this one worked; drop any earlier reason
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile
@@ -1012,6 +1050,7 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.cipherSuites = ""
   cfg.ocsp = ""
   cfg.ocspFile = ""
+  cfg.lastReloadError = ""
   deinitLock(cfg.reloadLock)
   deinitLock(cfg.ctxLock)
   deallocShared(cfg)

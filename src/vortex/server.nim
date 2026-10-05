@@ -331,6 +331,17 @@ proc close*(server: var Server) =
   server.requestShutdown()
   server.waitFor()
 
+const noTlsReason = "TLS is not enabled on this server"
+  ## The one reload rejection that has no TlsConfig to record itself on, so both
+  ## reloadTls and lastTlsReloadError name it from here.
+
+proc logNoTls() =
+  ## The stderr half of a rejection reloadTlsConfig never sees, in the same
+  ## shape it writes for the ones it does (#378).
+  try:
+    stderr.writeLine("vortex: TLS reload failed: " & noTlsReason)
+  except IOError, OSError: discard
+
 proc reloadTls*(server: var Server, certFile = "", keyFile = "",
                 ocspFile = "", ocspResponse = "", clearOcsp = false,
                 sni: openArray[SniCertEntry] = []): bool =
@@ -376,9 +387,12 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## HTTP/3: each h3 loop updates its own QUIC ctx in place on its next tick, so
   ## new h3 handshakes use the new certificate while in-flight ones keep theirs.
   when defined(plainHttp):
+    logNoTls()
     false
   else:
-    if server.tls == nil: return false
+    if server.tls == nil:
+      logNoTls()
+      return false
     # Reuse eventloop's single SniCertEntry -> SniCert mapping rather than
     # repeating the field list here; the other VortexConfig fields are unused by
     # it. An empty `sni` stays empty, which reloadTlsConfig reads as "keep the
@@ -394,6 +408,20 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
       requestCertReload(cast[ptr CertReload](server.quicReload),
                         certFile, keyFile)
     ok
+
+proc lastTlsReloadError*(server: Server): string =
+  ## Why the most recent `reloadTls` returned false; "" when the last one
+  ## succeeded, or none has run. A bare false left a certbot deploy hook with no
+  ## way to tell an unreadable certificate from a mismatched key, a missing OCSP
+  ## file or a rejected cipher string (#378). The same reason also goes to stderr
+  ## as one `vortex: TLS reload failed: <reason>` line, so a hook that ignores
+  ## the bool still leaves a trace. Under `-d:plainHttp`, where `reloadTls`
+  ## never succeeds, it always names that.
+  when defined(plainHttp):
+    noTlsReason
+  else:
+    if server.tls == nil: return noTlsReason
+    lastTlsReloadError(cast[ptr TlsConfig](server.tls))
 
 # --- the Vortex object API --------------------------------------------------
 
@@ -468,3 +496,8 @@ proc reloadTls*(v: Vortex, certFile = "", keyFile = "",
   ## restart (see the Server-level docs). Returns false if TLS is off or the new
   ## material is bad.
   v.server.reloadTls(certFile, keyFile, ocspFile, ocspResponse, clearOcsp, sni)
+
+proc lastTlsReloadError*(v: Vortex): string =
+  ## Why the most recent `reloadTls` returned false; "" when the last one
+  ## succeeded, or none has run (see the Server-level docs).
+  v.server.lastTlsReloadError
