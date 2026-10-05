@@ -514,7 +514,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packets naming an unsupported QUIC version (each answered with a Version
   Negotiation packet, so each costs a parse plus a send): a plain HTTP/1.1
   request on the same server went unserved past a 2 s client timeout, and now
-  completes in tens of milliseconds. The loop treats a spent budget the way it
+  completes well inside the bound (tens of milliseconds with four senders,
+  about a second with every core but one blasting). The loop treats a spent
+  budget the way it
   treats its `sslReady` queue, going straight back round without waiting on the
   selector, so the backlog is still drained promptly, just with the TCP fds
   serviced between batches. Address validation (a Retry token) is still not
