@@ -162,10 +162,34 @@ type
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default).
                               ## TCP only: a QUIC handshake is never TLS 1.2.
                               ## The order is the server's preference order and
-                              ## wins over the client's (#375)
+                              ## wins over the client's (#375), so **lead with an
+                              ## ECDHE/DHE AEAD suite**: the first mutually
+                              ## supported entry is now forced, and HTTP/2
+                              ## clients refuse the non-AEAD suites RFC 7540
+                              ## Appendix A blacklists. A list whose first TLS
+                              ## 1.2 suite is blacklisted is rejected at startup
     tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default).
                               ## Applies to HTTP/1.1, HTTP/2 and HTTP/3, and its
-                              ## order is the server's preference order too
+                              ## order is the server's preference order too.
+                              ## Every TLS 1.3 suite is AEAD, so there is no
+                              ## HTTP/2 blacklist to avoid here
+                              ##
+                              ## Two notes on the enforced ordering. On OpenSSL
+                              ## 3.5+ the option that enforces it also makes
+                              ## ECDH group, TLS 1.2 curve and
+                              ## signature-algorithm selection follow the
+                              ## server's order; the group list is OpenSSL's
+                              ## default unless configured, and a client key
+                              ## share for the server's preferred group is still
+                              ## used, so no extra round trip appears. And when
+                              ## BOTH lists are empty the operator configured no
+                              ## policy, so a client that offers
+                              ## ChaCha20-Poly1305 first (the "no AES hardware"
+                              ## signal) still gets ChaCha20-Poly1305;
+                              ## configuring either list withholds that
+                              ## courtesy. QUIC never sees `tlsCipherList`, so
+                              ## setting only that one leaves HTTP/3 with the
+                              ## courtesy while TCP enforces strict order
 
 proc initVortexConfig*(
     port = Port(8080),

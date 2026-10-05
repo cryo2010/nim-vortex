@@ -1243,15 +1243,46 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
       SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1)
     return fail("invalid TLS 1.3 cipher suites");
   // That list is a preference order, not a set. Without
-  // SSL_OP_CIPHER_SERVER_PREFERENCE OpenSSL walks the CLIENT's ciphersuite list
+  // SSL_OP_SERVER_PREFERENCE (the OpenSSL >= 3.5 name for the bit also spelled
+  // SSL_OP_CIPHER_SERVER_PREFERENCE) OpenSSL walks the CLIENT's ciphersuite list
   // and takes the first entry we also allow, so tlsCipherSuites would be an
   // unordered allow-set here and an ordered preference on TCP: the same
   // configuration, two answers, depending only on which transport the client
   // picked (#375). SSL_OP_NO_RENEGOTIATION has no counterpart to add -- QUIC is
-  // TLS 1.3 only and TLS 1.3 has no renegotiation. Every per-host (SNI) context
-  // is built by this same function via ctxConfig, so they inherit the option
-  // rather than needing it re-applied.
-  SSL_CTX_set_options(ctx.get(), SSL_OP_CIPHER_SERVER_PREFERENCE);
+  // TLS 1.3 only and TLS 1.3 has no renegotiation. Nor is there a counterpart to
+  // the TCP side's RFC 7540 Appendix A screen of tlsCipherList: QUIC never
+  // negotiates TLS 1.2, and every TLS 1.3 ciphersuite is AEAD, so a QUIC
+  // handshake cannot land on a suite HTTP/2 (or HTTP/3) refuses.
+  //
+  // On OpenSSL >= 3.5, this project's minimum, the same bit is documented more
+  // widely: "when choosing a cipher, signature, (TLS 1.2) curve or (TLS 1.3)
+  // group, use the server's preferences". So ECDH group and
+  // signature-algorithm selection follow our order too. That is the policy we
+  // want (the server decides) and it costs no round trip: the group list here is
+  // OpenSSL's default, and OpenSSL still picks a group the client sent a key
+  // share for when that group is in our list, so no HelloRetryRequest appears.
+  //
+  // SSL_OP_PRIORITIZE_CHACHA keeps our order except for a client whose own first
+  // choice is ChaCha20-Poly1305, which in practice means a client with no AES
+  // hardware. With tls_cipher_suites unset the operator stated no policy -- the
+  // order we would be enforcing is just OpenSSL's built-in one -- so the
+  // courtesy is granted, matching Go's crypto/tls and the BoringSSL-based
+  // servers. A configured list IS a policy statement, so it is withheld there.
+  // The TCP side keys the same decision off both lists being empty; QUIC has
+  // only this one, so an operator who sets tlsCipherList alone gets strict
+  // server order on TCP for both TLS versions while QUIC, which has no TLS 1.2
+  // to order, keeps the ChaCha courtesy.
+  uint64_t opts = SSL_OP_SERVER_PREFERENCE;
+  if (!cfg->tls_cipher_suites || !cfg->tls_cipher_suites[0])
+    opts |= SSL_OP_PRIORITIZE_CHACHA;
+  SSL_CTX_set_options(ctx.get(), opts);
+  // Every per-host (SNI) context is built by this same function via ctxConfig,
+  // so they carry these options too. That is defence in depth, not what makes
+  // an SNI connection ordered: SSL_set_SSL_CTX in servernameCb does not re-read
+  // options, and a connection's option word is the copy SSL_new took from the
+  // context it was created on, which is always the default one. The per-host bit
+  // is inert at runtime; it is here so that a future refactor creating the SSL
+  // from a host context cannot silently drop the policy.
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);

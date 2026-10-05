@@ -54,9 +54,17 @@ const
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
   SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
   SSL_OP_NO_RENEGOTIATION = uint64(1) shl 30   # <openssl/ssl.h> SSL_OP_BIT(30)
-  SSL_OP_CIPHER_SERVER_PREFERENCE = uint64(1) shl 22   # ditto, SSL_OP_BIT(22)
+  # SSL_OP_BIT(22). OpenSSL >= 3.5 spells this `SSL_OP_SERVER_PREFERENCE` and
+  # keeps `SSL_OP_CIPHER_SERVER_PREFERENCE` as a backwards-compatible alias for
+  # the same bit, so both names find it in a 3.6 <openssl/ssl.h> (#375).
+  SSL_OP_SERVER_PREFERENCE = uint64(1) shl 22
+  SSL_OP_PRIORITIZE_CHACHA = uint64(1) shl 21   # ditto, SSL_OP_BIT(21)
   SSL_SESS_CACHE_SERVER = clong(0x0002)
   CRYPTO_EX_INDEX_SSL_CTX = cint(1)   # ex_data class for SSL_CTX (crypto/ex_data)
+  # Key-exchange NIDs, for the RFC 7540 Appendix A screen below.
+  # <openssl/obj_mac.h>: NID_kx_rsa is 1037, so do not mistake it for a DHE one.
+  NID_kx_ecdhe = cint(1038)
+  NID_kx_dhe = cint(1039)
 
 const
   # OpenSSL protocol version numbers (for set_min_proto_version).
@@ -90,6 +98,11 @@ proc SSL_CTX_set_options(ctx: SslCtxPtr, op: uint64): uint64
 proc SSL_CTX_get_options(ctx: SslCtxPtr): uint64
 proc SSL_CTX_set_cipher_list(ctx: SslCtxPtr, str: cstring): cint
 proc SSL_CTX_set_ciphersuites(ctx: SslCtxPtr, str: cstring): cint
+proc SSL_CTX_get_ciphers(ctx: SslCtxPtr): pointer   # STACK_OF(SSL_CIPHER)* (borrowed)
+proc SSL_CIPHER_get_name(c: pointer): cstring
+proc SSL_CIPHER_get_version(c: pointer): cstring
+proc SSL_CIPHER_is_aead(c: pointer): cint
+proc SSL_CIPHER_get_kx_nid(c: pointer): cint
 proc SSL_CTX_set_alpn_select_cb(ctx: SslCtxPtr,
     cb: proc (ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
               inProtos: ptr uint8, inLen: cuint, arg: pointer): cint {.cdecl.},
@@ -678,15 +691,62 @@ proc checkCertValidity(ctx: SslCtxPtr): string =
     if cmp > 0: return "certificate not valid until " & asn1TimeStr(notBefore)
   ""
 
+proc h2InProtos(protos: string): bool =
+  ## Is "h2" one of the ALPN protocols this context will offer? `protos` is the
+  ## wire format (length-prefixed tokens), so scan it as such rather than
+  ## substring-matching, which would also hit a hypothetical "h2c" or a
+  ## certificate-shaped token that happens to contain the bytes.
+  var i = 0
+  while i < protos.len:
+    let n = int(uint8(protos[i]))
+    if n == 0 or i + 1 + n > protos.len: return false
+    if protos[i + 1 ..< i + 1 + n] == "h2": return true
+    i += 1 + n
+  false
+
+proc firstTls12Cipher(ctx: SslCtxPtr): pointer =
+  ## The first TLS <= 1.2 cipher in the context's resolved preference order, or
+  ## nil if it has none. `SSL_CTX_get_ciphers` returns one stack holding both
+  ## generations, with the TLS 1.3 ciphersuites ahead of the TLS 1.2 list and
+  ## no regard for the configured version range, so the 1.3 entries are skipped
+  ## by the version each cipher was first defined in.
+  let st = SSL_CTX_get_ciphers(ctx)
+  if st == nil: return nil
+  for i in 0 ..< OPENSSL_sk_num(st):
+    let c = OPENSSL_sk_value(st, cint(i))
+    if c == nil: continue
+    let v = SSL_CIPHER_get_version(c)
+    if v != nil and $v == "TLSv1.3": continue
+    return c
+  nil
+
+proc h2BlacklistedLead(ctx: SslCtxPtr): string =
+  ## "" when the first TLS 1.2 cipher this context would pick is an ephemeral
+  ## (ECDHE or DHE) AEAD suite, i.e. one RFC 7540 Appendix A does *not*
+  ## blacklist. Otherwise the suite's name, for the error message.
+  let c = firstTls12Cipher(ctx)
+  if c == nil: return ""
+  let kx = SSL_CIPHER_get_kx_nid(c)
+  if SSL_CIPHER_is_aead(c) == 1 and (kx == NID_kx_ecdhe or kx == NID_kx_dhe):
+    return ""
+  let n = SSL_CIPHER_get_name(c)
+  if n == nil: "(unnamed cipher)" else: $n
+
 proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
                  clientCaFile, clientCaPem: string,
                  minProtoVersion, maxProtoVersion: clong,
-                 cipherList, cipherSuites: string): SslCtxPtr =
+                 cipherList, cipherSuites: string,
+                 h2 = false): SslCtxPtr =
   ## Build a fully-configured SSL_CTX: min version, ciphers, the cert/key from
   ## `m` (PKCS#12, in-memory PEM, or files), and client-cert verification
   ## (mTLS). Raises on any failure, freeing the partial ctx. The ALPN callback
   ## is set by the caller, which owns the stable arg pointer. Shared by initial
   ## config and certificate hot-reload.
+  ##
+  ## `h2` says whether this context will offer HTTP/2 over ALPN, which turns on
+  ## the RFC 7540 Appendix A screen of `cipherList` below. Callers derive it
+  ## from the ALPN list they pass (or have stored), so the default context, the
+  ## per-host SNI contexts and a hot-reload's replacement all agree.
   ##
   ## Clears the error queue on entry: every failure below reports
   ## `lastErrorMsg()`, and the SSL_CTX_new, version and cipher-string steps do
@@ -708,19 +768,47 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   # no_renegotiation alert, leaving the connection usable.
   #
   # Pick ciphers in the order the operator wrote them. Without
-  # SSL_OP_CIPHER_SERVER_PREFERENCE OpenSSL walks the *client's* list and takes
+  # SSL_OP_SERVER_PREFERENCE (the OpenSSL >= 3.5 name for the bit also spelled
+  # SSL_OP_CIPHER_SERVER_PREFERENCE) OpenSSL walks the *client's* list and takes
   # the first entry we also allow, which turns tlsCipherList and
   # tlsCipherSuites into unordered allow-sets: a list of
   # "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256" is accepted,
   # applied, and then silently inverted by any client that happens to put
-  # AES-128 first (#375). One option covers both, because OpenSSL runs TLS 1.2
-  # cipher selection and TLS 1.3 ciphersuite selection through the same
-  # ssl3_choose_cipher preference pick. The ordering is a policy statement, not
-  # a hint, so the server's list wins; we deliberately do NOT set
-  # SSL_OP_PRIORITIZE_CHACHA, which would let a ChaCha-first client reorder it
-  # again.
-  discard SSL_CTX_set_options(ctx,
-      SSL_OP_NO_RENEGOTIATION or SSL_OP_CIPHER_SERVER_PREFERENCE)
+  # AES-128 first (#375). One option covers both cipher generations, because
+  # OpenSSL runs TLS 1.2 cipher selection and TLS 1.3 ciphersuite selection
+  # through the same preference pick.
+  #
+  # Be honest about how wide that is. On OpenSSL >= 3.5, which is this project's
+  # minimum, the option is documented as "when choosing a cipher, signature,
+  # (TLS 1.2) curve or (TLS 1.3) group, use the server's preferences", so the
+  # same bit also makes ECDH group, TLS 1.2 curve and signature-algorithm
+  # selection follow the server's order. There is no cipher-only variant to ask
+  # for instead, and the wider policy is the right one for a server: the server
+  # decides. It costs nothing at the handshake level either -- our group list is
+  # OpenSSL's default unless an embedder configures one, and OpenSSL still uses
+  # a group the client sent a key share for when that group is in our list, so
+  # no extra HelloRetryRequest round trip appears.
+  #
+  # The ChaCha courtesy. SSL_OP_PRIORITIZE_CHACHA says: keep the server's order,
+  # except that a client whose *own* first choice is ChaCha20-Poly1305 gets
+  # ChaCha20-Poly1305. That signal means "no AES hardware" in practice (phones),
+  # and software AES is both slower and more side-channel exposed for them. When
+  # the operator configured neither list there is no policy to defend -- the
+  # order being enforced is just OpenSSL's built-in one (AES-256-GCM, ChaCha20,
+  # AES-128-GCM) -- so set it and match what Go's crypto/tls and BoringSSL-based
+  # servers do by default. When the operator *did* write a list, that list is a
+  # policy statement and the courtesy is withheld, because a ChaCha-first client
+  # must not be able to reorder it.
+  #
+  # cipherSuites alone is enough to withhold it on TCP even though it only
+  # covers TLS 1.3: it is still an explicit ordering, and the TLS 1.2 half of
+  # a context whose operator ordered the 1.3 half should not behave differently.
+  # QUIC sees only cipherSuites (there is no TLS 1.2 there), so the QUIC context
+  # in the ngtcp2 shim keys the same decision off that field alone.
+  var opts = SSL_OP_NO_RENEGOTIATION or SSL_OP_SERVER_PREFERENCE
+  if cipherList.len == 0 and cipherSuites.len == 0:
+    opts = opts or SSL_OP_PRIORITIZE_CHACHA
+  discard SSL_CTX_set_options(ctx, opts)
   if minProtoVersion != 0:
     if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION,
                     minProtoVersion, nil) != 1:
@@ -741,6 +829,27 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "invalid TLS 1.3 cipher suites: " & lastErrorMsg())
+  # RFC 7540 Appendix A screen, now that the list is resolved. HTTP/2 forbids a
+  # long list of TLS 1.2 suites -- everything that is not an ephemeral-key AEAD
+  # suite -- and a client that sees one of them on an h2 connection closes it
+  # with INADEQUATE_SECURITY (browsers show a protocol error). Before server
+  # preference was enforced a CBC-first tlsCipherList was quietly rescued by
+  # every real client's own AEAD-first order; now we impose it, so the operator
+  # would get a server that negotiates h2 on a cipher no browser will accept.
+  # Vortex used to check only that OpenSSL *parsed* the string. Refuse the
+  # configuration at construction instead, where the message can say what to do
+  # (#375). TLS 1.3 has no such list (every 1.3 suite is AEAD), so only the TLS
+  # 1.2 lead matters, and a version range that excludes TLS 1.2 altogether
+  # skips the screen. There is no QUIC counterpart for the same reason: QUIC is
+  # TLS 1.3 only, so tlsCipherSuites can never resolve to a blacklisted suite.
+  if h2 and cipherList.len > 0 and minProtoVersion < TLS1_3_VERSION:
+    let bad = h2BlacklistedLead(ctx)
+    if bad.len > 0:
+      SSL_CTX_free(ctx)
+      raise newException(CatchableError,
+        "tlsCipherList must lead with an ECDHE/DHE AEAD suite: \"" & bad &
+        "\" is on the RFC 7540 Appendix A blacklist and HTTP/2 clients refuse " &
+        "it; move an AEAD suite first or disable HTTP/2")
   let loaded = try: loadCertKey(ctx, m)
                except CatchableError:
                  SSL_CTX_free(ctx)   # an unreadable key/bundle file: re-raise
@@ -819,7 +928,8 @@ proc buildSniCtxs(cfg: ptr TlsConfig, hosts: openArray[string],
     try:
       hctx = buildTlsCtx(cfg.meth, mats[i], cfg.verify, cfg.clientCaFile,
                          cfg.clientCaPem, cfg.minProtoVersion,
-                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
+                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites,
+                         h2 = h2InProtos(cfg.protos))
     except CatchableError as e:
       for c in result: SSL_CTX_free(c)
       # buildTlsCtx only ever sees the material, so without the host name an
@@ -836,7 +946,8 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        sni: openArray[SniCert] = [], maxProtoVersion: clong = 0,
                        ocsp = "", ocspFile = ""): ptr TlsConfig =
   let ctx = buildTlsCtx(meth, m, verify, clientCaFile, clientCaPem,
-                        minProtoVersion, maxProtoVersion, cipherList, cipherSuites)
+                        minProtoVersion, maxProtoVersion, cipherList,
+                        cipherSuites, h2 = h2InProtos(protos))
   result = createShared(TlsConfig)
   initLock(result.ctxLock)
   initLock(result.reloadLock)
@@ -1042,7 +1153,8 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   try:
     newCtx = buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
                          cfg.clientCaPem, cfg.minProtoVersion,
-                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
+                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites,
+                         h2 = h2InProtos(cfg.protos))
   except CatchableError as e:
     return reloadFailed(cfg, e.msg)
   # The per-host ctxs, all or nothing with the default one: a host that fails to
@@ -1257,6 +1369,35 @@ proc ctxRefusesRenegotiation*(cfg: ptr TlsConfig): bool =
   ## Is renegotiation refused on the active ctx (SSL_OP_NO_RENEGOTIATION)? For
   ## tests/introspection, like ctxCertSubject above.
   (SSL_CTX_get_options(cfg.ctx) and SSL_OP_NO_RENEGOTIATION) != 0
+
+proc ctxPrefersServerOrder*(cfg: ptr TlsConfig): bool =
+  ## Does the active ctx pick ciphers (and, on OpenSSL >= 3.5, groups, curves
+  ## and signature algorithms) in the server's order? For tests/introspection.
+  (SSL_CTX_get_options(cfg.ctx) and SSL_OP_SERVER_PREFERENCE) != 0
+
+proc ctxPrioritizesChaCha*(cfg: ptr TlsConfig): bool =
+  ## Does the active ctx still let a ChaCha-first client have ChaCha
+  ## (SSL_OP_PRIORITIZE_CHACHA)? Set only when the operator configured neither
+  ## cipher list, so there is no ordering policy of theirs to defend (#375).
+  (SSL_CTX_get_options(cfg.ctx) and SSL_OP_PRIORITIZE_CHACHA) != 0
+
+proc sniCtxCount*(cfg: ptr TlsConfig): int =
+  ## How many per-host (SNI) contexts the config currently holds. For tests.
+  acquire(cfg.ctxLock)
+  defer: release(cfg.ctxLock)
+  cfg.sniCtx.len
+
+proc sniCtxPrefersServerOrder*(cfg: ptr TlsConfig, i: int): bool =
+  ## Server-preference bit of per-host context `i`, read straight off the
+  ## SSL_CTX. A handshake cannot observe this bit on a per-host context -- a
+  ## connection carries the option word copied from the ctx it was created on,
+  ## which is always the default one, and SSL_set_SSL_CTX does not re-read
+  ## options -- so an assertion over the real bit is the only way to pin it
+  ## (#375).
+  acquire(cfg.ctxLock)
+  defer: release(cfg.ctxLock)
+  if i < 0 or i >= cfg.sniCtx.len: return false
+  (SSL_CTX_get_options(cfg.sniCtx[i]) and SSL_OP_SERVER_PREFERENCE) != 0
 
 proc newTlsConfig*(certFile, keyFile: string, enableH2 = false,
                    minProtoVersion: clong = 0, cipherList = "", cipherSuites = "",

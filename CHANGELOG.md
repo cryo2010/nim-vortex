@@ -805,9 +805,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outside the lock and the callback's own reference is dropped straight
   afterwards. (#356)
 - TLS: `tlsCipherList` and `tlsCipherSuites` are now enforced as the server's
-  preference order. `SSL_OP_CIPHER_SERVER_PREFERENCE` was never set, so OpenSSL
-  walked the *client's* list and took the first entry the server also allowed:
-  the configured order was accepted, applied, and then silently inverted by any
+  preference order. `SSL_OP_SERVER_PREFERENCE` (the same option bit OpenSSL < 3.5
+  spelled `SSL_OP_CIPHER_SERVER_PREFERENCE`) was never set, so OpenSSL walked the
+  *client's* list and took the first entry the server also allowed: the
+  configured order was accepted, applied, and then silently inverted by any
   client that disagreed with it. An operator writing
   `"ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256"` to prefer AES-256
   got AES-128 on every connection from every AES-128-first client. The option
@@ -815,8 +816,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it is set on the QUIC context and every per-SNI context too, so HTTP/3 orders
   `tlsCipherSuites` the same way HTTP/1.1 and HTTP/2 do. The lists are still
   allow-sets: a client that cannot do the preferred entry still connects on
-  another one. `SSL_OP_PRIORITIZE_CHACHA` is deliberately not set, so a
-  ChaCha-first client cannot reorder the list back. (#375)
+  another one.
+
+  Three things about that policy, stated plainly rather than discovered later. On
+  OpenSSL 3.5+ (the project minimum) the same option also makes ECDH group, TLS
+  1.2 curve and signature-algorithm selection follow the server's order; the
+  server's group list is OpenSSL's default unless configured, and a client key
+  share for the server's preferred group is still used, so no extra round trip
+  appears. With *both* lists empty the operator configured no policy, so
+  `SSL_OP_PRIORITIZE_CHACHA` is now set as well: the order being imposed would
+  otherwise be OpenSSL's own, and a client that offers ChaCha20-Poly1305 first is
+  signalling that it has no AES hardware, so it keeps ChaCha instead of being
+  moved onto software AES, which is what Go's `crypto/tls` and the
+  BoringSSL-based servers do by default. Writing either list withholds that
+  courtesy, because then the order is a policy statement a ChaCha-first client
+  must not be able to reorder; QUIC never sees `tlsCipherList`, so an operator
+  who sets only that one gets strict server order on TCP while HTTP/3, which has
+  no TLS 1.2 to order, keeps the courtesy. And the per-SNI bit is defence in
+  depth only: `SSL_set_SSL_CTX` does not re-read options, so an SNI connection is
+  governed by the option word copied from the default context. (#375)
+- TLS: a `tlsCipherList` whose first TLS 1.2 suite is on the RFC 7540 Appendix A
+  blacklist is now rejected at startup (and on `reloadTls`, and for every per-SNI
+  context) with the suite named and what to do about it. Enforcing the server's
+  order created this footgun: vortex only ever checked that OpenSSL *accepted*
+  the cipher string, and a CBC-first list used to be rescued by every real
+  client's own AEAD-first preference, but the server now imposes it, so HTTP/2
+  was negotiated on a forbidden cipher and browsers failed the connection with
+  `INADEQUATE_SECURITY`. The screen inspects only the suite that would actually
+  be chosen, so an AEAD-first list with CBC fallbacks further down is accepted,
+  and it is skipped when the configured version range excludes TLS 1.2 or the
+  context does not offer `h2`. There is no QUIC counterpart: QUIC is TLS 1.3
+  only and every TLS 1.3 suite is AEAD. (#375)
 
 ### Changed
 
