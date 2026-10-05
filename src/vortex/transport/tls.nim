@@ -224,6 +224,12 @@ proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
 
 proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   ## Load a PEM private key from memory, decrypting with `password` if set.
+  ## On failure the error queue is left holding the reason (bad decrypt, a
+  ## truncated block, an unsupported algorithm), so the caller's exception can
+  ## name it; clearing it here is what made every key failure read as "unknown
+  ## TLS error" (#377). Clears on entry instead, so what the caller reports is
+  ## ours and not a leftover from an earlier step.
+  ERR_clear_error()
   if pem.len == 0: return false
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
@@ -235,9 +241,7 @@ proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   # cleanly instead of prompting; an unencrypted key never consults it.
   let ud = if password.len > 0: cast[pointer](password.cstring) else: nil
   let pkey = PEM_read_bio_PrivateKey(bio, nil, passwdCb, ud)
-  if pkey == nil:
-    ERR_clear_error()
-    return false
+  if pkey == nil: return false      # reason stays queued: see the doc comment
   defer: EVP_PKEY_free(pkey)                            # up-ref'd by use below
   result = SSL_CTX_use_PrivateKey(ctx, pkey) == 1
 
@@ -297,9 +301,15 @@ type
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
 
 proc lastErrorMsg(): string =
+  ## The oldest queued error (the root cause: OpenSSL pushes the deepest
+  ## failure first and wraps it on the way out), then drain the rest. Draining
+  ## matters because the queue is per-thread and outlives the call: a leftover
+  ## error would otherwise be reported as the reason for an unrelated later
+  ## failure, or be mistaken for real corruption by pemReadEndedCleanly.
   let e = ERR_get_error()
   if e == 0: return "unknown TLS error"
-  $ERR_error_string(e, nil)
+  result = $ERR_error_string(e, nil)
+  ERR_clear_error()
 
 proc tlsLastErrorMsg*(): string =
   ## The top of OpenSSL's thread-local error queue, as a sentence, popping it.

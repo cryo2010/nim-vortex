@@ -529,6 +529,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`/stats` keeps its exact three fields), prints the tally on SIGTERM, and
   dumps the server container's log when a cell fails, so the server's stderr
   survives in the run log. (#388)
+- TLS: a private-key load failure now names its reason. `loadKeyMem` cleared the
+  OpenSSL error queue on the failure path, so by the time `buildTlsCtx` read it
+  there was nothing left and every key problem -- a wrong `keyPassword`, a
+  truncated PEM block, a key in an encoding the decoder rejects -- was reported
+  as `cannot load TLS certificate/key: unknown TLS error`, which reads like a
+  library fault rather than the configuration mistake it is. The reason now
+  survives to the exception message (`bad decrypt` for a wrong passphrase), on
+  key files and in-memory `keyPem` alike, and `lastErrorMsg` drains the queue it
+  read from so one failed load cannot lend its reason to the next attempt on the
+  same thread. (#377)
 
 ### Changed
 
