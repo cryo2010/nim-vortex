@@ -224,17 +224,22 @@ type
 # --- operator log -----------------------------------------------------------
 
 proc opLog*(msg: string) =
-  ## The one sink for vortex's operator-facing messages. There is deliberately
-  ## no logging API and no pluggable hook: this is the handful of lines the
-  ## server emits about its own health (accept-path drops, fd exhaustion, a
-  ## shutdown blocked by a worker, a loop thread that died), and they go to
-  ## stderr with a `vortex:` prefix. Having one sink is the point -- bare
-  ## `stderr.writeLine` calls scattered through the loop were impossible to find
-  ## and impossible to redirect, which is how the accept-path drops stayed
-  ## invisible in a soak log (#388, #387).
+  ## The one sink for vortex's operator-facing messages. Internal: there is
+  ## deliberately no logging API and no pluggable hook, and this is not exported
+  ## from `vortex.nim`. It carries the handful of lines the server emits about
+  ## its own health (accept-path drops, fd exhaustion, a shutdown blocked by a
+  ## worker, a loop thread that died) to stderr with a `vortex:` prefix. Having
+  ## one sink is the point: the bare `stderr.writeLine` calls scattered through
+  ## the loop were impossible to find and impossible to keep consistent, which
+  ## is how the accept-path drops stayed invisible in a soak log (#388, #387).
+  ##
+  ## The line is built first and written with a single `stderr.write`.
+  ## `writeLine` is two `fwrite` calls (payload, then newline), and every loop
+  ## thread writes here, so a concurrent line could land between the two and
+  ## split a message across the log.
   ##
   ## Never raises: a server must not die because stderr is closed or full.
-  try: stderr.writeLine("vortex: " & msg)
+  try: stderr.write("vortex: " & msg & "\n")
   except IOError, OSError: discard
 
 # --- accept-path drop counters ----------------------------------------------
