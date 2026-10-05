@@ -242,6 +242,12 @@ const char *vq_conn_peer_ip(VqConn *conn);
  * (client) certificate through it for req.clientCertSubject over h3 (#351). */
 void *vq_conn_ssl(VqConn *conn);
 
+/* The max_udp_payload_size this shim advertises to peers (RFC 9000 18.2), i.e.
+ * the largest datagram a client may send us. The caller owns the receive socket
+ * and must size its buffer to at least this, or oversize datagrams are silently
+ * truncated and dropped (#380). */
+size_t vq_max_recv_udp_payload(void);
+
 #ifdef __cplusplus
 }
 #endif

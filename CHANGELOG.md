@@ -480,6 +480,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prints its traceback for the same reason and now covers `BaseException`, so a
   `CancelledError` escaping its `run()` exits 2 (internal error) instead of 1,
   which is its fd-leak verdict. (#387)
+- HTTP/3: the QUIC receive buffer now holds a datagram as large as the
+  `max_udp_payload_size` the server advertises. It was 2048 bytes while the
+  transport parameters carried ngtcp2's 65527 default, so a conforming client on
+  a large-MTU path (a 9000-byte VPC MTU, 65536 on loopback) was entitled to send
+  a datagram the kernel then truncated: header protection and AEAD failed,
+  ngtcp2 dropped the packet, the client retransmitted the same oversize datagram
+  indefinitely, and the connection died on the idle timer with nothing logged at
+  either end. Both numbers now come from one constant in the shim
+  (`vq_max_recv_udp_payload`), so they cannot drift apart; the advertisement was
+  deliberately NOT clamped down to the old buffer, which would have capped every
+  datagram the peer sends us and cost throughput on exactly those paths. On
+  Linux the receive passes `MSG_TRUNC`, so a datagram that still does not fit is
+  dropped and counted instead of being fed to ngtcp2 as line corruption. (#380)
 
 ### Changed
 

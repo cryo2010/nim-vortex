@@ -121,6 +121,7 @@ proc vqConnShutdown(conn: ptr VqConn) {.importc: "vq_conn_shutdown".}
 proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
 proc vqConnCloseGraceful(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close_graceful".}
 proc vqConnSsl(conn: ptr VqConn): pointer {.importc: "vq_conn_ssl".}
+proc vqMaxRecvUdpPayload(): csize_t {.importc: "vq_max_recv_udp_payload".}
 {.pop.}
 
 # --- H3 state (codec-compatible surface) ------------------------------------
@@ -186,6 +187,18 @@ var
   gLocalSa {.threadvar.}: array[128, byte]   # bound local sockaddr (for the QUIC path)
   gLocalLen {.threadvar.}: cuint
   gReady {.threadvar.}: seq[tuple[slot: int, gen: uint32, sid: uint64]]
+  gRecvBuf {.threadvar.}: seq[uint8]         # ngReceive's datagram buffer, sized
+                                             # from the max_udp_payload_size the
+                                             # shim advertises (#380)
+  gTruncDrops {.threadvar.}: uint64          # datagrams dropped for not fitting
+                                             # that buffer; only observable where
+                                             # recvfrom honours MSG_TRUNC (Linux)
+
+# NOT a threadvar: the receive buffer size every loop thread settles on, stamped
+# by ngSetup so a test (and an operator at a REPL) can read it off the main
+# thread. Every loop writes the same number, computed from the one shim
+# constant, so the concurrent stores are benign (#380).
+var gRecvBufSize: int
 
 proc ngNowNs*(): uint64 = getMonoTime().ticks.uint64
   ## The one clock this loop thread hands ngtcp2 -- every entry point (recv,
@@ -583,6 +596,25 @@ proc recvfromUdp(fd: cint, buf: pointer, n: csize_t, flags: cint, peer: pointer,
                  peerLen: ptr cuint): int {.importc: "recvfrom", header: "<sys/socket.h>".}
 proc getsocknameC(fd: cint, a: pointer, l: ptr cuint): cint {.importc: "getsockname", header: "<sys/socket.h>".}
 
+when defined(linux):
+  # MSG_TRUNC on a datagram socket makes recvfrom return the packet's REAL
+  # length rather than how much it copied, which is the only way to notice a
+  # truncated datagram. Hardcoded because std/posix exports it as an importc var
+  # on some targets (same reasoning as sendFlags in eventloop.nim); the value is
+  # uniform across Linux architectures. BSD/macOS recvfrom has no MSG_TRUNC
+  # semantics, so there the larger buffer is the whole mitigation and an
+  # oversize datagram stays indistinguishable from a full one (#380).
+  const recvFlags = cint(0x20)
+else:
+  const recvFlags = cint(0)
+
+proc ngMaxRecvUdpPayload*(): int =
+  ## The max_udp_payload_size the shim advertises in its transport parameters,
+  ## i.e. the largest datagram a conforming client may send us. ngReceive sizes
+  ## its buffer from this same number, so the advertisement is honest by
+  ## construction; exported so a test can pin the two together (#380).
+  int(vqMaxRecvUdpPayload())
+
 proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
             peer: pointer, peerLen: csize_t): cint {.cdecl.} =
   # Return < 0 on any send failure (notably EWOULDBLOCK, a full UDP socket
@@ -666,19 +698,54 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   if gEngine == nil: return false
   gLocalLen = cuint(sizeof(gLocalSa))
   discard getsocknameC(udpFd, addr gLocalSa[0], addr gLocalLen)
+  # Size the receive buffer from the max_udp_payload_size the shim advertises,
+  # here rather than lazily, so the two can never disagree while traffic flows
+  # (#380). gRecvBufSize is the readable record of it.
+  gRecvBuf = newSeq[uint8](ngMaxRecvUdpPayload())
+  gRecvBufSize = gRecvBuf.len
   true
+
+proc ngRecvBufSize*(): int =
+  ## The ngReceive buffer size the loops settled on, 0 before any ngSetup. It
+  ## must equal ngMaxRecvUdpPayload(): that equality IS the #380 fix, and it is
+  ## what the regression test asserts.
+  gRecvBufSize
+
+proc ngTruncatedDrops*(): uint64 =
+  ## Datagrams this loop thread dropped because they did not fit the receive
+  ## buffer. Only ever non-zero on Linux, where MSG_TRUNC reports the real
+  ## datagram length; elsewhere a truncated datagram cannot be told from a full
+  ## one and goes to the engine, which drops it when AEAD fails.
+  gTruncDrops
 
 proc ngReceive*() =
   ## Drain all pending datagrams from the loop's (nonblocking) UDP socket into
   ## the engine; the shim's callbacks populate connections and the ready list.
-  var buf: array[2048, uint8]
+  ##
+  ## The buffer is sized from the max_udp_payload_size we advertise, not from a
+  ## path-MTU guess. A conforming client on a large-MTU path (a 9000-byte VPC
+  ## MTU, 65536 on loopback) is entitled to fill that advertisement, and the old
+  ## 2048-byte buffer had the kernel truncate those datagrams: header protection
+  ## and AEAD then failed, ngtcp2 dropped the packet, the client retransmitted
+  ## the same oversize datagram, and the connection died on the idle timer with
+  ## nothing logged at either end. Clamping the advertisement down to the buffer
+  ## instead would have capped every datagram the peer sends us and cost
+  ## throughput on exactly those paths (#380). One heap buffer per loop thread:
+  ## 64 KB of stack per call is not free.
+  if gRecvBuf.len == 0: gRecvBuf = newSeq[uint8](ngMaxRecvUdpPayload())
   var peer: array[128, byte]
   while true:
     var plen = cuint(sizeof(peer))
-    let n = recvfromUdp(gUdpFd, addr buf[0], csize_t(buf.len), cint(0),
-                        addr peer[0], addr plen)
+    let n = recvfromUdp(gUdpFd, addr gRecvBuf[0], csize_t(gRecvBuf.len),
+                        recvFlags, addr peer[0], addr plen)
     if n <= 0: break
-    vqEngineRecv(gEngine, addr buf[0], csize_t(n), addr peer[0], csize_t(plen),
+    if n > gRecvBuf.len:
+      # MSG_TRUNC: recvfrom reported a datagram larger than it copied. Feeding
+      # the prefix to ngtcp2 would just fail AEAD and look like line corruption,
+      # so drop it as the oversize datagram it is and count it.
+      inc gTruncDrops
+      continue
+    vqEngineRecv(gEngine, addr gRecvBuf[0], csize_t(n), addr peer[0], csize_t(plen),
                  addr gLocalSa[0], csize_t(gLocalLen), ngNowNs())
 
 proc ngPump*() = vqEnginePump(gEngine, ngNowNs())

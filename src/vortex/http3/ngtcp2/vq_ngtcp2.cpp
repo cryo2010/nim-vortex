@@ -31,6 +31,16 @@
 namespace {
 
 constexpr size_t kMaxUdpPayload = 1452;   // conservative IPv4 path MTU
+// The largest datagram we are willing to *receive*, advertised to the peer as
+// max_udp_payload_size (RFC 9000 18.2) and exported via
+// vq_max_recv_udp_payload so the Nim side can size its recvfrom buffer from
+// this one number. 65527 is the largest a UDP payload can be and is also
+// ngtcp2's NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE, so the value the peer
+// sees is unchanged -- what changes is that the receive buffer now actually
+// holds it (#380). Keeping the advertisement honest matters more than keeping
+// it small: clamping it to a 2 KB buffer would also cap every datagram the
+// peer sends us, costing throughput on a large-MTU path.
+constexpr size_t kMaxRecvUdpPayload = 65527;
 constexpr size_t kScidLen = 18;           // our connection-id length
 
 // unique_ptr deleters for the C OpenSSL handles the shim owns. Scoped locals
@@ -609,6 +619,14 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   tp.initial_max_streams_bidi = e->cfg.max_concurrent_streams
                                     ? e->cfg.max_concurrent_streams : 100;
   tp.initial_max_streams_uni = 3;
+  // What we advertise as the biggest datagram we can take. ngtcp2's default is
+  // the same number, but set it explicitly from the constant the receive buffer
+  // is sized from: the two must agree or a conforming client on a jumbo-frame
+  // path (a 9000-byte VPC MTU, 65536 on loopback) takes us at our word, sends a
+  // datagram we then truncate in recvfrom, and every packet fails AEAD until
+  // the connection dies on the idle timer with nothing logged at either end
+  // (#380).
+  tp.max_udp_payload_size = kMaxRecvUdpPayload;
   tp.original_dcid = hd.dcid;
   tp.original_dcid_present = 1;
 
@@ -1416,5 +1434,7 @@ void *vq_conn_ssl(VqConn *conn) {
   auto *c = reinterpret_cast<Conn *>(conn);
   return c->ssl;
 }
+
+size_t vq_max_recv_udp_payload(void) { return kMaxRecvUdpPayload; }
 
 }  // extern "C"
