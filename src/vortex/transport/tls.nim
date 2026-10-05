@@ -124,7 +124,9 @@ proc SSL_CTX_set_ex_data(ctx: SslCtxPtr, idx: cint, arg: pointer): cint
 proc ERR_clear_error()
 proc ERR_get_error(): culong
 proc ERR_peek_last_error(): culong
-proc ERR_error_string(e: culong, buf: cstring): cstring
+proc ERR_error_string_n(e: culong, buf: cstring, len: csize_t)
+  ## Deliberately not ERR_error_string: that one formats into a process-wide
+  ## static buffer. See lastErrorMsg.
 proc X509_get_subject_name(x: pointer): pointer          # X509_NAME* (borrowed)
 proc X509_NAME_oneline(name: pointer, buf: cstring, size: cint): cstring
 proc BIO_new_mem_buf(buf: pointer, len: cint): pointer   # read-only mem BIO
@@ -321,15 +323,31 @@ proc lastErrorMsg(): string =
   ## matters because the queue is per-thread and outlives the call: a leftover
   ## error would otherwise be reported as the reason for an unrelated later
   ## failure, or be mistaken for real corruption by pemReadEndedCleanly.
+  ##
+  ## Formats into a buffer of our own. The error *queue* is per-thread, but
+  ## `ERR_error_string(e, nil)` formats into a single process-wide
+  ## `static char buf[256]` and is documented as not thread-safe: two threads
+  ## formatting at once each get whichever message landed in that buffer last.
+  ## Since #388 this runs on every loop thread (the accept path's "TLS session
+  ## setup failed" line), so a wrong reason was reachable in a running server,
+  ## not just in a test. `ERR_error_string_n` writes into the caller's buffer
+  ## instead; 256 bytes is the size OpenSSL's own buffer has, and it always
+  ## NUL-terminates within whatever it is given.
   let e = ERR_get_error()
   if e == 0: return "unknown TLS error"
-  result = $ERR_error_string(e, nil)
+  var buf = newString(256)
+  ERR_error_string_n(e, cast[cstring](addr buf[0]), csize_t(buf.len))
+  var n = 0
+  while n < buf.len and buf[n] != '\0': inc n
+  buf.setLen(n)
   ERR_clear_error()
+  buf
 
 proc tlsLastErrorMsg*(): string =
-  ## The top of OpenSSL's thread-local error queue, as a sentence, popping it.
-  ## Exported so a caller that only gets a nil/false back from this module can
-  ## still say *why* in its own log line (the accept path, #388).
+  ## The oldest error on OpenSSL's thread-local error queue (its root cause), as
+  ## a sentence, draining the queue. Exported so a caller that only gets a
+  ## nil/false back from this module can still say *why* in its own log line
+  ## (the accept path, #388). Safe to call from several loop threads at once.
   lastErrorMsg()
 
 proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
@@ -473,6 +491,10 @@ proc attachOcsp(ctx: SslCtxPtr, der: string) =
 
 proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
   ## Load cert + key (+ any bundled CA chain) from PKCS#12 (.pfx/.p12) bytes.
+  ## Clears the error queue on entry like the PEM loaders do, so a rejected
+  ## bundle is reported with its own reason and not with a leftover from
+  ## earlier OpenSSL work on this thread.
+  ERR_clear_error()
   if data.len == 0: return false
   let bio = BIO_new_mem_buf(unsafeAddr data[0], cint(data.len))
   if bio == nil: return false
@@ -626,6 +648,12 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   ## (mTLS). Raises on any failure, freeing the partial ctx. The ALPN callback
   ## is set by the caller, which owns the stable arg pointer. Shared by initial
   ## config and certificate hot-reload.
+  ##
+  ## Clears the error queue on entry: every failure below reports
+  ## `lastErrorMsg()`, and the SSL_CTX_new, version and cipher-string steps do
+  ## not go through a loader that clears for itself, so a stale entry left on
+  ## this thread by unrelated OpenSSL work would be named as the cause.
+  ERR_clear_error()
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
@@ -1116,6 +1144,12 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =
+  # Start from an empty error queue. The queue is per-thread and outlives the
+  # call, and tlsHandshake/tlsRead/tlsWrite leave their reason on it when a
+  # connection fails, so without this the accept path's "TLS session setup
+  # failed: <tlsLastErrorMsg()>" line (#388) could name the failure of an
+  # *earlier* connection accepted on the same loop thread.
+  ERR_clear_error()
   # A concurrent hot-reload may swap cfg.ctx and release the old one, so take a
   # reference to what we loaded (acquireCtx) instead of carrying a bare pointer
   # into SSL_new, which up-refs the ctx itself once it gets there. Ours is

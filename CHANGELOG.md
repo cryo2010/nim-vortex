@@ -689,6 +689,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exposes at most two hours of resumed sessions instead of every session since
   startup, which is what nginx and envoy rotate for. 0-RTT early data is not
   offered on any protocol and is unaffected. (#382)
+- TLS: an OpenSSL failure reason is now formatted into a buffer of its own, and
+  the thread's error queue is cleared before each session is created, so the
+  reason an operator reads belongs to the failure in front of them.
+  `lastErrorMsg` formatted with `ERR_error_string(e, nil)`, which writes into
+  OpenSSL's single process-wide `static char buf[256]` and is documented as not
+  thread-safe. That was harmless while only the configuration path used it, but
+  #388 exported it as `tlsLastErrorMsg()` and the accept path calls it from
+  every loop thread, so two threads reporting a failure at the same moment could
+  each be handed the other's message: a two-thread probe read 128 to 2,760 wrong
+  messages per 400,000 samples, and none at all through
+  `ERR_error_string_n` into a local buffer. `newTlsSession` also never cleared
+  the queue, and `tlsHandshake` / `tlsRead` / `tlsWrite` leave their reason on
+  it when a connection fails, so the accept path's `TLS session setup failed`
+  line could name the failure of an *earlier* connection accepted on the same
+  loop thread. `loadPkcs12` and `buildTlsCtx` now clear the queue on entry as
+  the PEM loaders already did, so a rejected bundle, cipher string or protocol
+  version is not reported with a leftover from unrelated OpenSSL work either.
+  (#377, #388)
 
 ### Changed
 
