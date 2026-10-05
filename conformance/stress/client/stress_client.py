@@ -27,7 +27,7 @@ directly, without diffing cumulative counts across lines:
     [sse h3 chronos] final 200x1493782 | 802 events/s | RSS 29MB | heap 6MB | fds 41 | t=60s
     == sse chronos h3 passed (1493782 events) ==
 """
-import asyncio, hashlib, sys, time
+import asyncio, hashlib, sys, time, traceback
 from collections import Counter
 import httpx
 from transport import (
@@ -56,6 +56,54 @@ def ok_ops() -> int:
 def fmt_codes() -> str:
     parts = [f"{c}x{n}" for c, n in sorted(codes.items())]
     return " ".join(parts) if parts else "0"
+
+def leaf_causes(exc):
+    """The non-group exceptions inside `exc` (ExceptionGroups nest)."""
+    if isinstance(exc, BaseExceptionGroup):
+        out = []
+        for sub in exc.exceptions: out.extend(leaf_causes(sub))
+        return out
+    return [exc]
+
+def print_cause(exc):
+    """Print a FAIL verdict for `exc` AND its traceback, both to stdout.
+
+    Same rationale as the `Fail` handler in main(): the harness is driven as
+    `nimble stress | tee stress.log`, which tees only stdout, so a cause left on
+    stderr -- where the interpreter prints an unhandled traceback -- never
+    reaches the archived log and the cell shows a bare `FAILED (exit 1)` with no
+    reason (#387). The traceback matters as much as the one-liner: "unexpected
+    AttributeError" is not a diagnosis without the frame it came from.
+    """
+    leaves = leaf_causes(exc)
+    desc = "; ".join(f"{type(x).__name__}: {x}" for x in leaves[:3])
+    if len(leaves) > 3: desc += f"; (+{len(leaves) - 3} more)"
+    if isinstance(exc, BaseExceptionGroup): desc = f"{type(exc).__name__}[{desc}]"
+    print(f"FAIL {WORKLOAD}: unexpected {desc} ({fmt_codes()})", flush=True)
+    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stdout)
+    sys.stdout.flush()
+
+def watch_task(name):
+    """A done-callback that reports a background task's death on stdout.
+
+    `reporter` and `loop_watchdog` are fire-and-forget: main() cancels both in
+    its `finally` and never awaits them, so an exception inside one is never
+    retrieved. By then the task is already done, `cancel()` is a no-op, and
+    asyncio's "Task exception was never retrieved" notice goes to stderr at
+    collection time -- which the harness does not tee (#387). The run silently
+    loses its reporting (or its loop-stall detection) and nothing says why: a
+    healthy soak and a dead reporter both print zero report lines, which is
+    exactly the confusion reporter()'s comment below describes. A dead helper is
+    not itself a verdict, so this logs and never touches the exit code.
+    """
+    def done(task):
+        if task.cancelled(): return       # the expected end: main()'s finally
+        e = task.exception()
+        if e is None: return
+        print(f"WARN {name} task died: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exception(type(e), e, e.__traceback__, file=sys.stdout)
+        sys.stdout.flush()
+    return done
 
 def fmt_rate(now: float) -> str:
     """A per-interval throughput segment for the non-streaming workloads: the 2xx
@@ -450,7 +498,9 @@ async def main():
     _rate[0] = _ops[0] = start
     deadline = start + SECONDS
     rep = asyncio.ensure_future(reporter())
+    rep.add_done_callback(watch_task("reporter"))
     wd = asyncio.ensure_future(loop_watchdog())
+    wd.add_done_callback(watch_task("loop_watchdog"))
     try:
         # workers self-stop at the deadline; wait_for is a safety net so a stalled
         # await (e.g. a peer flow-control stall) can never hang the harness.
@@ -472,6 +522,32 @@ async def main():
         # a pass once some early iterations happened to succeed.
         print(f"FAIL {WORKLOAD}: workers did not stop within deadline+60s "
               f"(stall) ({fmt_codes()})", flush=True)
+        return 1
+    except BaseExceptionGroup as eg:
+        # `asyncio.gather` re-raises only the FIRST exception, never a group, so
+        # this is not about gather itself; it is about a library in the stack
+        # (aioquic and httpx both use asyncio.TaskGroup, which raises
+        # ExceptionGroup on 3.11+, and the client image is python:3.12-slim)
+        # handing us a group. Neither the `Fail` nor the `TimeoutError` handler
+        # above matches a group that merely CONTAINS one, so without this the
+        # real cause only ever reached stderr. BaseExceptionGroup also covers the
+        # ExceptionGroup case (a subclass) and, unlike `except Exception`, a
+        # group whose leaves are all BaseExceptions. ^C stays an interrupt: split
+        # the interrupts back out and re-raise them after reporting the rest.
+        interrupts, rest = eg.split((KeyboardInterrupt, SystemExit))
+        if rest is None: raise
+        print_cause(rest)
+        if interrupts is not None: raise interrupts
+        return 1
+    except Exception as e:
+        # The catch-all the two handlers above were missing: an AttributeError in
+        # a workload, a RuntimeError out of aioquic/httpx internals, a KeyError
+        # in reporting. These used to propagate out of asyncio.run, which prints
+        # the traceback to stderr and exits 1, so the tee'd log recorded a bare
+        # `FAILED (exit 1)` and the cell was undiagnosable after the fact (#387).
+        # KeyboardInterrupt and SystemExit are BaseExceptions and still
+        # propagate: a ^C or an explicit exit must not read as a soak failure.
+        print_cause(e)
         return 1
     finally:
         rep.cancel(); wd.cancel()

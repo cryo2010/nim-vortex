@@ -67,6 +67,16 @@ when not defined(plainHttp):
         pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
         keyPassword: e.keyPassword)
 
+  proc toH3SniCerts*(s: openArray[SniCert]): seq[H3SniCert] =
+    ## The same, for the replacement per-host set a reload carries over to the
+    ## loop threads: CertReload decodes its blob into TLS-layer SniCerts, and
+    ## applyQuicReload hands them on to the shim (#356).
+    for e in s:
+      result.add H3SniCert(host: e.host, certFile: e.material.certFile,
+        keyFile: e.material.keyFile, certPem: e.material.certPem,
+        keyPem: e.material.keyPem, pkcs12File: e.material.pkcs12File,
+        pkcs12: e.material.pkcs12, keyPassword: e.material.keyPassword)
+
   proc tlsMaxVer*(v: TlsVersion): clong =
     ## Map the max-version enum to an OpenSSL version number (0 = no cap).
     case v
@@ -99,6 +109,43 @@ else:
 type
   FdKind = enum fkListen, fkClient, fkWakeup, fkQuic
 
+  AcceptDropCause* = enum
+    ## Why the accept path gave up on a connection. The first three are
+    ## connections the kernel had already handed us and we let go of: each
+    ## reaches the client as a connection that opened and then died with nothing
+    ## on it -- httpx reports an empty `ConnectError` -- which is exactly what a
+    ## network fault looks like, so each one is counted and logged with a reason
+    ## (#388). `adSuspend` is the odd one out: nothing was accepted there, so it
+    ## counts events rather than connections (see below).
+    adCap            ## `maxConnections` reached; accepted and closed at once
+    adTls            ## `startTls` failed (newTlsSession returned nil)
+    adRegister       ## the selector refused the fd (registerHandle raised)
+    adSuspend        ## accept() itself failed with fd/memory exhaustion
+                     ## (EMFILE/ENFILE/ENOBUFS/ENOMEM) and the listener was
+                     ## suspended for ~1s. No connection was accepted or
+                     ## dropped: whatever is in the backlog waits for the
+                     ## listener to come back, or times out there. One count per
+                     ## backoff, not per waiting connection.
+
+  AcceptDrops* = object
+    ## Accept-path drop tally. Process-wide: summed over every loop thread of
+    ## every server in the process, which is the granularity the counters are
+    ## kept at (the loops have no back-pointer to their Server). Read it with
+    ## `acceptDrops()` and watch it alongside your own connect-error rate: a
+    ## rising `cap` or `tls` here is the server refusing connections on purpose,
+    ## not the network breaking.
+    cap*: int            ## connections refused by the `maxConnections` cap
+    tls*: int            ## connections dropped because TLS setup failed
+    register*: int       ## connections dropped because the selector refused the fd
+    acceptSuspend*: int  ## times accept() hit fd/memory exhaustion and the
+                         ## listener backed off for ~1s. An event count, not a
+                         ## connection count: nothing had been accepted, so this
+                         ## is deliberately NOT part of `total`. A rising
+                         ## `acceptSuspend` means raise the fd rlimit
+    total*: int          ## connections accepted and then dropped:
+                         ## `cap + tls + register`. `acceptSuspend` is excluded
+                         ## (it counts backoffs, not connections)
+
   Loop* = ref object
     selector: Selector[FdKind]
     listenFd: int
@@ -129,6 +176,15 @@ type
                                  # outside the input path (flushHook with fd < 0):
                                  # QUIC egress must be driven before the loop
                                  # sleeps again (#262). h3Drive clears it.
+    quicMorePending: bool        # the last ngReceive stopped on its per-pass
+                                 # datagram budget rather than on an empty
+                                 # socket, so QUIC ingress has more to read.
+                                 # While set the selector does not wait at all
+                                 # (the sslReady pattern below): the loop goes
+                                 # round, services its TCP fds, and comes back
+                                 # for the next budget, so a UDP flood costs
+                                 # bounded time per pass instead of pinning the
+                                 # thread inside the receive loop (#381)
     quicReload: pointer          # ptr CertReload: main-thread reload signal
     quicReloadSeen: int          # last reload generation this loop applied
     connCount: int               # live TCP connections (maxConnections cap)
@@ -138,6 +194,15 @@ type
                                  # continuations once all connections are gone
     warnedDrainStuck: bool       # one-time warning emitted when graceful
                                  # shutdown is blocked by a still-running worker
+    acceptDropped: array[AcceptDropCause, int]
+                                 # this loop's accept-path drops per cause; also
+                                 # folded into the process-wide tally that
+                                 # acceptDrops() reports (#388)
+    acceptDropLoggedAt: array[AcceptDropCause, int64]
+                                 # monotonic sec of the last operator-log line
+                                 # per cause on this loop, for the rate limiter
+                                 # in noteAcceptDrop. 0 = never logged, so the
+                                 # FIRST occurrence of each cause always prints
     acceptSuspendedUntil: int64  # monotonic sec; while > nowSec the listener is
                                  # deregistered after an fd/memory-exhaustion
                                  # accept() error (EMFILE/ENFILE/...), then
@@ -165,6 +230,57 @@ type
                                  # ack un-pauses the read); without the cap an idle
                                  # dispatcher would only wake on the 1s tick and
                                  # stall the drain (see the select below).
+
+# --- operator log -----------------------------------------------------------
+
+proc opLog*(msg: string) =
+  ## The one sink for vortex's operator-facing messages. Internal: there is
+  ## deliberately no logging API and no pluggable hook, and this is not exported
+  ## from `vortex.nim`. It carries the handful of lines the server emits about
+  ## its own health (accept-path drops, fd exhaustion, a shutdown blocked by a
+  ## worker, a loop thread that died) to stderr with a `vortex:` prefix. Having
+  ## one sink is the point: the bare `stderr.writeLine` calls scattered through
+  ## the loop were impossible to find and impossible to keep consistent, which
+  ## is how the accept-path drops stayed invisible in a soak log (#388, #387).
+  ##
+  ## The line is built first and written with a single `stderr.write`.
+  ## `writeLine` is two `fwrite` calls (payload, then newline), and every loop
+  ## thread writes here, so a concurrent line could land between the two and
+  ## split a message across the log.
+  ##
+  ## Never raises: a server must not die because stderr is closed or full.
+  try: stderr.write("vortex: " & msg & "\n")
+  except IOError, OSError: discard
+
+# --- accept-path drop counters ----------------------------------------------
+
+var gAcceptDrops: array[AcceptDropCause, Atomic[int]]
+  ## Process-wide accept-drop tally. Shared (not a threadvar) and atomic because
+  ## every loop thread adds to it and the reader is usually the main thread.
+  ## Relaxed ordering: these are counters, nothing is ordered against them.
+
+const acceptDropLogSec = 5
+  ## Minimum seconds between operator-log lines for the SAME cause on the SAME
+  ## loop. Under a flood the cap fires on every accept, and a line per drop would
+  ## turn a diagnosis into a denial of service all by itself. The first
+  ## occurrence of each cause is never suppressed (see acceptDropLoggedAt).
+
+proc acceptDrops*(): AcceptDrops =
+  ## The process-wide accept-path drop tally (see `AcceptDrops`). Cheap: four
+  ## relaxed atomic loads. `total` sums only the three causes that dropped an
+  ## accepted connection (`cap`, `tls`, `register`); `acceptSuspend` counts
+  ## accept() backoffs and is reported beside it. Also reachable as
+  ## `server.acceptDrops()` / `vortex.acceptDrops()`; the no-argument form
+  ## exists because a `{.gcsafe.}` handler cannot touch the `Vortex` ref.
+  result.cap = gAcceptDrops[adCap].load(moRelaxed)
+  result.tls = gAcceptDrops[adTls].load(moRelaxed)
+  result.register = gAcceptDrops[adRegister].load(moRelaxed)
+  result.acceptSuspend = gAcceptDrops[adSuspend].load(moRelaxed)
+  # `total` is connections accepted and then dropped. adSuspend is not one of
+  # those -- accept() itself failed, nothing was accepted, and the backlog waits
+  # for the listener to be re-armed -- so it stays out of the sum even though it
+  # shares the counter array and the rate-limited log line (#388).
+  result.total = result.cap + result.tls + result.register
 
 when defined(linux):
   const clockMonotonicCoarse = ClockId(6)
@@ -358,11 +474,8 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
         # (e.g. a cert/key that failed makeCtx's check). Surface it instead of
         # silently serving h1/h2 with a bound-but-unused UDP socket and no
         # Alt-Svc. h1/h2 keep working; only h3 is unavailable on this loop.
-        try:
-          stderr.writeLine("vortex: HTTP/3 engine setup failed; serving " &
-                           "HTTP/1.1 and HTTP/2 only on this loop " &
-                           "(check the TLS certificate/key for QUIC)")
-        except IOError, OSError: discard
+        opLog("HTTP/3 engine setup failed (" & ngLastError() &
+              "); serving HTTP/1.1 and HTTP/2 only on this loop")
 
 const drainTimeoutSec = 5    # bound on how long a lingering close waits
 
@@ -1513,6 +1626,26 @@ proc startTls(loop: Loop, c: ptr Connection): bool =
       c.handshaking = true
   true
 
+proc noteAcceptDrop(loop: Loop, cause: AcceptDropCause, why: string) =
+  ## Record, and rate-limitedly explain, a connection the accept path gave up
+  ## on. Every one of these used to be a silent `posix.close` (or a bare
+  ## stderr line the stress harness never captured), so a server refusing
+  ## connections on purpose was indistinguishable at the client from a broken
+  ## network: an empty `ConnectError` and nothing anywhere to say why (#388).
+  ##
+  ## `why` is the operator-facing reason, already specific (which cap, which
+  ## OpenSSL error). The counters are what a soak samples; the line is what a
+  ## human reads. At most one line per cause per `acceptDropLogSec` per loop,
+  ## and the first occurrence of a cause is never suppressed.
+  inc loop.acceptDropped[cause]
+  discard gAcceptDrops[cause].fetchAdd(1, moRelaxed)
+  let now = loop.core.nowSec
+  if loop.acceptDropLoggedAt[cause] != 0 and
+      now - loop.acceptDropLoggedAt[cause] < acceptDropLogSec:
+    return
+  loop.acceptDropLoggedAt[cause] = max(now, 1)   # 0 stays "never logged"
+  opLog(why & " [" & $loop.acceptDropped[cause] & " on this loop thread so far]")
+
 proc suspendAccept(loop: Loop) =
   ## fd/memory exhaustion during accept(): deregister the listener for a short
   ## spell and re-arm it in tick(). The listen fd is level-triggered, so simply
@@ -1522,10 +1655,9 @@ proc suspendAccept(loop: Loop) =
     try: loop.selector.unregister(loop.listenFd)
     except CatchableError: discard
     loop.acceptSuspendedUntil = loop.core.nowSec + 1
-    try: stderr.writeLine("vortex: accept() hit fd/memory exhaustion; " &
-                          "pausing new connections ~1s (raise the fd rlimit " &
-                          "or lower maxConnections)")
-    except IOError, OSError: discard
+    loop.noteAcceptDrop(adSuspend,
+      "accept() hit fd/memory exhaustion; pausing new connections ~1s " &
+      "(raise the fd rlimit or lower maxConnections)")
 
 proc handleAccept(loop: Loop) =
   while true:
@@ -1557,6 +1689,10 @@ proc handleAccept(loop: Loop) =
     if loop.settings.maxConnections > 0 and
         loop.connCount >= loop.settings.maxConnections:
       discard posix.close(client)
+      loop.noteAcceptDrop(adCap, "connection cap " &
+        $loop.settings.maxConnections & " reached on this loop thread; " &
+        "dropping the connection just accepted (raise maxConnections, or add " &
+        "loop threads: the cap is per thread)")
       continue
     if fd >= loop.core.conns.len:
       # Grow the table for a higher fd. Unconditional, and that is the fix for
@@ -1584,6 +1720,14 @@ proc handleAccept(loop: Loop) =
       inc c.gen
       c.state = csFree
       dec loop.connCount
+      # SSL_new / SSL_set_fd failed: an allocation failure, or a context in a
+      # state OpenSSL refuses. Pop its error queue so the line says which --
+      # without it this was the one drop path with a plausible cause and no way
+      # to confirm it (#388).
+      when not defined(plainHttp):
+        loop.noteAcceptDrop(adTls,
+          "TLS session setup failed: " & tlsLastErrorMsg() &
+          "; dropping the connection just accepted")
       continue
     c.setDeadline(loop, dkHeader)   # handshake counts toward header timeout
     try:
@@ -1592,6 +1736,9 @@ proc handleAccept(loop: Loop) =
       # registerHandle can raise (selector limits, a stale duplicate fd). Clean
       # up the fd and the connCount/slot we reserved rather than leaking them
       # and letting the exception unwind out of the loop thread (R11).
+      loop.noteAcceptDrop(adRegister,
+        "selector registration failed: " & getCurrentExceptionMsg() &
+        "; dropping the connection just accepted")
       discard posix.close(client)
       inc c.gen
       c.state = csFree
@@ -1604,6 +1751,10 @@ proc beginAfterProxy(loop: Loop, c: ptr Connection) =
   ## and process whatever bytes are already buffered in the socket.
   c.awaitingProxy = false
   if not loop.startTls(c):
+    when not defined(plainHttp):
+      loop.noteAcceptDrop(adTls,
+        "TLS session setup failed after the PROXY header: " & tlsLastErrorMsg() &
+        "; dropping the connection")
     loop.closeConn(c)
     return
   when not defined(plainHttp):
@@ -1678,7 +1829,12 @@ when not defined(plainHttp):
     ## Advance the QUIC stack: the ngtcp2/nghttp3 shim accepts connections and
     ## parses HTTP/3 via its callbacks (which fill h3slots and the ready list);
     ## we drain UDP in, run timers, dispatch ready requests, and flush UDP out.
-    ngReceive()
+    ##
+    ## ngReceive takes at most ngRecvBudget datagrams and reports whether it
+    ## stopped on the budget rather than on an empty socket. Record that: the
+    ## selector must not wait while QUIC ingress still has work, or a flood's
+    ## backlog would be drained one budget per second-long sleep (#381).
+    loop.quicMorePending = ngReceive()
     for (slot, gen, sid) in ngTakeReady():
       if slot < loop.core.h3slots.len and
           loop.core.h3slots[slot].gen == gen and
@@ -2120,24 +2276,47 @@ proc sweepWsIdle(loop: Loop) =
 
 proc applyQuicReload(loop: Loop) =
   ## Loop thread: apply a pending QUIC certificate reload to this loop's shim
-  ## engine in place. New h3 handshakes present the new cert; in-flight keep
-  ## theirs. A failed reload keeps the running cert and is logged (not silently
+  ## engine. The shim builds a replacement context and swaps it in, so new h3
+  ## handshakes present the new cert and in-flight ones keep theirs. Empty paths
+  ## mean "re-read the configured material", as on the TCP side, and an empty
+  ## per-host set means "rebuild the configured per-host material". A failed
+  ## reload keeps the running cert and is logged with its reason (not silently
   ## dropped); the generation is consumed either way, so a permanently-bad cert
   ## does not spin -- the operator fixes the files and re-issues the reload.
   when not defined(plainHttp):
     if loop.quicReload == nil or loop.udpFd < 0: return
     var cf, kf: string
+    var sni: seq[SniCert]
     let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
-                                loop.quicReloadSeen, cf, kf)
+                                loop.quicReloadSeen, cf, kf, sni)
     if gen != loop.quicReloadSeen:
+      # The paths go to the shim as paths: it owns the engine's configured
+      # material and re-reads the files itself, so empty paths (a bare
+      # reloadTls()) mean "rebuild from what was configured" exactly as they do
+      # on the TCP side. This used to readFile(cf) with cf == "", which raised
+      # and failed the reload, so the certbot pattern never rotated the h3
+      # certificate (#353).
+      #
+      # A reloadTls(sni = ...) override arrives with them and replaces the
+      # engine's per-host set, hosts included. Before that the signal was
+      # cert/key-only: a host added through the override was served the default
+      # certificate over h3 and every client that followed Alt-Svc failed on a
+      # name mismatch, and a removed one kept being served over h3 (#356).
       var ok = false
-      try: ok = ngReloadCert(readFile(cf), readFile(kf))
-      except CatchableError: ok = false
+      var why = ""
+      try:
+        ok = ngReloadCert(cf, kf, toH3SniCerts(sni))
+        if not ok: why = ngLastError()
+      except CatchableError as err:
+        ok = false
+        why = err.msg
       if not ok:
-        try:
-          stderr.writeLine("vortex: HTTP/3 certificate reload failed; " &
-                           "keeping the current certificate on this loop")
-        except IOError, OSError: discard
+        # The reason comes from the shim (makeCtx's own diagnosis, or the
+        # per-host context that refused to build), so the operator learns what
+        # was wrong instead of only that something was (#352).
+        opLog("HTTP/3 certificate reload failed (" &
+              (if why.len > 0: why else: "unknown reason") &
+              "); keeping the current certificate on this loop")
       loop.quicReloadSeen = gen
 
 proc tick(loop: Loop) =
@@ -2353,6 +2532,14 @@ proc run*(loop: Loop) =
       # this a body that paused and then resumed stalls until some unrelated
       # event happens to wake the loop (#366).
       timeoutMs = 0
+    when not defined(plainHttp):
+      if loop.quicMorePending:
+        # The previous pass hit ngReceive's datagram budget with the UDP socket
+        # still readable. Same rule as sslReady: there is known work in hand, so
+        # do not sleep on the selector. The point of the budget is to come back
+        # here between batches so this iteration's TCP fds get serviced; waiting
+        # would undo it (#381).
+        timeoutMs = 0
     var n = 0
     try:
       n = loop.selector.selectInto(timeoutMs, keys)
@@ -2458,11 +2645,10 @@ proc run*(loop: Loop) =
           var stuck = 0
           for c in loop.core.conns.slots:
             if c.state != csFree and c.totalPins > 0: inc stuck
-          try: stderr.writeLine("vortex: graceful shutdown is waiting on " &
-            $stuck & " connection(s) held by a still-running blocking: " &
-            "handler; the loop cannot exit until they return (a handler that " &
-            "never returns will block shutdown -- blocking: bodies must finish)")
-          except IOError, OSError: discard
+          opLog("graceful shutdown is waiting on " & $stuck &
+            " connection(s) held by a still-running blocking: handler; the " &
+            "loop cannot exit until they return (a handler that never returns " &
+            "will block shutdown -- blocking: bodies must finish)")
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
@@ -2516,9 +2702,7 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
     # left for teardown to trip over.
     when defined(gcOrc): GC_fullCollect()
   except CatchableError, Defect:
-    try: stderr.writeLine("vortex: event-loop thread exited on error: " &
-                          getCurrentExceptionMsg())
-    except IOError, OSError: discard
+    opLog("event-loop thread exited on error: " & getCurrentExceptionMsg())
     if arg.listenFd != osInvalidSocket:
       discard posix.close(cint(arg.listenFd))
     if arg.udpFd != osInvalidSocket:

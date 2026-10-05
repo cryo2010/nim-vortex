@@ -82,9 +82,27 @@ suite "PKCS#12 reload":
     # the key recorded during the ignored call.
     check not srv.reloadTls(certFile = dir / "rot.pem")
     check "localhost" in subject()
+    # ...and it says which configuration mistake it was. This used to clear the
+    # bundle fields and then fall into loadCertKey with an empty keyFile, whose
+    # reason was `cannot read private key : cannot open:`: a blank path and a
+    # blank OS reason, naming neither the key nor the bundle.
+    let certOnly = srv.lastTlsReloadError
+    check "certificate-only reload cannot replace a PKCS#12 bundle" in certOnly
+    check "cannot read private key" notin certOnly
     # Rotating both halves replaces the bundle and does take effect.
     check srv.reloadTls(certFile = dir / "rot.pem", keyFile = dir / "rotkey.pem")
     check "rotated.vortex" in subject()
+
+  test "material with no private key at all names what is missing":
+    # The same hole reached through the config rather than a reload: an empty
+    # key path is a configuration gap, not a file error, so readMaterialFile
+    # refuses it by name instead of asking the OS to open "".
+    var msg = ""
+    try:
+      discard tlstransport.newTlsConfig(cert, "")
+    except CatchableError as e:
+      msg = e.msg
+    check "no private key configured" in msg
 
 suite "mTLS":
   test "require: connection without a client cert is refused":
@@ -150,6 +168,75 @@ suite "SNI":
       execCmdEx(cmd)[0].strip()
     check "alt.example" in servedSubject("alt.example")   # SNI hit -> alt cert
     check "localhost" in servedSubject("localhost")       # default cert
+
+  test "the servername match is ASCII-case-insensitive":
+    # Host names are case-insensitive (RFC 6066), so a client that sends
+    # `Alt.Example` must get the same per-host certificate as `alt.example`.
+    # Byte-exact matching fell through to the default cert instead, which the
+    # client then rejects as a name mismatch (#358).
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                 sni = @[SniCertEntry(host: "alt.example",
+                                         certFile: dir / "alt.pem",
+                                         keyFile: dir / "altkey.pem")])).start(0)
+    defer: srv.close()
+    proc servedSubject(servername: string): string =
+      let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " -servername " & servername &
+        " 2>/dev/null | " & opensslBin & " x509 -noout -subject"
+      execCmdEx(cmd)[0].strip()
+    check "alt.example" in servedSubject("Alt.Example")
+    check "alt.example" in servedSubject("ALT.EXAMPLE")
+    check "localhost" in servedSubject("Other.Org")       # still no match
+
+  test "a failing SNI host names itself and leaves nothing half-built":
+    # buildTlsCtx only ever saw the material, so a config with several SNI
+    # entries reported "cannot load TLS certificate/key: ..." with no hint which
+    # host was broken -- and the default ctx, the per-host ctxs ahead of the
+    # failing one and the shared TlsConfig block all leaked out of a
+    # half-initialized config (#361). The leak itself is not observable from
+    # here; what is observable is the named host and that an embedder which
+    # catches the raise can retry with corrected configuration.
+    writeFile(dir / "garbage.pem", "-----BEGIN CERTIFICATE-----\nnope\n")
+    var msg: string
+    try:
+      let cfg = tlstransport.newTlsConfig(cert, key, sni = @[
+        tlstransport.SniCert(host: "good.example", material: tlstransport.TlsMaterial(
+          certFile: dir / "alt.pem", keyFile: dir / "altkey.pem")),
+        tlstransport.SniCert(host: "broken.example", material: tlstransport.TlsMaterial(
+          certFile: dir / "garbage.pem", keyFile: dir / "altkey.pem"))])
+      tlstransport.freeTlsConfig(cfg)
+    except CatchableError as e:
+      msg = e.msg
+    check "broken.example" in msg
+    check "good.example" notin msg          # the host that built fine
+    # Retry with the second host corrected: the failed attempt left no state
+    # behind that would stop a fresh config from coming up and serving.
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                 sni = @[SniCertEntry(host: "broken.example",
+                                         certFile: dir / "alt.pem",
+                                         keyFile: dir / "altkey.pem")])).start(0)
+    defer: srv.close()
+    proc servedSubject(servername: string): string =
+      let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " -servername " & servername &
+        " 2>/dev/null | " & opensslBin & " x509 -noout -subject"
+      execCmdEx(cmd)[0].strip()
+    check "alt.example" in servedSubject("broken.example")
+
+  test "a configured host in mixed case matches a lower-case servername":
+    # The fold applies to both sides, so an operator is not required to
+    # lower-case the configured host.
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                 sni = @[SniCertEntry(host: "Alt.Example",
+                                         certFile: dir / "alt.pem",
+                                         keyFile: dir / "altkey.pem")])).start(0)
+    defer: srv.close()
+    proc servedSubject(servername: string): string =
+      let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " -servername " & servername &
+        " 2>/dev/null | " & opensslBin & " x509 -noout -subject"
+      execCmdEx(cmd)[0].strip()
+    check "alt.example" in servedSubject("alt.example")
 
 removeDir(dir)
 echo "tls advanced ok"

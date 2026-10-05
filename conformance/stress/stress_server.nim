@@ -22,13 +22,25 @@
 ##                            matches the client's x-sha1 header, else 400
 ##   /download                stream STREAM_BYTES of a deterministic generator
 ##                            (byte i = i mod 256); the client re-hashes and checks
+##   /stats                   "<rss> <heap> <fds>", exactly three fields (the
+##                            client and the chaos sidecar both parse it)
+##   /drops                   vortex's accept-path drop counters, so a soak can
+##                            tell "the server refused the connection, here is
+##                            why" from "the network broke" (#388). Also printed
+##                            on SIGTERM/SIGINT.
+##
+## The SIGTERM/SIGINT path at the bottom of the file is for HAND runs: run.sh
+## tears a cell's server down with `docker rm -f`, which is a SIGKILL, so no
+## handler runs and nothing is printed (that is why run.sh dumps the container's
+## last 200 log lines when a cell fails). Run the binary directly and Ctrl-C it
+## and you get the tally plus an orderly shutdown.
 ##
 ## Two build-time axes (driven by the Dockerfile from run.sh), same as
 ## loadtest_server.nim: protocol/codecs via BUILD_FLAGS + LOADTEST_*-style env,
 ## and the handler runtime via one -d:lt* flag (sync / asyncdispatch / chronos),
 ## so VORTEX_SERVER sweeps sync|async|chronos under load.
 
-import std/[os, strutils, posix]
+import std/[os, strutils, posix, atomics]
 import vortex
 import nimcrypto/[sha, hash]        # incremental SHA-1 (nimcrypto is a core dep)
 
@@ -120,6 +132,30 @@ proc openFds(): int =
     for _ in walkDir("/proc/self/fd"): inc result
   except CatchableError: result = 0
 
+var terminating: Atomic[bool]
+  ## Set by the SIGTERM/SIGINT handler; polled by the main loop (see the bottom
+  ## of the file). vortex installs its own signal handlers only in `serve`, not
+  ## `start`, so taking these over here does not fight it.
+
+proc onTerm(sig: cint) {.noconv.} =
+  terminating.store(true, moRelaxed)
+
+proc dropsText(): string {.gcsafe.} =
+  ## The accept-path drop tally as "cap=N tls=N register=N total=N
+  ## acceptSuspend=N". Served on /drops and printed on shutdown. `cap`, `tls`
+  ## and `register` are each a connection the server accepted and then let go of
+  ## on purpose, which at the client is an empty `ConnectError` indistinguishable
+  ## from a network fault -- the soak that chased that for an hour is why this is
+  ## exposed (#388); `total` is their sum. `acceptSuspend` is printed last
+  ## because it is a different kind of number: accept() itself failed on fd
+  ## exhaustion and the listener backed off for ~1s, so nothing was accepted and
+  ## it is not in `total`.
+  ## Deliberately NOT folded into /stats: the client parses that as exactly
+  ## three fields.
+  let d = acceptDrops()
+  "cap=" & $d.cap & " tls=" & $d.tls & " register=" & $d.register &
+    " total=" & $d.total & " acceptSuspend=" & $d.acceptSuspend
+
 # --- shared handler bodies (no await needed; identical sync/async) -----------
 
 template echoBody(req, res: untyped) =
@@ -172,6 +208,11 @@ template statsBody(req, res: untyped) =
   vortex.send(res, Http200,
               $rssBytes() & " " & $getOccupiedMem() & " " & $openFds())
 
+template dropsBody(req, res: untyped) =
+  ## The accept-path drop counters (see dropsText). Its own route so /stats
+  ## keeps its exact three-field contract with the client.
+  vortex.send(res, Http200, dropsText())
+
 template whoamiBody(req, res: untyped) =
   ## The remote address as vortex sees it: the PROXY-protocol source when behind
   ## a trusted L4 proxy (HAProxy `send-proxy`), else the direct peer. The proxy
@@ -184,6 +225,7 @@ when asyncMode:
   proc hEcho(req: Request, res: Response) {.async.} = echoBody(req, res)
   proc hSse(req: Request, res: Response) {.async.} = sseBody(req, res)
   proc hStats(req: Request, res: Response) {.async.} = statsBody(req, res)
+  proc hDrops(req: Request, res: Response) {.async.} = dropsBody(req, res)
   proc hWhoami(req: Request, res: Response) {.async.} = whoamiBody(req, res)
 
   proc hWs(req: Request, res: Response) {.async.} =
@@ -215,6 +257,7 @@ else:
   proc hEcho(req: Request, res: Response) {.gcsafe.} = echoBody(req, res)
   proc hSse(req: Request, res: Response) {.gcsafe.} = sseBody(req, res)
   proc hStats(req: Request, res: Response) {.gcsafe.} = statsBody(req, res)
+  proc hDrops(req: Request, res: Response) {.gcsafe.} = dropsBody(req, res)
   proc hWhoami(req: Request, res: Response) {.gcsafe.} = whoamiBody(req, res)
 
   proc hWs(req: Request, res: Response) {.gcsafe.} =
@@ -271,6 +314,7 @@ when isMainModule:
     rt.addRoute(HttpConnect, "/ws", hWs)
   rt.get("/sse", hSse)
   rt.get("/stats", hStats)
+  rt.get("/drops", hDrops)                 # accept-path drop counters (#388)
   rt.post("/upload", hUpload, streaming = true)
   rt.get("/download", hDownload)
 
@@ -308,4 +352,23 @@ when isMainModule:
       settings.http3 = getEnv("STRESS_HTTP3") == "1"   # QUIC listener for h3 cells
   let srv = newVortex(rt.toHandler, settings, rt.streamPredicate).start()
   echo "listening on ", int(srv.port)
-  while true: sleep(3600 * 1000)
+  # Print the accept-path drop tally on the way out, so a cell that ends with
+  # `docker stop` leaves the number in the container log even if nothing polled
+  # /drops. `docker rm -f` is a SIGKILL and gets nothing, which is why run.sh
+  # also dumps the server's logs when a cell fails. The handler only sets a flag
+  # (the only async-signal-safe thing to do here); the loop below prints.
+  signal(SIGTERM, onTerm)
+  signal(SIGINT, onTerm)
+  while not terminating.load(moRelaxed): sleep(200)
+  # Tally first, teardown second: the print must not be lost if the join below
+  # takes the shutdown grace period (or detaches a stuck thread).
+  echo "stress_server: accept drops: ", dropsText()
+  flushFile(stdout)
+  # `close` = requestShutdown + waitFor, i.e. it blocks until the loop threads
+  # have drained and been joined. `requestShutdown` alone is non-blocking, so
+  # this used to be the last statement of the program: main fell off the end and
+  # ran the process's exit while the loop threads were still serving, racing
+  # teardown in the one binary whose whole job is to surface crashes.
+  srv.close()
+  echo "stress_server: stopped"
+  flushFile(stdout)

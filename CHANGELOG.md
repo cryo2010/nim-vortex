@@ -459,6 +459,329 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are deliberately NOT given the loop's stall credit above: ngtcp2 asserts that
   the clock never goes behind a stamp it has already seen, and the loop drives
   h3 before it ticks, so crediting the gap aborted the process. (#386)
+- Stress harness: a soak cell that fails for an unhandled reason now records
+  that reason. The canary client (`conformance/stress/client/stress_client.py`)
+  handled exactly two failure classes, `Fail` and `asyncio.TimeoutError`, and
+  printed both to stdout; anything else -- an `AttributeError` in a workload, a
+  `RuntimeError` out of aioquic/httpx -- propagated out of `asyncio.run`, which
+  puts the traceback on stderr. The canary container was also run without
+  `2>&1`, and the harness is driven as `nimble stress | tee stress.log`, which
+  tees only stdout, so the archived log showed a bare `FAILED (exit 1)` with no
+  cause anywhere and the cell could not be root-caused after the fact. The
+  canary's stderr is now merged into the tee'd stream, and `main` has a
+  catch-all (plus an `ExceptionGroup` arm, since a library's `TaskGroup` can
+  raise one that neither existing handler matches) that prints
+  `FAIL <workload>: unexpected <type>: <message>` and the full traceback to
+  stdout before exiting non-zero. `KeyboardInterrupt` and `SystemExit` still
+  propagate. The fire-and-forget `reporter` and `loop_watchdog` tasks, which
+  `main` cancels without awaiting, report their own death on stdout too: an
+  exception in either was never retrieved, so a dead reporter and a healthy
+  quiet run both looked like zero report lines. The chaos sidecar's catch-all
+  prints its traceback for the same reason and now covers `BaseException`, so a
+  `CancelledError` escaping its `run()` exits 2 (internal error) instead of 1,
+  which is its fd-leak verdict. (#387)
+- HTTP/3: the QUIC receive buffer now holds a datagram as large as the
+  `max_udp_payload_size` the server advertises. It was 2048 bytes while the
+  transport parameters carried ngtcp2's 65527 default, so a conforming client on
+  a large-MTU path (a 9000-byte VPC MTU, 65536 on loopback) was entitled to send
+  a datagram the kernel then truncated: header protection and AEAD failed,
+  ngtcp2 dropped the packet, the client retransmitted the same oversize datagram
+  indefinitely, and the connection died on the idle timer with nothing logged at
+  either end. Both numbers now come from one constant in the shim
+  (`vq_max_recv_udp_payload`), so they cannot drift apart; the advertisement was
+  deliberately NOT clamped down to the old buffer, which would have capped every
+  datagram the peer sends us and cost throughput on exactly those paths. 65527
+  is also the largest a UDP payload can be, so nothing can arrive truncated any
+  more: the `MSG_TRUNC` the receive passes on Linux, and the `ngTruncatedDrops`
+  counter behind it, are a guard against a future smaller buffer rather than a
+  live path. That counter and `ngRecvBufSize` are shared `Atomic`s instead of a
+  threadvar and a plain global: read off the main thread a threadvar copy was
+  always the main thread's own and so always zero, which made the regression
+  test's assertion on it vacuous, and a plain global written by every loop
+  thread was a data race whatever the values. The two per-thread buffers are
+  released with the engine now (`ngEngineFree`), so a process that starts and
+  stops servers no longer leaks the 64 KiB receive buffer per loop thread per
+  cycle. (#380)
+- HTTP/3: QUIC ingress now takes at most 256 datagrams per drain of the UDP
+  socket (and the loop may drain up to four times per pass: `h3Drive` runs from
+  the outbox, the main drive, the tick's idle sweep and the end-of-pass flush
+  re-drive), so a UDP flood can no longer starve the HTTP/1.1 and HTTP/2
+  connections on the same loop thread. `ngReceive` drained the socket with
+  `while true`, and every datagram is decrypted and parsed synchronously
+  before the next `recvfrom`, so a source whose datagrams cost the server more
+  than they cost the sender kept the thread inside the receive loop: TLS
+  handshakes stalled, responses did not flush, deadlines fired. Reproduced with a flood of Initial
+  packets naming an unsupported QUIC version (each answered with a Version
+  Negotiation packet, so each costs a parse plus a send): a plain HTTP/1.1
+  request on the same server went unserved past a 2 s client timeout, and now
+  completes well inside the bound (tens of milliseconds with four senders,
+  about a second with every core but one blasting). The loop treats a spent
+  budget the way it
+  treats its `sslReady` queue, going straight back round without waiting on the
+  selector, so the backlog is still drained promptly, just with the TCP fds
+  serviced between batches. Address validation (a Retry token) is still not
+  issued, so a spoofed-source flood can still make the shim commit
+  per-connection state up to `maxConnections`. (#381)
+- Accept path: a connection the server accepts and then drops is now counted and
+  explained instead of vanishing. Three paths did it in silence -- the
+  `maxConnections` cap, `startTls` failing because `newTlsSession` returned nil,
+  and `registerHandle` raising (the reason swallowed by `except CatchableError`)
+  -- and at the client every one of them is a socket that opens and dies with
+  nothing on it, which is indistinguishable from a network fault. A 1-hour soak
+  lost a cell to an empty `ConnectError` 90 s in with nothing anywhere to say
+  which. New `server.acceptDrops()` / `vortex.acceptDrops()` (and a no-argument
+  `acceptDrops()` a `{.gcsafe.}` handler can call) return a process-wide
+  `AcceptDrops` whose `total` sums exactly those three (`cap`, `tls`,
+  `register`). A fourth counter, `acceptSuspend`, reports the times `accept()`
+  itself failed on fd/memory exhaustion and the listener was deregistered for
+  ~1s; it is reported beside `total` and deliberately not part of it, because
+  nothing was accepted there and the kernel's backlog simply waits for the
+  listener to come back, so it counts backoff events rather than connections.
+  Each of the four writes one line to stderr saying why -- which cap, the
+  OpenSSL reason, the selector's message -- rate-limited to one per cause per
+  5 s per loop thread, with the first occurrence of a cause never suppressed.
+  Those lines, and the handful of other operator messages the server emits, go
+  through a single sink (`opLog`) rather than bare `stderr.writeLine` calls
+  scattered through the loop. The stress harness grew a `/drops` endpoint
+  (`/stats` keeps its exact three fields), prints the tally on SIGTERM and then
+  shuts the server down through the blocking `close` so its loop threads are
+  joined before the process exits (it used to fall off the end of `main` with
+  them still running), and dumps the server container's log when a cell fails,
+  so the server's stderr survives in the run log. (#388)
+- TLS: a private-key load failure now names its reason. `loadKeyMem` cleared the
+  OpenSSL error queue on the failure path, so by the time `buildTlsCtx` read it
+  there was nothing left and every key problem -- a wrong `keyPassword`, a
+  truncated PEM block, a key in an encoding the decoder rejects -- was reported
+  as `cannot load TLS certificate/key: unknown TLS error`, which reads like a
+  library fault rather than the configuration mistake it is. The reason now
+  survives to the exception message (`bad decrypt` for a wrong passphrase), on
+  key files and in-memory `keyPem` alike, and `lastErrorMsg` drains the queue it
+  read from so one failed load cannot lend its reason to the next attempt on the
+  same thread. The QUIC path names its files the same way: a missing or
+  unreadable certificate, key or PKCS#12 path was reported as `cannot load TLS
+  certificate/key: error:80000002:system library::No such file or directory`,
+  with neither the path nor which half of the pair failed in it, and now reads
+  `cannot read private key <path>: <reason>`. (#377)
+- TLS: SNI host matching on the TCP listener is ASCII-case-insensitive. Host
+  names are case-insensitive (RFC 6066, and DNS generally), but `cstrEq` and
+  `wildMatch` compared bytes, so a client that sent `Example.com` for a
+  configured `example.com` matched nothing, fell through to the default
+  certificate and failed the handshake on a name mismatch. Both sides of the
+  comparison are now folded, so the configured `host` need not be lower-cased
+  either, and the fold is ASCII-only rather than locale-aware (a locale tolower
+  folds `I` to a dotless `i` under tr_TR, which would make matching depend on
+  the server's locale). The HTTP/3 path already folded case. (#358)
+- TLS: a per-host SNI certificate that fails to build no longer leaks the
+  half-built config. `newTlsConfigWith` let the exception escape, so the default
+  context, every per-host context ahead of the failing one and the shared
+  `TlsConfig` block were all abandoned. They are freed before the raise, and the
+  message now names the host (`SNI host "broken.example": ...`) rather than
+  reporting only the material, so an operator with several SNI entries can tell
+  which one is broken and an embedder that catches the raise can retry with
+  corrected configuration. (#361)
+- TLS: SNI keeps working after a certificate reload. `reloadTlsConfig` rebuilds
+  the default context and re-registered only the ALPN callback on the
+  replacement, so the servername callback went away with the old context: from
+  the first `reloadTls()` onwards every configured SNI host was served the
+  *default* certificate and failed the handshake on a name mismatch, until the
+  process restarted. Because the fault only appears after a reload it would
+  surface in production long after deployment rather than in testing. The
+  callback registration both paths need is now one helper (`installDefaultCbs`),
+  so the initial build and the reload cannot drift apart again. (#355)
+- TLS: per-host (SNI) certificates rotate on reload. `reloadTlsConfig` rebuilt
+  only the default context, so every SNI host served the certificate it loaded
+  at startup for the lifetime of the process and eventually served an expired
+  one, with no API to rotate it short of a restart. `TlsConfig` now keeps each
+  host's `TlsMaterial` alongside its host name and context, every per-host
+  context is rebuilt from it on reload (so a bare `reloadTls()` re-reads the
+  per-host files, the certbot pattern), and `reloadTls`/`reloadTlsConfig` take
+  an `sni` override that replaces the per-host material wholesale, host set
+  included, persisted only on success. The reload is all-or-nothing with the
+  default context: one per-host certificate that fails to build rejects it and
+  leaves everything as it was, rather than half-rotating or dropping a host back
+  to the default certificate. The new contexts are published and the old ones
+  released under `ctxLock`, which `servernameCb` now holds across its whole
+  lookup, so a handshake can neither index a context array that disagrees with
+  the host list it scanned nor have a context freed between the load and
+  `SSL_set_SSL_CTX` (which up-refs what it is handed). The override reaches
+  HTTP/3 as well: the loops used to be signalled with the cert/key paths alone
+  and rebuilt their host contexts from the material the engine was configured
+  with, so a host *added* through `sni` was served the default certificate over
+  QUIC and every client that followed Alt-Svc failed on a name mismatch (the
+  #374 bug again, for any host configured after startup), while a host removed
+  from it kept being served its retired certificate over h3 for the life of the
+  process. `CertReload` now carries the replacement set across to the loop
+  threads as a serialised, GC-free blob published with the generation, and the
+  QUIC reload installs it in the same all-or-nothing transaction as the default
+  certificate, so the host set and the material are identical on both
+  transports. An empty `sni` still means "keep what is configured" on either
+  side; there is no spelling for "drop every host". (#356)
+- TLS: a rejected certificate reload says why. `reloadTlsConfig` caught the
+  exception carrying the only diagnostic that existed and returned a bare
+  false, which `server.reloadTls` passed on with nothing written anywhere and
+  no accessor to ask, so an operator whose certbot deploy hook failed could not
+  tell an unreadable certificate from a mismatched key, a missing OCSP file or a
+  rejected cipher string. Every false return now records the reason on the
+  config and writes one `vortex: TLS reload failed: <reason>` line to stderr,
+  matching the convention `applyQuicReload` already follows, so a hook that
+  ignores the bool still leaves a trace. Read the reason back with
+  `server.lastTlsReloadError` / `vortex.lastTlsReloadError` (present and
+  constant under `-d:plainHttp`); a successful reload clears it. The reason is
+  published and read under the short context lock, not the reload lock, so
+  reading it from a health handler on a loop thread cannot stall that loop for
+  the length of a rotation. (#378)
+- HTTP/3: the ngtcp2 ossl crypto backend is initialized exactly once per
+  process instead of once per QUIC engine. `ngtcp2_crypto_ossl_init` allocates
+  an OpenSSL `ex_data` index and parks it in a library-level global, and is
+  documented as a once-per-process, not-thread-safe initializer -- yet
+  `vq_engine_new` ran it on every loop thread as the loops came up, all at the
+  same time. Each extra call leaked an index, and while they raced a session
+  configured under one index could be read back under another, which yields a
+  null crypto context and a failed handshake: non-deterministic, only during
+  startup of a `numThreads > 1` server, and indistinguishable from a flaky
+  client. The initializer now runs under a `std::call_once` and every engine
+  sees the same verdict, so a failure fails them all rather than leaving some
+  loops on a half-initialized backend. (#357)
+- HTTP/3: the shim's certificate loaders clear the context's existing chain
+  before installing a new one, so an in-place certificate reload no longer
+  grows what h3 clients receive. `SSL_CTX_use_certificate` does not touch the
+  chain (unlike `SSL_CTX_use_certificate_chain_file`, which clears it first),
+  and the PEM loader appended the new intermediates on top of the previous
+  leaf's, as did the PKCS#12 loader's `SSL_CTX_add1_chain_cert` calls. After a
+  CA rotated its intermediate, the next reload handed clients the new leaf
+  together with the old, no-longer-valid intermediates -- rejected outright by
+  strict clients, a larger handshake for the rest -- and the chain grew again
+  with every subsequent reload. (#354)
+- HTTP/3: a certificate hot reload now builds a complete replacement `SSL_CTX`
+  and installs it only once every piece of material loaded and the key matches
+  the certificate, so a refused reload leaves the engine serving exactly what
+  it was serving before. It used to write into the live context, certificate
+  first then key, with no validation and no rollback: OpenSSL's `ssl_set_cert`
+  silently frees the existing private key when the new leaf does not match it,
+  and `ssl_set_pkey` silently frees the existing certificate when the new key
+  does not match, so an unreadable, missing or mismatched key left the loop's
+  context holding one half of a pair and every later HTTP/3 handshake on it
+  failed until the process restarted -- while the operator was told the old
+  certificate was still serving. A cert-only reload was even reported as a
+  success. The per-host (SNI) rebuild is part of the same transaction, so a
+  failure anywhere leaves every context untouched, and the reload's failure
+  reason now reaches the log line instead of generic text: the shim's context
+  builder records which step failed plus whatever OpenSSL queued about it
+  (`vq_engine_last_error`), and the same reason is appended to the "HTTP/3
+  engine setup failed" line at startup. (#352)
+- HTTP/3: a bare `reloadTls()` now rotates the HTTP/3 certificate too. The
+  no-argument form means "re-read the configured material", which the TCP
+  listener has always honoured, but nothing resolved it on the QUIC side: the
+  loop handed the shim `readFile("")`, which raised, so the reload failed and
+  was logged. That is the certbot pattern the project documents (renew in
+  place, then `srv.reloadTls()`), so after a renewal HTTP/1.1 and HTTP/2 served
+  the new certificate while HTTP/3 kept serving the one loaded at startup until
+  it expired, at which point every h3 connection failed while the other
+  protocols stayed healthy. The QUIC engine now keeps the material it was
+  configured from -- cert/key paths, in-memory PEM, PKCS#12 bundle and the key
+  passphrase -- and a reload with no paths rebuilds from it, re-reading any
+  files, exactly as `reloadTlsConfig` does; what loads successfully becomes
+  what the next bare reload re-reads. Explicit paths replace the configured
+  source under the same rules as the TCP path, including refusing a one-sided
+  reload against a PKCS#12-sourced certificate: a `keyFile` without a
+  `certFile`, and now a `certFile` without a `keyFile` too, which cleared the
+  bundle and left the key half with nothing to load, so it came back as a bare
+  `certificate/key mismatch` instead of naming the one thing to change. For
+  material configured as PEM bytes or PKCS#12 *bytes* there is nothing to
+  re-read, so the rebuild is a correct no-op for the default certificate (a
+  configured `pkcs12File` is re-read like any other path) and still refreshes
+  the per-host files. (#353)
+- TLS, HTTP/3: certificate validity (`notBefore` / `notAfter`) is now checked
+  wherever material is installed -- at startup and on reload, on the TCP path
+  (`buildTlsCtx`) and the QUIC path alike, default and per-host certificates
+  both. Nothing checked it before: an expired certificate loaded cleanly and
+  `reloadTls()` returned true, so a renewal hook racing a certbot symlink swap,
+  or one pointed at `archive/` instead of `live/`, reported success while every
+  new connection from that moment failed at the client with
+  `certificate_expired`, masked until the in-flight ones turned over. The
+  policy is a hard failure with no clock-skew allowance and no warning-only
+  mode: startup raises `certificate expired at <notAfter>` or `certificate not
+  valid until <notBefore>`, and a reload is rejected with the running
+  certificate left serving. A time that cannot be read at all is refused too:
+  `X509_cmp_current_time` returns 0 only on failure (it reports an exact
+  equality as -1), and that 0 used to count as "inside the window", so a
+  certificate whose `notAfter` OpenSSL's own `x509` command prints as `Bad time
+  value` was installed on the strength of a comparison that never happened; it
+  now fails with `certificate validity time could not be parsed`.
+  **Behaviour change**: a server that previously started while serving an
+  expired certificate now refuses to start. (#379)
+  certificate left serving. A `notBefore`/`notAfter` that OpenSSL cannot parse
+  at all is a rejection too (`certificate validity time could not be parsed`)
+  rather than a pass: it is the one case where nothing is known about the
+  window. **Behaviour change**: a server that previously started while serving
+  an expired certificate now refuses to start. (#379)
+- HTTP/3: TLS 1.3 session resumption now works across loop threads. Each loop
+  builds its own QUIC `SSL_CTX` and OpenSSL mints a random ticket key per
+  context, so a ticket was only decryptable by the loop that issued it -- while
+  which loop receives a returning client's first datagram is decided by the
+  kernel's SO_REUSEPORT hash over its new 4-tuple, which has nothing to do with
+  the issuing loop. On an N-loop server roughly (N-1)/N of resumption attempts
+  therefore fell back to a full handshake, invisibly: the connection succeeded,
+  just a round trip slower, every time. The contexts stay per-loop (the
+  per-loop certificate reload is built on that) and a process-wide ticket key
+  is installed on every one of them, default and per-host, initial and rebuilt,
+  alongside an explicit session-id context like the TCP path's. The key rotates
+  hourly: the current key encrypts, the previous one still decrypts for one
+  more lifetime with the ticket reissued under the new key, and any older name
+  is refused and costs that client one full handshake -- so a disclosed key
+  exposes at most two hours of resumed sessions instead of every session since
+  startup, which is what nginx and envoy rotate for. The TCP listener is
+  unchanged and keeps OpenSSL's per-context key: nothing rotates it on a
+  schedule, but it (and the TLS 1.2 session cache) is regenerated by every
+  certificate reload, which invalidates every ticket issued before it -- so h3
+  resumption now survives a rotation where TCP's does not. 0-RTT early data is
+  not offered on any protocol and is unaffected. (#382)
+- TLS: an OpenSSL failure reason is now formatted into a buffer of its own, and
+  the thread's error queue is cleared before each session is created, so the
+  reason an operator reads belongs to the failure in front of them.
+  `lastErrorMsg` formatted with `ERR_error_string(e, nil)`, which writes into
+  OpenSSL's single process-wide `static char buf[256]` and is documented as not
+  thread-safe. That was harmless while only the configuration path used it, but
+  #388 exported it as `tlsLastErrorMsg()` and the accept path calls it from
+  every loop thread, so two threads reporting a failure at the same moment could
+  each be handed the other's message: a two-thread probe read 128 to 2,760 wrong
+  messages per 400,000 samples, and none at all through
+  `ERR_error_string_n` into a local buffer. `newTlsSession` also never cleared
+  the queue, and `tlsHandshake` / `tlsRead` / `tlsWrite` leave their reason on
+  it when a connection fails, so the accept path's `TLS session setup failed`
+  line could name the failure of an *earlier* connection accepted on the same
+  loop thread. `loadPkcs12` and `buildTlsCtx` now clear the queue on entry as
+  the PEM loaders already did, so a rejected bundle, cipher string or protocol
+  version is not reported with a leftover from unrelated OpenSSL work either.
+  (#377, #388)
+- TLS: a certificate-only `reloadTls(certFile = ...)` against material that came
+  from a PKCS#12 bundle is rejected with a reason, the way the key-only case
+  already was. The bundle carries both halves, so clearing the bundle fields for
+  a lone certificate left no private key at all: the reload did fail, but its
+  reason was `cannot read private key : cannot open:` -- the path and the OS
+  reason both blank, naming neither the key nor the bundle. It is now refused
+  before anything is built, with `a certificate-only reload cannot replace a
+  PKCS#12 bundle: rotate certFile and keyFile together, or reconfigure with a
+  new bundle`, and an empty key or bundle path reaching the loader anywhere else
+  reports `no private key configured` rather than asking the OS to open `""`.
+  (#377, #378)
+- TLS: an SNI handshake no longer serialises every loop's accept path. The
+  servername callback held the config's context lock across `SSL_set_SSL_CTX`,
+  which in OpenSSL 3 is not a pointer store: it duplicates the entire CERT of
+  the context it is handed (an allocation plus an up-ref per chain entry and per
+  key slot) and frees the connection's old one. `acquireCtx` takes that same
+  lock on every accept, so every accepted connection on every loop thread
+  queued behind each SNI handshake's certificate duplication. The lock now
+  covers only the host scan and an up-ref of the chosen context -- which is what
+  keeps a concurrent reload from releasing it -- while the switch itself runs
+  outside the lock and the callback's own reference is dropped straight
+  afterwards. (#356)
+  startup, which is what nginx and envoy rotate for. The rotation is driven
+  from the per-tick engine entry the loops already run, not only from the
+  encrypt side of the callback: keyed off ticket traffic alone the hourly bound
+  held only on a busy server, and a ticket minted at t=0 was still accepted at
+  t=10h if no ticket had been issued in between. 0-RTT early data is not
+  offered on any protocol and is unaffected. (#382)
 
 ### Changed
 

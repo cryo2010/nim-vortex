@@ -53,6 +53,13 @@ incompressible store-fallback.
 The matrix is `VORTEX_PROTO` × `VORTEX_SERVER`; each cell builds its own server
 image and prints `== <workload> [proto=<p> server=<s>]: PASS/FAIL ==`.
 
+Capture a soak with `nimble stress | tee stress.log`: `tee` takes stdout only,
+so every line that explains a verdict is on stdout, the client containers'
+stderr included (`run.sh` merges it, and the clients print a `FAIL <workload>:
+<cause>` line with its traceback rather than letting the interpreter put one on
+stderr). A cell that fails with nothing but `FAILED (exit N)` in the log is a
+harness bug, not a soak to re-run blind.
+
 Runs are isolated by `VORTEX_RUN_ID` (defaults to the PID), so several can run
 concurrently without clobbering each other's containers/images, e.g.
 
@@ -196,6 +203,47 @@ drain pause):
 ```sh
 VORTEX_CHAOS=none nimble stress
 ```
+
+## Diagnosing a connection that just died (`/drops`)
+
+At the client, a connection the server refused after accepting it is
+indistinguishable from a network fault: the socket opens, dies with nothing on
+it, and httpx reports an empty `ConnectError`. A 1-hour soak lost a cell to
+exactly that, 90 s in, with nothing anywhere saying which (#388). The stress
+server therefore exposes vortex's accept-path counters on its own route:
+
+```sh
+curl -s http://localhost:8080/drops
+cap=0 tls=0 register=0 total=0 acceptSuspend=0
+```
+
+| Field | Meaning |
+|-------|---------|
+| `cap` | `maxConnections` was reached on that loop thread; the connection was accepted and closed at once |
+| `tls` | the TLS session could not be created |
+| `register` | the selector refused the accepted fd |
+| `total` | `cap + tls + register`: every connection accepted and then dropped |
+| `acceptSuspend` | `accept()` itself failed on fd/memory exhaustion and the listener backed off for ~1s. Nothing was accepted, so this is **not** in `total`; it counts backoffs, and it means the container is out of descriptors |
+
+Each is process-wide and monotonic, so compare two samples rather than reading
+one. The same numbers also go to the server's stderr: one rate-limited `vortex:`
+line per cause per 5 s per loop thread, saying which cap, which OpenSSL reason,
+which selector message.
+
+Two things to know about it:
+
+- **Nothing polls `/drops` automatically.** Neither the verified client nor the
+  chaos sidecar touches it (and it is deliberately a separate route from
+  `/stats`, which the client parses as exactly three fields). It is there for
+  you to `curl` while a soak runs, or to read out of the log afterwards.
+- **A failed cell dumps the server log for you.** `run.sh` prints
+  `--- server log (last 200 lines) ---` followed by `docker logs --tail 200` of
+  the server container before tearing it down, but only when the cell failed (a
+  clean hour-long cell would bury its own report lines). That tail is where the
+  `vortex:` lines live, because the container's stderr goes away with it:
+  teardown is `docker rm -f`, a SIGKILL, so the server's own
+  "accept drops: ..." print on SIGTERM never runs under `run.sh`. It is there
+  for hand runs of the binary.
 
 ## Gaps
 

@@ -70,10 +70,38 @@ type
     quicReload: pointer        ## ptr CertReload: signals loops to reload h3 certs
     port*: Port                ## actual bound port (settings may say 0)
 
+export AcceptDrops, AcceptDropCause
+export eventloop.acceptDrops   ## the no-argument, process-wide form (see below)
+
 proc requestShutdown*(server: var Server) =
   ## Ask just this server's event loops to stop after their current tick.
   if server.stopFlag != nil:
     server.stopFlag[].store(true, moRelaxed)
+
+proc acceptDrops*(server: Server): AcceptDrops =
+  ## Connections this process accepted and then dropped, per cause: the
+  ## `maxConnections` cap (`cap`), a failed TLS session setup (`tls`), and a
+  ## selector registration the kernel refused (`register`). Each of those
+  ## reaches the client as a connection that opened and died with nothing on it,
+  ## which is indistinguishable from a network fault -- sample this to tell "the
+  ## server refused you on purpose" from "the network broke" (#388). `total`
+  ## sums exactly those three.
+  ##
+  ## `acceptSuspend` is reported alongside them but is NOT in `total`: it counts
+  ## the times accept() itself failed with fd/memory exhaustion and the listener
+  ## backed off for ~1s. Nothing was accepted there, so no connection was
+  ## dropped -- the backlog waits for the listener to come back, or times out in
+  ## it. Treat it as "the process is out of descriptors", i.e. raise the fd
+  ## rlimit.
+  ##
+  ## Every one of the four writes one rate-limited line to stderr saying why.
+  ##
+  ## The tally is process-wide, not per-server: the loop threads keep the
+  ## counters and have no back-pointer to their `Server`. With one server per
+  ## process (the normal case) that distinction does not arise. The
+  ## no-argument `acceptDrops()` reads the same numbers and is what a
+  ## `{.gcsafe.}` handler can call.
+  eventloop.acceptDrops()
 
 proc validateConfig(s: VortexConfig) =
   ## Reject nonsensical/dangerous configurations up front rather than failing
@@ -291,10 +319,9 @@ proc waitFor*(server: var Server) =
     # (it would hang) and do NOT free anything they still reference (pool,
     # outboxes, stopFlag, tls, quicReload, alive). Drop our handles so a second
     # close/waitFor is a no-op.
-    try: stderr.writeLine("vortex: " & $live & " thread(s) still in a blocking: " &
-      "handler after " & $server.hardShutdownSec & "s; detaching and leaking " &
-      "their resources so shutdown returns (the handler never returned)")
-    except IOError, OSError: discard
+    opLog($live & " thread(s) still in a blocking: handler after " &
+      $server.hardShutdownSec & "s; detaching and leaking their resources so " &
+      "shutdown returns (the handler never returned)")
     server.threads.setLen(0)
     server.outboxes.setLen(0)
     server.pool = nil
@@ -313,8 +340,19 @@ proc close*(server: var Server) =
   server.requestShutdown()
   server.waitFor()
 
+const noTlsReason = "TLS is not enabled on this server"
+  ## The one reload rejection that has no TlsConfig to record itself on, so both
+  ## reloadTls and lastTlsReloadError name it from here.
+
+proc logNoTls() =
+  ## The logged half of a rejection reloadTlsConfig never sees, in the same
+  ## shape it writes for the ones it does (#378), through the loop's one
+  ## operator-log sink (#388).
+  opLog("TLS reload failed: " & noTlsReason)
+
 proc reloadTls*(server: var Server, certFile = "", keyFile = "",
-                ocspFile = "", ocspResponse = "", clearOcsp = false): bool =
+                ocspFile = "", ocspResponse = "", clearOcsp = false,
+                sni: openArray[SniCertEntry] = []): bool =
   ## Hot-reload the TLS certificate/key for new HTTPS (HTTP/1.1 and HTTP/2)
   ## connections, without a restart and without dropping in-flight ones. Pass
   ## new paths, or leave empty to re-read the originally configured files (e.g.
@@ -325,34 +363,75 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## bundle is one such rejection: the bundle carries both halves, so rotate
   ## both (`certFile` + `keyFile`) rather than the key alone.
   ##
+  ## Per-host (SNI) certificates rotate on the same call, on both transports.
+  ## Each one is rebuilt from the material it was configured with, so a bare
+  ## `reloadTls()` re-reads the per-host files as well and a renewal that
+  ## replaces them in place is picked up without naming them. Pass `sni` to
+  ## replace the per-host material wholesale -- the host set may change, and the
+  ## new material may be in-memory PEM -- and the HTTP/3 engine takes the
+  ## replacement set too, so a host added here is served its own certificate
+  ## over h3 and a host removed here stops being served over h3. It is persisted
+  ## only on success, like the default pair, and an empty `sni` means "keep what
+  ## is configured" (there is no spelling for "drop every host"). The whole
+  ## reload is all-or-nothing: one bad per-host certificate rejects it and
+  ## leaves the default certificate and every host exactly as they were.
+  ##
   ## The stapled OCSP response rotates on the same call: `ocspResponse` supplies
   ## DER bytes, `ocspFile` a path read now (an unreadable one rejects the reload
   ## like a bad cert), `clearOcsp = true` drops the staple. With all three empty
   ## a configured `ocspFile` is re-read best-effort (so a bare `reloadTls()`
   ## after certbot picks up a refreshed staple without failing on a stale one).
   ## Staple rotation covers the default cert only: SNI ctxs and HTTP/3 do not
-  ## staple, and the h3 reload signal below stays cert/key-only.
+  ## staple, so the h3 reload signal below carries the cert/key paths and the
+  ## per-host set, never a staple.
   ##
   ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
   ## inside a raw signal handler. Two threads may call it at once (a SIGHUP
   ## loop plus an admin endpoint, say): the reloads serialise internally.
   ## Covers HTTP/1.1, HTTP/2, and (when enabled)
-  ## HTTP/3: each h3 loop updates its own QUIC ctx in place on its next tick, so
-  ## new h3 handshakes use the new certificate while in-flight ones keep theirs.
+  ## HTTP/3: each h3 loop builds a replacement QUIC ctx on its next tick and
+  ## swaps it in only once the material has loaded and the key matches, so new
+  ## h3 handshakes use the new certificate while in-flight ones keep theirs.
   when defined(plainHttp):
+    logNoTls()
     false
   else:
-    if server.tls == nil: return false
+    if server.tls == nil:
+      logNoTls()
+      return false
+    # Reuse eventloop's single SniCertEntry -> SniCert mapping rather than
+    # repeating the field list here; the other VortexConfig fields are unused by
+    # it. An empty `sni` stays empty, which reloadTlsConfig reads as "keep the
+    # configured per-host material and re-read its files".
     let ok = reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile,
-                             ocspFile, ocspResponse, clearOcsp)
+                             ocspFile, ocspResponse, clearOcsp,
+                             toSniCerts(VortexConfig(sni: @sni)))
     # Only signal the h3 loops when the TCP reload succeeded, so TCP and h3
     # never end up on different certificates and the returned bool applies to
     # both. A per-loop h3 apply failure (e.g. a transient bad read) is logged by
     # the loop; re-issue reloadTls to retry it.
     if ok and server.quicReload != nil:
+      # The per-host override travels with the paths, so h3 ends up on the same
+      # host set and the same certificates as the TCP listener (#356). Converted
+      # by the same mapping the TCP reload above used.
       requestCertReload(cast[ptr CertReload](server.quicReload),
-                        certFile, keyFile)
+                        certFile, keyFile,
+                        toSniCerts(VortexConfig(sni: @sni)))
     ok
+
+proc lastTlsReloadError*(server: Server): string =
+  ## Why the most recent `reloadTls` returned false; "" when the last one
+  ## succeeded, or none has run. A bare false left a certbot deploy hook with no
+  ## way to tell an unreadable certificate from a mismatched key, a missing OCSP
+  ## file or a rejected cipher string (#378). The same reason also goes to stderr
+  ## as one `vortex: TLS reload failed: <reason>` line, so a hook that ignores
+  ## the bool still leaves a trace. Under `-d:plainHttp`, where `reloadTls`
+  ## never succeeds, it always names that.
+  when defined(plainHttp):
+    noTlsReason
+  else:
+    if server.tls == nil: return noTlsReason
+    lastTlsReloadError(cast[ptr TlsConfig](server.tls))
 
 # --- the Vortex object API --------------------------------------------------
 
@@ -402,6 +481,11 @@ proc requestShutdown*(v: Vortex) =
   ## Ask this server's loops to stop after their current tick (non-blocking).
   v.server.requestShutdown()
 
+proc acceptDrops*(v: Vortex): AcceptDrops =
+  ## Accept-path drops per cause (see the `Server` overload for what each one
+  ## means and why the tally is process-wide).
+  v.server.acceptDrops()
+
 proc waitFor*(v: Vortex) =
   ## Block until the loops exit (after `requestShutdown` or a signal).
   v.server.waitFor()
@@ -415,8 +499,15 @@ proc stop*(v: Vortex) =
   v.server.close()
 
 proc reloadTls*(v: Vortex, certFile = "", keyFile = "",
-                ocspFile = "", ocspResponse = "", clearOcsp = false): bool =
-  ## Hot-reload the TLS cert/key (and optionally rotate/clear the OCSP staple)
-  ## for new connections without a restart (see the Server-level docs). Returns
-  ## false if TLS is off or the new material is bad.
-  v.server.reloadTls(certFile, keyFile, ocspFile, ocspResponse, clearOcsp)
+                ocspFile = "", ocspResponse = "", clearOcsp = false,
+                sni: openArray[SniCertEntry] = []): bool =
+  ## Hot-reload the TLS cert/key (and optionally rotate/clear the OCSP staple,
+  ## or replace the per-host SNI material) for new connections without a
+  ## restart (see the Server-level docs). Returns false if TLS is off or the new
+  ## material is bad.
+  v.server.reloadTls(certFile, keyFile, ocspFile, ocspResponse, clearOcsp, sni)
+
+proc lastTlsReloadError*(v: Vortex): string =
+  ## Why the most recent `reloadTls` returned false; "" when the last one
+  ## succeeded, or none has run (see the Server-level docs).
+  v.server.lastTlsReloadError

@@ -294,7 +294,7 @@ of "hotReload":
     fail("initial cert is not alpha")
   genCert(dir / "bravo.pem", dir / "bravokey.pem", "bravo.vortex")
   if not srv.reloadTls(dir / "bravo.pem", dir / "bravokey.pem"):
-    fail("reloadTls returned false")
+    fail("reloadTls returned false: " & srv.lastTlsReloadError)
   if "bravo.vortex" notin sClientSubject(srv.port, "localhost"):
     fail("cert did not swap to bravo after reload")
   let (o, rc) = curlGet(srv.port)
@@ -326,7 +326,7 @@ of "ocspReload":
     fail("initial staple A not served: " & s)
   if not srv.reloadTls(dir / "srv2.pem", dir / "srv2.key",
                        ocspFile = dir / "resp2.der"):
-    fail("reloadTls(cert+ocsp) returned false")
+    fail("reloadTls(cert+ocsp) returned false: " & srv.lastTlsReloadError)
   s = staple()
   if serialB notin s: fail("staple did not rotate to B: " & s)
   if serialA in s: fail("staple A still served after rotation: " & s)

@@ -284,6 +284,12 @@ OpenSSL accepts (RSA, ECDSA, Ed25519) is supported. `keyPassword` applies to a
 file or in-memory key; without it, an encrypted key fails to start (rather than
 prompting).
 
+The certificate's validity window is checked wherever material is installed, on
+every transport: an expired or not-yet-valid leaf fails startup outright
+(`certificate expired at <notAfter>` / `certificate not valid until
+<notBefore>`) and makes `reloadTls` return `false` with the running certificate
+untouched. There is no skew allowance and no warning-only mode.
+
 **PKCS#12 (.pfx/.p12)** bundles the cert, key, and chain in one blob; pass the
 file or the bytes, with `keyPassword` as the bundle passphrase:
 
@@ -311,15 +317,28 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
 default cert is the fallback; `sni` adds host-specific certs (each from files,
 PEM, or PKCS#12). A `host` of `*.example.com` matches a single leading label
 (`api.example.com`, not `example.com` or `a.b.example.com`); an exact host wins
-over a wildcard. Per-host certificates are served over HTTP/3 as well, so a
-browser that follows the Alt-Svc upgrade to QUIC gets the same certificate it
-got over TCP:
+over a wildcard. Host matching is ASCII-case-insensitive on both sides (RFC
+6066), so a client sending `API.Example.com` gets the same certificate and the
+configured `host` need not be lower-cased. Per-host certificates are served over
+HTTP/3 as well, so a browser that follows the Alt-Svc upgrade to QUIC gets the
+same certificate it got over TCP:
 
 ```nim
 initVortexConfig(certFile = "default.pem", keyFile = "default.key",
                  sni = @[SniCertEntry(host: "*.example.com",
                                       certFile: "wild.pem", keyFile: "wild.key")])
 ```
+
+Per-host certificates rotate through `reloadTls` along with the default one, on
+both transports: a bare `srv.reloadTls()` re-reads every per-host file as well,
+so one certbot deploy hook covers the whole set. Pass
+`sni = @[SniCertEntry(...)]` to replace the per-host material outright, adding
+or removing hosts or handing over new in-memory PEM, and HTTP/3 takes the
+replacement set too, so a host added there is served its own certificate over
+QUIC and one removed there stops being served over QUIC. An empty `sni` means
+"keep what is configured" (there is no way to drop every host). A reload is
+all-or-nothing: one bad per-host certificate rejects it and leaves the default
+certificate and every host as they were.
 
 **TLS version range**: `minTlsVersion` (default `TlsVersion.V12`) floors it; `maxTlsVersion`
 (default `TlsVersion.None` = no cap) ceils it, e.g. `maxTlsVersion = TlsVersion.V12` to keep
@@ -339,6 +358,12 @@ initVortexConfig(certFile = "cert.pem", keyFile = "key.pem",
 # later, after refreshing ocsp.der (or renewing the cert):
 discard srv.reloadTls(ocspFile = "ocsp.der")   # rotate the staple
 ```
+
+A `reloadTls` that returns false records why: read it back with
+`srv.lastTlsReloadError`, and the same reason is written to stderr as one
+`vortex: TLS reload failed: <reason>` line so a deploy hook that ignores the
+bool still leaves a trace. A successful reload clears it. Reading it is cheap
+and safe from a request handler: it never waits for a reload in progress.
 
 #### Request size limits
 
@@ -369,6 +394,23 @@ app.serve(8080, config = initVortexConfig(
 
 To accept a large upload without buffering it whole (so `maxBodySize` isn't the
 constraint), stream it instead; see [Upload](#upload).
+
+Connections refused *before* a request exists (the `maxConnections` cap, a
+failed TLS session setup, a selector refusal) cannot be reported in a response,
+so they are counted instead:
+
+```nim
+let d = srv.acceptDrops()   # total = cap + tls + register
+```
+
+`d.acceptSuspend` sits beside that total without being part of it: it counts the
+times `accept()` itself failed on fd exhaustion and the listener backed off, so
+nothing was accepted and the kernel's backlog waited rather than being dropped.
+
+Each also writes one rate-limited `vortex:` line to stderr saying why. Sample
+the counters to tell "the server refused the connection on purpose" from "the
+network broke" -- at the client both look like a bare connect failure. See
+[HARDENING.md](HARDENING.md#seeing-the-limits-fire).
 
 ### Handlers
 

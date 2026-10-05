@@ -124,7 +124,9 @@ proc SSL_CTX_set_ex_data(ctx: SslCtxPtr, idx: cint, arg: pointer): cint
 proc ERR_clear_error()
 proc ERR_get_error(): culong
 proc ERR_peek_last_error(): culong
-proc ERR_error_string(e: culong, buf: cstring): cstring
+proc ERR_error_string_n(e: culong, buf: cstring, len: csize_t)
+  ## Deliberately not ERR_error_string: that one formats into a process-wide
+  ## static buffer. See lastErrorMsg.
 proc X509_get_subject_name(x: pointer): pointer          # X509_NAME* (borrowed)
 proc X509_NAME_oneline(name: pointer, buf: cstring, size: cint): cstring
 proc BIO_new_mem_buf(buf: pointer, len: cint): pointer   # read-only mem BIO
@@ -147,6 +149,13 @@ proc CRYPTO_malloc(num: csize_t, file: cstring, line: cint): pointer
 proc CRYPTO_free(p: pointer, file: cstring, line: cint)
 proc CRYPTO_get_ex_new_index(classIndex: cint, argl: clong, argp: pointer,
                              newFn, dupFn, freeFn: pointer): cint
+proc X509_getm_notBefore(x: pointer): pointer            # ASN1_TIME* (borrowed)
+proc X509_getm_notAfter(x: pointer): pointer             # ASN1_TIME* (borrowed)
+proc X509_cmp_current_time(t: pointer): cint   # <0 past, >0 future, 0 unparsable
+proc ASN1_TIME_print(bio, t: pointer): cint
+proc BIO_new(meth: pointer): pointer
+proc BIO_s_mem(): pointer
+proc BIO_read(bio: pointer, data: pointer, dlen: cint): cint
 {.pop.}
 
 proc passwdCb(buf: cstring, size: cint, rwflag: cint,
@@ -224,6 +233,12 @@ proc loadCertChainMem(ctx: SslCtxPtr, pem: string): bool =
 
 proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   ## Load a PEM private key from memory, decrypting with `password` if set.
+  ## On failure the error queue is left holding the reason (bad decrypt, a
+  ## truncated block, an unsupported algorithm), so the caller's exception can
+  ## name it; clearing it here is what made every key failure read as "unknown
+  ## TLS error" (#377). Clears on entry instead, so what the caller reports is
+  ## ours and not a leftover from an earlier step.
+  ERR_clear_error()
   if pem.len == 0: return false
   let bio = BIO_new_mem_buf(unsafeAddr pem[0], cint(pem.len))
   if bio == nil: return false
@@ -235,9 +250,7 @@ proc loadKeyMem(ctx: SslCtxPtr, pem, password: string): bool =
   # cleanly instead of prompting; an unencrypted key never consults it.
   let ud = if password.len > 0: cast[pointer](password.cstring) else: nil
   let pkey = PEM_read_bio_PrivateKey(bio, nil, passwdCb, ud)
-  if pkey == nil:
-    ERR_clear_error()
-    return false
+  if pkey == nil: return false      # reason stays queued: see the doc comment
   defer: EVP_PKEY_free(pkey)                            # up-ref'd by use below
   result = SSL_CTX_use_PrivateKey(ctx, pkey) == 1
 
@@ -291,15 +304,59 @@ type
     ocspFile: string         ## source path the staple was last read from ("" =
                              ## none / in-memory), for empty-arg reload re-reads
     sniHosts: seq[string]              ## per-host SNI: hostnames...
-    sniCtx: seq[SslCtxPtr]             ## ...and their ctxs (parallel to sniHosts)
+    sniCtx: seq[SslCtxPtr]             ## ...their ctxs (parallel to sniHosts)...
+    sniMaterial: seq[TlsMaterial]      ## ...and where each one's cert/key came
+                             ## from, so a reload can rebuild them (#356). All
+                             ## three are swapped together under `ctxLock`,
+                             ## which is also what servernameCb holds while it
+                             ## scans sniHosts and indexes sniCtx.
+    lastReloadError: string  ## why the last reloadTlsConfig returned false ("" =
+                             ## the last one succeeded). Written and read under
+                             ## `ctxLock` (the short lock), so reading it back
+                             ## through lastTlsReloadError never waits for a
+                             ## reload in progress. Like `material`, `ocsp` and
+                             ## the `sni*` seqs it is a GC string living in
+                             ## createShared memory, so its payload is
+                             ## allocated and freed from whichever thread
+                             ## reloads: the lock, not the allocator, is what
+                             ## makes that safe. Same pre-existing pattern as
+                             ## the fields above, not a new one
 
   TlsIo* = enum
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
 
 proc lastErrorMsg(): string =
+  ## The oldest queued error (the root cause: OpenSSL pushes the deepest
+  ## failure first and wraps it on the way out), then drain the rest. Draining
+  ## matters because the queue is per-thread and outlives the call: a leftover
+  ## error would otherwise be reported as the reason for an unrelated later
+  ## failure, or be mistaken for real corruption by pemReadEndedCleanly.
+  ##
+  ## Formats into a buffer of our own. The error *queue* is per-thread, but
+  ## `ERR_error_string(e, nil)` formats into a single process-wide
+  ## `static char buf[256]` and is documented as not thread-safe: two threads
+  ## formatting at once each get whichever message landed in that buffer last.
+  ## Since #388 this runs on every loop thread (the accept path's "TLS session
+  ## setup failed" line), so a wrong reason was reachable in a running server,
+  ## not just in a test. `ERR_error_string_n` writes into the caller's buffer
+  ## instead; 256 bytes is the size OpenSSL's own buffer has, and it always
+  ## NUL-terminates within whatever it is given.
   let e = ERR_get_error()
   if e == 0: return "unknown TLS error"
-  $ERR_error_string(e, nil)
+  var buf = newString(256)
+  ERR_error_string_n(e, cast[cstring](addr buf[0]), csize_t(buf.len))
+  var n = 0
+  while n < buf.len and buf[n] != '\0': inc n
+  buf.setLen(n)
+  ERR_clear_error()
+  buf
+
+proc tlsLastErrorMsg*(): string =
+  ## The oldest error on OpenSSL's thread-local error queue (its root cause), as
+  ## a sentence, draining the queue. Exported so a caller that only gets a
+  ## nil/false back from this module can still say *why* in its own log line
+  ## (the accept path, #388). Safe to call from several loop threads at once.
+  lastErrorMsg()
 
 proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
                 inProtos: ptr uint8, inLen: cuint,
@@ -325,18 +382,30 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
     # gets plain HTTP/1 rather than an alert.
     SSL_TLSEXT_ERR_ALERT_FATAL
 
+proc asciiLower(c: char): char {.inline.} =
+  ## tolower over ASCII only, deliberately not the locale's. Host names are
+  ## case-insensitive (RFC 6066, and DNS generally), but a locale-aware tolower
+  ## would make matching depend on the server's locale: under tr_TR it folds
+  ## 'I' to a dotless 'i', so `WWW.EXAMPLE.COM` would stop matching
+  ## `www.example.com`. Also avoids a libc call per byte on the loop thread.
+  if c >= 'A' and c <= 'Z': chr(ord(c) + 32) else: c
+
 proc cstrEq(cs: cstring, s: string): bool =
-  ## Compare a NUL-terminated C string to a Nim string without allocating (the
-  ## SNI callback runs on a loop thread; avoid ORC ops on the shared config).
+  ## Compare a NUL-terminated C string to a Nim string, ASCII-case-insensitively
+  ## (#358: a client may send `Example.com` for a configured `example.com`) and
+  ## without allocating (the SNI callback runs on a loop thread; avoid ORC ops
+  ## on the shared config). Both sides are folded, so a configured host does not
+  ## have to be lower-cased first.
   var i = 0
   while i < s.len:
-    if cs[i] == '\0' or cs[i] != s[i]: return false
+    if cs[i] == '\0' or asciiLower(cs[i]) != asciiLower(s[i]): return false
     inc i
   cs[i] == '\0'
 
 proc wildMatch(name: cstring, pat: string): bool =
   ## `*.example.com` matches exactly one leading label: `foo.example.com` yes,
-  ## `example.com` no, `a.b.example.com` no. No allocation (loop-thread cb).
+  ## `example.com` no, `a.b.example.com` no. ASCII-case-insensitive like
+  ## cstrEq. No allocation (loop-thread cb).
   if pat.len < 3 or pat[0] != '*' or pat[1] != '.': return false
   var dot = 0
   while name[dot] != '\0' and name[dot] != '.': inc dot
@@ -344,7 +413,7 @@ proc wildMatch(name: cstring, pat: string): bool =
   var i = dot                                        # name[dot..] == pat[1..]
   var j = 1                                          # (both include the dot)
   while j < pat.len:
-    if name[i] == '\0' or name[i] != pat[j]: return false
+    if name[i] == '\0' or asciiLower(name[i]) != asciiLower(pat[j]): return false
     inc i; inc j
   name[i] == '\0'
 
@@ -352,16 +421,40 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
   ## SNI: switch the connection to the ctx whose host matches the requested
   ## server name (exact match preferred over a wildcard); fall through to the
   ## default ctx when none matches.
+  ##
+  ## Runs on a loop thread, and since #356 a reload replaces the per-host table
+  ## underneath it, so `cfg.ctxLock` covers the whole *lookup*: the host scan and
+  ## an up-ref of the ctx it picks. A reload swaps sniHosts/sniCtx/sniMaterial
+  ## under that same lock and releases the displaced ctxs only after it, which
+  ## gives two things: the host list we scan always matches the ctx array we
+  ## index, and we hold a reference of our own before the reload's release can
+  ## turn into a destroy.
+  ##
+  ## `SSL_set_SSL_CTX` runs *outside* the lock, because in OpenSSL 3 it is not a
+  ## pointer store: it `ssl_cert_dup`s the entire CERT of the ctx it is handed
+  ## (an allocation plus an up-ref per chain entry and per key slot) and frees
+  ## the connection's old one. `acquireCtx` takes this same lock on every
+  ## accept, so holding it across that call serialised every loop's accept path
+  ## behind one SNI handshake's certificate duplication. The call up-refs the
+  ## ctx itself, so our own reference is dropped immediately afterwards.
   let cfg = cast[ptr TlsConfig](arg)
   let name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
   if name != nil:
+    var hostCtx: SslCtxPtr = nil
+    acquire(cfg.ctxLock)
     var idx = -1
     for i in 0 ..< cfg.sniHosts.len:
       if cstrEq(name, cfg.sniHosts[i]): idx = i; break
     if idx < 0:
       for i in 0 ..< cfg.sniHosts.len:
         if wildMatch(name, cfg.sniHosts[i]): idx = i; break
-    if idx >= 0: discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[idx])
+    if idx >= 0:
+      hostCtx = cfg.sniCtx[idx]
+      discard SSL_CTX_up_ref(hostCtx)   # ours until the swap takes its own
+    release(cfg.ctxLock)
+    if hostCtx != nil:
+      discard SSL_set_SSL_CTX(ssl, hostCtx)
+      SSL_CTX_free(hostCtx)
   SSL_TLSEXT_ERR_OK
 
 proc ocspExFree(parent, p: pointer, ad: pointer, idx: cint,
@@ -419,6 +512,10 @@ proc attachOcsp(ctx: SslCtxPtr, der: string) =
 
 proc loadPkcs12(ctx: SslCtxPtr, data, password: string): bool =
   ## Load cert + key (+ any bundled CA chain) from PKCS#12 (.pfx/.p12) bytes.
+  ## Clears the error queue on entry like the PEM loaders do, so a rejected
+  ## bundle is reported with its own reason and not with a leftover from
+  ## earlier OpenSSL work on this thread.
+  ERR_clear_error()
   if data.len == 0: return false
   let bio = BIO_new_mem_buf(unsafeAddr data[0], cint(data.len))
   if bio == nil: return false
@@ -494,13 +591,31 @@ proc applyClientVerify(ctx: SslCtxPtr, verify: cint,
   SSL_CTX_set_verify(ctx, verify, nil)   # nil cb: OpenSSL's default chain check
   true
 
+proc readMaterialFile(path, what: string): string =
+  ## readFile for a key or bundle path, with the path and the OS reason in the
+  ## error. A missing or unreadable file never touches OpenSSL's error queue, so
+  ## without this it surfaced as "unknown TLS error", the same lost-reason shape
+  ## as a key the decoder rejected (#377). (A missing certFile is read by
+  ## OpenSSL itself and already reports its own reason.)
+  ##
+  ## An empty path is a configuration hole, not a file error: `readFile("")`
+  ## produced `cannot read private key : cannot open:`, with the path and the OS
+  ## reason both blank, which is what a certificate-only reload against PKCS#12
+  ## material used to report. Say what is missing instead.
+  if path.len == 0:
+    raise newException(CatchableError, "no " & what & " configured")
+  try: readFile(path)
+  except CatchableError as e:
+    raise newException(CatchableError,
+      "cannot read " & what & " " & path & ": " & e.msg)
+
 proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
   ## Load the server cert + key from a PKCS#12 bundle, in-memory PEM, or files.
+  ## Returns false when OpenSSL rejects the material (the reason is left on its
+  ## error queue); raises when a file named by `m` cannot be read at all.
   if m.pkcs12.len > 0 or m.pkcs12File.len > 0:
     let data = if m.pkcs12.len > 0: m.pkcs12
-               else:
-                 try: readFile(m.pkcs12File)
-                 except CatchableError: return false
+               else: readMaterialFile(m.pkcs12File, "PKCS#12 bundle")
     return loadPkcs12(ctx, data, m.keyPassword)
   let certOk = if m.certPem.len > 0: loadCertChainMem(ctx, m.certPem)
                else: SSL_CTX_use_certificate_chain_file(ctx, m.certFile.cstring) == 1
@@ -514,9 +629,53 @@ proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
   if m.keyPem.len > 0:
     loadKeyMem(ctx, m.keyPem, m.keyPassword)
   else:
-    let keyData = try: readFile(m.keyFile)
-                  except CatchableError: return false
-    loadKeyMem(ctx, keyData, m.keyPassword)
+    loadKeyMem(ctx, readMaterialFile(m.keyFile, "private key"), m.keyPassword)
+
+proc asn1TimeStr(t: pointer): string =
+  ## An ASN1_TIME rendered the way OpenSSL prints it ("Jan  2 00:00:00 2020
+  ## GMT"), or "" if it will not print.
+  let bio = BIO_new(BIO_s_mem())
+  if bio == nil: return ""
+  defer: discard BIO_free(bio)
+  if ASN1_TIME_print(bio, t) != 1:
+    ERR_clear_error()
+    return ""
+  var buf = newString(64)
+  let n = BIO_read(bio, addr buf[0], cint(buf.len))
+  if n <= 0:
+    ERR_clear_error()
+    return ""
+  buf.setLen(n)
+  buf
+
+proc checkCertValidity(ctx: SslCtxPtr): string =
+  ## Why the ctx's leaf certificate must not be installed, or "" when it is
+  ## inside its validity window. Nothing checked notBefore/notAfter before, so
+  ## an expired certificate loaded cleanly and a `reloadTls` pointed at an
+  ## archived copy (or racing a certbot symlink swap) returned true while every
+  ## new connection failed at the client with certificate_expired (#379). Hard
+  ## failure, with no clock-skew allowance: serving an expired certificate is
+  ## never intentional. At startup it fails loudly; on a reload it keeps the
+  ## running certificate, like any other bad material.
+  ##
+  ## `X509_cmp_current_time` returns 0 only on failure: it maps an exact
+  ## equality to -1, so 0 means an ASN.1 time it could not parse. Treat it as a
+  ## rejection rather than as "inside the window", which is what it used to
+  ## mean here: a certificate whose notAfter will not parse must not be
+  ## installed on the strength of a comparison that never happened.
+  let x = SSL_CTX_get0_certificate(ctx)
+  if x == nil: return "no certificate"
+  let notAfter = X509_getm_notAfter(x)
+  if notAfter != nil:
+    let cmp = X509_cmp_current_time(notAfter)
+    if cmp == 0: return "certificate validity time could not be parsed"
+    if cmp < 0: return "certificate expired at " & asn1TimeStr(notAfter)
+  let notBefore = X509_getm_notBefore(x)
+  if notBefore != nil:
+    let cmp = X509_cmp_current_time(notBefore)
+    if cmp == 0: return "certificate validity time could not be parsed"
+    if cmp > 0: return "certificate not valid until " & asn1TimeStr(notBefore)
+  ""
 
 proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
                  clientCaFile, clientCaPem: string,
@@ -527,6 +686,12 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   ## (mTLS). Raises on any failure, freeing the partial ctx. The ALPN callback
   ## is set by the caller, which owns the stable arg pointer. Shared by initial
   ## config and certificate hot-reload.
+  ##
+  ## Clears the error queue on entry: every failure below reports
+  ## `lastErrorMsg()`, and the SSL_CTX_new, version and cipher-string steps do
+  ## not go through a loader that clears for itself, so a stale entry left on
+  ## this thread by unrelated OpenSSL work would be named as the cause.
+  ERR_clear_error()
   let ctx = SSL_CTX_new(meth)
   if ctx == nil:
     raise newException(CatchableError, "SSL_CTX_new failed: " & lastErrorMsg())
@@ -561,7 +726,11 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "invalid TLS 1.3 cipher suites: " & lastErrorMsg())
-  if not loadCertKey(ctx, m):
+  let loaded = try: loadCertKey(ctx, m)
+               except CatchableError:
+                 SSL_CTX_free(ctx)   # an unreadable key/bundle file: re-raise
+                 raise               # with the path and OS reason it carries
+  if not loaded:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "cannot load TLS certificate/key: " & lastErrorMsg())
@@ -569,6 +738,10 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "certificate/key mismatch: " & lastErrorMsg())
+  let validity = checkCertValidity(ctx)
+  if validity.len > 0:
+    SSL_CTX_free(ctx)
+    raise newException(CatchableError, validity)
   if not applyClientVerify(ctx, verify, clientCaFile, clientCaPem):
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
@@ -592,6 +765,54 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE,
                        SSL_SESS_CACHE_SERVER, nil)
   ctx
+
+proc freeTlsConfig*(cfg: ptr TlsConfig)
+  ## Forward-declared: newTlsConfigWith unwinds through it when a per-host SNI
+  ## context fails to build (#361). Defined with the rest of the lifecycle below.
+
+proc installDefaultCbs(cfg: ptr TlsConfig, ctx: SslCtxPtr, ocsp: string,
+                       hasSni: bool) =
+  ## Install on a freshly built *default* ctx everything buildTlsCtx leaves to
+  ## the caller, i.e. every callback that needs the stable `cfg` pointer as its
+  ## argument. Both the initial build and a hot-reload go through here, because
+  ## the reload used to re-register only ALPN: the servername callback was
+  ## dropped with the old ctx, so every configured SNI host silently fell back
+  ## to the default certificate from the first reload onwards and failed the
+  ## handshake on a name mismatch until the process restarted (#355).
+  SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, cfg)
+  attachOcsp(ctx, ocsp)   # OCSP stapling for the default cert
+  if hasSni:
+    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+                                  cast[pointer](servernameCb))
+    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, cfg)
+
+proc buildSniCtxs(cfg: ptr TlsConfig, hosts: openArray[string],
+                  mats: openArray[TlsMaterial]): seq[SslCtxPtr] =
+  ## One ctx per SNI host, built from `mats` with the build parameters already
+  ## stored on `cfg` (method, verify mode, client CA, version range, ciphers),
+  ## each carrying the ALPN callback: servernameCb switches the connection to
+  ## the per-host ctx, which then negotiates ALPN on its own.
+  ##
+  ## All or nothing. Anything built here is freed again before the exception
+  ## leaves, and the message names the host, so neither the initial build nor a
+  ## reload can leave a half-built set behind or drop a configured host silently
+  ## back to the default certificate. Shared by both paths so the two cannot
+  ## disagree about what a per-host ctx needs.
+  result = newSeqOfCap[SslCtxPtr](mats.len)
+  for i in 0 ..< mats.len:
+    var hctx: SslCtxPtr
+    try:
+      hctx = buildTlsCtx(cfg.meth, mats[i], cfg.verify, cfg.clientCaFile,
+                         cfg.clientCaPem, cfg.minProtoVersion,
+                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
+    except CatchableError as e:
+      for c in result: SSL_CTX_free(c)
+      # buildTlsCtx only ever sees the material, so without the host name an
+      # operator with several SNI entries cannot tell which one is broken.
+      raise newException(CatchableError,
+        "SNI host \"" & hosts[i] & "\": " & e.msg)
+    SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, cfg)
+    result.add hctx
 
 proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        minProtoVersion: clong = 0, cipherList = "",
@@ -617,20 +838,22 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   result.cipherSuites = cipherSuites
   result.ocsp = ocsp
   result.ocspFile = ocspFile
-  SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
-  attachOcsp(ctx, ocsp)   # OCSP stapling for the default cert
-  # SNI: one ctx per host, selected by the servername callback on the default.
   for sc in sni:
-    let hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
-                           minProtoVersion, maxProtoVersion, cipherList,
-                           cipherSuites)
-    SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, result)
     result.sniHosts.add sc.host
-    result.sniCtx.add hctx
-  if sni.len > 0:
-    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
-                                  cast[pointer](servernameCb))
-    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, result)
+    result.sniMaterial.add sc.material   # kept so a reload can rebuild (#356)
+  installDefaultCbs(result, ctx, ocsp, sni.len > 0)
+  # SNI: one ctx per host, selected by the servername callback on the default.
+  try:
+    result.sniCtx = buildSniCtxs(result, result.sniHosts, result.sniMaterial)
+  except CatchableError:
+    # Unwind everything built so far -- the default ctx, the shared block and
+    # its locks -- rather than letting the exception escape from a
+    # half-initialized config (#361). buildSniCtxs has already freed the
+    # per-host ctxs it got as far as. The process is usually about to exit, but
+    # an embedder may catch this and retry with corrected configuration, and a
+    # leak-checked test run should stay quiet.
+    freeTlsConfig(result)
+    raise
 
 # --- active SSL_CTX lifetime -------------------------------------------------
 #
@@ -652,9 +875,45 @@ proc acquireCtx(cfg: ptr TlsConfig): SslCtxPtr =
   discard SSL_CTX_up_ref(result)   # only fails without a live reference to it
   release(cfg.ctxLock)
 
+proc reloadFailed(cfg: ptr TlsConfig, reason: string): bool =
+  ## Reject a reload *with* a reason: record it on the config for
+  ## `lastTlsReloadError` and write one line to stderr. Every `return false` in
+  ## reloadTlsConfig goes through here, because a bare false left the operator
+  ## nothing at all -- no way to tell an unreadable certificate from a
+  ## mismatched key, a missing OCSP file or a rejected cipher string -- and the
+  ## reload path's own silence is what made the rest hard to diagnose (#378).
+  ## The stderr line matches eventloop's applyQuicReload, so a certbot deploy
+  ## hook that ignores the bool still leaves a trace. The caller holds
+  ## `reloadLock`; the field itself is published under `ctxLock` (lock order
+  ## reloadLock -> ctxLock, the order the ctx swap already uses) so that reading
+  ## it back never waits for a reload.
+  acquire(cfg.ctxLock)
+  cfg.lastReloadError = reason
+  release(cfg.ctxLock)
+  try:
+    stderr.writeLine("vortex: TLS reload failed: " & reason)
+  except IOError, OSError: discard
+  false
+
+proc lastTlsReloadError*(cfg: ptr TlsConfig): string =
+  ## Why the most recent `reloadTlsConfig` returned false; "" when the last one
+  ## succeeded, or none has run. Cheap, and safe to call from anywhere
+  ## including a request handler on a loop thread: it copies the string under
+  ## `ctxLock`, the same short lock `acquireCtx` holds for an up-ref, and does
+  ## nothing else. It deliberately does *not* take `reloadLock`, which a reload
+  ## holds across file reads, key parsing, one ctx build per SNI host and a
+  ## stderr write, so a health endpoint reading the reason used to stall its
+  ## whole loop for that long. What it returns is therefore the reason as of the
+  ## last reload that finished publishing one, which is exactly what a reload's
+  ## own `false` return pairs with.
+  acquire(cfg.ctxLock)
+  defer: release(cfg.ctxLock)
+  result = cfg.lastReloadError
+
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                       ocspFile = "", ocspResponse = "",
-                      clearOcsp = false): bool =
+                      clearOcsp = false,
+                      sni: openArray[SniCert] = []): bool =
   ## Rebuild the SSL_CTX from `certFile`/`keyFile` (or, when empty, the paths
   ## most recently loaded -- initially the configured ones -- e.g. after an
   ## in-place renewal) and atomically install it, so subsequent TLS handshakes
@@ -664,6 +923,19 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## whose current material is a PKCS#12 bundle (rotate both halves, or supply
   ## a new bundle by reconfiguring). Nothing is persisted on a rejection.
   ##
+  ## The per-host (SNI) contexts rotate on the same swap. Every one of them is
+  ## rebuilt from its stored `TlsMaterial`, so a bare `reloadTlsConfig()`
+  ## re-reads the per-host certificate *files* too and a renewal that replaces
+  ## them in place is picked up without naming them (the certbot pattern);
+  ## in-memory per-host PEM is rebuilt from the same bytes, i.e. unchanged. A
+  ## non-empty `sni` instead replaces the configured per-host material
+  ## wholesale, so the host set may grow or shrink; it is persisted only on
+  ## success, like `certFile`/`keyFile`. An empty `sni` means "keep what is
+  ## configured", so there is no way to drop every host through this call.
+  ## The whole reload is all-or-nothing: one per-host certificate that fails to
+  ## build rejects it, and the default context and every other host are left
+  ## exactly as they were, rather than leaving the server half-rotated.
+  ##
   ## The stapled OCSP response rotates on the same swap: `ocspResponse` supplies
   ## bytes, `ocspFile` a path read now, `clearOcsp` drops the staple; all empty
   ## re-reads a previously configured `ocspFile` (best-effort) or preserves the
@@ -671,6 +943,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## rejects the whole reload; a failed empty-arg re-read does not (a cert
   ## renewal must not be blocked by a stale staple). `ocspResponse`/`ocspFile`
   ## together with `clearOcsp` is contradictory and rejected.
+  ##
+  ## Every false return records why on the config: read it back with
+  ## `lastTlsReloadError`, and it is also written to stderr as one
+  ## `vortex: TLS reload failed: <reason>` line. A successful reload clears it.
   ##
   ## Callable from any ordinary thread, including several at once: the whole
   ## body runs under `cfg.reloadLock`, so concurrent reloads serialise instead
@@ -686,8 +962,30 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   # Explicit file paths override any stored in-memory/PKCS#12 material; empty
   # means "reuse what was last loaded" (files, PEM, or p12).
   var m = cfg.material
+  # Per-host material: an explicit `sni` replaces the configured set wholesale
+  # (hosts may be added or removed), otherwise the stored material is reused,
+  # which is what makes a bare reload re-read renewed per-host files. Built into
+  # locals and swapped in only on success, so a rejection persists nothing.
+  var newHosts = @(cfg.sniHosts)
+  var newSniMaterial = @(cfg.sniMaterial)
+  if sni.len > 0:
+    newHosts = @[]
+    newSniMaterial = @[]
+    for sc in sni:
+      newHosts.add sc.host
+      newSniMaterial.add sc.material
   let p12Sourced = m.pkcs12.len > 0 or m.pkcs12File.len > 0
   if certFile.len > 0:
+    # The mirror image of the keyFile-only rejection below, and for the same
+    # reason: a PKCS#12 bundle carries both halves, so clearing the bundle
+    # fields for a lone certFile leaves no private key at all. That reached
+    # loadCertKey with an empty keyFile and reported `cannot read private key :
+    # cannot open:` -- a blank path and a blank OS reason, with nothing to say
+    # the bundle was the problem. Reject it before anything is built.
+    if keyFile.len == 0 and p12Sourced:
+      return reloadFailed(cfg, "a certificate-only reload cannot replace a " &
+        "PKCS#12 bundle: rotate certFile and keyFile together, or " &
+        "reconfigure with a new bundle")
     m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   if keyFile.len > 0:
     # A key-only rotation cannot apply to a PKCS#12-sourced certificate: the
@@ -698,7 +996,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
     # key against a p12 certificate is meaningless) rather than silently
     # no-op, and clear the bundle fields either way so the branches are
     # symmetric with certFile's.
-    if certFile.len == 0 and p12Sourced: return false
+    if certFile.len == 0 and p12Sourced:
+      return reloadFailed(cfg, "a keyFile-only reload cannot apply to a " &
+        "PKCS#12-sourced certificate: rotate certFile and keyFile together, " &
+        "or reconfigure with a new bundle")
     m.keyFile = keyFile; m.keyPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   # Resolve the staple for the new ctx *before* buildTlsCtx, so any rejection
   # leaves the running ctx (and its staple) completely untouched. newOcsp is the
@@ -706,14 +1007,16 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   var newOcsp = cfg.ocsp
   var newOcspFile = cfg.ocspFile
   if clearOcsp and (ocspResponse.len > 0 or ocspFile.len > 0):
-    return false                             # contradictory request
+    return reloadFailed(cfg,                 # contradictory request
+      "clearOcsp cannot be combined with ocspResponse or ocspFile")
   elif clearOcsp:
     newOcsp = ""; newOcspFile = ""
   elif ocspResponse.len > 0:
     newOcsp = ocspResponse; newOcspFile = "" # in-memory bytes win, no source path
   elif ocspFile.len > 0:
     try: newOcsp = readFile(ocspFile)        # explicit path: unreadable rejects
-    except CatchableError: return false      # the reload (bad-material contract)
+    except CatchableError as e:              # the reload (bad-material contract)
+      return reloadFailed(cfg, "cannot read ocspFile \"" & ocspFile & "\": " & e.msg)
     newOcspFile = ocspFile
   elif cfg.ocspFile.len > 0:
     # Empty-arg reload with a stored path (certbot pattern): best-effort re-read;
@@ -725,10 +1028,20 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
     newCtx = buildTlsCtx(cfg.meth, m, cfg.verify, cfg.clientCaFile,
                          cfg.clientCaPem, cfg.minProtoVersion,
                          cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
-  except CatchableError:
-    return false
-  SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
-  attachOcsp(newCtx, newOcsp)   # per-ctx staple (own blob, freed with the ctx)
+  except CatchableError as e:
+    return reloadFailed(cfg, e.msg)
+  # The per-host ctxs, all or nothing with the default one: a host that fails to
+  # build rejects the whole reload rather than leaving the server half-rotated
+  # (new default certificate, stale per-host ones) or dropping that host back to
+  # the default certificate, which the client would reject as a name mismatch.
+  var newSniCtx: seq[SslCtxPtr]
+  try:
+    newSniCtx = buildSniCtxs(cfg, newHosts, newSniMaterial)
+  except CatchableError as e:
+    SSL_CTX_free(newCtx)   # nothing published yet, and no staple attached to
+                           # it either: installDefaultCbs has not run
+    return reloadFailed(cfg, e.msg)
+  installDefaultCbs(cfg, newCtx, newOcsp, newHosts.len > 0)
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile
@@ -740,39 +1053,56 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   # approximated: with a fixed number of slots and a time-based grace window, a
   # burst of reloads had to evict (and free) a ctx a thread could still be
   # holding between its load and SSL_new.
+  #
+  # The per-host table goes over in the same critical section, and for the same
+  # reason: servernameCb holds `ctxLock` across {scan sniHosts, index sniCtx,
+  # SSL_set_SSL_CTX}, so publishing all three together means it never scans a
+  # host list that disagrees with the ctx array, and the releases below are
+  # decrements for any handshake that got there first. `swap` keeps the critical
+  # section allocation-free; the locals carry the retired values out.
   acquire(cfg.ctxLock)
+  cfg.lastReloadError = ""   # this one worked; drop any earlier reason
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
+  swap(cfg.sniHosts, newHosts)
+  swap(cfg.sniMaterial, newSniMaterial)
+  swap(cfg.sniCtx, newSniCtx)
   release(cfg.ctxLock)
   SSL_CTX_free(old)       # the config's reference; sessions keep their own
+  for c in newSniCtx:     # the retired per-host ctxs, same discipline
+    SSL_CTX_free(c)
   true
 
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
 #
 # The h3 stack (ngtcp2 + nghttp3) owns a per-loop TLS context that the atomic
-# pointer swap the TCP path uses would not reach, so each loop thread reloads its
-# own engine *in place* on its own thread (eventloop.applyQuicReload ->
-# ngReloadCert). New handshakes present the new cert; in-flight connections keep
-# theirs.
+# pointer swap the TCP path uses would not reach, so each loop thread rebuilds
+# its own engine's context on its own thread (eventloop.applyQuicReload ->
+# ngReloadCert) and swaps it in once the material checks out. New handshakes
+# present the new cert; in-flight connections keep theirs.
 #
 # The main thread signals a reload through this plain-memory struct (fixed
-# buffers, never GC strings, so it is safe to read from the loop threads).
+# buffers and one `allocShared` blob, never GC strings, so it is safe to read
+# from the loop threads).
 
 const certPathMax = 4096            # PATH_MAX on Linux; macOS is 1024
 
 type
   CertReload* = object
     ## Main-thread -> loop-thread signal for a QUIC certificate reload. A Lock
-    ## makes the {generation, paths} update atomic as a unit, so a loop can
-    ## never read a path spliced from two overlapping reloads. Paths are fixed
-    ## buffers (never GC strings), so they are safe to read from the loop
-    ## threads without ORC refcount races.
+    ## makes the {generation, paths, per-host set} update atomic as a unit, so a
+    ## loop can never read material spliced from two overlapping reloads. The
+    ## paths are fixed buffers and the per-host set a serialised `allocShared`
+    ## blob (never GC strings), so they are safe to read from the loop threads
+    ## without ORC refcount races.
     lock: Lock
     gen: int
     certPath: array[certPathMax, char]
     keyPath: array[certPathMax, char]
+    sni: pointer            ## serialised replacement per-host set, or nil for
+                            ## "keep the configured material" (see encodeSni)
+    sniLen: int             ## byte length of `sni`
 
 proc initCertReload*(r: ptr CertReload) = initLock(r.lock)
-proc deinitCertReload*(r: ptr CertReload) = deinitLock(r.lock)
 
 proc setPath(dst: var array[certPathMax, char], s: string) =
   let n = min(s.len, certPathMax - 1)   # over-length paths truncate -> the
@@ -785,28 +1115,114 @@ proc getPath(src: array[certPathMax, char]): string =
   result = newString(n)
   for i in 0 ..< n: result[i] = src[i]
 
-proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string) =
-  ## Main thread: publish the paths for a QUIC certificate reload and bump the
-  ## generation, as one locked update. Empty paths mean "re-read the configured
-  ## ones".
+# The replacement per-host set travels as one flat, GC-free blob: a 4-byte
+# entry count, then every entry's eight material fields as a 4-byte length plus
+# its bytes, in the order sniFields lists them. A serialised copy rather than a
+# seq of SniCerts because the loop threads decode it on their own threads, and
+# an ORC string handed across them would race its refcount -- the same reason
+# the paths above are fixed char buffers. The blob the main thread publishes is
+# freed by the next request (and by deinitCertReload), so a loop that never
+# woke for a generation does not leak it.
+
+proc sniFields(e: SniCert): array[8, string] =
+  [e.host, e.material.certFile, e.material.keyFile, e.material.certPem,
+   e.material.keyPem, e.material.keyPassword, e.material.pkcs12File,
+   e.material.pkcs12]
+
+proc putU32(buf: ptr UncheckedArray[byte], off: var int, v: int) =
+  buf[off] = byte(v and 0xff)
+  buf[off + 1] = byte((v shr 8) and 0xff)
+  buf[off + 2] = byte((v shr 16) and 0xff)
+  buf[off + 3] = byte((v shr 24) and 0xff)
+  off += 4
+
+proc getU32(buf: ptr UncheckedArray[byte], off: var int): int =
+  result = int(buf[off]) or (int(buf[off + 1]) shl 8) or
+           (int(buf[off + 2]) shl 16) or (int(buf[off + 3]) shl 24)
+  off += 4
+
+proc encodeSni(entries: openArray[SniCert]): (pointer, int) =
+  ## Main thread: serialise `entries` into one allocShared'd blob, or (nil, 0)
+  ## for an empty set. Allocated before the lock is taken, so the critical
+  ## section is a couple of stores.
+  if entries.len == 0: return (nil, 0)
+  var total = 4
+  for e in entries:
+    for f in sniFields(e): total += 4 + f.len
+  let buf = cast[ptr UncheckedArray[byte]](allocShared(total))
+  var off = 0
+  putU32(buf, off, entries.len)
+  for e in entries:
+    for f in sniFields(e):
+      putU32(buf, off, f.len)
+      if f.len > 0: copyMem(addr buf[off], unsafeAddr f[0], f.len)
+      off += f.len
+  (cast[pointer](buf), total)
+
+proc decodeSni(blob: pointer, len: int): seq[SniCert] =
+  ## Loop thread: the per-host set `blob` carries, as the TLS-layer SniCerts
+  ## eventloop converts for the h3 backend. An empty blob decodes to @[], which
+  ## every consumer reads as "keep the configured material".
+  if blob == nil or len < 4: return @[]
+  let buf = cast[ptr UncheckedArray[byte]](blob)
+  var off = 0
+  let n = getU32(buf, off)
+  result = newSeq[SniCert](n)
+  for i in 0 ..< n:
+    var f: array[8, string]
+    for j in 0 ..< f.len:
+      let flen = getU32(buf, off)
+      f[j] = newString(flen)
+      if flen > 0: copyMem(addr f[j][0], addr buf[off], flen)
+      off += flen
+    result[i] = SniCert(host: f[0], material: TlsMaterial(
+      certFile: f[1], keyFile: f[2], certPem: f[3], keyPem: f[4],
+      keyPassword: f[5], pkcs12File: f[6], pkcs12: f[7]))
+
+proc deinitCertReload*(r: ptr CertReload) =
+  if r.sni != nil:
+    deallocShared(r.sni)
+    r.sni = nil
+    r.sniLen = 0
+  deinitLock(r.lock)
+
+proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string,
+                        sni: openArray[SniCert] = []) =
+  ## Main thread: publish the paths, and any replacement per-host set, for a
+  ## QUIC certificate reload and bump the generation, as one locked update.
+  ## Empty paths mean "re-read the configured ones"; an empty `sni` means "keep
+  ## the configured per-host material", exactly as on the TCP side (#356).
+  let (blob, blobLen) = encodeSni(sni)
   acquire(r.lock)
   defer: release(r.lock)
   setPath(r.certPath, certFile)
   setPath(r.keyPath, keyFile)
+  if r.sni != nil: deallocShared(r.sni)   # the previous request's, now stale
+  r.sni = blob
+  r.sniLen = blobLen
   inc r.gen
 
 proc pendingCertReload*(r: ptr CertReload, seen: int,
-                        certFile, keyFile: var string): int =
+                        certFile, keyFile: var string,
+                        sni: var seq[SniCert]): int =
   ## Loop thread: returns the current reload generation. When it differs from
-  ## `seen`, fills `certFile`/`keyFile` with the requested paths (a consistent
-  ## snapshot under the lock). The caller advances its own `seen` once it has
-  ## acted on the result.
+  ## `seen`, fills `certFile`/`keyFile` with the requested paths and `sni` with
+  ## the replacement per-host set (@[] when the request carried none) -- one
+  ## consistent snapshot under the lock. The caller advances its own `seen` once
+  ## it has acted on the result.
   acquire(r.lock)
   defer: release(r.lock)
   result = r.gen
   if result != seen:
     certFile = getPath(r.certPath)   # allocates: a raise here must not hold the lock
     keyFile = getPath(r.keyPath)
+    sni = decodeSni(r.sni, r.sniLen)
+
+proc pendingCertReload*(r: ptr CertReload, seen: int,
+                        certFile, keyFile: var string): int =
+  ## The paths alone, for a caller with no per-host material to apply.
+  var ignored: seq[SniCert]
+  pendingCertReload(r, seen, certFile, keyFile, ignored)
 
 
 proc ctxCertSubject*(cfg: ptr TlsConfig): string =
@@ -862,6 +1278,7 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   for c in cfg.sniCtx: SSL_CTX_free(c)
   cfg.sniCtx = @[]
   cfg.sniHosts = @[]
+  cfg.sniMaterial = @[]   # the per-host material a reload rebuilds from (#356)
   cfg.protos = ""
   cfg.material = TlsMaterial()
   cfg.clientCaFile = ""
@@ -870,11 +1287,18 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   cfg.cipherSuites = ""
   cfg.ocsp = ""
   cfg.ocspFile = ""
+  cfg.lastReloadError = ""
   deinitLock(cfg.reloadLock)
   deinitLock(cfg.ctxLock)
   deallocShared(cfg)
 
 proc newTlsSession*(cfg: ptr TlsConfig, fd: cint): SslPtr =
+  # Start from an empty error queue. The queue is per-thread and outlives the
+  # call, and tlsHandshake/tlsRead/tlsWrite leave their reason on it when a
+  # connection fails, so without this the accept path's "TLS session setup
+  # failed: <tlsLastErrorMsg()>" line (#388) could name the failure of an
+  # *earlier* connection accepted on the same loop thread.
+  ERR_clear_error()
   # A concurrent hot-reload may swap cfg.ctx and release the old one, so take a
   # reference to what we loaded (acquireCtx) instead of carrying a bare pointer
   # into SSL_new, which up-refs the ctx itself once it gets there. Ours is

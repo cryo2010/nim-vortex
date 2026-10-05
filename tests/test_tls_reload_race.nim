@@ -11,7 +11,8 @@
 ## double free or use-after-free into an ASan abort instead of leaving it to
 ## chance.
 
-import std/[unittest, os, atomics, net, nativesockets, httpcore, strutils]
+import std/[unittest, os, osproc, atomics, net, nativesockets, httpcore,
+            strutils, monotimes, times]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 import vortex/transport/tls
@@ -138,4 +139,116 @@ suite "TLS reload burst with connections in flight":
     srv.close()
 
 removeDir(bdir)
+
+# --- SNI handshakes against a reload burst ------------------------------------
+# servernameCb reads the per-host table (host names, contexts) on a loop thread
+# and hands one of those contexts to SSL_set_SSL_CTX. Since #356 a reload
+# replaces that whole table and releases the displaced contexts straight
+# afterwards, so the callback holds `ctxLock` across the lookup and the up-ref
+# of the context it picks: without it a handshake could scan a host list that no
+# longer matches the context array it indexes, or have its chosen context freed
+# between the load and the up-ref. SSL_set_SSL_CTX itself runs outside the lock
+# (it duplicates the whole CERT, which would serialise every loop's accept path
+# behind it), so the reference the callback takes for itself is what keeps the
+# context alive across that call.
+# Like the tests above this cannot be asserted directly: hammer it, require
+# every reload to succeed and the right certificate to come back, and let
+# NIM_SANITIZE=1 turn a use-after-free into an abort.
+
+let sdir = getTempDir() / "vortex_tls_sniburst_" & $getCurrentProcessId()
+removeDir(sdir); createDir(sdir)
+genCert(sdir / "def.pem", sdir / "def.key", "sniburst.vortex")
+genCert(sdir / "alt.pem", sdir / "alt.key", "sniburst.alt")
+
+proc sniOpener(arg: tuple[port: Port, reps: int]) {.thread.} =
+  ## Full handshakes with a server name set, so servernameCb runs each time.
+  ## wrapConnectedSocket sends SNI for a non-IP hostname, which is why it is
+  ## used here instead of the plain wrapSocket the opener above needs.
+  {.cast(gcsafe).}:
+    let ctx = newContext(verifyMode = CVerifyNone)
+    for _ in 0 ..< arg.reps:
+      var s = newSocket(buffered = true)
+      try:
+        s.connect("127.0.0.1", arg.port)
+        ctx.wrapConnectedSocket(s, handshakeAsClient, "sniburst.alt")
+      except CatchableError: discard
+      s.close()
+    ctx.destroyContext()
+
+suite "SNI handshakes against a reload burst":
+  test "the per-host certificate is served throughout and after the burst":
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(
+      numThreads = 4, reusePort = true, http3 = false,
+      certFile = sdir / "def.pem", keyFile = sdir / "def.key",
+      sni = @[SniCertEntry(host: "sniburst.alt", certFile: sdir / "alt.pem",
+                           keyFile: sdir / "alt.key")])).start(0)
+    let port = srv.port
+    var th: array[3, Thread[tuple[port: Port, reps: int]]]
+    for i in 0 ..< th.len: createThread(th[i], sniOpener, (port, 20))
+    for _ in 0 ..< 40: check srv.reloadTls()
+    joinThreads(th)
+    let (o, _) = execCmdEx(
+      "echo | openssl s_client -connect 127.0.0.1:" & $port &
+      " -servername sniburst.alt 2>/dev/null | openssl x509 -noout -subject")
+    check "sniburst.alt" in o
+    srv.close()
+
+removeDir(sdir)
+
+# --- lastTlsReloadError against a reload in progress -------------------------
+# reloadTlsConfig holds `reloadLock` across its file reads, key parsing, one ctx
+# build per SNI host and a stderr write. The accessor used to take that same
+# lock, so a health handler reading the last reason stalled its whole loop
+# thread for the length of a reload. It now publishes and reads the reason under
+# `ctxLock`, the short lock acquireCtx takes for an up-ref.
+#
+# Deterministic rather than timing-sensitive: the reload is pointed at a FIFO as
+# its ocspFile, so it sits inside readFile with `reloadLock` held until
+# something writes to the pipe. A writer thread opens it after a delay whatever
+# the accessor does, so a regression fails the test instead of hanging it.
+
+let fdir = getTempDir() / "vortex_tls_fifo_" & $getCurrentProcessId()
+removeDir(fdir); createDir(fdir)
+let fCert = fdir / "cert.pem"
+let fKey = fdir / "key.pem"
+genCert(fCert, fKey, "fifo.vortex")
+let fifoPath = fdir / "staple.fifo"
+let haveFifo = execCmdEx("mkfifo " & fifoPath)[1] == 0
+
+var fifoCfg: ptr TlsConfig
+var fifoReloadOk: Atomic[bool]
+
+proc fifoReloader(x: int) {.thread.} =
+  {.cast(gcsafe).}:
+    fifoReloadOk.store(reloadTlsConfig(fifoCfg, ocspFile = fifoPath))
+
+proc fifoWriter(delayMs: int) {.thread.} =
+  ## Unblock the reload after `delayMs`. The bytes are never parsed, they are
+  ## just attached as the staple.
+  {.cast(gcsafe).}:
+    sleep(delayMs)
+    try: writeFile(fifoPath, "\x30\x03\x02\x01\x00")
+    except CatchableError: discard
+
+suite "lastTlsReloadError does not wait for a reload":
+  test "it answers while a reload is blocked reading its OCSP file":
+    if not haveFifo:
+      echo "SKIP: mkfifo unavailable"
+    else:
+      fifoCfg = newTlsConfig(fCert, fKey)
+      var rth, wth: Thread[int]
+      createThread(rth, fifoReloader, 0)
+      sleep(200)                       # let the reload get into readFile
+      createThread(wth, fifoWriter, 2000)
+      let t0 = getMonoTime()
+      let reason = lastTlsReloadError(fifoCfg)
+      let waitedMs = (getMonoTime() - t0).inMilliseconds
+      check reason == ""               # no reload has failed
+      check waitedMs < 500             # it used to wait for the writer (~1.8 s)
+      joinThread(rth)
+      joinThread(wth)
+      check fifoReloadOk.load
+      freeTlsConfig(fifoCfg)
+
+removeDir(fdir)
 echo "tls reload race ok"

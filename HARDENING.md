@@ -46,6 +46,10 @@ reference below.
 | `h3StreamWindow` | 1 MiB | HTTP/3 per-stream receive window (upload flow control) |
 | `h3ConnWindow` | 4 MiB | HTTP/3 per-connection receive window (aggregate cap on buffered uploads) |
 
+The HTTP/3 rows above bound *buffered upload bytes*. The UDP socket underneath
+them is bounded separately, in work rather than memory, and has its own residual
+risks: see [QUIC ingress (HTTP/3)](#quic-ingress-http3) below.
+
 HTTP/1 has no configurable upload window, but it is bounded too: a streaming
 route whose consumer acks on consume (the async `await req.read()` API, which
 registers its `onBody` sink with `manualAck`) may hold at most 1 MiB
@@ -53,6 +57,80 @@ delivered-but-unacked before the loop stops reading the socket, so the rest of
 the upload waits in the kernel as TCP backpressure instead of piling up in the
 consumer's queue. `req.ackBody` repays that debt and resumes the read. It is the
 coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
+
+#### Seeing the limits fire
+
+A connection the server refuses after accepting it looks, at the client, exactly
+like a network fault: the socket opens and then dies with nothing on it, which
+httpx and friends report as an empty `ConnectError`. Three paths do that, and each
+one keeps a counter plus one rate-limited `vortex:` line on stderr saying why:
+
+| `acceptDrops()` field | Cause |
+|-----------------------|-------|
+| `cap` | `maxConnections` reached on that loop thread |
+| `tls` | the TLS session could not be created (the line carries the OpenSSL reason) |
+| `register` | the selector refused the accepted fd |
+| `total` | `cap + tls + register`, i.e. every connection accepted and then dropped |
+
+A fourth counter sits beside them and is **not** part of `total`:
+
+| `acceptDrops()` field | Cause |
+|-----------------------|-------|
+| `acceptSuspend` | `accept()` itself failed with fd/memory exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM) and the listener was deregistered for ~1s |
+
+Nothing is accepted or dropped on that path: the connections already in the
+kernel's backlog simply wait for the listener to come back (or time out there),
+so counting them as drops would be wrong. It is one count per backoff, not per
+waiting connection, and it reads "this process is out of descriptors".
+
+```nim
+let d = srv.acceptDrops()     # also acceptDrops() with no argument
+echo "refused: ", d.total, " (cap=", d.cap, " tls=", d.tls,
+     " register=", d.register, ") accept backoffs: ", d.acceptSuspend
+```
+
+The tally is process-wide and monotonic, so sample it and watch the rate. A
+rising `cap` means raise `maxConnections` or add loop threads (the cap is per
+thread); a rising `acceptSuspend` means raise the fd rlimit. Both are the server
+shedding load on purpose, not a broken network.
+
+#### QUIC ingress (HTTP/3)
+
+HTTP/3 arrives on a UDP socket, which has no accept queue and no backlog: every
+datagram the kernel hands up is decrypted and parsed synchronously, on the loop
+thread that owns the socket, before the next one is read. That thread also owns
+HTTP/1.1 and HTTP/2 connections, so the UDP side has to be bounded in *work*,
+not just in memory. Nothing here is configurable; the numbers are listed so you
+know what the floor is.
+
+| Property | Value | Why |
+|----------|-------|-----|
+| Receive buffer | 65527 bytes | Sized from the `max_udp_payload_size` the server advertises, from one constant in the shim so the two cannot drift. A conforming client on a large-MTU path (a 9000-byte VPC MTU, 65536 on loopback) is entitled to fill the advertisement; a smaller buffer had the kernel truncate those datagrams, AEAD then failed, and the connection died on the idle timer with nothing logged at either end. On Linux the receive passes `MSG_TRUNC`, so anything that still does not fit is dropped and counted rather than fed to ngtcp2 as line corruption |
+| Datagrams per drain | 256 (`ngRecvBudget`) | A work quantum, not a rate limit. The drain hands the thread back after 256 datagrams so the TCP fds on it get serviced between batches; a legitimate burst is still received in full, just across several passes |
+| Drains per loop pass | up to 4 | Ingress runs once after the selector and again wherever the pass may have produced QUIC egress (a batch flush, the WebSocket idle sweep, a deferred flush), so a pass can take up to 4 x 256 datagrams |
+| Selector wait with a spent budget | 0 ms | When a drain stops on the budget rather than on an empty socket, the loop goes straight back round instead of sleeping, so the backlog is still cleared promptly. Without that the budget would mean one batch per second-long sleep |
+
+The point of the budget is that a UDP source whose datagrams cost the server
+more than they cost the sender can no longer keep a loop thread inside the
+receive loop. The worst such datagram is an Initial naming a QUIC version the
+server does not support: ngtcp2 answers each with a Version Negotiation packet,
+so every one buys a parse plus a `sendto`. Unbounded, a flood of those left a
+plain HTTP/1.1 request on the same server unserved until the client gave up; it
+is now answered while the flood runs, in well under 2 s with every core but one
+blasting (`tests/test_h3_udp_flood.nim` asserts it, with a 5 s bound).
+
+**Residual risk.** Two things the budget does not fix:
+
+- **No address validation.** The server does not issue a Retry token, so a
+  spoofed-source Initial flood still makes the QUIC stack commit per-connection
+  state before it knows the peer address is real, up to `maxConnections`. The
+  budget bounds how much loop time that costs per pass, not how much state
+  accumulates. If you are exposed to this, rate-limit UDP to the QUIC port
+  upstream (or turn `http3` off) until Retry lands.
+- **Version Negotiation is unmetered.** One reply per unsupported-version
+  Initial, with no per-source limit. The reply is smaller than the Initial that
+  provoked it, so the amplification factor is below 1 and this is not a
+  reflection vector, but it is work an off-path sender can make the server do.
 
 ### Timeouts
 
@@ -108,6 +186,46 @@ ALPN list overlapping neither is refused with a fatal `no_application_protocol`
 alert (RFC 7301 3.2) rather than being handed a no-ALPN connection that it would
 misframe; a client that advertises no ALPN at all still gets HTTP/1.1.
 
+Session resumption works across loop threads on every protocol. The TCP
+listener shares one `SSL_CTX` between loops, so its session cache and ticket key
+are shared; HTTP/3 keeps a context per loop (the per-loop certificate reload is
+built on that) and installs a process-wide TLS 1.3 ticket key on each of them
+instead, so a returning client resumes on whichever loop the kernel's
+SO_REUSEPORT hash hands it rather than only on the one that issued the ticket.
+The HTTP/3 ticket key rotates hourly: the current key encrypts, the previous one
+still decrypts for one more hour and the ticket is reissued under the new key,
+and anything older costs that client one full handshake, so a disclosed key
+exposes at most two hours of resumed sessions. Rotation is driven off the clock
+from the per-tick engine entry every loop runs, not off ticket traffic, so the
+bound holds on an idle server too (keyed off traffic alone, a ticket minted at
+t=0 was still accepted at t=10h if no ticket had been issued in between).
+
+The TCP listener keeps OpenSSL's own ticket key, which belongs to the
+`SSL_CTX` rather than to the process. Nothing rotates it on a schedule, but a
+certificate reload builds a replacement context, so the ticket key and the TLS
+1.2 session cache are both regenerated on every `reloadTls` and every ticket or
+cached session issued before it stops resuming (a saved session resumes with
+`Reused` before the reload and `New` after it). The two transports therefore
+behave in opposite ways across a rotation: the HTTP/3 key is process-wide, so an
+h3 client's ticket survives a certificate reload, while a TCP client's is
+invalidated by it and costs that client one full handshake on its next visit.
+Having the TCP listener share the rotating key is not implemented.
+
+0-RTT early data is not offered on any protocol, so none of this changes what a
+client may send on its first flight.
+
+Certificate material is checked against its own validity window wherever it is
+installed: a leaf whose `notAfter` has passed, or whose `notBefore` has not
+arrived, is refused outright on HTTP/1.1, HTTP/2 and HTTP/3 alike. There is no
+clock-skew allowance and no warning-only mode -- serving an expired certificate
+is never intentional and every client rejects it. At startup that is a hard
+failure (`certificate expired at <notAfter>` / `certificate not valid until
+<notBefore>`), so a server that would have come up serving an expired
+certificate now refuses to start; on a reload it is a rejection like any other
+bad material, so the running certificate keeps serving. This is what catches a
+renewal hook racing a certbot symlink swap, or one pointed at `archive/`
+instead of `live/`.
+
 Certificates can be rotated at runtime with `server.reloadTls(certFile, keyFile)`
 (TCP and h3), which validates the new material and swaps it in without dropping
 connections. The same call rotates the stapled OCSP response:
@@ -119,10 +237,37 @@ staple), and OpenSSL only sends a staple whose serial matches the served
 certificate, so rotate the cert and its staple together. Reload from any
 ordinary thread, and from two at once if that is how your renewal plumbing is
 built (concurrent reloads serialise internally); not from inside a raw signal
-handler, since the call takes a lock and reads files. On the HTTP/3 side the
-reload also rebuilds the per-host (SNI) contexts from the material they were
-configured with, so per-host certificate *files* replaced by the same renewal
-are picked up even though `reloadTls` names only the default pair.
+handler, since the call takes a lock and reads files.
+
+A rejected reload says why. `server.lastTlsReloadError` (and
+`vortex.lastTlsReloadError`) returns the reason the most recent `reloadTls`
+returned false, "" after one that succeeded, and the same reason goes to stderr
+as a single `vortex: TLS reload failed: <reason>` line, so a deploy hook that
+ignores the bool still leaves a trace in the log. Every rejection is covered:
+unreadable or mismatched material, a certificate-only or key-only rotation
+against a PKCS#12 bundle (rotate both halves, or reconfigure with a new
+bundle), contradictory OCSP arguments, an unreadable explicit `ocspFile`, and a
+per-host certificate that fails to build (which names the host). Reading the
+reason is cheap and takes no lock a reload holds for any length of time, so a
+health endpoint or a request handler on a loop thread can report it without
+stalling its loop behind a rotation in progress.
+
+Per-host (SNI) certificates rotate on the same call: each per-host context is
+rebuilt from the material it was configured with, so per-host certificate
+*files* replaced by the same renewal are picked up even though `reloadTls` names
+only the default pair. The reload is all-or-nothing --
+one per-host certificate that fails to build rejects it and leaves the default
+certificate and every host exactly as they were, rather than half-rotating or
+silently dropping a host back to the default certificate, which the client
+would reject as a name mismatch. `reloadTls(sni = @[SniCertEntry(...)])`
+replaces the per-host material outright, so the host set may change on both
+transports: the HTTP/3 engine is handed the same replacement set and installs
+it in the same all-or-nothing transaction as its default certificate, so a host
+added through the override is served its own certificate over QUIC and one
+removed through it stops being served over QUIC instead of keeping its retired
+certificate for the life of the process. The set is persisted only on success,
+and an empty `sni` means "keep what is configured" (there is no way to drop
+every host).
 
 ## Deployment recipes
 

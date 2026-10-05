@@ -3,6 +3,7 @@
 
 import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
+import vortex/transport/tls as tlstransport
 import ./helper
 
 when defined(plainHttp):
@@ -61,6 +62,59 @@ suite "TLS key options":
     expect CatchableError:
       var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = enckey, keyPassword = "wrong")).start(0)
       srv.close()
+
+  test "a key failure reports the OpenSSL reason, not 'unknown TLS error'":
+    # loadKeyMem used to clear the error queue before the caller read it, so
+    # every key failure -- wrong passphrase, truncated PEM, wrong algorithm --
+    # surfaced as "cannot load TLS certificate/key: unknown TLS error" and read
+    # like a library fault rather than a configuration one (#377). Both key
+    # paths (file and in-memory PEM) go through loadKeyMem, so check both.
+    var fileMsg, memMsg, truncMsg: string
+    try:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certFile = cert, keyFile = enckey,
+        keyPassword = "wrong")).start(0)
+      srv.close()
+    except CatchableError as e:
+      fileMsg = e.msg
+    try:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certPem = certData, keyPem = encKeyData,
+        keyPassword = "wrong")).start(0)
+      srv.close()
+    except CatchableError as e:
+      memMsg = e.msg
+    # A truncated (not encrypted) key: a different reason reaches the message.
+    try:
+      var srv = newVortex(RequestHandler(handler), initVortexConfig(
+        numThreads = 1, certPem = certData,
+        keyPem = keyData[0 ..< keyData.len div 2])).start(0)
+      srv.close()
+    except CatchableError as e:
+      truncMsg = e.msg
+    check "unknown TLS error" notin fileMsg
+    check "bad decrypt" in fileMsg
+    check "unknown TLS error" notin memMsg
+    check "bad decrypt" in memMsg
+    check "unknown TLS error" notin truncMsg
+    check truncMsg.len > 0
+
+  test "a cert failure after a key failure is not reported with the key's reason":
+    # lastErrorMsg drains the queue it read from, so one failed load cannot
+    # lend its reason to the next one on the same thread.
+    var second: string
+    try:
+      let cfg = tlstransport.newTlsConfig(cert, enckey, keyPassword = "wrong")
+      tlstransport.freeTlsConfig(cfg)
+    except CatchableError:
+      discard
+    try:
+      let cfg = tlstransport.newTlsConfig(dir / "missing.pem", key)
+      tlstransport.freeTlsConfig(cfg)
+    except CatchableError as e:
+      second = e.msg
+    check second.len > 0
+    check "bad decrypt" notin second
 
   test "cert without key is rejected":
     expect CatchableError:

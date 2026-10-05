@@ -204,6 +204,14 @@ run_cell() {
 
   # The client reports RSS/heap (from the server's /stats) and prints the
   # per-cell "== <workload> <server> <proto> passed ==" line on success.
+  #
+  # `2>&1` merges the client's stderr into the tee'd stream. The harness is run
+  # as `nimble stress | tee stress.log`, which tees only stdout, so anything the
+  # client wrote to stderr -- an interpreter traceback, an asyncio "Task
+  # exception was never retrieved" notice -- never reached the archived log and a
+  # cell died with nothing but a bare "FAILED (exit 1)" to show for it (#387).
+  # The chaos sidecar is dumped via `docker logs "$chc" 2>&1` and never had the
+  # gap; the canary was the only hole.
   set +e
   docker run --rm --network "$net" \
     -e VORTEX_WORKLOAD="$workload" -e VORTEX_PROTO="$p" -e STRESS_SERVER="$s" \
@@ -211,7 +219,7 @@ run_cell() {
     -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
     -e VORTEX_CONCURRENCY="$conc" -e VORTEX_CLIENTS="$clients" \
     -e VORTEX_REQ_COMPRESSION="$reqc" -e VORTEX_RESP_COMPRESSION="$respc" \
-    -e VORTEX_STREAM_BYTES="$sbytes" "$cimg"
+    -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" 2>&1
   crc=$?
   set -e
 
@@ -252,6 +260,18 @@ run_cell() {
       docker logs "$chc" 2>&1 || true
       docker rm -f "$chc" >/dev/null 2>&1 || true
     fi
+  fi
+
+  # The server's stderr exists only inside its container, and `docker rm -f` is
+  # a SIGKILL that takes the log with it. vortex writes its operator lines there
+  # -- why the accept path dropped a connection, fd/memory exhaustion, a loop
+  # thread that died -- and those are precisely what explains an empty
+  # ConnectError at the client (#387, #388). On a failed cell, dump the tail
+  # into the tee'd run log BEFORE the container goes away. Only on failure: a
+  # clean hour-long cell would bury its own report lines.
+  if [ "$crc" != 0 ]; then
+    echo "--- server log (last 200 lines) ---"
+    docker logs --tail 200 "$srvc" 2>&1 || true
   fi
 
   # Server teardown. Moved to AFTER the sidecar wait so the sidecar's final
