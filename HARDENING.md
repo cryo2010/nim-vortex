@@ -132,6 +132,20 @@ ALPN list overlapping neither is refused with a fatal `no_application_protocol`
 alert (RFC 7301 3.2) rather than being handed a no-ALPN connection that it would
 misframe; a client that advertises no ALPN at all still gets HTTP/1.1.
 
+Session resumption works across loop threads on every protocol. The TCP
+listener shares one `SSL_CTX` between loops, so its session cache and ticket key
+are shared; HTTP/3 keeps a context per loop (the per-loop certificate reload is
+built on that) and installs a process-wide TLS 1.3 ticket key on each of them
+instead, so a returning client resumes on whichever loop the kernel's
+SO_REUSEPORT hash hands it rather than only on the one that issued the ticket.
+The HTTP/3 ticket key rotates hourly: the current key encrypts, the previous one
+still decrypts for one more hour and the ticket is reissued under the new key,
+and anything older costs that client one full handshake, so a disclosed key
+exposes at most two hours of resumed sessions. The TCP listener still uses
+OpenSSL's own per-context ticket key, generated once at startup and not rotated.
+0-RTT early data is not offered on any protocol, so none of this changes what a
+client may send on its first flight.
+
 Certificate material is checked against its own validity window wherever it is
 installed: a leaf whose `notAfter` has passed, or whose `notBefore` has not
 arrived, is refused outright on HTTP/1.1, HTTP/2 and HTTP/3 alike. There is no

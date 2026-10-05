@@ -1,6 +1,7 @@
 // Test harness for the shim's TLS-context plumbing: the once-per-process
 // ngtcp2 ossl initializer (#357), the certificate chain a reload installs
-// (#354) and what a refused reload leaves the engine serving (#352).
+// (#354), what a refused reload leaves the engine serving (#352, #353, #379)
+// and the process-wide session-ticket key (#382).
 //
 // None of this is reachable through a QUIC client: the initializer runs before
 // the first engine exists, the served chain length is not something curl
@@ -118,6 +119,78 @@ void vq_test_engine_subject(VqEngine *eng, char *buf, size_t len) {
 void vq_test_engine_host_subject(VqEngine *eng, char *buf, size_t len) {
   auto *e = reinterpret_cast<Engine *>(eng);
   subjectOf(e->sni_ctx.empty() ? nullptr : e->sni_ctx[0].get(), buf, len);
+}
+
+// --- #382: one session-ticket key across engines, with rotation -----------
+//
+// Drives the ticket-key callback exactly as OpenSSL does, so the sharing and
+// the rotation are observable without a resuming QUIC client (curl cannot
+// easily be made to resume over h3).
+
+// The process-wide key name the encrypt side would stamp, as lowercase hex.
+// Building another engine must not change it: pre-fix every SSL_CTX carried its
+// own OpenSSL-generated key, so a ticket issued on one loop was undecryptable
+// on all the others.
+void vq_test_ticket_key_name(char *buf, size_t len) {
+  std::lock_guard<std::mutex> lock(gTicketMu);
+  size_t n = 0;
+  for (size_t i = 0; i < kTicketKeyNameLen && n + 3 <= len; i++)
+    n += static_cast<size_t>(snprintf(buf + n, len - n, "%02x",
+                                      gTicketCur.name[i]));
+}
+
+// Non-zero if this engine's default context would suppress tickets.
+int vq_test_engine_no_ticket(VqEngine *eng) {
+  auto *e = reinterpret_cast<Engine *>(eng);
+  return (SSL_CTX_get_options(e->ssl_ctx.get()) & SSL_OP_NO_TICKET) ? 1 : 0;
+}
+
+// Bits:
+//   1   the encrypt side succeeded
+//   2   the name it stamped decrypts (rv 1)
+//   4   an unknown key name is refused with 0: a full handshake, not an error
+//   8   once the lifetime has elapsed the encrypt side stamps a NEW name
+//   16  ... and the retired name still decrypts, asking for a reissue (rv 2)
+//   32  ... while a name two lifetimes old is refused
+int vq_test_ticket_key_cycle(void) {
+  if (!osslInitOnce()) return -1;
+  EVP_MAC *mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+  if (!mac) return -1;
+  unsigned char name1[kTicketKeyNameLen], name2[kTicketKeyNameLen];
+  unsigned char name3[kTicketKeyNameLen], bogus[kTicketKeyNameLen];
+  unsigned char iv[EVP_MAX_IV_LENGTH];
+  auto call = [&](unsigned char *nm, int enc) {
+    EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
+    EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
+    const int rv =
+        (cctx && mctx) ? ticketKeyCb(nullptr, nm, iv, cctx, mctx, enc) : -1;
+    EVP_MAC_CTX_free(mctx);
+    EVP_CIPHER_CTX_free(cctx);
+    return rv;
+  };
+  auto age = [] {
+    std::lock_guard<std::mutex> lock(gTicketMu);
+    gTicketBorn -= std::chrono::seconds(
+        static_cast<long long>(kTicketKeyLifetimeSec));
+  };
+
+  int result = 0;
+  if (call(name1, 1) == 1) result |= 1;
+  if (call(name1, 0) == 1) result |= 2;
+  memcpy(bogus, name1, kTicketKeyNameLen);
+  bogus[0] = static_cast<unsigned char>(bogus[0] ^ 0xff);
+  if (call(bogus, 0) == 0) result |= 4;
+
+  age();
+  if (call(name2, 1) == 1 && memcmp(name1, name2, kTicketKeyNameLen) != 0)
+    result |= 8;
+  if (call(name1, 0) == 2) result |= 16;
+
+  age();
+  if (call(name3, 1) == 1 && call(name1, 0) == 0) result |= 32;
+
+  EVP_MAC_free(mac);
+  return result;
 }
 
 }  // extern "C"

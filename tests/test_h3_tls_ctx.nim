@@ -41,6 +41,12 @@ when not defined(plainHttp):
   proc vqEngineLastError(e: pointer): cstring
     {.importc: "vq_engine_last_error", cdecl.}
   proc vqEngineFree(e: pointer) {.importc: "vq_engine_free", cdecl.}
+  proc vqTestTicketKeyName(buf: cstring, len: csize_t)
+    {.importc: "vq_test_ticket_key_name", cdecl.}
+  proc vqTestEngineNoTicket(e: pointer): cint
+    {.importc: "vq_test_engine_no_ticket", cdecl.}
+  proc vqTestTicketKeyCycle(): cint
+    {.importc: "vq_test_ticket_key_cycle", cdecl.}
 
   suite "ngtcp2 ossl backend initialization (#357)":
     test "the backend initializes successfully":
@@ -326,5 +332,48 @@ when not defined(plainHttp):
         check "certificate expired at" in $vqEngineLastError(e)
         check "localhost" in subject(e)
         check vqTestEngineUsable(e) == 1
+
+  suite "the QUIC session-ticket key is process-wide and rotates (#382)":
+    ## Each loop builds its own SSL_CTX, and OpenSSL mints a random ticket key
+    ## per context, so a ticket issued on one loop decrypted only there -- while
+    ## the kernel's SO_REUSEPORT hash sends a returning client to an arbitrary
+    ## loop. On an N-loop server about (N-1)/N of resumption attempts quietly
+    ## fell back to a full handshake. The contexts stay per-loop (the per-loop
+    ## reload needs them) and the key is shared instead.
+    proc ticketKeyName(): string =
+      var buf = newString(64)
+      vqTestTicketKeyName(buf.cstring, csize_t(buf.len))
+      $cast[cstring](addr buf[0])
+
+    test "building another engine does not mint another key":
+      let before = ticketKeyName()
+      check before.len == 32              # 16 bytes, hex
+      check before != repeat('0', 32)
+      let a = engineFromPem(startCert, startKey)
+      let b = engineFromPem(startCert, startKey)
+      check a != nil and b != nil
+      defer:
+        vqEngineFree(a)
+        vqEngineFree(b)
+      check ticketKeyName() == before
+      # ... and both contexts still offer tickets at all.
+      check vqTestEngineNoTicket(a) == 0
+      check vqTestEngineNoTicket(b) == 0
+
+    test "a ticket encrypts and decrypts under the shared key":
+      # Bits from the harness: encrypt ok, the stamped name decrypts, an
+      # unknown name falls back to a full handshake instead of erroring.
+      let rv = vqTestTicketKeyCycle()
+      check rv >= 0
+      check (rv and 1) != 0
+      check (rv and 2) != 0
+      check (rv and 4) != 0
+
+    test "the key rotates and the previous one is honoured once more":
+      # Run last: it ages the process-wide key by two lifetimes.
+      let rv = vqTestTicketKeyCycle()
+      check (rv and 8) != 0     # a new name after the lifetime elapsed
+      check (rv and 16) != 0    # the retired name decrypts, asking for reissue
+      check (rv and 32) != 0    # two lifetimes old: refused
 
   removeDir(dir)

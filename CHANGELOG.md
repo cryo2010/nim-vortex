@@ -666,6 +666,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   valid until <notBefore>`, and a reload is rejected with the running
   certificate left serving. **Behaviour change**: a server that previously
   started while serving an expired certificate now refuses to start. (#379)
+- HTTP/3: TLS 1.3 session resumption now works across loop threads. Each loop
+  builds its own QUIC `SSL_CTX` and OpenSSL mints a random ticket key per
+  context, so a ticket was only decryptable by the loop that issued it -- while
+  which loop receives a returning client's first datagram is decided by the
+  kernel's SO_REUSEPORT hash over its new 4-tuple, which has nothing to do with
+  the issuing loop. On an N-loop server roughly (N-1)/N of resumption attempts
+  therefore fell back to a full handshake, invisibly: the connection succeeded,
+  just a round trip slower, every time. The contexts stay per-loop (the
+  per-loop certificate reload is built on that) and a process-wide ticket key
+  is installed on every one of them, default and per-host, initial and rebuilt,
+  alongside an explicit session-id context like the TCP path's. The key rotates
+  hourly: the current key encrypts, the previous one still decrypts for one
+  more lifetime with the ticket reissued under the new key, and any older name
+  is refused and costs that client one full handshake -- so a disclosed key
+  exposes at most two hours of resumed sessions instead of every session since
+  startup, which is what nginx and envoy rotate for. 0-RTT early data is not
+  offered on any protocol and is unaffected. (#382)
 
 ### Changed
 

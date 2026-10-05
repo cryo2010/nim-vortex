@@ -10,7 +10,10 @@
 #include <nghttp3/nghttp3.h>
 
 #include <openssl/ssl.h>
+#include <openssl/core_names.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/params.h>
 #include <openssl/rand.h>
 #include <openssl/pemerr.h>
 #include <openssl/pkcs12.h>
@@ -20,6 +23,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -989,6 +993,119 @@ static std::string sslErrStr() {
   return std::string(buf);
 }
 
+// --- process-wide TLS 1.3 session-ticket keys (#382) -----------------------
+//
+// Every loop thread builds its own QUIC SSL_CTX, and OpenSSL generates a fresh
+// random ticket key per context, so a ticket issued on one loop could only be
+// decrypted on that loop -- while which loop receives a returning client's
+// first datagram is decided by the kernel's SO_REUSEPORT hash over its NEW
+// 4-tuple, which has no relationship to the issuing loop. On an N-loop server
+// roughly (N-1)/N of resumption attempts therefore fell back to a full
+// handshake, invisibly: the connection succeeded, just a round trip slower,
+// every time. The contexts stay per-loop (the per-loop reload is built on
+// that); the ticket key is shared instead, which is the sharing the TCP path
+// gets for free from its single ctx.
+//
+// The keys rotate: the current key encrypts, the previous one still decrypts
+// for one more lifetime and the callback returns 2 so OpenSSL reissues the
+// ticket under the current key, and any older name is refused (0), which costs
+// that client one full handshake. Without rotation a memory disclosure would
+// compromise every session resumed since startup, which is why nginx and envoy
+// both rotate. The callback runs on every loop thread, so the state is behind a
+// mutex; it is touched once per ticket, not per packet.
+//
+// 0-RTT early data is NOT offered anywhere in the shim (nothing enables early
+// data on the SSL or sets an early-data context), so this is about session
+// resumption only and does not change what a client may send on its first
+// flight.
+
+constexpr uint64_t kTicketKeyLifetimeSec = 3600;
+constexpr size_t kTicketKeyNameLen = 16;
+constexpr size_t kTicketAesIvLen = 16;    // AES-256-CBC
+
+struct TicketKey {
+  unsigned char name[kTicketKeyNameLen]{};
+  unsigned char aes[32]{};    // AES-256-CBC key
+  unsigned char hmac[32]{};   // HMAC-SHA256 key
+  bool valid = false;
+};
+
+static std::mutex gTicketMu;
+static TicketKey gTicketCur;
+static TicketKey gTicketPrev;
+static std::chrono::steady_clock::time_point gTicketBorn;
+
+static bool genTicketKey(TicketKey *k) {
+  if (RAND_bytes(k->name, sizeof k->name) != 1 ||
+      RAND_bytes(k->aes, sizeof k->aes) != 1 ||
+      RAND_bytes(k->hmac, sizeof k->hmac) != 1) {
+    ERR_clear_error();
+    return false;
+  }
+  k->valid = true;
+  return true;
+}
+
+// Caller holds gTicketMu.
+static void rotateTicketKeyIfDue() {
+  const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::steady_clock::now() - gTicketBorn)
+                       .count();
+  if (age < static_cast<long long>(kTicketKeyLifetimeSec)) return;
+  TicketKey next;
+  if (!genTicketKey(&next)) return;   // RNG trouble: keep the current key
+  gTicketPrev = gTicketCur;
+  gTicketCur = next;
+  gTicketBorn = std::chrono::steady_clock::now();
+}
+
+static bool ticketMacInit(EVP_MAC_CTX *hctx, const unsigned char *key,
+                          size_t len) {
+  OSSL_PARAM params[2];
+  params[0] = OSSL_PARAM_construct_utf8_string(
+      OSSL_MAC_PARAM_DIGEST, const_cast<char *>(SN_sha256), 0);
+  params[1] = OSSL_PARAM_construct_end();
+  return EVP_MAC_init(hctx, key, len, params) == 1;
+}
+
+static int ticketKeyCb(SSL * /*ssl*/, unsigned char key_name[16],
+                       unsigned char iv[EVP_MAX_IV_LENGTH],
+                       EVP_CIPHER_CTX *ctx, EVP_MAC_CTX *hctx, int enc) {
+  std::lock_guard<std::mutex> lock(gTicketMu);
+  // Normally seeded by osslInitOnce before any engine exists; self-heal rather
+  // than fail a handshake if a context somehow got here first.
+  if (!gTicketCur.valid) {
+    if (!genTicketKey(&gTicketCur)) return -1;
+    gTicketBorn = std::chrono::steady_clock::now();
+  }
+  if (enc) {
+    rotateTicketKeyIfDue();
+    if (RAND_bytes(iv, static_cast<int>(kTicketAesIvLen)) != 1) {
+      ERR_clear_error();
+      return -1;
+    }
+    memcpy(key_name, gTicketCur.name, kTicketKeyNameLen);
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, gTicketCur.aes,
+                           iv) != 1)
+      return -1;
+    return ticketMacInit(hctx, gTicketCur.hmac, sizeof gTicketCur.hmac) ? 1
+                                                                        : -1;
+  }
+  const TicketKey *k = nullptr;
+  int rv = 1;
+  if (memcmp(key_name, gTicketCur.name, kTicketKeyNameLen) == 0) {
+    k = &gTicketCur;
+  } else if (gTicketPrev.valid &&
+             memcmp(key_name, gTicketPrev.name, kTicketKeyNameLen) == 0) {
+    k = &gTicketPrev;
+    rv = 2;   // accept, and reissue the ticket under the current key
+  }
+  if (!k) return 0;   // retired or foreign key name: a full handshake
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, k->aes, iv) != 1)
+    return -1;
+  return ticketMacInit(hctx, k->hmac, sizeof k->hmac) ? rv : -1;
+}
+
 // A readable rendering of an ASN1_TIME ("Jan  2 00:00:00 2020 GMT"), or "" if
 // OpenSSL will not print it.
 static std::string asn1TimeStr(const ASN1_TIME *t) {
@@ -1059,6 +1176,18 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);
+  // Session resumption. Tickets are issued by default (SSL_OP_NO_TICKET is
+  // never set, and the ngtcp2 ossl backend does not change that: it only
+  // registers the QUIC record-layer callbacks on the SSL, so the TLS stack
+  // builds and encrypts tickets as usual and they travel in CRYPTO frames).
+  // The key is process-wide so a returning client resumes on whichever loop the
+  // kernel's SO_REUSEPORT hash hands it, instead of only on the loop that
+  // issued the ticket (#382). An explicit session-id context goes with it, like
+  // the TCP path's: under client-cert auth OpenSSL refuses to resume a session
+  // that has none.
+  SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx.get(), ticketKeyCb);
+  static const unsigned char kSidCtx[] = "vortex-h3/1";
+  SSL_CTX_set_session_id_context(ctx.get(), kSidCtx, sizeof kSidCtx - 1);
   bool ok;
   if ((cfg->pkcs12 && cfg->pkcs12_len) ||
       (cfg->pkcs12_file && cfg->pkcs12_file[0])) {
@@ -1253,6 +1382,14 @@ static thread_local std::string gEngineError;
 static bool osslInitOnce() {
   std::call_once(gOsslInitOnce, [] {
     gOsslInitRv = ngtcp2_crypto_ossl_init();
+    // The first process-wide ticket key is generated here too, once, before any
+    // loop thread can build a context (#382). A broken RNG fails the engine:
+    // nothing about TLS works without it.
+    if (gOsslInitRv == 0) {
+      std::lock_guard<std::mutex> lock(gTicketMu);
+      if (!genTicketKey(&gTicketCur)) gOsslInitRv = -1;
+      else gTicketBorn = std::chrono::steady_clock::now();
+    }
     ++gOsslInitRuns;
   });
   return gOsslInitRv == 0;
