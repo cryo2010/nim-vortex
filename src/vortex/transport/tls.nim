@@ -625,6 +625,22 @@ proc freeTlsConfig*(cfg: ptr TlsConfig)
   ## Forward-declared: newTlsConfigWith unwinds through it when a per-host SNI
   ## context fails to build (#361). Defined with the rest of the lifecycle below.
 
+proc installDefaultCbs(cfg: ptr TlsConfig, ctx: SslCtxPtr, ocsp: string,
+                       hasSni: bool) =
+  ## Install on a freshly built *default* ctx everything buildTlsCtx leaves to
+  ## the caller, i.e. every callback that needs the stable `cfg` pointer as its
+  ## argument. Both the initial build and a hot-reload go through here, because
+  ## the reload used to re-register only ALPN: the servername callback was
+  ## dropped with the old ctx, so every configured SNI host silently fell back
+  ## to the default certificate from the first reload onwards and failed the
+  ## handshake on a name mismatch until the process restarted (#355).
+  SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, cfg)
+  attachOcsp(ctx, ocsp)   # OCSP stapling for the default cert
+  if hasSni:
+    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+                                  cast[pointer](servernameCb))
+    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, cfg)
+
 proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        minProtoVersion: clong = 0, cipherList = "",
                        cipherSuites = "", verify: cint = 0,
@@ -649,8 +665,7 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   result.cipherSuites = cipherSuites
   result.ocsp = ocsp
   result.ocspFile = ocspFile
-  SSL_CTX_set_alpn_select_cb(ctx, alpnSelect, result)
-  attachOcsp(ctx, ocsp)   # OCSP stapling for the default cert
+  installDefaultCbs(result, ctx, ocsp, sni.len > 0)
   # SNI: one ctx per host, selected by the servername callback on the default.
   for sc in sni:
     var hctx: SslCtxPtr
@@ -672,10 +687,6 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
     SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, result)
     result.sniHosts.add sc.host
     result.sniCtx.add hctx
-  if sni.len > 0:
-    discard SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
-                                  cast[pointer](servernameCb))
-    discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, result)
 
 # --- active SSL_CTX lifetime -------------------------------------------------
 #
@@ -772,8 +783,7 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                          cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
   except CatchableError:
     return false
-  SSL_CTX_set_alpn_select_cb(newCtx, alpnSelect, cfg)
-  attachOcsp(newCtx, newOcsp)   # per-ctx staple (own blob, freed with the ctx)
+  installDefaultCbs(cfg, newCtx, newOcsp, cfg.sniHosts.len > 0)
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile

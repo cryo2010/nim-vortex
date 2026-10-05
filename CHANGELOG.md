@@ -556,6 +556,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting only the material, so an operator with several SNI entries can tell
   which one is broken and an embedder that catches the raise can retry with
   corrected configuration. (#361)
+- TLS: SNI keeps working after a certificate reload. `reloadTlsConfig` rebuilds
+  the default context and re-registered only the ALPN callback on the
+  replacement, so the servername callback went away with the old context: from
+  the first `reloadTls()` onwards every configured SNI host was served the
+  *default* certificate and failed the handshake on a name mismatch, until the
+  process restarted. Because the fault only appears after a reload it would
+  surface in production long after deployment rather than in testing. The
+  callback registration both paths need is now one helper (`installDefaultCbs`),
+  so the initial build and the reload cannot drift apart again. (#355)
 
 ### Changed
 

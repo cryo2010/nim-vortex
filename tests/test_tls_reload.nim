@@ -168,4 +168,54 @@ suite "OCSP staple rotation across reload":
     osrv.close()
 
 removeDir(odir)
+
+# --- SNI across a certificate reload -----------------------------------------
+# reloadTlsConfig rebuilds the default ctx, so every callback the initial build
+# installed on the old one has to be installed on the replacement. It used to
+# re-register only ALPN, which dropped the servername callback: from the first
+# reload onwards every configured SNI host was served the *default* certificate
+# and failed the handshake on a name mismatch, until the process restarted
+# (#355). Both paths now go through one helper so they cannot drift again.
+
+let sdir = getTempDir() / "vortex_tls_reload_sni_" & $getCurrentProcessId()
+removeDir(sdir); createDir(sdir)
+genCert(sdir / "def.pem", sdir / "def.key", "default.vortex")
+genCert(sdir / "host.pem", sdir / "host.key", "alt.vortex")
+
+# http3 = false keeps the assertions about the TCP listener: the h3 engine
+# reloads asynchronously on its own loop tick, and test_tls_reload_h3.nim is
+# where that path is covered.
+var ssrv = newVortex(RequestHandler(handler), initVortexConfig(
+  numThreads = 1, certFile = sdir / "def.pem", keyFile = sdir / "def.key",
+  http3 = false,
+  sni = @[SniCertEntry(host: "alt.vortex", certFile: sdir / "host.pem",
+                       keyFile: sdir / "host.key")])).start(0)
+let sport = $ssrv.port
+
+proc sniSubject(servername: string): string =
+  let (o, _) = execCmdEx(
+    "echo | openssl s_client -connect 127.0.0.1:" & sport &
+    " -servername " & servername &
+    " 2>/dev/null | openssl x509 -noout -subject 2>/dev/null")
+  result = o.strip()
+
+suite "SNI across a certificate reload":
+  test "the per-host certificate is served before any reload":
+    check "alt.vortex" in sniSubject("alt.vortex")
+    check "default.vortex" in sniSubject("other.vortex")
+
+  test "the servername callback survives a reload":
+    check ssrv.reloadTls()
+    check "alt.vortex" in sniSubject("alt.vortex")        # not the default cert
+    check "default.vortex" in sniSubject("other.vortex")
+    check stillServesOn(sport)
+
+  test "and survives a second one (the helper is used on every rebuild)":
+    genCert(sdir / "def.pem", sdir / "def.key", "default2.vortex")
+    check ssrv.reloadTls()
+    check "default2.vortex" in sniSubject("other.vortex")  # default rotated
+    check "alt.vortex" in sniSubject("alt.vortex")          # SNI still routed
+
+ssrv.close()
+removeDir(sdir)
 echo "tls reload ok"
