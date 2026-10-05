@@ -2,13 +2,13 @@
 ##
 ## These cover invariants no HTTP/3 client can observe: how many times the
 ## ngtcp2 ossl backend was initialized (#357), how long the certificate chain a
-## repeated load installs ends up being (#354), and what a refused certificate
-## reload leaves the engine serving (#352 -- a reload that fails only on the
-## QUIC side is one server.reloadTls rejects before it ever signals the loops,
-## so there is no way in from Nim). The harness
-## tests/vq_h3_tls_ctx.cpp compiles the shim's own translation unit to reach its
-## internals, so this suite must NOT import the vortex h3 backend -- the shim's
-## extern "C" ABI is linked exactly once here.
+## repeated load installs ends up being (#354), and what a certificate reload
+## installs or refuses (#352, #353 -- a reload that fails only on the QUIC side
+## is one server.reloadTls rejects before it ever signals the loops, so there is
+## no way in from Nim). The harness tests/vq_h3_tls_ctx.cpp compiles the shim's
+## own translation unit to reach its internals, so this suite must NOT import
+## the vortex h3 backend -- the shim's extern "C" ABI is linked exactly once
+## here.
 
 import std/[unittest, os, osproc, strutils]
 
@@ -25,8 +25,9 @@ when not defined(plainHttp):
   proc vqTestP12ChainLenAfterLoads(der: ptr uint8, len: csize_t, pw: cstring,
                                    times: cint): cint
     {.importc: "vq_test_p12_chain_len_after_loads", cdecl.}
-  proc vqTestEngineNew(certPem, keyPem, host, hostCertFile,
-                       hostKeyFile: cstring): pointer
+  proc vqTestEngineNewC(certFile, keyFile, certPem, keyPem, pkcs12File,
+                        keyPassword, host, hostCertFile,
+                        hostKeyFile: cstring): pointer
     {.importc: "vq_test_engine_new", cdecl.}
   proc vqTestEngineUsable(e: pointer): cint
     {.importc: "vq_test_engine_usable", cdecl.}
@@ -35,7 +36,7 @@ when not defined(plainHttp):
   proc vqTestEngineHostSubject(e: pointer, buf: cstring, len: csize_t)
     {.importc: "vq_test_engine_host_subject", cdecl.}
   # The real reload ABI, driven directly.
-  proc vqEngineReloadCert(e: pointer, certPem, keyPem: cstring): cint
+  proc vqEngineReloadCert(e: pointer, certFile, keyFile: cstring): cint
     {.importc: "vq_engine_reload_cert", cdecl.}
   proc vqEngineLastError(e: pointer): cstring
     {.importc: "vq_engine_last_error", cdecl.}
@@ -55,8 +56,6 @@ when not defined(plainHttp):
       # race from a client, so the invariant itself is what is pinned here.
       check vqTestOsslInitRuns() == 1
 
-  # A two-level chain (ChainCA -> leaf) and the same material as a PKCS#12
-  # bundle carrying the CA, so both loaders have one chain certificate to add.
   let dir = getTempDir() / "vortex_h3tlsctx_" & $getCurrentProcessId()
   removeDir(dir); createDir(dir)
 
@@ -64,10 +63,13 @@ when not defined(plainHttp):
     let (o, rc) = execCmdEx(cmd)
     doAssert rc == 0, cmd & "\n" & o
 
-  let openssl = findExe("openssl")
-  if openssl.len == 0:
-    echo "SKIP: need openssl for the chain fixtures"
+  if findExe("openssl").len == 0:
+    echo "SKIP: need openssl for the certificate fixtures"
     quit 0
+
+  # A two-level chain (ChainCA -> leaf, CN=localhost) and the same material as a
+  # PKCS#12 bundle carrying the CA, so both loaders have one chain certificate
+  # to add.
   must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
        "/ca.key -out " & dir & "/ca.pem -days 2 -subj /CN=ChainCA")
   must("openssl req -newkey rsa:2048 -nodes -keyout " & dir &
@@ -98,19 +100,35 @@ when not defined(plainHttp):
       check vqTestP12ChainLenAfterLoads(der, csize_t(p12.len), "".cstring, 1) == 1
       check vqTestP12ChainLenAfterLoads(der, csize_t(p12.len), "".cstring, 4) == 1
 
-  # A second, unrelated pair for the reload cases, plus a third key that parses
-  # cleanly but belongs to neither certificate.
+  # A second pair for the reload cases, a third key that parses cleanly but
+  # belongs to neither certificate, a per-host pair, and a key file that is not
+  # a key at all.
   must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
        "/beta.key -out " & dir & "/beta.pem -days 2 -subj /CN=beta.vortex")
   must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
        "/stray.key -out " & dir & "/stray.pem -days 2 -subj /CN=stray.vortex")
   must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
        "/api.key -out " & dir & "/api.pem -days 2 -subj /CN=api.example.com")
+  writeFile(dir / "junk.key", "-----BEGIN PRIVATE KEY-----\nzzzz\n")
   let startCert = readFile(dir / "leaf.pem")      # CN=localhost
   let startKey = readFile(dir / "leaf.key")
-  let newCert = readFile(dir / "beta.pem")        # CN=beta.vortex
-  let newKey = readFile(dir / "beta.key")
-  let strayKey = readFile(dir / "stray.key")      # parses, matches neither
+  let betaCert = dir / "beta.pem"                 # CN=beta.vortex
+  let betaKey = dir / "beta.key"
+
+  proc engineFromPem(cert, key: string, host = "", hostCert = "",
+                     hostKey = ""): pointer =
+    vqTestEngineNewC("".cstring, "".cstring, cert.cstring, key.cstring,
+                     "".cstring, "".cstring, host.cstring, hostCert.cstring,
+                     hostKey.cstring)
+
+  proc engineFromFiles(cert, key: string): pointer =
+    vqTestEngineNewC(cert.cstring, key.cstring, "".cstring, "".cstring,
+                     "".cstring, "".cstring, "".cstring, "".cstring, "".cstring)
+
+  proc engineFromP12(p12File: string): pointer =
+    vqTestEngineNewC("".cstring, "".cstring, "".cstring, "".cstring,
+                     p12File.cstring, "".cstring, "".cstring, "".cstring,
+                     "".cstring)
 
   proc subject(e: pointer): string =
     var buf = newString(512)
@@ -122,7 +140,7 @@ when not defined(plainHttp):
     vqTestEngineHostSubject(e, buf.cstring, csize_t(buf.len))
     $cast[cstring](addr buf[0])
 
-  proc reload(e: pointer, cert, key: string): bool =
+  proc reload(e: pointer, cert = "", key = ""): bool =
     vqEngineReloadCert(e, cert.cstring, key.cstring) == 0
 
   suite "QUIC certificate reload is all or nothing (#352)":
@@ -134,11 +152,11 @@ when not defined(plainHttp):
     ## on that loop failed, permanently, while the caller was told the old
     ## certificate was still serving.
     test "a key that does not match the certificate is refused":
-      let e = vqTestEngineNew(startCert.cstring, startKey.cstring, "", "", "")
+      let e = engineFromPem(startCert, startKey)
       check e != nil
       defer: vqEngineFree(e)
       check "localhost" in subject(e)
-      check not reload(e, newCert, strayKey)
+      check not reload(e, betaCert, dir / "stray.key")
       # SSL_CTX_use_PrivateKey rejects the pair itself, so the reason OpenSSL
       # queued reaches the caller; makeCtx's own check_private_key is the
       # backstop for the halves that load but do not go together.
@@ -146,28 +164,38 @@ when not defined(plainHttp):
       check vqTestEngineUsable(e) == 1      # pre-fix: 0, h3 dead for good
       check "localhost" in subject(e)       # pre-fix: the new leaf, keyless
 
-    test "a key that does not parse is refused":
-      let e = vqTestEngineNew(startCert.cstring, startKey.cstring, "", "", "")
+    test "a key file that does not parse is refused":
+      let e = engineFromPem(startCert, startKey)
       check e != nil
       defer: vqEngineFree(e)
-      check not reload(e, newCert, "-----BEGIN NOT A KEY-----\nzzzz\n")
+      check not reload(e, betaCert, dir / "junk.key")
       check "cannot load TLS certificate/key" in $vqEngineLastError(e)
       check vqTestEngineUsable(e) == 1
       check "localhost" in subject(e)
 
-    test "a certificate with no key is refused":
-      let e = vqTestEngineNew(startCert.cstring, startKey.cstring, "", "", "")
+    test "a key file that cannot be read is refused":
+      let e = engineFromPem(startCert, startKey)
       check e != nil
       defer: vqEngineFree(e)
-      check not reload(e, newCert, "")
+      check not reload(e, betaCert, dir / "no-such.key")
+      check vqTestEngineUsable(e) == 1
+      check "localhost" in subject(e)
+
+    test "a certificate rotated without its key is refused":
+      # An empty key means "keep the configured one", which cannot match the
+      # new certificate. The pre-fix reload reported this as a success.
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      check not reload(e, betaCert, "")
       check vqTestEngineUsable(e) == 1
       check "localhost" in subject(e)
 
     test "a matching pair is installed and reported as a success":
-      let e = vqTestEngineNew(startCert.cstring, startKey.cstring, "", "", "")
+      let e = engineFromPem(startCert, startKey)
       check e != nil
       defer: vqEngineFree(e)
-      check reload(e, newCert, newKey)
+      check reload(e, betaCert, betaKey)
       check $vqEngineLastError(e) == ""
       check "beta.vortex" in subject(e)
       check vqTestEngineUsable(e) == 1
@@ -176,18 +204,92 @@ when not defined(plainHttp):
       # The per-host rebuild is part of the same transaction, so a per-host
       # certificate file that went bad between reloads must not leave the
       # default context half-swapped.
-      let e = vqTestEngineNew(startCert.cstring, startKey.cstring,
-                              "api.example.com".cstring,
-                              (dir / "api.pem").cstring,
-                              (dir / "api.key").cstring)
+      let e = engineFromPem(startCert, startKey, "api.example.com",
+                            dir / "api.pem", dir / "api.key")
       check e != nil
       defer: vqEngineFree(e)
       check "api.example.com" in hostSubject(e)
       writeFile(dir / "api.pem", "-----BEGIN CERTIFICATE-----\nzzzz\n")
-      check not reload(e, newCert, newKey)
+      check not reload(e, betaCert, betaKey)
       check "api.example.com" in $vqEngineLastError(e)
       check "localhost" in subject(e)            # default context untouched
       check "api.example.com" in hostSubject(e)  # and so is the per-host one
       check vqTestEngineUsable(e) == 1
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+           "/api.key -out " & dir & "/api.pem -days 2 -subj /CN=api.example.com")
+
+  suite "a bare QUIC reload re-reads the configured material (#353)":
+    ## The engine keeps the material it was configured from, so a reload with no
+    ## paths means the same thing on QUIC as on TCP. It used to mean nothing at
+    ## all: the loop called readFile("") and the reload failed, so the certbot
+    ## pattern the project documents rotated HTTP/1.1 and HTTP/2 and left h3 on
+    ## the certificate loaded at startup.
+    test "a file-configured engine picks up the files replaced on disk":
+      let cert = dir / "rot.pem"
+      let key = dir / "rot.key"
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
+           " -out " & cert & " -days 2 -subj /CN=before.vortex")
+      let e = engineFromFiles(cert, key)
+      check e != nil
+      defer: vqEngineFree(e)
+      check "before.vortex" in subject(e)
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
+           " -out " & cert & " -days 2 -subj /CN=after.vortex")
+      check reload(e)                              # no paths: certbot's form
+      check "after.vortex" in subject(e)
+
+    test "explicit paths become what the next bare reload re-reads":
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      let cert = dir / "roll.pem"
+      let key = dir / "roll.key"
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
+           " -out " & cert & " -days 2 -subj /CN=roll-one.vortex")
+      check reload(e, cert, key)
+      check "roll-one.vortex" in subject(e)
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & key &
+           " -out " & cert & " -days 2 -subj /CN=roll-two.vortex")
+      check reload(e)
+      check "roll-two.vortex" in subject(e)
+
+    test "a PEM-configured engine keeps serving its bytes":
+      # Nothing to re-read, so the rebuild is a no-op for the default
+      # certificate. It must still report success: the per-host files are
+      # re-read on the same call.
+      let e = engineFromPem(startCert, startKey, "api.example.com",
+                            dir / "api.pem", dir / "api.key")
+      check e != nil
+      defer: vqEngineFree(e)
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+           "/api.key -out " & dir & "/api.pem -days 2 -subj /CN=api2.example.com")
+      check reload(e)
+      check "localhost" in subject(e)
+      check "api2.example.com" in hostSubject(e)
+
+    test "a bare reload on a PKCS#12 engine is a no-op that succeeds":
+      let e = engineFromP12(dir / "bundle.p12")
+      check e != nil
+      defer: vqEngineFree(e)
+      check "localhost" in subject(e)
+      check reload(e)
+      check "localhost" in subject(e)
+
+    test "a key-only reload against a PKCS#12 certificate is refused":
+      # Mirrors reloadTlsConfig: the bundle carries both halves and takes
+      # precedence, so a lone key would never be opened.
+      let e = engineFromP12(dir / "bundle.p12")
+      check e != nil
+      defer: vqEngineFree(e)
+      check not reload(e, "", betaKey)
+      check "PKCS#12" in $vqEngineLastError(e)
+      check "localhost" in subject(e)
+
+    test "explicit paths replace a PKCS#12 bundle":
+      let e = engineFromP12(dir / "bundle.p12")
+      check e != nil
+      defer: vqEngineFree(e)
+      check reload(e, betaCert, betaKey)
+      check "beta.vortex" in subject(e)
 
   removeDir(dir)

@@ -62,19 +62,25 @@ int vq_test_p12_chain_len_after_loads(const uint8_t *der, size_t len,
   return chainLen(ctx.get());
 }
 
-// --- #352: a refused reload must change nothing ---------------------------
+// --- #352 / #353: what a reload installs, and what a refused one leaves ---
 //
-// An engine built straight from PEM material, with an optional single per-host
-// (SNI) certificate read from files so the per-host rebuild can be driven too.
-// The caller reloads it through the real vq_engine_reload_cert ABI and then
-// asks what the engine is left with.
+// An engine built from any of the material sources VqConfig accepts, with an
+// optional single per-host (SNI) certificate read from files so the per-host
+// rebuild can be driven too. The caller then reloads it through the real
+// vq_engine_reload_cert ABI and asks what the engine is left with.
 
-VqEngine *vq_test_engine_new(const char *cert_pem, const char *key_pem,
+VqEngine *vq_test_engine_new(const char *cert_file, const char *key_file,
+                             const char *cert_pem, const char *key_pem,
+                             const char *pkcs12_file, const char *key_password,
                              const char *host, const char *host_cert_file,
                              const char *host_key_file) {
   VqConfig cfg{};
+  cfg.cert_file = cert_file;
+  cfg.key_file = key_file;
   cfg.cert_pem = cert_pem;
   cfg.key_pem = key_pem;
+  cfg.pkcs12_file = pkcs12_file;
+  cfg.key_password = key_password;
   VqSniCert sc{};
   if (host && host[0]) {
     sc.host = host;

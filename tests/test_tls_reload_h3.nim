@@ -3,16 +3,29 @@
 ## server surviving a TCP+h3 cert swap) needs ngtcp2/nghttp3, which a TLS build
 ## links, so it runs whenever this suite is built (i.e. not -d:plainHttp).
 ##
-## The actual cert *presented* over h3 is verified by CI's curl-h3 suite (which
-## exercises the per-loop ngtcp2 engine); locally there is no h3 client that
-## reports the peer certificate, so this checks the server keeps serving (and the
-## TCP side presents the new cert) after a reload with h3 enabled.
+## The certificate actually *presented* over h3 is read back with an
+## HTTP/3-capable curl where one is installed (findH3Curl); the rest of the
+## suite runs without it, checking that the server keeps serving and that the
+## TCP side presents the new certificate.
 
 import std/[unittest, os, osproc, net, httpcore, strutils]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 import vortex/transport/tls
 import ./helper
+
+let h3curlBin = findH3Curl()   # "" when no HTTP/3-capable curl is installed
+
+proc h3Subject(port: Port): string =
+  ## The certificate subject an HTTP/3 handshake is served, per curl -v.
+  if h3curlBin.len == 0: return ""
+  let (output, _) = execCmdEx(
+    h3curlBin & " -sv -k -m 10 -o /dev/null --http3-only https://127.0.0.1:" &
+    $port & "/ 2>&1")
+  for line in output.splitLines:
+    let l = line.strip(chars = {' ', '*', '\t'})
+    if l.startsWith("subject:"): return l
+  ""
 
 let dir = getTempDir() / "vortex_h3reload_" & $getCurrentProcessId()
 createDir(dir)
@@ -64,6 +77,57 @@ suite "http3 server survives a certificate reload":
     sleep(1500)                           # let the loop ticks apply the h3 swap
     check "charlie.vortex" in cn()         # TCP presents the new cert
     check served()                         # and the server is still up
+    if h3curlBin.len > 0:
+      check "charlie.vortex" in h3Subject(srv.port)
+
+suite "a bare reloadTls() rotates the h3 certificate too (#353)":
+  ## The certbot pattern: renew in place, then srv.reloadTls() with no
+  ## arguments. Nothing resolved the configured paths on the QUIC side (the loop
+  ## called readFile("")), so HTTP/1.1 and HTTP/2 picked up the new certificate
+  ## and HTTP/3 kept serving the one loaded at startup until it expired -- a
+  ## protocol-specific outage 90 days after deployment.
+  test "overwriting the configured files and reloading rotates both transports":
+    let certR = dir / "r.pem"
+    let keyR = dir / "rkey.pem"
+    genCert(certR, keyR, "renew-before.vortex")
+    var srv = newVortex(RequestHandler(proc(req: Request, res: Response) {.gcsafe.} =
+                      res.send(Http200, "ok")),
+                      initVortexConfig(numThreads = 2, certFile = certR,
+                                       keyFile = keyR, http3 = true)).start(0)
+    defer: srv.close()
+    proc tcpSubject(): string =
+      execCmdEx("echo | openssl s_client -connect 127.0.0.1:" & $srv.port &
+                " 2>/dev/null | openssl x509 -noout -subject 2>/dev/null")[0]
+    check "renew-before.vortex" in tcpSubject()
+    if h3curlBin.len > 0:
+      check "renew-before.vortex" in h3Subject(srv.port)
+    genCert(certR, keyR, "renew-after.vortex")   # certbot, in place
+    check srv.reloadTls()                        # no arguments at all
+    sleep(1500)                                  # let every loop tick apply it
+    check "renew-after.vortex" in tcpSubject()
+    if h3curlBin.len > 0:
+      check "renew-after.vortex" in h3Subject(srv.port)
+
+  test "a server configured from certPem keeps serving across a bare reload":
+    # No files to re-read, so the rebuild is a no-op for the material. It must
+    # still report success rather than failing the renewal hook.
+    let certP = dir / "p.pem"
+    let keyP = dir / "pkey.pem"
+    genCert(certP, keyP, "inmem.vortex")
+    var srv = newVortex(RequestHandler(proc(req: Request, res: Response) {.gcsafe.} =
+                      res.send(Http200, "ok")),
+                      initVortexConfig(numThreads = 2,
+                                       certPem = readFile(certP),
+                                       keyPem = readFile(keyP),
+                                       http3 = true)).start(0)
+    defer: srv.close()
+    check srv.reloadTls()
+    sleep(1500)
+    var c = newHttpClient(sslContext = newContext(verifyMode = CVerifyNone))
+    defer: c.close()
+    check c.getContent("https://127.0.0.1:" & $srv.port & "/") == "ok"
+    if h3curlBin.len > 0:
+      check "inmem.vortex" in h3Subject(srv.port)
 
 removeDir(dir)
 echo "h3 cert reload ok"

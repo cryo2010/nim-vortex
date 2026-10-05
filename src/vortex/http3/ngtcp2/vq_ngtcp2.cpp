@@ -185,6 +185,10 @@ struct Engine {
   // that already switched to one keeps it alive through its own reference.
   std::vector<Material> sni;
   std::vector<SslCtxPtr> sni_ctx;
+  // The DEFAULT certificate's material, kept for the same reason (#353): a
+  // reload with no paths means "re-read what was configured", which needs the
+  // configured sources, not just the bytes they produced at startup.
+  Material def_material;
   // Every CID that routes to a conn (our SCIDs + the client's original DCID).
   std::unordered_map<std::string, Conn *> byCid;
   std::vector<std::unique_ptr<Conn>> conns;
@@ -1070,6 +1074,21 @@ static Material materialOf(const VqSniCert *s) {
   return m;
 }
 
+// Same, for the default certificate's material in a VqConfig.
+static Material materialOfConfig(const VqConfig *c) {
+  auto str = [](const char *p) { return std::string(p ? p : ""); };
+  Material m;
+  m.cert_file = str(c->cert_file);
+  m.key_file = str(c->key_file);
+  m.cert_pem = str(c->cert_pem);
+  m.key_pem = str(c->key_pem);
+  m.key_password = str(c->key_password);
+  m.pkcs12_file = str(c->pkcs12_file);
+  if (c->pkcs12 && c->pkcs12_len)
+    m.pkcs12.assign(reinterpret_cast<const char *>(c->pkcs12), c->pkcs12_len);
+  return m;
+}
+
 // A VqConfig view over the engine's retained TLS policy plus `m`'s certificate
 // material: what makeCtx needs to build a per-host context, or rebuild one after
 // the caller's pointers are gone. Going through makeCtx is the point -- a host
@@ -1215,6 +1234,7 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   e->client_ca_pem = cfg->client_ca_pem ? cfg->client_ca_pem : "";
   e->cfg.tls_cipher_suites = nullptr;
   e->cfg.client_ca_file = e->cfg.client_ca_pem = nullptr;
+  e->def_material = materialOfConfig(cfg);
   for (size_t i = 0; i < cfg->sni_len; i++)
     e->sni.push_back(materialOf(&cfg->sni[i]));
   e->cfg.sni = nullptr;
@@ -1247,8 +1267,8 @@ const char *vq_engine_last_error(VqEngine *eng) {
   return reinterpret_cast<Engine *>(eng)->last_error.c_str();
 }
 
-int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
-                          const char *key_pem) {
+int vq_engine_reload_cert(VqEngine *eng, const char *cert_file,
+                          const char *key_file) {
   auto *e = reinterpret_cast<Engine *>(eng);
   e->last_error.clear();
   // Build a complete replacement context and publish it only once every piece
@@ -1260,9 +1280,43 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
   // missing or mismatched key left the engine holding a certificate with no
   // private key. Every later h3 handshake on that loop then failed, for good,
   // while the caller was told the old certificate was still serving (#352).
-  Material m;
-  m.cert_pem = cert_pem ? cert_pem : "";
-  m.key_pem = key_pem ? key_pem : "";
+  //
+  // Empty paths mean "rebuild from the configured material, re-reading any
+  // files", which is what a bare reloadTls() asks for and what the TCP path has
+  // always done. Before this the loop resolved nothing: applyQuicReload did
+  // readFile("") and the reload failed, so the certbot pattern the project
+  // documents (renew in place, then srv.reloadTls()) rotated HTTP/1.1 and
+  // HTTP/2 and left HTTP/3 on the certificate loaded at startup until it
+  // expired, at which point h3 broke on its own while the other protocols
+  // stayed healthy (#353). For material configured as PEM bytes or a PKCS#12
+  // blob there is nothing to re-read, so the rebuild is a no-op for the default
+  // certificate and still picks up per-host files replaced on disk.
+  const bool haveCert = cert_file && cert_file[0];
+  const bool haveKey = key_file && key_file[0];
+  Material m = e->def_material;
+  // Explicit paths replace whatever the material was sourced from, with the
+  // same rules as the TCP path's reloadTlsConfig: a certificate path clears the
+  // in-memory PEM and the bundle, and a key-only rotation against a
+  // PKCS#12-sourced certificate is refused rather than silently rebuilding the
+  // old pair (the bundle carries both halves and takes precedence, so the new
+  // key would never be opened).
+  const bool p12Sourced = !m.pkcs12.empty() || !m.pkcs12_file.empty();
+  if (haveCert) {
+    m.cert_file = cert_file;
+    m.cert_pem.clear();
+    m.pkcs12.clear();
+    m.pkcs12_file.clear();
+  }
+  if (haveKey) {
+    if (!haveCert && p12Sourced) {
+      e->last_error = "a key-only reload cannot replace a PKCS#12 certificate";
+      return -1;
+    }
+    m.key_file = key_file;
+    m.key_pem.clear();
+    m.pkcs12.clear();
+    m.pkcs12_file.clear();
+  }
   // A hot cert/key swap keeps the passphrase the engine was built with, and
   // ctxConfig carries over the verify policy, cipher suites, version pinning
   // and client CA, so the replacement is the same context with new material.
@@ -1286,6 +1340,10 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
   // its SSL is freed.
   if (!e->sni.empty()) e->sni_ctx = std::move(freshSni);
   e->ssl_ctx = std::move(fresh);
+  // Remember what was actually loaded, so the NEXT bare reload re-reads these
+  // paths rather than the ones configured at startup. Nothing is persisted on a
+  // rejection, matching reloadTlsConfig.
+  e->def_material = m;
   return 0;
 }
 

@@ -97,7 +97,7 @@ type
 {.push header: "vq_ngtcp2.h", cdecl.}
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
 proc vqEngineFree(e: ptr VqEngine) {.importc: "vq_engine_free".}
-proc vqEngineReloadCert(e: ptr VqEngine, certPem, keyPem: cstring): cint {.importc: "vq_engine_reload_cert".}
+proc vqEngineReloadCert(e: ptr VqEngine, certFile, keyFile: cstring): cint {.importc: "vq_engine_reload_cert".}
 proc vqEngineLastError(e: ptr VqEngine): cstring {.importc: "vq_engine_last_error".}
 proc vqEngineRecv(e: ptr VqEngine, pkt: ptr uint8, len: csize_t, peer: pointer,
   peerLen: csize_t, local: pointer, localLen: csize_t, nowNs: uint64) {.importc: "vq_engine_recv".}
@@ -780,8 +780,14 @@ proc ngTimeoutMs*(): int =
   if e == high(uint64): -1
   elif e <= now: 0
   else: int((e - now) div 1_000_000) + 1
-proc ngReloadCert*(certPem, keyPem: string): bool =
-  gEngine != nil and vqEngineReloadCert(gEngine, certPem.cstring, keyPem.cstring) == 0
+proc ngReloadCert*(certFile, keyFile: string): bool =
+  ## Rotate this loop's QUIC certificate from PEM file paths. Empty paths mean
+  ## "rebuild from the configured material, re-reading any files" -- the bare
+  ## reloadTls() form (#353). The shim builds a replacement context and installs
+  ## it only if everything loaded, so false means nothing changed; ngLastError
+  ## says why.
+  gEngine != nil and
+    vqEngineReloadCert(gEngine, certFile.cstring, keyFile.cstring) == 0
 proc ngLastError*(): string =
   ## Why this loop's last ngReloadCert was refused, or -- with no engine, i.e.
   ## after a failed ngSetup -- why the engine could not be built (#352). The

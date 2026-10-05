@@ -2247,8 +2247,10 @@ proc sweepWsIdle(loop: Loop) =
 
 proc applyQuicReload(loop: Loop) =
   ## Loop thread: apply a pending QUIC certificate reload to this loop's shim
-  ## engine in place. New h3 handshakes present the new cert; in-flight keep
-  ## theirs. A failed reload keeps the running cert and is logged (not silently
+  ## engine. The shim builds a replacement context and swaps it in, so new h3
+  ## handshakes present the new cert and in-flight ones keep theirs. Empty paths
+  ## mean "re-read the configured material", as on the TCP side. A failed reload
+  ## keeps the running cert and is logged with its reason (not silently
   ## dropped); the generation is consumed either way, so a permanently-bad cert
   ## does not spin -- the operator fixes the files and re-issues the reload.
   when not defined(plainHttp):
@@ -2257,10 +2259,16 @@ proc applyQuicReload(loop: Loop) =
     let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
                                 loop.quicReloadSeen, cf, kf)
     if gen != loop.quicReloadSeen:
+      # The paths go to the shim as paths: it owns the engine's configured
+      # material and re-reads the files itself, so empty paths (a bare
+      # reloadTls()) mean "rebuild from what was configured" exactly as they do
+      # on the TCP side. This used to readFile(cf) with cf == "", which raised
+      # and failed the reload, so the certbot pattern never rotated the h3
+      # certificate (#353).
       var ok = false
       var why = ""
       try:
-        ok = ngReloadCert(readFile(cf), readFile(kf))
+        ok = ngReloadCert(cf, kf)
         if not ok: why = ngLastError()
       except CatchableError as err:
         ok = false

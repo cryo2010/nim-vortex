@@ -168,20 +168,30 @@ typedef struct {
 VqEngine *vq_engine_new(const VqConfig *cfg);
 void      vq_engine_free(VqEngine *e);
 
-/* Hot-reload the TLS certificate/key (PEM blobs). 0 on success, -1 on failure.
- * A fresh SSL_CTX is built from the new material plus the engine's retained TLS
- * policy (passphrase, verify mode, cipher suites, version pinning, client CA)
- * and installed only once the certificate and key both loaded and match, so a
- * refused reload leaves the engine serving exactly what it was serving before.
- * Any per-host (SNI) contexts are rebuilt from the material they were
- * configured with in the same transaction, so a rotation of on-disk per-host
- * certificates is picked up with the default one and a failure anywhere leaves
- * every context as it was.
+/* Hot-reload the TLS certificate/key from PEM file paths. 0 on success, -1 on
+ * failure. A fresh SSL_CTX is built from the new material plus the engine's
+ * retained TLS policy (passphrase, verify mode, cipher suites, version pinning,
+ * client CA) and installed only once the certificate and key both loaded and
+ * match, so a refused reload leaves the engine serving exactly what it was
+ * serving before. Any per-host (SNI) contexts are rebuilt from the material
+ * they were configured with in the same transaction, so a rotation of on-disk
+ * per-host certificates is picked up with the default one and a failure
+ * anywhere leaves every context as it was.
+ *
+ * NULL/empty paths mean "rebuild from the material this engine was configured
+ * with, re-reading any files": the bare-reloadTls() form. Material configured
+ * as in-memory PEM or a PKCS#12 blob has nothing to re-read, so that is a no-op
+ * for the default certificate and still refreshes the per-host files. Explicit
+ * paths replace whatever the material was sourced from, with the TCP path's
+ * rules: a certificate path clears the in-memory PEM and the bundle, and a
+ * key-only reload against a PKCS#12-sourced certificate is refused. What loads
+ * successfully becomes the material the next bare reload re-reads.
  *
  * In-flight connections keep the certificate they handshook with: SSL_new
  * up-refs the SSL_CTX, so releasing the engine's reference here is a decrement
  * and the old context lives as long as the sessions created on it. */
-int vq_engine_reload_cert(VqEngine *e, const char *cert_pem, const char *key_pem);
+int vq_engine_reload_cert(VqEngine *e, const char *cert_file,
+                          const char *key_file);
 
 /* Why the last vq_engine_reload_cert on `e` failed (empty if it succeeded), or,
  * with e == NULL, why the last vq_engine_new on THIS thread failed. The string

@@ -635,6 +635,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builder records which step failed plus whatever OpenSSL queued about it
   (`vq_engine_last_error`), and the same reason is appended to the "HTTP/3
   engine setup failed" line at startup. (#352)
+- HTTP/3: a bare `reloadTls()` now rotates the HTTP/3 certificate too. The
+  no-argument form means "re-read the configured material", which the TCP
+  listener has always honoured, but nothing resolved it on the QUIC side: the
+  loop handed the shim `readFile("")`, which raised, so the reload failed and
+  was logged. That is the certbot pattern the project documents (renew in
+  place, then `srv.reloadTls()`), so after a renewal HTTP/1.1 and HTTP/2 served
+  the new certificate while HTTP/3 kept serving the one loaded at startup until
+  it expired, at which point every h3 connection failed while the other
+  protocols stayed healthy. The QUIC engine now keeps the material it was
+  configured from -- cert/key paths, in-memory PEM, PKCS#12 bundle and the key
+  passphrase -- and a reload with no paths rebuilds from it, re-reading any
+  files, exactly as `reloadTlsConfig` does; what loads successfully becomes
+  what the next bare reload re-reads. Explicit paths replace the configured
+  source under the same rules as the TCP path, including refusing a key-only
+  reload against a PKCS#12-sourced certificate. For material configured as PEM
+  bytes or a bundle there is nothing to re-read, so the rebuild is a correct
+  no-op for the default certificate and still refreshes the per-host files.
+  (#353)
 
 ### Changed
 
