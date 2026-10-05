@@ -608,6 +608,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client. The initializer now runs under a `std::call_once` and every engine
   sees the same verdict, so a failure fails them all rather than leaving some
   loops on a half-initialized backend. (#357)
+- HTTP/3: the shim's certificate loaders clear the context's existing chain
+  before installing a new one, so an in-place certificate reload no longer
+  grows what h3 clients receive. `SSL_CTX_use_certificate` does not touch the
+  chain (unlike `SSL_CTX_use_certificate_chain_file`, which clears it first),
+  and the PEM loader appended the new intermediates on top of the previous
+  leaf's, as did the PKCS#12 loader's `SSL_CTX_add1_chain_cert` calls. After a
+  CA rotated its intermediate, the next reload handed clients the new leaf
+  together with the old, no-longer-valid intermediates -- rejected outright by
+  strict clients, a larger handshake for the rest -- and the chain grew again
+  with every subsequent reload. (#354)
 
 ### Changed
 

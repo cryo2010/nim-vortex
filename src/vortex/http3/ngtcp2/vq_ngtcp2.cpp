@@ -857,6 +857,16 @@ static bool loadKey(SSL_CTX *ctx, const char *pem, const char *file,
 static bool loadCertChain(SSL_CTX *ctx, const char *pem) {
   BioPtr b(BIO_new_mem_buf(pem, -1));
   if (!b) return false;
+  // Drop whatever chain the ctx already holds before appending this one.
+  // SSL_CTX_use_certificate does NOT touch the chain (unlike
+  // SSL_CTX_use_certificate_chain_file, which clears it first), so loading into
+  // a context that already had a certificate left the previous leaf's
+  // intermediates in place and stacked the new ones on top: after a CA rotated
+  // its intermediate, h3 clients were handed the new leaf together with the
+  // old, no-longer-valid intermediates, and the chain grew with every reload
+  // (#354). Harmless on a fresh context, which is the only caller left now that
+  // a reload builds one (#352), but the function has to be correct on its own.
+  (void)SSL_CTX_clear_chain_certs(ctx);
   ERR_clear_error();   // so the peek below sees only our own errors
   X509Ptr leaf(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
   bool ok = leaf && SSL_CTX_use_certificate(ctx, leaf.get()) == 1;
@@ -887,6 +897,8 @@ static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
            : (file && file[0]) ? BIO_new_file(file, "rb")
                                : nullptr);
   if (!b) return false;
+  (void)SSL_CTX_clear_chain_certs(ctx);   // same accumulation as loadCertChain
+                                          // (add1_chain_cert appends), #354
   PKCS12 *p12 = d2i_PKCS12_bio(b.get(), nullptr);
   if (!p12) { ERR_clear_error(); return false; }
   EVP_PKEY *pkey = nullptr;
