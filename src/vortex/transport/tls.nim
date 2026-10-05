@@ -657,14 +657,24 @@ proc checkCertValidity(ctx: SslCtxPtr): string =
   ## failure, with no clock-skew allowance: serving an expired certificate is
   ## never intentional. At startup it fails loudly; on a reload it keeps the
   ## running certificate, like any other bad material.
+  ##
+  ## `X509_cmp_current_time` returns 0 only on failure: it maps an exact
+  ## equality to -1, so 0 means an ASN.1 time it could not parse. Treat it as a
+  ## rejection rather than as "inside the window", which is what it used to
+  ## mean here: a certificate whose notAfter will not parse must not be
+  ## installed on the strength of a comparison that never happened.
   let x = SSL_CTX_get0_certificate(ctx)
   if x == nil: return "no certificate"
   let notAfter = X509_getm_notAfter(x)
-  if notAfter != nil and X509_cmp_current_time(notAfter) < 0:
-    return "certificate expired at " & asn1TimeStr(notAfter)
+  if notAfter != nil:
+    let cmp = X509_cmp_current_time(notAfter)
+    if cmp == 0: return "certificate validity time could not be parsed"
+    if cmp < 0: return "certificate expired at " & asn1TimeStr(notAfter)
   let notBefore = X509_getm_notBefore(x)
-  if notBefore != nil and X509_cmp_current_time(notBefore) > 0:
-    return "certificate not valid until " & asn1TimeStr(notBefore)
+  if notBefore != nil:
+    let cmp = X509_cmp_current_time(notBefore)
+    if cmp == 0: return "certificate validity time could not be parsed"
+    if cmp > 0: return "certificate not valid until " & asn1TimeStr(notBefore)
   ""
 
 proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,

@@ -673,8 +673,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy is a hard failure with no clock-skew allowance and no warning-only
   mode: startup raises `certificate expired at <notAfter>` or `certificate not
   valid until <notBefore>`, and a reload is rejected with the running
-  certificate left serving. **Behaviour change**: a server that previously
-  started while serving an expired certificate now refuses to start. (#379)
+  certificate left serving. A time that cannot be read at all is refused too:
+  `X509_cmp_current_time` returns 0 only on failure (it reports an exact
+  equality as -1), and that 0 used to count as "inside the window", so a
+  certificate whose `notAfter` OpenSSL's own `x509` command prints as `Bad time
+  value` was installed on the strength of a comparison that never happened; it
+  now fails with `certificate validity time could not be parsed`.
+  **Behaviour change**: a server that previously started while serving an
+  expired certificate now refuses to start. (#379)
 - HTTP/3: TLS 1.3 session resumption now works across loop threads. Each loop
   builds its own QUIC `SSL_CTX` and OpenSSL mints a random ticket key per
   context, so a ticket was only decryptable by the loop that issued it -- while
