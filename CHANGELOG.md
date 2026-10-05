@@ -539,6 +539,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   key files and in-memory `keyPem` alike, and `lastErrorMsg` drains the queue it
   read from so one failed load cannot lend its reason to the next attempt on the
   same thread. (#377)
+- TLS: SNI host matching on the TCP listener is ASCII-case-insensitive. Host
+  names are case-insensitive (RFC 6066, and DNS generally), but `cstrEq` and
+  `wildMatch` compared bytes, so a client that sent `Example.com` for a
+  configured `example.com` matched nothing, fell through to the default
+  certificate and failed the handshake on a name mismatch. Both sides of the
+  comparison are now folded, so the configured `host` need not be lower-cased
+  either, and the fold is ASCII-only rather than locale-aware (a locale tolower
+  folds `I` to a dotless `i` under tr_TR, which would make matching depend on
+  the server's locale). The HTTP/3 path already folded case. (#358)
 
 ### Changed
 

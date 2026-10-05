@@ -341,18 +341,30 @@ proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
     # gets plain HTTP/1 rather than an alert.
     SSL_TLSEXT_ERR_ALERT_FATAL
 
+proc asciiLower(c: char): char {.inline.} =
+  ## tolower over ASCII only, deliberately not the locale's. Host names are
+  ## case-insensitive (RFC 6066, and DNS generally), but a locale-aware tolower
+  ## would make matching depend on the server's locale: under tr_TR it folds
+  ## 'I' to a dotless 'i', so `WWW.EXAMPLE.COM` would stop matching
+  ## `www.example.com`. Also avoids a libc call per byte on the loop thread.
+  if c >= 'A' and c <= 'Z': chr(ord(c) + 32) else: c
+
 proc cstrEq(cs: cstring, s: string): bool =
-  ## Compare a NUL-terminated C string to a Nim string without allocating (the
-  ## SNI callback runs on a loop thread; avoid ORC ops on the shared config).
+  ## Compare a NUL-terminated C string to a Nim string, ASCII-case-insensitively
+  ## (#358: a client may send `Example.com` for a configured `example.com`) and
+  ## without allocating (the SNI callback runs on a loop thread; avoid ORC ops
+  ## on the shared config). Both sides are folded, so a configured host does not
+  ## have to be lower-cased first.
   var i = 0
   while i < s.len:
-    if cs[i] == '\0' or cs[i] != s[i]: return false
+    if cs[i] == '\0' or asciiLower(cs[i]) != asciiLower(s[i]): return false
     inc i
   cs[i] == '\0'
 
 proc wildMatch(name: cstring, pat: string): bool =
   ## `*.example.com` matches exactly one leading label: `foo.example.com` yes,
-  ## `example.com` no, `a.b.example.com` no. No allocation (loop-thread cb).
+  ## `example.com` no, `a.b.example.com` no. ASCII-case-insensitive like
+  ## cstrEq. No allocation (loop-thread cb).
   if pat.len < 3 or pat[0] != '*' or pat[1] != '.': return false
   var dot = 0
   while name[dot] != '\0' and name[dot] != '.': inc dot
@@ -360,7 +372,7 @@ proc wildMatch(name: cstring, pat: string): bool =
   var i = dot                                        # name[dot..] == pat[1..]
   var j = 1                                          # (both include the dot)
   while j < pat.len:
-    if name[i] == '\0' or name[i] != pat[j]: return false
+    if name[i] == '\0' or asciiLower(name[i]) != asciiLower(pat[j]): return false
     inc i; inc j
   name[i] == '\0'
 

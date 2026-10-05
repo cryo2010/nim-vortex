@@ -54,6 +54,9 @@ suite "wildcard SNI":
     check "*.example.com" in servedSubject(srv.port, "foo.example.com")  # wildcard hit
     check "localhost" in servedSubject(srv.port, "example.com")          # bare -> default
     check "localhost" in servedSubject(srv.port, "other.org")            # no match -> default
+    # The wildcard match folds ASCII case too (#358).
+    check "*.example.com" in servedSubject(srv.port, "FOO.Example.COM")
+    check "localhost" in servedSubject(srv.port, "Example.COM")          # still bare
 
 suite "max TLS version":
   test "cap at 1.2 negotiates 1.2, refuses 1.3":

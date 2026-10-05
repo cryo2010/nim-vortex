@@ -151,5 +151,39 @@ suite "SNI":
     check "alt.example" in servedSubject("alt.example")   # SNI hit -> alt cert
     check "localhost" in servedSubject("localhost")       # default cert
 
+  test "the servername match is ASCII-case-insensitive":
+    # Host names are case-insensitive (RFC 6066), so a client that sends
+    # `Alt.Example` must get the same per-host certificate as `alt.example`.
+    # Byte-exact matching fell through to the default cert instead, which the
+    # client then rejects as a name mismatch (#358).
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                 sni = @[SniCertEntry(host: "alt.example",
+                                         certFile: dir / "alt.pem",
+                                         keyFile: dir / "altkey.pem")])).start(0)
+    defer: srv.close()
+    proc servedSubject(servername: string): string =
+      let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " -servername " & servername &
+        " 2>/dev/null | " & opensslBin & " x509 -noout -subject"
+      execCmdEx(cmd)[0].strip()
+    check "alt.example" in servedSubject("Alt.Example")
+    check "alt.example" in servedSubject("ALT.EXAMPLE")
+    check "localhost" in servedSubject("Other.Org")       # still no match
+
+  test "a configured host in mixed case matches a lower-case servername":
+    # The fold applies to both sides, so an operator is not required to
+    # lower-case the configured host.
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                 sni = @[SniCertEntry(host: "Alt.Example",
+                                         certFile: dir / "alt.pem",
+                                         keyFile: dir / "altkey.pem")])).start(0)
+    defer: srv.close()
+    proc servedSubject(servername: string): string =
+      let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " -servername " & servername &
+        " 2>/dev/null | " & opensslBin & " x509 -noout -subject"
+      execCmdEx(cmd)[0].strip()
+    check "alt.example" in servedSubject("alt.example")
+
 removeDir(dir)
 echo "tls advanced ok"
