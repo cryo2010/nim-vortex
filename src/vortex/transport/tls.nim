@@ -295,7 +295,12 @@ type
     ocspFile: string         ## source path the staple was last read from ("" =
                              ## none / in-memory), for empty-arg reload re-reads
     sniHosts: seq[string]              ## per-host SNI: hostnames...
-    sniCtx: seq[SslCtxPtr]             ## ...and their ctxs (parallel to sniHosts)
+    sniCtx: seq[SslCtxPtr]             ## ...their ctxs (parallel to sniHosts)...
+    sniMaterial: seq[TlsMaterial]      ## ...and where each one's cert/key came
+                             ## from, so a reload can rebuild them (#356). All
+                             ## three are swapped together under `ctxLock`,
+                             ## which is also what servernameCb holds while it
+                             ## scans sniHosts and indexes sniCtx.
 
   TlsIo* = enum
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
@@ -380,9 +385,19 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
   ## SNI: switch the connection to the ctx whose host matches the requested
   ## server name (exact match preferred over a wildcard); fall through to the
   ## default ctx when none matches.
+  ##
+  ## Runs on a loop thread, and since #356 a reload replaces the per-host table
+  ## underneath it, so `cfg.ctxLock` covers the whole lookup rather than just
+  ## the ctx load. A reload swaps sniHosts/sniCtx/sniMaterial under that same
+  ## lock and releases the displaced ctxs only after it, which gives two things:
+  ## the host list we scan always matches the ctx array we index, and
+  ## SSL_set_SSL_CTX (which up-refs the ctx it is handed) takes a reference of
+  ## our own before the reload's release can turn into a destroy. The hold is a
+  ## scan of a handful of short host names plus one up-ref, once per handshake.
   let cfg = cast[ptr TlsConfig](arg)
   let name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
   if name != nil:
+    acquire(cfg.ctxLock)
     var idx = -1
     for i in 0 ..< cfg.sniHosts.len:
       if cstrEq(name, cfg.sniHosts[i]): idx = i; break
@@ -390,6 +405,7 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
       for i in 0 ..< cfg.sniHosts.len:
         if wildMatch(name, cfg.sniHosts[i]): idx = i; break
     if idx >= 0: discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[idx])
+    release(cfg.ctxLock)
   SSL_TLSEXT_ERR_OK
 
 proc ocspExFree(parent, p: pointer, ad: pointer, idx: cint,
@@ -641,6 +657,34 @@ proc installDefaultCbs(cfg: ptr TlsConfig, ctx: SslCtxPtr, ocsp: string,
                                   cast[pointer](servernameCb))
     discard SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, cfg)
 
+proc buildSniCtxs(cfg: ptr TlsConfig, hosts: openArray[string],
+                  mats: openArray[TlsMaterial]): seq[SslCtxPtr] =
+  ## One ctx per SNI host, built from `mats` with the build parameters already
+  ## stored on `cfg` (method, verify mode, client CA, version range, ciphers),
+  ## each carrying the ALPN callback: servernameCb switches the connection to
+  ## the per-host ctx, which then negotiates ALPN on its own.
+  ##
+  ## All or nothing. Anything built here is freed again before the exception
+  ## leaves, and the message names the host, so neither the initial build nor a
+  ## reload can leave a half-built set behind or drop a configured host silently
+  ## back to the default certificate. Shared by both paths so the two cannot
+  ## disagree about what a per-host ctx needs.
+  result = newSeqOfCap[SslCtxPtr](mats.len)
+  for i in 0 ..< mats.len:
+    var hctx: SslCtxPtr
+    try:
+      hctx = buildTlsCtx(cfg.meth, mats[i], cfg.verify, cfg.clientCaFile,
+                         cfg.clientCaPem, cfg.minProtoVersion,
+                         cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
+    except CatchableError as e:
+      for c in result: SSL_CTX_free(c)
+      # buildTlsCtx only ever sees the material, so without the host name an
+      # operator with several SNI entries cannot tell which one is broken.
+      raise newException(CatchableError,
+        "SNI host \"" & hosts[i] & "\": " & e.msg)
+    SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, cfg)
+    result.add hctx
+
 proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        minProtoVersion: clong = 0, cipherList = "",
                        cipherSuites = "", verify: cint = 0,
@@ -665,28 +709,22 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   result.cipherSuites = cipherSuites
   result.ocsp = ocsp
   result.ocspFile = ocspFile
+  for sc in sni:
+    result.sniHosts.add sc.host
+    result.sniMaterial.add sc.material   # kept so a reload can rebuild (#356)
   installDefaultCbs(result, ctx, ocsp, sni.len > 0)
   # SNI: one ctx per host, selected by the servername callback on the default.
-  for sc in sni:
-    var hctx: SslCtxPtr
-    try:
-      hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
-                         minProtoVersion, maxProtoVersion, cipherList,
-                         cipherSuites)
-    except CatchableError as e:
-      # Unwind everything built so far -- the default ctx, the per-host ctxs
-      # ahead of this one, the shared block and its locks -- rather than letting
-      # the exception escape from a half-initialized config (#361). The process
-      # is usually about to exit, but an embedder may catch this and retry with
-      # corrected configuration, and a leak-checked test run should stay quiet.
-      # Name the host: buildTlsCtx only knows the material, so without this the
-      # operator cannot tell which of several SNI entries is the broken one.
-      freeTlsConfig(result)
-      raise newException(CatchableError,
-        "SNI host \"" & sc.host & "\": " & e.msg)
-    SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, result)
-    result.sniHosts.add sc.host
-    result.sniCtx.add hctx
+  try:
+    result.sniCtx = buildSniCtxs(result, result.sniHosts, result.sniMaterial)
+  except CatchableError:
+    # Unwind everything built so far -- the default ctx, the shared block and
+    # its locks -- rather than letting the exception escape from a
+    # half-initialized config (#361). buildSniCtxs has already freed the
+    # per-host ctxs it got as far as. The process is usually about to exit, but
+    # an embedder may catch this and retry with corrected configuration, and a
+    # leak-checked test run should stay quiet.
+    freeTlsConfig(result)
+    raise
 
 # --- active SSL_CTX lifetime -------------------------------------------------
 #
@@ -710,7 +748,8 @@ proc acquireCtx(cfg: ptr TlsConfig): SslCtxPtr =
 
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                       ocspFile = "", ocspResponse = "",
-                      clearOcsp = false): bool =
+                      clearOcsp = false,
+                      sni: openArray[SniCert] = []): bool =
   ## Rebuild the SSL_CTX from `certFile`/`keyFile` (or, when empty, the paths
   ## most recently loaded -- initially the configured ones -- e.g. after an
   ## in-place renewal) and atomically install it, so subsequent TLS handshakes
@@ -719,6 +758,19 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   ## missing/invalid/mismatched, including a `keyFile`-only reload of a server
   ## whose current material is a PKCS#12 bundle (rotate both halves, or supply
   ## a new bundle by reconfiguring). Nothing is persisted on a rejection.
+  ##
+  ## The per-host (SNI) contexts rotate on the same swap. Every one of them is
+  ## rebuilt from its stored `TlsMaterial`, so a bare `reloadTlsConfig()`
+  ## re-reads the per-host certificate *files* too and a renewal that replaces
+  ## them in place is picked up without naming them (the certbot pattern);
+  ## in-memory per-host PEM is rebuilt from the same bytes, i.e. unchanged. A
+  ## non-empty `sni` instead replaces the configured per-host material
+  ## wholesale, so the host set may grow or shrink; it is persisted only on
+  ## success, like `certFile`/`keyFile`. An empty `sni` means "keep what is
+  ## configured", so there is no way to drop every host through this call.
+  ## The whole reload is all-or-nothing: one per-host certificate that fails to
+  ## build rejects it, and the default context and every other host are left
+  ## exactly as they were, rather than leaving the server half-rotated.
   ##
   ## The stapled OCSP response rotates on the same swap: `ocspResponse` supplies
   ## bytes, `ocspFile` a path read now, `clearOcsp` drops the staple; all empty
@@ -742,6 +794,18 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   # Explicit file paths override any stored in-memory/PKCS#12 material; empty
   # means "reuse what was last loaded" (files, PEM, or p12).
   var m = cfg.material
+  # Per-host material: an explicit `sni` replaces the configured set wholesale
+  # (hosts may be added or removed), otherwise the stored material is reused,
+  # which is what makes a bare reload re-read renewed per-host files. Built into
+  # locals and swapped in only on success, so a rejection persists nothing.
+  var newHosts = @(cfg.sniHosts)
+  var newSniMaterial = @(cfg.sniMaterial)
+  if sni.len > 0:
+    newHosts = @[]
+    newSniMaterial = @[]
+    for sc in sni:
+      newHosts.add sc.host
+      newSniMaterial.add sc.material
   let p12Sourced = m.pkcs12.len > 0 or m.pkcs12File.len > 0
   if certFile.len > 0:
     m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
@@ -783,7 +847,17 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
                          cfg.maxProtoVersion, cfg.cipherList, cfg.cipherSuites)
   except CatchableError:
     return false
-  installDefaultCbs(cfg, newCtx, newOcsp, cfg.sniHosts.len > 0)
+  # The per-host ctxs, all or nothing with the default one: a host that fails to
+  # build rejects the whole reload rather than leaving the server half-rotated
+  # (new default certificate, stale per-host ones) or dropping that host back to
+  # the default certificate, which the client would reject as a name mismatch.
+  var newSniCtx: seq[SslCtxPtr]
+  try:
+    newSniCtx = buildSniCtxs(cfg, newHosts, newSniMaterial)
+  except CatchableError:
+    SSL_CTX_free(newCtx)   # nothing published yet; releases its OCSP blob too
+    return false
+  installDefaultCbs(cfg, newCtx, newOcsp, newHosts.len > 0)
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile
@@ -795,10 +869,22 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   # approximated: with a fixed number of slots and a time-based grace window, a
   # burst of reloads had to evict (and free) a ctx a thread could still be
   # holding between its load and SSL_new.
+  #
+  # The per-host table goes over in the same critical section, and for the same
+  # reason: servernameCb holds `ctxLock` across {scan sniHosts, index sniCtx,
+  # SSL_set_SSL_CTX}, so publishing all three together means it never scans a
+  # host list that disagrees with the ctx array, and the releases below are
+  # decrements for any handshake that got there first. `swap` keeps the critical
+  # section allocation-free; the locals carry the retired values out.
   acquire(cfg.ctxLock)
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
+  swap(cfg.sniHosts, newHosts)
+  swap(cfg.sniMaterial, newSniMaterial)
+  swap(cfg.sniCtx, newSniCtx)
   release(cfg.ctxLock)
   SSL_CTX_free(old)       # the config's reference; sessions keep their own
+  for c in newSniCtx:     # the retired per-host ctxs, same discipline
+    SSL_CTX_free(c)
   true
 
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
@@ -917,6 +1003,7 @@ proc freeTlsConfig*(cfg: ptr TlsConfig) =
   for c in cfg.sniCtx: SSL_CTX_free(c)
   cfg.sniCtx = @[]
   cfg.sniHosts = @[]
+  cfg.sniMaterial = @[]   # the per-host material a reload rebuilds from (#356)
   cfg.protos = ""
   cfg.material = TlsMaterial()
   cfg.clientCaFile = ""

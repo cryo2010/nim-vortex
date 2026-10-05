@@ -143,10 +143,23 @@ staple), and OpenSSL only sends a staple whose serial matches the served
 certificate, so rotate the cert and its staple together. Reload from any
 ordinary thread, and from two at once if that is how your renewal plumbing is
 built (concurrent reloads serialise internally); not from inside a raw signal
-handler, since the call takes a lock and reads files. On the HTTP/3 side the
-reload also rebuilds the per-host (SNI) contexts from the material they were
-configured with, so per-host certificate *files* replaced by the same renewal
-are picked up even though `reloadTls` names only the default pair.
+handler, since the call takes a lock and reads files.
+
+Per-host (SNI) certificates rotate on the same call, on both transports: each
+per-host context is rebuilt from the material it was configured with, so
+per-host certificate *files* replaced by the same renewal are picked up even
+though `reloadTls` names only the default pair. The reload is all-or-nothing --
+one per-host certificate that fails to build rejects it and leaves the default
+certificate and every host exactly as they were, rather than half-rotating or
+silently dropping a host back to the default certificate, which the client
+would reject as a name mismatch. `reloadTls(sni = @[SniCertEntry(...)])`
+replaces the per-host material outright, so the host set may change; it is
+persisted only on success, and an empty `sni` means "keep what is configured".
+One asymmetry to know about: that override reaches the TCP listener only, while
+the HTTP/3 engine rebuilds its per-host contexts from *its* configured material
+(a file re-read) on the same reload. Renewed per-host files therefore rotate on
+both transports, but new in-memory per-host material supplied through `sni`
+rotates on TCP alone.
 
 ## Deployment recipes
 

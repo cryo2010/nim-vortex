@@ -565,6 +565,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surface in production long after deployment rather than in testing. The
   callback registration both paths need is now one helper (`installDefaultCbs`),
   so the initial build and the reload cannot drift apart again. (#355)
+- TLS: per-host (SNI) certificates rotate on reload. `reloadTlsConfig` rebuilt
+  only the default context, so every SNI host served the certificate it loaded
+  at startup for the lifetime of the process and eventually served an expired
+  one, with no API to rotate it short of a restart. `TlsConfig` now keeps each
+  host's `TlsMaterial` alongside its host name and context, every per-host
+  context is rebuilt from it on reload (so a bare `reloadTls()` re-reads the
+  per-host files, the certbot pattern), and `reloadTls`/`reloadTlsConfig` take
+  an `sni` override that replaces the per-host material wholesale, host set
+  included, persisted only on success. The reload is all-or-nothing with the
+  default context: one per-host certificate that fails to build rejects it and
+  leaves everything as it was, rather than half-rotating or dropping a host back
+  to the default certificate. The new contexts are published and the old ones
+  released under `ctxLock`, which `servernameCb` now holds across its whole
+  lookup, so a handshake can neither index a context array that disagrees with
+  the host list it scanned nor have a context freed between the load and
+  `SSL_set_SSL_CTX` (which up-refs what it is handed). The `sni` override
+  reaches the TCP listener only: the HTTP/3 engine rebuilds its per-host
+  contexts from its own configured material on the same reload (#374), so
+  renewed per-host *files* rotate on both transports while new in-memory
+  per-host material rotates on TCP alone. (#356)
 
 ### Changed
 

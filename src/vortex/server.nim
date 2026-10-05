@@ -332,7 +332,8 @@ proc close*(server: var Server) =
   server.waitFor()
 
 proc reloadTls*(server: var Server, certFile = "", keyFile = "",
-                ocspFile = "", ocspResponse = "", clearOcsp = false): bool =
+                ocspFile = "", ocspResponse = "", clearOcsp = false,
+                sni: openArray[SniCertEntry] = []): bool =
   ## Hot-reload the TLS certificate/key for new HTTPS (HTTP/1.1 and HTTP/2)
   ## connections, without a restart and without dropping in-flight ones. Pass
   ## new paths, or leave empty to re-read the originally configured files (e.g.
@@ -342,6 +343,23 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## A `keyFile`-only call against a server whose current material is a PKCS#12
   ## bundle is one such rejection: the bundle carries both halves, so rotate
   ## both (`certFile` + `keyFile`) rather than the key alone.
+  ##
+  ## Per-host (SNI) certificates rotate on the same call. Each one is rebuilt
+  ## from the material it was configured with, so a bare `reloadTls()` re-reads
+  ## the per-host files as well and a renewal that replaces them in place is
+  ## picked up without naming them. Pass `sni` to replace the per-host material
+  ## wholesale (adding or removing hosts, or supplying new in-memory PEM); it is
+  ## persisted only on success, like the default pair, and an empty `sni` means
+  ## "keep what is configured". The whole reload is all-or-nothing: one bad
+  ## per-host certificate rejects it and leaves the default certificate and
+  ## every host exactly as they were.
+  ##
+  ## One asymmetry to know about: the `sni` override reaches the TCP listener
+  ## only. The HTTP/3 engine rebuilds its own per-host contexts from *its*
+  ## configured material (a file re-read) on the same reload, which is how #374
+  ## already works, so per-host files renewed in place rotate on both transports
+  ## but in-memory material supplied here rotates on TCP alone. Reconfigure and
+  ## restart if h3 must pick up new in-memory per-host material.
   ##
   ## The stapled OCSP response rotates on the same call: `ocspResponse` supplies
   ## DER bytes, `ocspFile` a path read now (an unreadable one rejects the reload
@@ -361,8 +379,13 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
     false
   else:
     if server.tls == nil: return false
+    # Reuse eventloop's single SniCertEntry -> SniCert mapping rather than
+    # repeating the field list here; the other VortexConfig fields are unused by
+    # it. An empty `sni` stays empty, which reloadTlsConfig reads as "keep the
+    # configured per-host material and re-read its files".
     let ok = reloadTlsConfig(cast[ptr TlsConfig](server.tls), certFile, keyFile,
-                             ocspFile, ocspResponse, clearOcsp)
+                             ocspFile, ocspResponse, clearOcsp,
+                             toSniCerts(VortexConfig(sni: @sni)))
     # Only signal the h3 loops when the TCP reload succeeded, so TCP and h3
     # never end up on different certificates and the returned bool applies to
     # both. A per-loop h3 apply failure (e.g. a transient bad read) is logged by
@@ -438,8 +461,10 @@ proc stop*(v: Vortex) =
   v.server.close()
 
 proc reloadTls*(v: Vortex, certFile = "", keyFile = "",
-                ocspFile = "", ocspResponse = "", clearOcsp = false): bool =
-  ## Hot-reload the TLS cert/key (and optionally rotate/clear the OCSP staple)
-  ## for new connections without a restart (see the Server-level docs). Returns
-  ## false if TLS is off or the new material is bad.
-  v.server.reloadTls(certFile, keyFile, ocspFile, ocspResponse, clearOcsp)
+                ocspFile = "", ocspResponse = "", clearOcsp = false,
+                sni: openArray[SniCertEntry] = []): bool =
+  ## Hot-reload the TLS cert/key (and optionally rotate/clear the OCSP staple,
+  ## or replace the per-host SNI material) for new connections without a
+  ## restart (see the Server-level docs). Returns false if TLS is off or the new
+  ## material is bad.
+  v.server.reloadTls(certFile, keyFile, ocspFile, ocspResponse, clearOcsp, sni)

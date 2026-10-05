@@ -216,6 +216,67 @@ suite "SNI across a certificate reload":
     check "default2.vortex" in sniSubject("other.vortex")  # default rotated
     check "alt.vortex" in sniSubject("alt.vortex")          # SNI still routed
 
+suite "per-host SNI certificates rotate on reload":
+  # Before #356 the per-host ctxs were built once and never rebuilt, so every
+  # SNI host served the certificate it loaded at startup for the lifetime of
+  # the process and eventually served an expired one, with no API to rotate it
+  # short of a restart.
+  test "a bare reloadTls re-reads the per-host certificate files":
+    # The certbot pattern: the per-host files are renewed in place and the
+    # deploy hook calls reloadTls() with no arguments.
+    genCert(sdir / "host.pem", sdir / "host.key", "alt2.vortex")
+    check ssrv.reloadTls()
+    check "alt2.vortex" in sniSubject("alt.vortex")   # the renewed per-host cert
+    check "default2.vortex" in sniSubject("other.vortex")   # default untouched
+    check stillServesOn(sport)
+
+  test "reloadTls(sni = ...) installs new in-memory per-host material":
+    genCert(sdir / "mem.pem", sdir / "mem.key", "alt3.vortex")
+    check ssrv.reloadTls(sni = @[SniCertEntry(host: "alt.vortex",
+      certPem: readFile(sdir / "mem.pem"), keyPem: readFile(sdir / "mem.key"))])
+    check "alt3.vortex" in sniSubject("alt.vortex")
+    check "default2.vortex" in sniSubject("other.vortex")
+    check stillServesOn(sport)
+
+  test "the sni override can add a host":
+    genCert(sdir / "extra.pem", sdir / "extra.key", "extra.vortex")
+    check ssrv.reloadTls(sni = @[
+      SniCertEntry(host: "alt.vortex", certPem: readFile(sdir / "mem.pem"),
+                   keyPem: readFile(sdir / "mem.key")),
+      SniCertEntry(host: "extra.vortex", certFile: sdir / "extra.pem",
+                   keyFile: sdir / "extra.key")])
+    check "alt3.vortex" in sniSubject("alt.vortex")
+    check "extra.vortex" in sniSubject("extra.vortex")
+    check "default2.vortex" in sniSubject("other.vortex")
+
+  test "a bad per-host certificate rejects the whole reload":
+    # All-or-nothing with the default ctx: the default must not rotate either,
+    # or the server would be left half-rotated with no way to tell.
+    genCert(sdir / "def.pem", sdir / "def.key", "default3.vortex")
+    writeFile(sdir / "bad.pem", "-----BEGIN CERTIFICATE-----\nnot a cert\n")
+    check not ssrv.reloadTls(sni = @[
+      SniCertEntry(host: "alt.vortex", certFile: sdir / "bad.pem",
+                   keyFile: sdir / "extra.key")])
+    check "alt3.vortex" in sniSubject("alt.vortex")          # per-host unchanged
+    check "extra.vortex" in sniSubject("extra.vortex")       # and the other host
+    check "default2.vortex" in sniSubject("other.vortex")    # default unchanged
+    check stillServesOn(sport)
+
+  test "a per-host file that disappears rejects a bare reload too":
+    removeFile(sdir / "extra.pem")
+    check not ssrv.reloadTls()
+    check "default2.vortex" in sniSubject("other.vortex")    # default unchanged
+    check "alt3.vortex" in sniSubject("alt.vortex")
+    check stillServesOn(sport)
+
+  test "a good reload after the rejection still works":
+    # The rejected attempt persisted nothing, so the stored material is the one
+    # that worked and a corrected reload rotates from it.
+    genCert(sdir / "extra.pem", sdir / "extra.key", "extra2.vortex")
+    check ssrv.reloadTls()
+    check "default3.vortex" in sniSubject("other.vortex")    # now it rotates
+    check "extra2.vortex" in sniSubject("extra.vortex")
+
 ssrv.close()
 removeDir(sdir)
 echo "tls reload ok"
