@@ -763,6 +763,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps a concurrent reload from releasing it -- while the switch itself runs
   outside the lock and the callback's own reference is dropped straight
   afterwards. (#356)
+  startup, which is what nginx and envoy rotate for. The rotation is driven
+  from the per-tick engine entry the loops already run, not only from the
+  encrypt side of the callback: keyed off ticket traffic alone the hourly bound
+  held only on a busy server, and a ticket minted at t=0 was still accepted at
+  t=10h if no ticket had been issued in between. 0-RTT early data is not
+  offered on any protocol and is unaffected. (#382)
 
 ### Changed
 

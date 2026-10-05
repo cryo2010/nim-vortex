@@ -1056,6 +1056,14 @@ static std::mutex gTicketMu;
 static TicketKey gTicketCur;
 static TicketKey gTicketPrev;
 static std::chrono::steady_clock::time_point gTicketBorn;
+// How many times OpenSSL has invoked the callback below, per direction.
+// Diagnostics only, and the only way a test can observe that the callback is
+// installed on an engine's SSL_CTX at all: driving ticketKeyCb directly proves
+// the key is shared and rotates, but passes just as happily with the
+// SSL_CTX_set_tlsext_ticket_key_evp_cb line deleted from makeCtx
+// (tests/vq_h3_tls_ctx.cpp runs real handshakes against these).
+static uint64_t gTicketEncRuns = 0;
+static uint64_t gTicketDecRuns = 0;
 
 static bool genTicketKey(TicketKey *k) {
   if (RAND_bytes(k->name, sizeof k->name) != 1 ||
@@ -1081,6 +1089,18 @@ static void rotateTicketKeyIfDue() {
   gTicketBorn = std::chrono::steady_clock::now();
 }
 
+// Rotate on the clock, not only on ticket traffic. Rotation used to be driven
+// from the `enc` branch of the callback alone, so the hourly bound held only
+// while tickets were being issued: on a server that went quiet, a ticket minted
+// at t=0 was still accepted at t=10h, and "a disclosed key exposes at most two
+// hours of resumed sessions" was not true of an idle deployment (#382). The
+// loops call this once per engine tick (at least once a second), which is one
+// steady_clock read under the mutex.
+static void ticketKeyTick() {
+  std::lock_guard<std::mutex> lock(gTicketMu);
+  if (gTicketCur.valid) rotateTicketKeyIfDue();
+}
+
 static bool ticketMacInit(EVP_MAC_CTX *hctx, const unsigned char *key,
                           size_t len) {
   OSSL_PARAM params[2];
@@ -1101,6 +1121,7 @@ static int ticketKeyCb(SSL * /*ssl*/, unsigned char key_name[16],
     gTicketBorn = std::chrono::steady_clock::now();
   }
   if (enc) {
+    ++gTicketEncRuns;
     rotateTicketKeyIfDue();
     if (RAND_bytes(iv, static_cast<int>(kTicketAesIvLen)) != 1) {
       ERR_clear_error();
@@ -1113,6 +1134,7 @@ static int ticketKeyCb(SSL * /*ssl*/, unsigned char key_name[16],
     return ticketMacInit(hctx, gTicketCur.hmac, sizeof gTicketCur.hmac) ? 1
                                                                         : -1;
   }
+  ++gTicketDecRuns;
   const TicketKey *k = nullptr;
   int rv = 1;
   if (memcmp(key_name, gTicketCur.name, kTicketKeyNameLen) == 0) {
@@ -1739,6 +1761,9 @@ uint64_t vq_engine_next_expiry_ns(VqEngine *eng, uint64_t) {
 
 void vq_engine_handle_expiry(VqEngine *eng, uint64_t now_ns) {
   auto *e = reinterpret_cast<Engine *>(eng);
+  // The loops run this on every pass (at least once a second), which is where
+  // the session-ticket key's hourly rotation is driven from: see ticketKeyTick.
+  ticketKeyTick();
   for (auto &c : e->conns)
     if (c->conn && ngtcp2_conn_get_expiry(c->conn) <= now_ns)
       if (ngtcp2_conn_handle_expiry(c->conn, now_ns) != 0) c->closed = true;

@@ -250,4 +250,142 @@ int vq_test_ticket_key_cycle(void) {
   return result;
 }
 
+// --- #382: the callback as OpenSSL sees it ---------------------------------
+//
+// Everything above drives ticketKeyCb directly, which proves the key is shared
+// and rotates but says nothing about whether makeCtx ever INSTALLED the
+// callback: delete the SSL_CTX_set_tlsext_ticket_key_evp_cb line and those
+// cases still pass, while every context falls back to its own OpenSSL-generated
+// key and the cross-loop resumption #382 is about stops working. So run real
+// TLS 1.3 handshakes over a BIO pair against the engines' own contexts: first
+// one against engine A to mint a ticket, then one against a DIFFERENT engine B
+// that resumes it. Only a shared, installed key can make the second succeed.
+
+static SSL_SESSION *gSavedSession = nullptr;
+
+// SSL_CTX_sess_set_new_cb: returning 1 takes ownership of `sess`.
+static int captureSessionCb(SSL *, SSL_SESSION *sess) {
+  if (gSavedSession) SSL_SESSION_free(gSavedSession);
+  gSavedSession = sess;
+  return 1;
+}
+
+// A TLS 1.3 client context that the shim's alpnSelect will accept (it offers h3
+// alone and alerts on anything else) and that hands its tickets to the callback
+// above rather than an internal cache we cannot see into.
+static SSL_CTX *ticketClientCtx(void) {
+  SSL_CTX *c = SSL_CTX_new(TLS_client_method());
+  if (!c) return nullptr;
+  SSL_CTX_set_min_proto_version(c, TLS1_3_VERSION);
+  SSL_CTX_set_max_proto_version(c, TLS1_3_VERSION);
+  SSL_CTX_set_verify(c, SSL_VERIFY_NONE, nullptr);   // self-signed fixtures
+  static const unsigned char kAlpn[] = {2, 'h', '3'};
+  if (SSL_CTX_set_alpn_protos(c, kAlpn, sizeof kAlpn) != 0) {
+    SSL_CTX_free(c);
+    return nullptr;
+  }
+  SSL_CTX_set_session_cache_mode(
+      c, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+  SSL_CTX_sess_set_new_cb(c, captureSessionCb);
+  return c;
+}
+
+// One handshake between `cctx` (client, resuming `resume` if given) and `sctx`
+// (the engine's server context) over a BIO pair, followed by a record each way
+// so the client processes the server's NewSessionTicket: TLS 1.3 sends it after
+// the handshake, and nothing reaches captureSessionCb until the client reads.
+// Returns 1 when both ends finished, with *reused set from SSL_session_reused.
+static int ticketHandshake(SSL_CTX *sctx, SSL_CTX *cctx, SSL_SESSION *resume,
+                           int *reused) {
+  *reused = 0;
+  BIO *cb = nullptr, *sb = nullptr;
+  if (BIO_new_bio_pair(&cb, 0, &sb, 0) != 1) return 0;
+  SSL *c = SSL_new(cctx);
+  SSL *s = SSL_new(sctx);
+  int ok = 0;
+  if (c && s) {
+    SSL_set_bio(c, cb, cb);   // SSL_free releases its end of the pair
+    SSL_set_bio(s, sb, sb);
+    SSL_set_connect_state(c);
+    SSL_set_accept_state(s);
+    if (resume) (void)SSL_set_session(c, resume);
+    for (int i = 0; i < 64; i++) {
+      const int cr = SSL_do_handshake(c);
+      const int sr = SSL_do_handshake(s);
+      if (cr == 1 && sr == 1) break;
+      // WANT_READ/WANT_WRITE on either side just means the other has to run.
+      if (cr <= 0 && SSL_get_error(c, cr) != SSL_ERROR_WANT_READ &&
+          SSL_get_error(c, cr) != SSL_ERROR_WANT_WRITE)
+        break;
+      if (sr <= 0 && SSL_get_error(s, sr) != SSL_ERROR_WANT_READ &&
+          SSL_get_error(s, sr) != SSL_ERROR_WANT_WRITE)
+        break;
+    }
+    if (SSL_is_init_finished(c) && SSL_is_init_finished(s)) {
+      ok = 1;
+      *reused = SSL_session_reused(c) ? 1 : 0;
+      unsigned char buf[64];
+      (void)SSL_write(s, "x", 1);
+      for (int i = 0; i < 8 && !gSavedSession; i++)
+        (void)SSL_read(c, buf, sizeof buf);
+      // Close cleanly. Without a sent close_notify, SSL_free below runs
+      // ssl_clear_bad_session, which calls SSL_CTX_remove_session on the
+      // client's session and that sets not_resumable on it -- so the ticket we
+      // just captured would be unusable and the resuming pass below would
+      // silently fall back to a full handshake.
+      (void)SSL_shutdown(c);
+      (void)SSL_shutdown(s);
+    }
+  }
+  if (c) SSL_free(c);
+  if (s) SSL_free(s);
+  ERR_clear_error();
+  return ok;
+}
+
+static uint64_t ticketRuns(bool enc) {
+  std::lock_guard<std::mutex> lock(gTicketMu);
+  return enc ? gTicketEncRuns : gTicketDecRuns;
+}
+
+// Bits:
+//   1   a TLS 1.3 handshake against engine A's own context completed
+//   2   OpenSSL invoked the shim's ticket-key callback to ENCRYPT a ticket,
+//       i.e. makeCtx actually installed it
+//   4   the client received a session ticket
+//   8   a second handshake, against engine B's context, RESUMED that session
+//  16   ... and OpenSSL invoked the callback to decrypt the ticket
+int vq_test_ticket_handshake(VqEngine *ea, VqEngine *eb) {
+  auto *a = reinterpret_cast<Engine *>(ea);
+  auto *b = reinterpret_cast<Engine *>(eb);
+  SSL_CTX *cc = ticketClientCtx();
+  if (!cc) return -1;
+  if (gSavedSession) {
+    SSL_SESSION_free(gSavedSession);
+    gSavedSession = nullptr;
+  }
+  int result = 0;
+  int reused = 0;
+  const uint64_t enc0 = ticketRuns(true);
+  if (ticketHandshake(a->ssl_ctx.get(), cc, nullptr, &reused)) result |= 1;
+  if (ticketRuns(true) > enc0) result |= 2;
+  if (gSavedSession) {
+    result |= 4;
+    SSL_SESSION *sess = gSavedSession;
+    gSavedSession = nullptr;          // so the resumed pass can capture its own
+    const uint64_t dec0 = ticketRuns(false);
+    if (ticketHandshake(b->ssl_ctx.get(), cc, sess, &reused) && reused)
+      result |= 8;
+    if (ticketRuns(false) > dec0) result |= 16;
+    SSL_SESSION_free(sess);
+    if (gSavedSession) {
+      SSL_SESSION_free(gSavedSession);
+      gSavedSession = nullptr;
+    }
+  }
+  SSL_CTX_free(cc);
+  ERR_clear_error();
+  return result;
+}
+
 }  // extern "C"

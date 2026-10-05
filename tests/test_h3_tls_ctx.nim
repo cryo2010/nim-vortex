@@ -509,6 +509,27 @@ when not defined(plainHttp):
       check (rv and 2) != 0
       check (rv and 4) != 0
 
+    test "a real handshake drives the callback, and a second engine resumes":
+      # The cases above call ticketKeyCb themselves, so they pass with the
+      # SSL_CTX_set_tlsext_ticket_key_evp_cb line deleted from makeCtx -- while
+      # every context would then fall back to its own OpenSSL-generated key and
+      # the cross-loop resumption this issue is about would be gone. These are
+      # real TLS 1.3 handshakes over a BIO pair against the engines' own
+      # contexts: one against A to mint a ticket, one against B to resume it.
+      let a = engineFromPem(startCert, startKey)
+      let b = engineFromPem(startCert, startKey)
+      check a != nil and b != nil
+      defer:
+        vqEngineFree(a)
+        vqEngineFree(b)
+      let rv = vqTestTicketHandshake(a, b)
+      check rv >= 0
+      check (rv and 1) != 0     # the handshake completed at all
+      check (rv and 2) != 0     # OpenSSL called our callback to mint a ticket
+      check (rv and 4) != 0     # the client got a session ticket
+      check (rv and 8) != 0     # and resumed it on the OTHER engine's context
+      check (rv and 16) != 0    # via our callback on the decrypt side
+
     test "the key rotates and the previous one is honoured once more":
       # Run last: it ages the process-wide key by two lifetimes.
       let rv = vqTestTicketKeyCycle()

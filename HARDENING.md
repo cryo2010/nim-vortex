@@ -195,7 +195,10 @@ SO_REUSEPORT hash hands it rather than only on the one that issued the ticket.
 The HTTP/3 ticket key rotates hourly: the current key encrypts, the previous one
 still decrypts for one more hour and the ticket is reissued under the new key,
 and anything older costs that client one full handshake, so a disclosed key
-exposes at most two hours of resumed sessions.
+exposes at most two hours of resumed sessions. Rotation is driven off the clock
+from the per-tick engine entry every loop runs, not off ticket traffic, so the
+bound holds on an idle server too (keyed off traffic alone, a ticket minted at
+t=0 was still accepted at t=10h if no ticket had been issued in between).
 
 The TCP listener keeps OpenSSL's own ticket key, which belongs to the
 `SSL_CTX` rather than to the process. Nothing rotates it on a schedule, but a
