@@ -70,10 +70,29 @@ type
     quicReload: pointer        ## ptr CertReload: signals loops to reload h3 certs
     port*: Port                ## actual bound port (settings may say 0)
 
+export AcceptDrops, AcceptDropCause
+export eventloop.acceptDrops   ## the no-argument, process-wide form (see below)
+
 proc requestShutdown*(server: var Server) =
   ## Ask just this server's event loops to stop after their current tick.
   if server.stopFlag != nil:
     server.stopFlag[].store(true, moRelaxed)
+
+proc acceptDrops*(server: Server): AcceptDrops =
+  ## Connections this process accepted and then dropped, per cause: the
+  ## `maxConnections` cap, a failed TLS session setup, a selector registration
+  ## the kernel refused, and accept() backing off on fd/memory exhaustion. Each
+  ## of those reaches the client as a connection that opened and died with
+  ## nothing on it, which is indistinguishable from a network fault -- sample
+  ## this to tell "the server refused you on purpose" from "the network broke"
+  ## (#388). Every drop also writes one rate-limited line to stderr saying why.
+  ##
+  ## The tally is process-wide, not per-server: the loop threads keep the
+  ## counters and have no back-pointer to their `Server`. With one server per
+  ## process (the normal case) that distinction does not arise. The
+  ## no-argument `acceptDrops()` reads the same numbers and is what a
+  ## `{.gcsafe.}` handler can call.
+  eventloop.acceptDrops()
 
 proc validateConfig(s: VortexConfig) =
   ## Reject nonsensical/dangerous configurations up front rather than failing
@@ -291,10 +310,9 @@ proc waitFor*(server: var Server) =
     # (it would hang) and do NOT free anything they still reference (pool,
     # outboxes, stopFlag, tls, quicReload, alive). Drop our handles so a second
     # close/waitFor is a no-op.
-    try: stderr.writeLine("vortex: " & $live & " thread(s) still in a blocking: " &
-      "handler after " & $server.hardShutdownSec & "s; detaching and leaking " &
-      "their resources so shutdown returns (the handler never returned)")
-    except IOError, OSError: discard
+    opLog($live & " thread(s) still in a blocking: handler after " &
+      $server.hardShutdownSec & "s; detaching and leaking their resources so " &
+      "shutdown returns (the handler never returned)")
     server.threads.setLen(0)
     server.outboxes.setLen(0)
     server.pool = nil
@@ -401,6 +419,11 @@ proc port*(v: Vortex): Port =
 proc requestShutdown*(v: Vortex) =
   ## Ask this server's loops to stop after their current tick (non-blocking).
   v.server.requestShutdown()
+
+proc acceptDrops*(v: Vortex): AcceptDrops =
+  ## Accept-path drops per cause (see the `Server` overload for what each one
+  ## means and why the tally is process-wide).
+  v.server.acceptDrops()
 
 proc waitFor*(v: Vortex) =
   ## Block until the loops exit (after `requestShutdown` or a signal).

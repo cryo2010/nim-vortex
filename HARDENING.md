@@ -54,6 +54,30 @@ the upload waits in the kernel as TCP backpressure instead of piling up in the
 consumer's queue. `req.ackBody` repays that debt and resumes the read. It is the
 coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 
+#### Seeing the limits fire
+
+A connection the server refuses after accepting it looks, at the client, exactly
+like a network fault: the socket opens and then dies with nothing on it, which
+httpx and friends report as an empty `ConnectError`. Four paths do that, and each
+one keeps a counter plus one rate-limited `vortex:` line on stderr saying why:
+
+| `acceptDrops()` field | Cause |
+|-----------------------|-------|
+| `cap` | `maxConnections` reached on that loop thread |
+| `tls` | the TLS session could not be created (the line carries the OpenSSL reason) |
+| `register` | the selector refused the accepted fd |
+| `acceptSuspend` | `accept()` hit fd/memory exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM) and the listener backed off for ~1s |
+
+```nim
+let d = srv.acceptDrops()     # also acceptDrops() with no argument
+echo "refused: cap=", d.cap, " tls=", d.tls, " register=", d.register
+```
+
+The tally is process-wide and monotonic, so sample it and watch the rate. A
+rising `cap` means raise `maxConnections` or add loop threads (the cap is per
+thread); a rising `acceptSuspend` means raise the fd rlimit. Both are the server
+shedding load on purpose, not a broken network.
+
 ### Timeouts
 
 | Setting | Default | Purpose |

@@ -99,6 +99,32 @@ else:
 type
   FdKind = enum fkListen, fkClient, fkWakeup, fkQuic
 
+  AcceptDropCause* = enum
+    ## Why the accept path let go of a connection the kernel had already given
+    ## us. Each of these reaches the client as a connection that opened and then
+    ## died with nothing on it -- httpx reports an empty `ConnectError` -- which
+    ## is exactly what a network fault looks like, so each one is counted and
+    ## logged with a reason (#388).
+    adCap            ## `maxConnections` reached; accepted and closed at once
+    adTls            ## `startTls` failed (newTlsSession returned nil)
+    adRegister       ## the selector refused the fd (registerHandle raised)
+    adSuspend        ## accept() hit fd/memory exhaustion and the listener was
+                     ## suspended; the connections still in the backlog wait or
+                     ## time out
+
+  AcceptDrops* = object
+    ## Accept-path drop tally. Process-wide: summed over every loop thread of
+    ## every server in the process, which is the granularity the counters are
+    ## kept at (the loops have no back-pointer to their Server). Read it with
+    ## `acceptDrops()` and watch it alongside your own connect-error rate: a
+    ## rising `cap` or `tls` here is the server refusing connections on purpose,
+    ## not the network breaking.
+    cap*: int            ## connections refused by the `maxConnections` cap
+    tls*: int            ## connections dropped because TLS setup failed
+    register*: int       ## connections dropped because the selector refused the fd
+    acceptSuspend*: int  ## times accept() hit fd/memory exhaustion
+    total*: int          ## sum of the above
+
   Loop* = ref object
     selector: Selector[FdKind]
     listenFd: int
@@ -147,6 +173,15 @@ type
                                  # continuations once all connections are gone
     warnedDrainStuck: bool       # one-time warning emitted when graceful
                                  # shutdown is blocked by a still-running worker
+    acceptDropped: array[AcceptDropCause, int]
+                                 # this loop's accept-path drops per cause; also
+                                 # folded into the process-wide tally that
+                                 # acceptDrops() reports (#388)
+    acceptDropLoggedAt: array[AcceptDropCause, int64]
+                                 # monotonic sec of the last operator-log line
+                                 # per cause on this loop, for the rate limiter
+                                 # in noteAcceptDrop. 0 = never logged, so the
+                                 # FIRST occurrence of each cause always prints
     acceptSuspendedUntil: int64  # monotonic sec; while > nowSec the listener is
                                  # deregistered after an fd/memory-exhaustion
                                  # accept() error (EMFILE/ENFILE/...), then
@@ -174,6 +209,46 @@ type
                                  # ack un-pauses the read); without the cap an idle
                                  # dispatcher would only wake on the 1s tick and
                                  # stall the drain (see the select below).
+
+# --- operator log -----------------------------------------------------------
+
+proc opLog*(msg: string) =
+  ## The one sink for vortex's operator-facing messages. There is deliberately
+  ## no logging API and no pluggable hook: this is the handful of lines the
+  ## server emits about its own health (accept-path drops, fd exhaustion, a
+  ## shutdown blocked by a worker, a loop thread that died), and they go to
+  ## stderr with a `vortex:` prefix. Having one sink is the point -- bare
+  ## `stderr.writeLine` calls scattered through the loop were impossible to find
+  ## and impossible to redirect, which is how the accept-path drops stayed
+  ## invisible in a soak log (#388, #387).
+  ##
+  ## Never raises: a server must not die because stderr is closed or full.
+  try: stderr.writeLine("vortex: " & msg)
+  except IOError, OSError: discard
+
+# --- accept-path drop counters ----------------------------------------------
+
+var gAcceptDrops: array[AcceptDropCause, Atomic[int]]
+  ## Process-wide accept-drop tally. Shared (not a threadvar) and atomic because
+  ## every loop thread adds to it and the reader is usually the main thread.
+  ## Relaxed ordering: these are counters, nothing is ordered against them.
+
+const acceptDropLogSec = 5
+  ## Minimum seconds between operator-log lines for the SAME cause on the SAME
+  ## loop. Under a flood the cap fires on every accept, and a line per drop would
+  ## turn a diagnosis into a denial of service all by itself. The first
+  ## occurrence of each cause is never suppressed (see acceptDropLoggedAt).
+
+proc acceptDrops*(): AcceptDrops =
+  ## The process-wide accept-path drop tally (see `AcceptDrops`). Cheap: four
+  ## relaxed atomic loads. Also reachable as `server.acceptDrops()` /
+  ## `vortex.acceptDrops()`; the no-argument form exists because a `{.gcsafe.}`
+  ## handler cannot touch the `Vortex` ref.
+  result.cap = gAcceptDrops[adCap].load(moRelaxed)
+  result.tls = gAcceptDrops[adTls].load(moRelaxed)
+  result.register = gAcceptDrops[adRegister].load(moRelaxed)
+  result.acceptSuspend = gAcceptDrops[adSuspend].load(moRelaxed)
+  result.total = result.cap + result.tls + result.register + result.acceptSuspend
 
 when defined(linux):
   const clockMonotonicCoarse = ClockId(6)
@@ -1522,6 +1597,26 @@ proc startTls(loop: Loop, c: ptr Connection): bool =
       c.handshaking = true
   true
 
+proc noteAcceptDrop(loop: Loop, cause: AcceptDropCause, why: string) =
+  ## Record, and rate-limitedly explain, a connection the accept path gave up
+  ## on. Every one of these used to be a silent `posix.close` (or a bare
+  ## stderr line the stress harness never captured), so a server refusing
+  ## connections on purpose was indistinguishable at the client from a broken
+  ## network: an empty `ConnectError` and nothing anywhere to say why (#388).
+  ##
+  ## `why` is the operator-facing reason, already specific (which cap, which
+  ## OpenSSL error). The counters are what a soak samples; the line is what a
+  ## human reads. At most one line per cause per `acceptDropLogSec` per loop,
+  ## and the first occurrence of a cause is never suppressed.
+  inc loop.acceptDropped[cause]
+  discard gAcceptDrops[cause].fetchAdd(1, moRelaxed)
+  let now = loop.core.nowSec
+  if loop.acceptDropLoggedAt[cause] != 0 and
+      now - loop.acceptDropLoggedAt[cause] < acceptDropLogSec:
+    return
+  loop.acceptDropLoggedAt[cause] = max(now, 1)   # 0 stays "never logged"
+  opLog(why & " [" & $loop.acceptDropped[cause] & " on this loop thread so far]")
+
 proc suspendAccept(loop: Loop) =
   ## fd/memory exhaustion during accept(): deregister the listener for a short
   ## spell and re-arm it in tick(). The listen fd is level-triggered, so simply
@@ -1531,10 +1626,9 @@ proc suspendAccept(loop: Loop) =
     try: loop.selector.unregister(loop.listenFd)
     except CatchableError: discard
     loop.acceptSuspendedUntil = loop.core.nowSec + 1
-    try: stderr.writeLine("vortex: accept() hit fd/memory exhaustion; " &
-                          "pausing new connections ~1s (raise the fd rlimit " &
-                          "or lower maxConnections)")
-    except IOError, OSError: discard
+    loop.noteAcceptDrop(adSuspend,
+      "accept() hit fd/memory exhaustion; pausing new connections ~1s " &
+      "(raise the fd rlimit or lower maxConnections)")
 
 proc handleAccept(loop: Loop) =
   while true:
@@ -1566,6 +1660,10 @@ proc handleAccept(loop: Loop) =
     if loop.settings.maxConnections > 0 and
         loop.connCount >= loop.settings.maxConnections:
       discard posix.close(client)
+      loop.noteAcceptDrop(adCap, "connection cap " &
+        $loop.settings.maxConnections & " reached on this loop thread; " &
+        "dropping the connection just accepted (raise maxConnections, or add " &
+        "loop threads: the cap is per thread)")
       continue
     if fd >= loop.core.conns.len:
       # Grow the table for a higher fd. Unconditional, and that is the fix for
@@ -1593,6 +1691,14 @@ proc handleAccept(loop: Loop) =
       inc c.gen
       c.state = csFree
       dec loop.connCount
+      # SSL_new / SSL_set_fd failed: an allocation failure, or a context in a
+      # state OpenSSL refuses. Pop its error queue so the line says which --
+      # without it this was the one drop path with a plausible cause and no way
+      # to confirm it (#388).
+      when not defined(plainHttp):
+        loop.noteAcceptDrop(adTls,
+          "TLS session setup failed: " & tlsLastErrorMsg() &
+          "; dropping the connection just accepted")
       continue
     c.setDeadline(loop, dkHeader)   # handshake counts toward header timeout
     try:
@@ -1601,6 +1707,9 @@ proc handleAccept(loop: Loop) =
       # registerHandle can raise (selector limits, a stale duplicate fd). Clean
       # up the fd and the connCount/slot we reserved rather than leaking them
       # and letting the exception unwind out of the loop thread (R11).
+      loop.noteAcceptDrop(adRegister,
+        "selector registration failed: " & getCurrentExceptionMsg() &
+        "; dropping the connection just accepted")
       discard posix.close(client)
       inc c.gen
       c.state = csFree
@@ -1613,6 +1722,10 @@ proc beginAfterProxy(loop: Loop, c: ptr Connection) =
   ## and process whatever bytes are already buffered in the socket.
   c.awaitingProxy = false
   if not loop.startTls(c):
+    when not defined(plainHttp):
+      loop.noteAcceptDrop(adTls,
+        "TLS session setup failed after the PROXY header: " & tlsLastErrorMsg() &
+        "; dropping the connection")
     loop.closeConn(c)
     return
   when not defined(plainHttp):
@@ -2480,11 +2593,10 @@ proc run*(loop: Loop) =
           var stuck = 0
           for c in loop.core.conns.slots:
             if c.state != csFree and c.totalPins > 0: inc stuck
-          try: stderr.writeLine("vortex: graceful shutdown is waiting on " &
-            $stuck & " connection(s) held by a still-running blocking: " &
-            "handler; the loop cannot exit until they return (a handler that " &
-            "never returns will block shutdown -- blocking: bodies must finish)")
-          except IOError, OSError: discard
+          opLog("graceful shutdown is waiting on " & $stuck &
+            " connection(s) held by a still-running blocking: handler; the " &
+            "loop cannot exit until they return (a handler that never returns " &
+            "will block shutdown -- blocking: bodies must finish)")
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
@@ -2538,9 +2650,7 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
     # left for teardown to trip over.
     when defined(gcOrc): GC_fullCollect()
   except CatchableError, Defect:
-    try: stderr.writeLine("vortex: event-loop thread exited on error: " &
-                          getCurrentExceptionMsg())
-    except IOError, OSError: discard
+    opLog("event-loop thread exited on error: " & getCurrentExceptionMsg())
     if arg.listenFd != osInvalidSocket:
       discard posix.close(cint(arg.listenFd))
     if arg.udpFd != osInvalidSocket:

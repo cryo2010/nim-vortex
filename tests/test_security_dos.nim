@@ -188,6 +188,47 @@ suite "connection cap":
     check "200" in s.recvUntilClose(1000)
     for i in 1 ..< held.len: held[i].close()
 
+  test "a capped drop is counted and readable through acceptDrops":
+    # The cap used to accept and close in silence: at the client that is a
+    # connection that opened and died with nothing on it, which is exactly what
+    # a network fault looks like (an empty ConnectError), and nothing on the
+    # server recorded it. Each drop now bumps a counter an operator can sample
+    # and writes one rate-limited stderr line saying which cap was hit (#388).
+    let before = capSrv.acceptDrops()
+    var held: seq[Socket]
+    for i in 0 ..< connCap:
+      let s = newSocket(buffered = false)
+      s.connect("127.0.0.1", capSrv.port)
+      s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      check s.recvAvailable(1000).len > 0
+      held.add s
+    const overCap = 3
+    for i in 0 ..< overCap:
+      let s = newSocket(buffered = false)
+      s.connect("127.0.0.1", capSrv.port)
+      s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      check s.waitForClose(tries = 6, stepMs = 250)
+      s.close()
+    let after = capSrv.acceptDrops()
+    check after.cap - before.cap >= overCap
+    check after.total >= after.cap
+    # Process-wide by construction, so the no-argument form (what a {.gcsafe.}
+    # handler can call) reports the same numbers.
+    check acceptDrops().cap == after.cap
+    # Nothing else fired: these connections were refused by the cap, not by a
+    # TLS failure or a selector refusal.
+    #
+    # Those two causes have no test here on purpose. `tls` needs
+    # `newTlsSession` to return nil, which means SSL_new or SSL_set_fd failing,
+    # i.e. an OpenSSL allocation failure on a context that just worked -- not
+    # reachable from a test without a malloc interposer. `register` needs the
+    # selector to refuse an fd it has room for. Both are covered by the shared
+    # noteAcceptDrop path this case exercises; only their trigger is
+    # unreachable.
+    check after.tls == before.tls
+    check after.register == before.register
+    for s in held.mitems: s.close()
+
 suite "slow-reader defenses (writeTimeout)":
   proc askFor(path: string, rcvbuf: cint): Socket =
     ## Connect with a receive buffer of `rcvbuf` bytes and request `path`. The

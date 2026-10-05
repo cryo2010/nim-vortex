@@ -301,6 +301,12 @@ proc lastErrorMsg(): string =
   if e == 0: return "unknown TLS error"
   $ERR_error_string(e, nil)
 
+proc tlsLastErrorMsg*(): string =
+  ## The top of OpenSSL's thread-local error queue, as a sentence, popping it.
+  ## Exported so a caller that only gets a nil/false back from this module can
+  ## still say *why* in its own log line (the accept path, #388).
+  lastErrorMsg()
+
 proc alpnSelect(ssl: SslPtr, outProto: ptr ptr uint8, outLen: ptr uint8,
                 inProtos: ptr uint8, inLen: cuint,
                 arg: pointer): cint {.cdecl.} =

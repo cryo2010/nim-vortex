@@ -262,6 +262,18 @@ run_cell() {
     fi
   fi
 
+  # The server's stderr exists only inside its container, and `docker rm -f` is
+  # a SIGKILL that takes the log with it. vortex writes its operator lines there
+  # -- why the accept path dropped a connection, fd/memory exhaustion, a loop
+  # thread that died -- and those are precisely what explains an empty
+  # ConnectError at the client (#387, #388). On a failed cell, dump the tail
+  # into the tee'd run log BEFORE the container goes away. Only on failure: a
+  # clean hour-long cell would bury its own report lines.
+  if [ "$crc" != 0 ]; then
+    echo "--- server log (last 200 lines) ---"
+    docker logs --tail 200 "$srvc" 2>&1 || true
+  fi
+
   # Server teardown. Moved to AFTER the sidecar wait so the sidecar's final
   # /stats fd sample lands on a live server; when chaos=none the sidecar block
   # above is skipped and this is exactly where it used to be (a no-op reorder).

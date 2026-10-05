@@ -370,6 +370,19 @@ app.serve(8080, config = initVortexConfig(
 To accept a large upload without buffering it whole (so `maxBodySize` isn't the
 constraint), stream it instead; see [Upload](#upload).
 
+Connections refused *before* a request exists (the `maxConnections` cap, a
+failed TLS session setup, a selector refusal, `accept()` backing off on fd
+exhaustion) cannot be reported in a response, so they are counted instead:
+
+```nim
+let d = srv.acceptDrops()   # cap / tls / register / acceptSuspend / total
+```
+
+Each also writes one rate-limited `vortex:` line to stderr saying why. Sample
+the counters to tell "the server refused the connection on purpose" from "the
+network broke" -- at the client both look like a bare connect failure. See
+[HARDENING.md](HARDENING.md#seeing-the-limits-fire).
+
 ### Handlers
 
 A handler is a plain `proc (req: Request, res: Response)` or `proc (req: Request, res: Response) {.async.}`. It runs

@@ -509,6 +509,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serviced between batches. Address validation (a Retry token) is still not
   issued, so a spoofed-source flood can still make the shim commit
   per-connection state up to `maxConnections`. (#381)
+- Accept path: a connection the server accepts and then drops is now counted and
+  explained instead of vanishing. Four paths did it in silence -- the
+  `maxConnections` cap, `startTls` failing because `newTlsSession` returned nil,
+  `registerHandle` raising (the reason swallowed by `except CatchableError`), and
+  `accept()` backing off on fd/memory exhaustion -- and at the client every one
+  of them is a socket that opens and dies with nothing on it, which is
+  indistinguishable from a network fault. A 1-hour soak lost a cell to an empty
+  `ConnectError` 90 s in with nothing anywhere to say which. New
+  `server.acceptDrops()` / `vortex.acceptDrops()` (and a no-argument
+  `acceptDrops()` a `{.gcsafe.}` handler can call) return a process-wide
+  `AcceptDrops` with `cap`, `tls`, `register`, `acceptSuspend` and `total`, and
+  each drop writes one line to stderr saying why -- which cap, the OpenSSL
+  reason, the selector's message -- rate-limited to one per cause per 5 s per
+  loop thread, with the first occurrence of a cause never suppressed. Those
+  lines, and the handful of other operator messages the server emits, now go
+  through a single sink (`opLog`) rather than bare `stderr.writeLine` calls
+  scattered through the loop. The stress harness grew a `/drops` endpoint
+  (`/stats` keeps its exact three fields), prints the tally on SIGTERM, and
+  dumps the server container's log when a cell fails, so the server's stderr
+  survives in the run log. (#388)
 
 ### Changed
 
