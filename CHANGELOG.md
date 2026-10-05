@@ -597,11 +597,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no accessor to ask, so an operator whose certbot deploy hook failed could not
   tell an unreadable certificate from a mismatched key, a missing OCSP file or a
   rejected cipher string. Every false return now records the reason on the
-  config under `reloadLock` and writes one `vortex: TLS reload failed: <reason>`
-  line to stderr, matching the convention `applyQuicReload` already follows, so
-  a hook that ignores the bool still leaves a trace. Read the reason back with
+  config and writes one `vortex: TLS reload failed: <reason>` line to stderr,
+  matching the convention `applyQuicReload` already follows, so a hook that
+  ignores the bool still leaves a trace. Read the reason back with
   `server.lastTlsReloadError` / `vortex.lastTlsReloadError` (present and
-  constant under `-d:plainHttp`); a successful reload clears it. (#378)
+  constant under `-d:plainHttp`); a successful reload clears it. The reason is
+  published and read under the short context lock, not the reload lock, so
+  reading it from a health handler on a loop thread cannot stall that loop for
+  the length of a rotation. (#378)
 - HTTP/3: the ngtcp2 ossl crypto backend is initialized exactly once per
   process instead of once per QUIC engine. `ngtcp2_crypto_ossl_init` allocates
   an OpenSSL `ex_data` index and parks it in a library-level global, and is

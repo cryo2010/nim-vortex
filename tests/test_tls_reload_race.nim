@@ -11,7 +11,8 @@
 ## double free or use-after-free into an ASan abort instead of leaving it to
 ## chance.
 
-import std/[unittest, os, osproc, atomics, net, nativesockets, httpcore, strutils]
+import std/[unittest, os, osproc, atomics, net, nativesockets, httpcore,
+            strutils, monotimes, times]
 import std/httpclient except Response
 import vortex/[settings, request, server]
 import vortex/transport/tls
@@ -193,4 +194,61 @@ suite "SNI handshakes against a reload burst":
     srv.close()
 
 removeDir(sdir)
+
+# --- lastTlsReloadError against a reload in progress -------------------------
+# reloadTlsConfig holds `reloadLock` across its file reads, key parsing, one ctx
+# build per SNI host and a stderr write. The accessor used to take that same
+# lock, so a health handler reading the last reason stalled its whole loop
+# thread for the length of a reload. It now publishes and reads the reason under
+# `ctxLock`, the short lock acquireCtx takes for an up-ref.
+#
+# Deterministic rather than timing-sensitive: the reload is pointed at a FIFO as
+# its ocspFile, so it sits inside readFile with `reloadLock` held until
+# something writes to the pipe. A writer thread opens it after a delay whatever
+# the accessor does, so a regression fails the test instead of hanging it.
+
+let fdir = getTempDir() / "vortex_tls_fifo_" & $getCurrentProcessId()
+removeDir(fdir); createDir(fdir)
+let fCert = fdir / "cert.pem"
+let fKey = fdir / "key.pem"
+genCert(fCert, fKey, "fifo.vortex")
+let fifoPath = fdir / "staple.fifo"
+let haveFifo = execCmdEx("mkfifo " & fifoPath)[1] == 0
+
+var fifoCfg: ptr TlsConfig
+var fifoReloadOk: Atomic[bool]
+
+proc fifoReloader(x: int) {.thread.} =
+  {.cast(gcsafe).}:
+    fifoReloadOk.store(reloadTlsConfig(fifoCfg, ocspFile = fifoPath))
+
+proc fifoWriter(delayMs: int) {.thread.} =
+  ## Unblock the reload after `delayMs`. The bytes are never parsed, they are
+  ## just attached as the staple.
+  {.cast(gcsafe).}:
+    sleep(delayMs)
+    try: writeFile(fifoPath, "\x30\x03\x02\x01\x00")
+    except CatchableError: discard
+
+suite "lastTlsReloadError does not wait for a reload":
+  test "it answers while a reload is blocked reading its OCSP file":
+    if not haveFifo:
+      echo "SKIP: mkfifo unavailable"
+    else:
+      fifoCfg = newTlsConfig(fCert, fKey)
+      var rth, wth: Thread[int]
+      createThread(rth, fifoReloader, 0)
+      sleep(200)                       # let the reload get into readFile
+      createThread(wth, fifoWriter, 2000)
+      let t0 = getMonoTime()
+      let reason = lastTlsReloadError(fifoCfg)
+      let waitedMs = (getMonoTime() - t0).inMilliseconds
+      check reason == ""               # no reload has failed
+      check waitedMs < 500             # it used to wait for the writer (~1.8 s)
+      joinThread(rth)
+      joinThread(wth)
+      check fifoReloadOk.load
+      freeTlsConfig(fifoCfg)
+
+removeDir(fdir)
 echo "tls reload race ok"

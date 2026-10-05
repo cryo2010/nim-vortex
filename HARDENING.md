@@ -233,7 +233,10 @@ ignores the bool still leaves a trace in the log. Every rejection is covered:
 unreadable or mismatched material, a certificate-only or key-only rotation
 against a PKCS#12 bundle (rotate both halves, or reconfigure with a new
 bundle), contradictory OCSP arguments, an unreadable explicit `ocspFile`, and a
-per-host certificate that fails to build (which names the host).
+per-host certificate that fails to build (which names the host). Reading the
+reason is cheap and takes no lock a reload holds for any length of time, so a
+health endpoint or a request handler on a loop thread can report it without
+stalling its loop behind a rotation in progress.
 
 Per-host (SNI) certificates rotate on the same call: each per-host context is
 rebuilt from the material it was configured with, so per-host certificate

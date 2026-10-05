@@ -311,8 +311,16 @@ type
                              ## which is also what servernameCb holds while it
                              ## scans sniHosts and indexes sniCtx.
     lastReloadError: string  ## why the last reloadTlsConfig returned false ("" =
-                             ## the last one succeeded). Written under
-                             ## `reloadLock`, read through lastTlsReloadError
+                             ## the last one succeeded). Written and read under
+                             ## `ctxLock` (the short lock), so reading it back
+                             ## through lastTlsReloadError never waits for a
+                             ## reload in progress. Like `material`, `ocsp` and
+                             ## the `sni*` seqs it is a GC string living in
+                             ## createShared memory, so its payload is
+                             ## allocated and freed from whichever thread
+                             ## reloads: the lock, not the allocator, is what
+                             ## makes that safe. Same pre-existing pattern as
+                             ## the fields above, not a new one
 
   TlsIo* = enum
     tlsOk, tlsWantRead, tlsWantWrite, tlsClosed, tlsError
@@ -866,8 +874,12 @@ proc reloadFailed(cfg: ptr TlsConfig, reason: string): bool =
   ## reload path's own silence is what made the rest hard to diagnose (#378).
   ## The stderr line matches eventloop's applyQuicReload, so a certbot deploy
   ## hook that ignores the bool still leaves a trace. The caller holds
-  ## `reloadLock`, which is also what the accessor takes to read the field.
+  ## `reloadLock`; the field itself is published under `ctxLock` (lock order
+  ## reloadLock -> ctxLock, the order the ctx swap already uses) so that reading
+  ## it back never waits for a reload.
+  acquire(cfg.ctxLock)
   cfg.lastReloadError = reason
+  release(cfg.ctxLock)
   try:
     stderr.writeLine("vortex: TLS reload failed: " & reason)
   except IOError, OSError: discard
@@ -875,11 +887,17 @@ proc reloadFailed(cfg: ptr TlsConfig, reason: string): bool =
 
 proc lastTlsReloadError*(cfg: ptr TlsConfig): string =
   ## Why the most recent `reloadTlsConfig` returned false; "" when the last one
-  ## succeeded, or none has run. Takes `reloadLock` (so it blocks for the
-  ## duration of a reload running concurrently) because the field is a GC string
-  ## the reload thread rewrites.
-  acquire(cfg.reloadLock)
-  defer: release(cfg.reloadLock)
+  ## succeeded, or none has run. Cheap, and safe to call from anywhere
+  ## including a request handler on a loop thread: it copies the string under
+  ## `ctxLock`, the same short lock `acquireCtx` holds for an up-ref, and does
+  ## nothing else. It deliberately does *not* take `reloadLock`, which a reload
+  ## holds across file reads, key parsing, one ctx build per SNI host and a
+  ## stderr write, so a health endpoint reading the reason used to stall its
+  ## whole loop for that long. What it returns is therefore the reason as of the
+  ## last reload that finished publishing one, which is exactly what a reload's
+  ## own `false` return pairs with.
+  acquire(cfg.ctxLock)
+  defer: release(cfg.ctxLock)
   result = cfg.lastReloadError
 
 proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
@@ -1010,10 +1028,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   try:
     newSniCtx = buildSniCtxs(cfg, newHosts, newSniMaterial)
   except CatchableError as e:
-    SSL_CTX_free(newCtx)   # nothing published yet; releases its OCSP blob too
+    SSL_CTX_free(newCtx)   # nothing published yet, and no staple attached to
+                           # it either: installDefaultCbs has not run
     return reloadFailed(cfg, e.msg)
   installDefaultCbs(cfg, newCtx, newOcsp, newHosts.len > 0)
-  cfg.lastReloadError = ""      # this one worked; drop any earlier reason
   cfg.material = m
   cfg.ocsp = newOcsp            # bytes/path for the *next* build (reload-thread)
   cfg.ocspFile = newOcspFile
@@ -1033,6 +1051,7 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
   # decrements for any handshake that got there first. `swap` keeps the critical
   # section allocation-free; the locals carry the retired values out.
   acquire(cfg.ctxLock)
+  cfg.lastReloadError = ""   # this one worked; drop any earlier reason
   let old = atomicExchangeN(addr cfg.ctx, newCtx, ATOMIC_ACQ_REL)
   swap(cfg.sniHosts, newHosts)
   swap(cfg.sniMaterial, newSniMaterial)
