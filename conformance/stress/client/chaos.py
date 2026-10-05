@@ -29,7 +29,7 @@ All output goes to stdout with flush=True: run.sh drives this detached and dumps
 its logs, and greps the `chaos: baseline` line, so the contract lines must be on
 stdout (same tee rationale as stress_client.py).
 """
-import asyncio, os, random, socket, sys, time
+import asyncio, os, random, socket, sys, time, traceback
 from collections import Counter
 from urllib.parse import urlparse
 
@@ -674,6 +674,26 @@ async def chaos_reporter(pool, start, deadline):
         t = int(time.monotonic() - start)
         print(f"{_tally_line(pool)} | t={t}s", flush=True)
 
+def _watch_task(name):
+    """A done-callback that reports a background task's death on stdout.
+
+    `chaos_reporter` is fire-and-forget: run() cancels it in its `finally` and
+    never awaits it, so an exception inside it is never retrieved -- the task is
+    already done, `cancel()` is a no-op, and asyncio's "Task exception was never
+    retrieved" notice lands on stderr at collection time with no verdict
+    attached. The tally lines are this sidecar's only running record, so losing
+    them silently makes a soak unreadable (#387). The reporter's death is not a
+    verdict (the fd assertion below still decides), so this only logs.
+    """
+    def done(task):
+        if task.cancelled(): return       # the expected end: run()'s finally
+        e = task.exception()
+        if e is None: return
+        print(f"chaos: WARN {name} task died ({type(e).__name__}): {e}", flush=True)
+        traceback.print_exception(type(e), e, e.__traceback__, file=sys.stdout)
+        sys.stdout.flush()
+    return done
+
 # --- fd sampling -------------------------------------------------------------
 async def sample_fds(retries=1, gap=0.0):
     """Open a fresh session and read the server's open-fd count from /stats.
@@ -862,6 +882,7 @@ async def run(enabled):
     deadline = start + SECONDS
 
     rep = asyncio.ensure_future(chaos_reporter(pool, start, deadline))
+    rep.add_done_callback(_watch_task("chaos_reporter"))
     try:
         await asyncio.wait_for(
             asyncio.gather(*[worker(i, pool, start, deadline, SEED)
@@ -920,12 +941,26 @@ def main():
         return 0
     try:
         return asyncio.run(run(enabled))
-    except SystemExit:
+    except (SystemExit, KeyboardInterrupt):
         raise
-    except Exception as e:
+    except BaseException as e:
         # Anything outside the per-iteration swallow scope is an internal error in
         # the sidecar itself (not an induced wire error): surface it and exit 2.
+        #
+        # BaseException, not Exception, for two reasons (#387). An
+        # `asyncio.CancelledError` escaping run() is a BaseException, and so is a
+        # `BaseExceptionGroup` whose leaves all are; either slipped past an
+        # `except Exception` and left asyncio.run to re-raise it, which exits 1
+        # -- and 1 is chaos's "fd leak" code, so an internal bug was reported as
+        # a server defect. ^C and an explicit exit still propagate.
+        #
+        # The traceback goes to STDOUT with the verdict line: run.sh dumps this
+        # container with `docker logs 2>&1`, but the one-line cause alone names
+        # no frame, and every other contract line of this file is on stdout for
+        # the same tee reason.
         print(f"chaos: internal error ({type(e).__name__}): {e}", flush=True)
+        traceback.print_exception(type(e), e, e.__traceback__, file=sys.stdout)
+        sys.stdout.flush()
         return 2
 
 if __name__ == "__main__":

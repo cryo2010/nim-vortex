@@ -459,6 +459,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are deliberately NOT given the loop's stall credit above: ngtcp2 asserts that
   the clock never goes behind a stamp it has already seen, and the loop drives
   h3 before it ticks, so crediting the gap aborted the process. (#386)
+- Stress harness: a soak cell that fails for an unhandled reason now records
+  that reason. The canary client (`conformance/stress/client/stress_client.py`)
+  handled exactly two failure classes, `Fail` and `asyncio.TimeoutError`, and
+  printed both to stdout; anything else -- an `AttributeError` in a workload, a
+  `RuntimeError` out of aioquic/httpx -- propagated out of `asyncio.run`, which
+  puts the traceback on stderr. The canary container was also run without
+  `2>&1`, and the harness is driven as `nimble stress | tee stress.log`, which
+  tees only stdout, so the archived log showed a bare `FAILED (exit 1)` with no
+  cause anywhere and the cell could not be root-caused after the fact. The
+  canary's stderr is now merged into the tee'd stream, and `main` has a
+  catch-all (plus an `ExceptionGroup` arm, since a library's `TaskGroup` can
+  raise one that neither existing handler matches) that prints
+  `FAIL <workload>: unexpected <type>: <message>` and the full traceback to
+  stdout before exiting non-zero. `KeyboardInterrupt` and `SystemExit` still
+  propagate. The fire-and-forget `reporter` and `loop_watchdog` tasks, which
+  `main` cancels without awaiting, report their own death on stdout too: an
+  exception in either was never retrieved, so a dead reporter and a healthy
+  quiet run both looked like zero report lines. The chaos sidecar's catch-all
+  prints its traceback for the same reason and now covers `BaseException`, so a
+  `CancelledError` escaping its `run()` exits 2 (internal error) instead of 1,
+  which is its fd-leak verdict. (#387)
 
 ### Changed
 

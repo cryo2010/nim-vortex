@@ -53,6 +53,13 @@ incompressible store-fallback.
 The matrix is `VORTEX_PROTO` × `VORTEX_SERVER`; each cell builds its own server
 image and prints `== <workload> [proto=<p> server=<s>]: PASS/FAIL ==`.
 
+Capture a soak with `nimble stress | tee stress.log`: `tee` takes stdout only,
+so every line that explains a verdict is on stdout, the client containers'
+stderr included (`run.sh` merges it, and the clients print a `FAIL <workload>:
+<cause>` line with its traceback rather than letting the interpreter put one on
+stderr). A cell that fails with nothing but `FAILED (exit N)` in the log is a
+harness bug, not a soak to re-run blind.
+
 Runs are isolated by `VORTEX_RUN_ID` (defaults to the PID), so several can run
 concurrently without clobbering each other's containers/images, e.g.
 

@@ -204,6 +204,14 @@ run_cell() {
 
   # The client reports RSS/heap (from the server's /stats) and prints the
   # per-cell "== <workload> <server> <proto> passed ==" line on success.
+  #
+  # `2>&1` merges the client's stderr into the tee'd stream. The harness is run
+  # as `nimble stress | tee stress.log`, which tees only stdout, so anything the
+  # client wrote to stderr -- an interpreter traceback, an asyncio "Task
+  # exception was never retrieved" notice -- never reached the archived log and a
+  # cell died with nothing but a bare "FAILED (exit 1)" to show for it (#387).
+  # The chaos sidecar is dumped via `docker logs "$chc" 2>&1` and never had the
+  # gap; the canary was the only hole.
   set +e
   docker run --rm --network "$net" \
     -e VORTEX_WORKLOAD="$workload" -e VORTEX_PROTO="$p" -e STRESS_SERVER="$s" \
@@ -211,7 +219,7 @@ run_cell() {
     -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
     -e VORTEX_CONCURRENCY="$conc" -e VORTEX_CLIENTS="$clients" \
     -e VORTEX_REQ_COMPRESSION="$reqc" -e VORTEX_RESP_COMPRESSION="$respc" \
-    -e VORTEX_STREAM_BYTES="$sbytes" "$cimg"
+    -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" 2>&1
   crc=$?
   set -e
 
