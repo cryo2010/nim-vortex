@@ -170,6 +170,41 @@ suite "SNI":
     check "alt.example" in servedSubject("ALT.EXAMPLE")
     check "localhost" in servedSubject("Other.Org")       # still no match
 
+  test "a failing SNI host names itself and leaves nothing half-built":
+    # buildTlsCtx only ever saw the material, so a config with several SNI
+    # entries reported "cannot load TLS certificate/key: ..." with no hint which
+    # host was broken -- and the default ctx, the per-host ctxs ahead of the
+    # failing one and the shared TlsConfig block all leaked out of a
+    # half-initialized config (#361). The leak itself is not observable from
+    # here; what is observable is the named host and that an embedder which
+    # catches the raise can retry with corrected configuration.
+    writeFile(dir / "garbage.pem", "-----BEGIN CERTIFICATE-----\nnope\n")
+    var msg: string
+    try:
+      let cfg = tlstransport.newTlsConfig(cert, key, sni = @[
+        tlstransport.SniCert(host: "good.example", material: tlstransport.TlsMaterial(
+          certFile: dir / "alt.pem", keyFile: dir / "altkey.pem")),
+        tlstransport.SniCert(host: "broken.example", material: tlstransport.TlsMaterial(
+          certFile: dir / "garbage.pem", keyFile: dir / "altkey.pem"))])
+      tlstransport.freeTlsConfig(cfg)
+    except CatchableError as e:
+      msg = e.msg
+    check "broken.example" in msg
+    check "good.example" notin msg          # the host that built fine
+    # Retry with the second host corrected: the failed attempt left no state
+    # behind that would stop a fresh config from coming up and serving.
+    var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                 sni = @[SniCertEntry(host: "broken.example",
+                                         certFile: dir / "alt.pem",
+                                         keyFile: dir / "altkey.pem")])).start(0)
+    defer: srv.close()
+    proc servedSubject(servername: string): string =
+      let cmd = "echo | " & opensslBin & " s_client -connect 127.0.0.1:" &
+        $srv.port & " -servername " & servername &
+        " 2>/dev/null | " & opensslBin & " x509 -noout -subject"
+      execCmdEx(cmd)[0].strip()
+    check "alt.example" in servedSubject("broken.example")
+
   test "a configured host in mixed case matches a lower-case servername":
     # The fold applies to both sides, so an operator is not required to
     # lower-case the configured host.

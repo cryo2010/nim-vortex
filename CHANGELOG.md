@@ -548,6 +548,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either, and the fold is ASCII-only rather than locale-aware (a locale tolower
   folds `I` to a dotless `i` under tr_TR, which would make matching depend on
   the server's locale). The HTTP/3 path already folded case. (#358)
+- TLS: a per-host SNI certificate that fails to build no longer leaks the
+  half-built config. `newTlsConfigWith` let the exception escape, so the default
+  context, every per-host context ahead of the failing one and the shared
+  `TlsConfig` block were all abandoned. They are freed before the raise, and the
+  message now names the host (`SNI host "broken.example": ...`) rather than
+  reporting only the material, so an operator with several SNI entries can tell
+  which one is broken and an embedder that catches the raise can retry with
+  corrected configuration. (#361)
 
 ### Changed
 

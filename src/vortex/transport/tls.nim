@@ -621,6 +621,10 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
                        SSL_SESS_CACHE_SERVER, nil)
   ctx
 
+proc freeTlsConfig*(cfg: ptr TlsConfig)
+  ## Forward-declared: newTlsConfigWith unwinds through it when a per-host SNI
+  ## context fails to build (#361). Defined with the rest of the lifecycle below.
+
 proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
                        minProtoVersion: clong = 0, cipherList = "",
                        cipherSuites = "", verify: cint = 0,
@@ -649,9 +653,22 @@ proc newTlsConfigWith*(meth: pointer, m: TlsMaterial, protos: string,
   attachOcsp(ctx, ocsp)   # OCSP stapling for the default cert
   # SNI: one ctx per host, selected by the servername callback on the default.
   for sc in sni:
-    let hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
-                           minProtoVersion, maxProtoVersion, cipherList,
-                           cipherSuites)
+    var hctx: SslCtxPtr
+    try:
+      hctx = buildTlsCtx(meth, sc.material, verify, clientCaFile, clientCaPem,
+                         minProtoVersion, maxProtoVersion, cipherList,
+                         cipherSuites)
+    except CatchableError as e:
+      # Unwind everything built so far -- the default ctx, the per-host ctxs
+      # ahead of this one, the shared block and its locks -- rather than letting
+      # the exception escape from a half-initialized config (#361). The process
+      # is usually about to exit, but an embedder may catch this and retry with
+      # corrected configuration, and a leak-checked test run should stay quiet.
+      # Name the host: buildTlsCtx only knows the material, so without this the
+      # operator cannot tell which of several SNI entries is the broken one.
+      freeTlsConfig(result)
+      raise newException(CatchableError,
+        "SNI host \"" & sc.host & "\": " & e.msg)
     SSL_CTX_set_alpn_select_cb(hctx, alpnSelect, result)
     result.sniHosts.add sc.host
     result.sniCtx.add hctx
