@@ -530,9 +530,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Those lines, and the handful of other operator messages the server emits, go
   through a single sink (`opLog`) rather than bare `stderr.writeLine` calls
   scattered through the loop. The stress harness grew a `/drops` endpoint
-  (`/stats` keeps its exact three fields), prints the tally on SIGTERM, and
-  dumps the server container's log when a cell fails, so the server's stderr
-  survives in the run log. (#388)
+  (`/stats` keeps its exact three fields), prints the tally on SIGTERM and then
+  shuts the server down through the blocking `close` so its loop threads are
+  joined before the process exits (it used to fall off the end of `main` with
+  them still running), and dumps the server container's log when a cell fails,
+  so the server's stderr survives in the run log. (#388)
 - TLS: a private-key load failure now names its reason. `loadKeyMem` cleared the
   OpenSSL error queue on the failure path, so by the time `buildTlsCtx` read it
   there was nothing left and every key problem -- a wrong `keyPassword`, a

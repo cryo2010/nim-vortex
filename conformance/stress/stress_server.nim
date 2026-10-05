@@ -29,6 +29,12 @@
 ##                            why" from "the network broke" (#388). Also printed
 ##                            on SIGTERM/SIGINT.
 ##
+## The SIGTERM/SIGINT path at the bottom of the file is for HAND runs: run.sh
+## tears a cell's server down with `docker rm -f`, which is a SIGKILL, so no
+## handler runs and nothing is printed (that is why run.sh dumps the container's
+## last 200 log lines when a cell fails). Run the binary directly and Ctrl-C it
+## and you get the tally plus an orderly shutdown.
+##
 ## Two build-time axes (driven by the Dockerfile from run.sh), same as
 ## loadtest_server.nim: protocol/codecs via BUILD_FLAGS + LOADTEST_*-style env,
 ## and the handler runtime via one -d:lt* flag (sync / asyncdispatch / chronos),
@@ -354,6 +360,15 @@ when isMainModule:
   signal(SIGTERM, onTerm)
   signal(SIGINT, onTerm)
   while not terminating.load(moRelaxed): sleep(200)
+  # Tally first, teardown second: the print must not be lost if the join below
+  # takes the shutdown grace period (or detaches a stuck thread).
   echo "stress_server: accept drops: ", dropsText()
   flushFile(stdout)
-  srv.requestShutdown()
+  # `close` = requestShutdown + waitFor, i.e. it blocks until the loop threads
+  # have drained and been joined. `requestShutdown` alone is non-blocking, so
+  # this used to be the last statement of the program: main fell off the end and
+  # ran the process's exit while the loop threads were still serving, racing
+  # teardown in the one binary whose whole job is to surface crashes.
+  srv.close()
+  echo "stress_server: stopped"
+  flushFile(stdout)
