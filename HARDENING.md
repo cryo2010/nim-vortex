@@ -46,6 +46,10 @@ reference below.
 | `h3StreamWindow` | 1 MiB | HTTP/3 per-stream receive window (upload flow control) |
 | `h3ConnWindow` | 4 MiB | HTTP/3 per-connection receive window (aggregate cap on buffered uploads) |
 
+The HTTP/3 rows above bound *buffered upload bytes*. The UDP socket underneath
+them is bounded separately, in work rather than memory, and has its own residual
+risks: see [QUIC ingress (HTTP/3)](#quic-ingress-http3) below.
+
 HTTP/1 has no configurable upload window, but it is bounded too: a streaming
 route whose consumer acks on consume (the async `await req.read()` API, which
 registers its `onBody` sink with `manualAck`) may hold at most 1 MiB
@@ -89,6 +93,44 @@ The tally is process-wide and monotonic, so sample it and watch the rate. A
 rising `cap` means raise `maxConnections` or add loop threads (the cap is per
 thread); a rising `acceptSuspend` means raise the fd rlimit. Both are the server
 shedding load on purpose, not a broken network.
+
+#### QUIC ingress (HTTP/3)
+
+HTTP/3 arrives on a UDP socket, which has no accept queue and no backlog: every
+datagram the kernel hands up is decrypted and parsed synchronously, on the loop
+thread that owns the socket, before the next one is read. That thread also owns
+HTTP/1.1 and HTTP/2 connections, so the UDP side has to be bounded in *work*,
+not just in memory. Nothing here is configurable; the numbers are listed so you
+know what the floor is.
+
+| Property | Value | Why |
+|----------|-------|-----|
+| Receive buffer | 65527 bytes | Sized from the `max_udp_payload_size` the server advertises, from one constant in the shim so the two cannot drift. A conforming client on a large-MTU path (a 9000-byte VPC MTU, 65536 on loopback) is entitled to fill the advertisement; a smaller buffer had the kernel truncate those datagrams, AEAD then failed, and the connection died on the idle timer with nothing logged at either end. On Linux the receive passes `MSG_TRUNC`, so anything that still does not fit is dropped and counted rather than fed to ngtcp2 as line corruption |
+| Datagrams per drain | 256 (`ngRecvBudget`) | A work quantum, not a rate limit. The drain hands the thread back after 256 datagrams so the TCP fds on it get serviced between batches; a legitimate burst is still received in full, just across several passes |
+| Drains per loop pass | up to 4 | Ingress runs once after the selector and again wherever the pass may have produced QUIC egress (a batch flush, the WebSocket idle sweep, a deferred flush), so a pass can take up to 4 x 256 datagrams |
+| Selector wait with a spent budget | 0 ms | When a drain stops on the budget rather than on an empty socket, the loop goes straight back round instead of sleeping, so the backlog is still cleared promptly. Without that the budget would mean one batch per second-long sleep |
+
+The point of the budget is that a UDP source whose datagrams cost the server
+more than they cost the sender can no longer keep a loop thread inside the
+receive loop. The worst such datagram is an Initial naming a QUIC version the
+server does not support: ngtcp2 answers each with a Version Negotiation packet,
+so every one buys a parse plus a `sendto`. Unbounded, a flood of those left a
+plain HTTP/1.1 request on the same server unserved until the client gave up; it
+is now answered while the flood runs, in well under 2 s with every core but one
+blasting (`tests/test_h3_udp_flood.nim` asserts it, with a 5 s bound).
+
+**Residual risk.** Two things the budget does not fix:
+
+- **No address validation.** The server does not issue a Retry token, so a
+  spoofed-source Initial flood still makes the QUIC stack commit per-connection
+  state before it knows the peer address is real, up to `maxConnections`. The
+  budget bounds how much loop time that costs per pass, not how much state
+  accumulates. If you are exposed to this, rate-limit UDP to the QUIC port
+  upstream (or turn `http3` off) until Retry lands.
+- **Version Negotiation is unmetered.** One reply per unsupported-version
+  Initial, with no per-source limit. The reply is smaller than the Initial that
+  provoked it, so the amplification factor is below 1 and this is not a
+  reflection vector, but it is work an off-path sender can make the server do.
 
 ### Timeouts
 
