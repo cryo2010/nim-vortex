@@ -22,8 +22,17 @@
 ## costs the sender -- a long-header Initial naming an unsupported QUIC version,
 ## which ngtcp2 answers with a Version Negotiation packet, so each one buys a
 ## parse plus a sendto. With the budget removed that flood kept the loop inside
-## `ngReceive` and curl gave up at its 2 s timeout having never been served;
-## with the budget it answers in tens of milliseconds.
+## `ngReceive` and curl gave up at its timeout having never been served; with
+## the budget it is served while the flood runs.
+##
+## The bound is therefore generous (5 s) and curl's own timeout is more generous
+## still (10 s): the pre-fix failure is "never served", not "served slowly", so
+## the assertion does not need to be tight, and letting curl finish keeps a slow
+## answer on a loaded runner distinguishable from no answer at all. Measured on
+## a 14-core host (13 senders), five runs: 0.46-1.7 s with the budget, and the
+## full 10 s curl timeout with it removed. The flood is sized to the host
+## (`countProcessors() - 1` senders), because a fixed count oversubscribed a
+## 2-vCPU runner and measured its scheduler instead.
 
 import std/[unittest, net, httpcore, os, times, strutils, osproc, atomics]
 import vortex/[settings, request, server]
@@ -35,9 +44,25 @@ when not defined(plainHttp):
   let curlBin = requireCurl()
   let (certPath, keyPath) = makeCertPair("nh3_flood_")
 
+  let blasters = max(1, osproc.countProcessors() - 1)
+    ## Sender threads. One less than the host has cores, so a thread is always
+    ## left for the loop: a fixed 4 oversubscribed a 2-vCPU CI runner and the
+    ## suite then measured the runner's scheduler rather than the receive
+    ## budget. One is enough to starve an unbounded drain (the datagrams cost
+    ## the server more than the sender), so the floor keeps the signal.
+
   const
-    blasters = 4             ## sender threads
-    requestBudgetMs = 2_000  ## a TCP request must complete inside this
+    requestBudgetMs = 5_000  ## a TCP request must complete inside this
+      ## The pre-fix failure is total, not slow: the loop thread never leaves
+      ## `ngReceive` while the flood runs, so it does not recover inside 5 s
+      ## either (measured with the budget removed: the full 10 s curl timeout,
+      ## never served). With the budget in place the request lands in well under
+      ## 2 s even with every core but one blasting, so this bound can be
+      ## generous about a loaded runner without losing the signal.
+    curlTimeoutSec = 10
+      ## Deliberately longer than requestBudgetMs: curl must be allowed to
+      ## finish so "served, but slowly" shows up as a latency the check reports,
+      ## not as the same exit code as "never served at all".
 
   proc handler(req: Request, res: Response) {.gcsafe.} =
     res.send(Http200, "tcp alive")
@@ -71,7 +96,7 @@ when not defined(plainHttp):
       sent.atomicInc(64)
     s.close()
 
-  var threads: array[blasters, Thread[int]]
+  var threads = newSeq[Thread[int]](blasters)
 
   suite "a UDP flood does not starve the loop's TCP connections":
     test "the per-pass receive budget is in force":
@@ -87,12 +112,12 @@ when not defined(plainHttp):
       sleep(150)                         # let the flood get going first
       let t0 = epochTime()
       let (out1, rc) = execCmdEx(curlBin & " -sk --http1.1 -m " &
-                                 $(requestBudgetMs div 1000) & " " & base & "/")
+                                 $curlTimeoutSec & " " & base & "/")
       let elapsedMs = int((epochTime() - t0) * 1000)
       stopFlood.store(true)
       for i in 0 ..< blasters: joinThread(threads[i])
-      echo "  flood sent ", sent.load(moRelaxed), " datagrams; request took ",
-           elapsedMs, " ms"
+      echo "  flood sent ", sent.load(moRelaxed), " datagrams from ", blasters,
+           " threads; request took ", elapsedMs, " ms"
       check rc == 0
       check out1.strip() == "tcp alive"
       check elapsedMs < requestBudgetMs
