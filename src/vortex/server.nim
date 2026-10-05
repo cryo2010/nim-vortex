@@ -336,11 +336,10 @@ const noTlsReason = "TLS is not enabled on this server"
   ## reloadTls and lastTlsReloadError name it from here.
 
 proc logNoTls() =
-  ## The stderr half of a rejection reloadTlsConfig never sees, in the same
-  ## shape it writes for the ones it does (#378).
-  try:
-    stderr.writeLine("vortex: TLS reload failed: " & noTlsReason)
-  except IOError, OSError: discard
+  ## The logged half of a rejection reloadTlsConfig never sees, in the same
+  ## shape it writes for the ones it does (#378), through the loop's one
+  ## operator-log sink (#388).
+  opLog("TLS reload failed: " & noTlsReason)
 
 proc reloadTls*(server: var Server, certFile = "", keyFile = "",
                 ocspFile = "", ocspResponse = "", clearOcsp = false,
@@ -384,8 +383,9 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## inside a raw signal handler. Two threads may call it at once (a SIGHUP
   ## loop plus an admin endpoint, say): the reloads serialise internally.
   ## Covers HTTP/1.1, HTTP/2, and (when enabled)
-  ## HTTP/3: each h3 loop updates its own QUIC ctx in place on its next tick, so
-  ## new h3 handshakes use the new certificate while in-flight ones keep theirs.
+  ## HTTP/3: each h3 loop builds a replacement QUIC ctx on its next tick and
+  ## swaps it in only once the material has loaded and the key matches, so new
+  ## h3 handshakes use the new certificate while in-flight ones keep theirs.
   when defined(plainHttp):
     logNoTls()
     false

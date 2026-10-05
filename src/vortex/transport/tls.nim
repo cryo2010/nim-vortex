@@ -548,13 +548,24 @@ proc applyClientVerify(ctx: SslCtxPtr, verify: cint,
   SSL_CTX_set_verify(ctx, verify, nil)   # nil cb: OpenSSL's default chain check
   true
 
+proc readMaterialFile(path, what: string): string =
+  ## readFile for a key or bundle path, with the path and the OS reason in the
+  ## error. A missing or unreadable file never touches OpenSSL's error queue, so
+  ## without this it surfaced as "unknown TLS error", the same lost-reason shape
+  ## as a key the decoder rejected (#377). (A missing certFile is read by
+  ## OpenSSL itself and already reports its own reason.)
+  try: readFile(path)
+  except CatchableError as e:
+    raise newException(CatchableError,
+      "cannot read " & what & " " & path & ": " & e.msg)
+
 proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
   ## Load the server cert + key from a PKCS#12 bundle, in-memory PEM, or files.
+  ## Returns false when OpenSSL rejects the material (the reason is left on its
+  ## error queue); raises when a file named by `m` cannot be read at all.
   if m.pkcs12.len > 0 or m.pkcs12File.len > 0:
     let data = if m.pkcs12.len > 0: m.pkcs12
-               else:
-                 try: readFile(m.pkcs12File)
-                 except CatchableError: return false
+               else: readMaterialFile(m.pkcs12File, "PKCS#12 bundle")
     return loadPkcs12(ctx, data, m.keyPassword)
   let certOk = if m.certPem.len > 0: loadCertChainMem(ctx, m.certPem)
                else: SSL_CTX_use_certificate_chain_file(ctx, m.certFile.cstring) == 1
@@ -568,9 +579,7 @@ proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
   if m.keyPem.len > 0:
     loadKeyMem(ctx, m.keyPem, m.keyPassword)
   else:
-    let keyData = try: readFile(m.keyFile)
-                  except CatchableError: return false
-    loadKeyMem(ctx, keyData, m.keyPassword)
+    loadKeyMem(ctx, readMaterialFile(m.keyFile, "private key"), m.keyPassword)
 
 proc asn1TimeStr(t: pointer): string =
   ## An ASN1_TIME rendered the way OpenSSL prints it ("Jan  2 00:00:00 2020
@@ -651,7 +660,11 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "invalid TLS 1.3 cipher suites: " & lastErrorMsg())
-  if not loadCertKey(ctx, m):
+  let loaded = try: loadCertKey(ctx, m)
+               except CatchableError:
+                 SSL_CTX_free(ctx)   # an unreadable key/bundle file: re-raise
+                 raise               # with the path and OS reason it carries
+  if not loaded:
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "cannot load TLS certificate/key: " & lastErrorMsg())
@@ -975,10 +988,10 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
 # --- QUIC (HTTP/3) certificate reload ---------------------------------------
 #
 # The h3 stack (ngtcp2 + nghttp3) owns a per-loop TLS context that the atomic
-# pointer swap the TCP path uses would not reach, so each loop thread reloads its
-# own engine *in place* on its own thread (eventloop.applyQuicReload ->
-# ngReloadCert). New handshakes present the new cert; in-flight connections keep
-# theirs.
+# pointer swap the TCP path uses would not reach, so each loop thread rebuilds
+# its own engine's context on its own thread (eventloop.applyQuicReload ->
+# ngReloadCert) and swaps it in once the material checks out. New handshakes
+# present the new cert; in-flight connections keep theirs.
 #
 # The main thread signals a reload through this plain-memory struct (fixed
 # buffers, never GC strings, so it is safe to read from the loop threads).
