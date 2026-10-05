@@ -195,8 +195,19 @@ SO_REUSEPORT hash hands it rather than only on the one that issued the ticket.
 The HTTP/3 ticket key rotates hourly: the current key encrypts, the previous one
 still decrypts for one more hour and the ticket is reissued under the new key,
 and anything older costs that client one full handshake, so a disclosed key
-exposes at most two hours of resumed sessions. The TCP listener still uses
-OpenSSL's own per-context ticket key, generated once at startup and not rotated.
+exposes at most two hours of resumed sessions.
+
+The TCP listener keeps OpenSSL's own ticket key, which belongs to the
+`SSL_CTX` rather than to the process. Nothing rotates it on a schedule, but a
+certificate reload builds a replacement context, so the ticket key and the TLS
+1.2 session cache are both regenerated on every `reloadTls` and every ticket or
+cached session issued before it stops resuming (a saved session resumes with
+`Reused` before the reload and `New` after it). The two transports therefore
+behave in opposite ways across a rotation: the HTTP/3 key is process-wide, so an
+h3 client's ticket survives a certificate reload, while a TCP client's is
+invalidated by it and costs that client one full handshake on its next visit.
+Having the TCP listener share the rotating key is not implemented.
+
 0-RTT early data is not offered on any protocol, so none of this changes what a
 client may send on its first flight.
 
