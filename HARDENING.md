@@ -132,6 +132,18 @@ ALPN list overlapping neither is refused with a fatal `no_application_protocol`
 alert (RFC 7301 3.2) rather than being handed a no-ALPN connection that it would
 misframe; a client that advertises no ALPN at all still gets HTTP/1.1.
 
+Certificate material is checked against its own validity window wherever it is
+installed: a leaf whose `notAfter` has passed, or whose `notBefore` has not
+arrived, is refused outright on HTTP/1.1, HTTP/2 and HTTP/3 alike. There is no
+clock-skew allowance and no warning-only mode -- serving an expired certificate
+is never intentional and every client rejects it. At startup that is a hard
+failure (`certificate expired at <notAfter>` / `certificate not valid until
+<notBefore>`), so a server that would have come up serving an expired
+certificate now refuses to start; on a reload it is a rejection like any other
+bad material, so the running certificate keeps serving. This is what catches a
+renewal hook racing a certbot symlink swap, or one pointed at `archive/`
+instead of `live/`.
+
 Certificates can be rotated at runtime with `server.reloadTls(certFile, keyFile)`
 (TCP and h3), which validates the new material and swaps it in without dropping
 connections. The same call rotates the stapled OCSP response:

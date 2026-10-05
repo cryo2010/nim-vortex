@@ -14,6 +14,7 @@
 #include <openssl/rand.h>
 #include <openssl/pemerr.h>
 #include <openssl/pkcs12.h>
+#include <openssl/x509.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -988,6 +989,41 @@ static std::string sslErrStr() {
   return std::string(buf);
 }
 
+// A readable rendering of an ASN1_TIME ("Jan  2 00:00:00 2020 GMT"), or "" if
+// OpenSSL will not print it.
+static std::string asn1TimeStr(const ASN1_TIME *t) {
+  BioPtr b(BIO_new(BIO_s_mem()));
+  if (!b || ASN1_TIME_print(b.get(), t) != 1) {
+    ERR_clear_error();
+    return "";
+  }
+  char buf[64];
+  const int n = BIO_read(b.get(), buf, static_cast<int>(sizeof buf) - 1);
+  if (n <= 0) { ERR_clear_error(); return ""; }
+  return std::string(buf, static_cast<size_t>(n));
+}
+
+// Why the context's leaf certificate must not be installed, or "" when it is
+// inside its validity window. Nothing checked notBefore/notAfter on either
+// transport, so an expired certificate loaded cleanly and a reload pointed at
+// an archived copy (or racing a certbot symlink swap) reported success while
+// every new client failed with certificate_expired (#379). Hard failure, with
+// no clock-skew allowance: serving an expired certificate is never intentional,
+// and refusing it at load time keeps the running certificate on a reload.
+static std::string certValidityError(SSL_CTX *ctx) {
+  X509 *x = SSL_CTX_get0_certificate(ctx);
+  if (!x) return "no certificate";
+  // X509_cmp_current_time returns < 0 for a time in the past, > 0 for one in
+  // the future, and 0 only when it cannot parse the field.
+  ASN1_TIME *notAfter = X509_getm_notAfter(x);
+  if (notAfter && X509_cmp_current_time(notAfter) < 0)
+    return "certificate expired at " + asn1TimeStr(notAfter);
+  ASN1_TIME *notBefore = X509_getm_notBefore(x);
+  if (notBefore && X509_cmp_current_time(notBefore) > 0)
+    return "certificate not valid until " + asn1TimeStr(notBefore);
+  return "";
+}
+
 // `err`, when given, is filled with the step that failed plus whatever OpenSSL
 // queued about it, so vq_engine_reload_cert / vq_engine_new can report a cause
 // instead of a bare failure.
@@ -1049,6 +1085,15 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
   if (!ok) return fail("cannot load TLS certificate/key");
   if (SSL_CTX_check_private_key(ctx.get()) != 1)
     return fail("certificate/key mismatch");
+  // Validity last among the material checks, so a mismatch is still reported as
+  // a mismatch. No OpenSSL error is queued for this one, so it does not go
+  // through fail().
+  const std::string invalid = certValidityError(ctx.get());
+  if (!invalid.empty()) {
+    if (err) *err = invalid;
+    ERR_clear_error();
+    return nullptr;
+  }
   // Client-certificate policy last, like the TCP path's buildTlsCtx. Fail
   // closed: a verifyClient config whose CA material will not load must not
   // yield an engine that accepts unauthenticated connections (#351).

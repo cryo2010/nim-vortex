@@ -284,6 +284,12 @@ OpenSSL accepts (RSA, ECDSA, Ed25519) is supported. `keyPassword` applies to a
 file or in-memory key; without it, an encrypted key fails to start (rather than
 prompting).
 
+The certificate's validity window is checked wherever material is installed, on
+every transport: an expired or not-yet-valid leaf fails startup outright
+(`certificate expired at <notAfter>` / `certificate not valid until
+<notBefore>`) and makes `reloadTls` return `false` with the running certificate
+untouched. There is no skew allowance and no warning-only mode.
+
 **PKCS#12 (.pfx/.p12)** bundles the cert, key, and chain in one blob; pass the
 file or the bytes, with `keyPassword` as the bundle passphrase:
 

@@ -653,6 +653,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes or a bundle there is nothing to re-read, so the rebuild is a correct
   no-op for the default certificate and still refreshes the per-host files.
   (#353)
+- TLS, HTTP/3: certificate validity (`notBefore` / `notAfter`) is now checked
+  wherever material is installed -- at startup and on reload, on the TCP path
+  (`buildTlsCtx`) and the QUIC path alike, default and per-host certificates
+  both. Nothing checked it before: an expired certificate loaded cleanly and
+  `reloadTls()` returned true, so a renewal hook racing a certbot symlink swap,
+  or one pointed at `archive/` instead of `live/`, reported success while every
+  new connection from that moment failed at the client with
+  `certificate_expired`, masked until the in-flight ones turned over. The
+  policy is a hard failure with no clock-skew allowance and no warning-only
+  mode: startup raises `certificate expired at <notAfter>` or `certificate not
+  valid until <notBefore>`, and a reload is rejected with the running
+  certificate left serving. **Behaviour change**: a server that previously
+  started while serving an expired certificate now refuses to start. (#379)
 
 ### Changed
 

@@ -292,4 +292,39 @@ when not defined(plainHttp):
       check reload(e, betaCert, betaKey)
       check "beta.vortex" in subject(e)
 
+  # Certificates with an explicitly stated validity window, for #379. Needs
+  # openssl's -not_before/-not_after (3.5+); without them those cases are
+  # skipped rather than failing the suite.
+  let expCert = dir / "expired.pem"
+  let expKey = dir / "expired.key"
+  let dated = execCmdEx("openssl req -x509 -newkey rsa:2048 -nodes -keyout " &
+    expKey & " -out " & expCert & " -subj /CN=expired.vortex" &
+    " -not_before 20200101000000Z -not_after 20200102000000Z")[1] == 0
+
+  suite "QUIC material outside its validity window is refused (#379)":
+    ## Nothing checked notBefore/notAfter on either transport, so an expired
+    ## certificate loaded cleanly and a reload pointed at an archived copy
+    ## reported success while every new client failed with
+    ## certificate_expired. Hard failure, no clock-skew allowance.
+    test "an engine will not start on an expired certificate":
+      if not dated:
+        echo "    (skipped: openssl has no -not_before/-not_after)"
+      else:
+        check engineFromFiles(expCert, expKey) == nil
+        # vq_engine_new has no engine to hang the reason on, so it lands in the
+        # per-thread slot vq_engine_last_error(NULL) reads.
+        check "certificate expired at" in $vqEngineLastError(nil)
+
+    test "a reload to an expired certificate keeps the running one":
+      if not dated:
+        echo "    (skipped: openssl has no -not_before/-not_after)"
+      else:
+        let e = engineFromPem(startCert, startKey)
+        check e != nil
+        defer: vqEngineFree(e)
+        check not reload(e, expCert, expKey)
+        check "certificate expired at" in $vqEngineLastError(e)
+        check "localhost" in subject(e)
+        check vqTestEngineUsable(e) == 1
+
   removeDir(dir)

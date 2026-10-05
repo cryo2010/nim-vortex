@@ -147,6 +147,13 @@ proc CRYPTO_malloc(num: csize_t, file: cstring, line: cint): pointer
 proc CRYPTO_free(p: pointer, file: cstring, line: cint)
 proc CRYPTO_get_ex_new_index(classIndex: cint, argl: clong, argp: pointer,
                              newFn, dupFn, freeFn: pointer): cint
+proc X509_getm_notBefore(x: pointer): pointer            # ASN1_TIME* (borrowed)
+proc X509_getm_notAfter(x: pointer): pointer             # ASN1_TIME* (borrowed)
+proc X509_cmp_current_time(t: pointer): cint   # <0 past, >0 future, 0 unparsable
+proc ASN1_TIME_print(bio, t: pointer): cint
+proc BIO_new(meth: pointer): pointer
+proc BIO_s_mem(): pointer
+proc BIO_read(bio: pointer, data: pointer, dlen: cint): cint
 {.pop.}
 
 proc passwdCb(buf: cstring, size: cint, rwflag: cint,
@@ -565,6 +572,42 @@ proc loadCertKey(ctx: SslCtxPtr, m: TlsMaterial): bool =
                   except CatchableError: return false
     loadKeyMem(ctx, keyData, m.keyPassword)
 
+proc asn1TimeStr(t: pointer): string =
+  ## An ASN1_TIME rendered the way OpenSSL prints it ("Jan  2 00:00:00 2020
+  ## GMT"), or "" if it will not print.
+  let bio = BIO_new(BIO_s_mem())
+  if bio == nil: return ""
+  defer: discard BIO_free(bio)
+  if ASN1_TIME_print(bio, t) != 1:
+    ERR_clear_error()
+    return ""
+  var buf = newString(64)
+  let n = BIO_read(bio, addr buf[0], cint(buf.len))
+  if n <= 0:
+    ERR_clear_error()
+    return ""
+  buf.setLen(n)
+  buf
+
+proc checkCertValidity(ctx: SslCtxPtr): string =
+  ## Why the ctx's leaf certificate must not be installed, or "" when it is
+  ## inside its validity window. Nothing checked notBefore/notAfter before, so
+  ## an expired certificate loaded cleanly and a `reloadTls` pointed at an
+  ## archived copy (or racing a certbot symlink swap) returned true while every
+  ## new connection failed at the client with certificate_expired (#379). Hard
+  ## failure, with no clock-skew allowance: serving an expired certificate is
+  ## never intentional. At startup it fails loudly; on a reload it keeps the
+  ## running certificate, like any other bad material.
+  let x = SSL_CTX_get0_certificate(ctx)
+  if x == nil: return "no certificate"
+  let notAfter = X509_getm_notAfter(x)
+  if notAfter != nil and X509_cmp_current_time(notAfter) < 0:
+    return "certificate expired at " & asn1TimeStr(notAfter)
+  let notBefore = X509_getm_notBefore(x)
+  if notBefore != nil and X509_cmp_current_time(notBefore) > 0:
+    return "certificate not valid until " & asn1TimeStr(notBefore)
+  ""
+
 proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
                  clientCaFile, clientCaPem: string,
                  minProtoVersion, maxProtoVersion: clong,
@@ -616,6 +659,10 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
       "certificate/key mismatch: " & lastErrorMsg())
+  let validity = checkCertValidity(ctx)
+  if validity.len > 0:
+    SSL_CTX_free(ctx)
+    raise newException(CatchableError, validity)
   if not applyClientVerify(ctx, verify, clientCaFile, clientCaPem):
     SSL_CTX_free(ctx)
     raise newException(CatchableError,
