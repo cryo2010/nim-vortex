@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -878,6 +879,10 @@ static bool loadCertChain(SSL_CTX *ctx, const char *pem) {
   // old, no-longer-valid intermediates, and the chain grew with every reload
   // (#354). Harmless on a fresh context, which is the only caller left now that
   // a reload builds one (#352), but the function has to be correct on its own.
+  // Note that SSL_CTX_clear_chain_certs clears the chain of the currently
+  // selected key slot only, not every slot the ctx may hold. That is exactly
+  // right here: every live reload builds a fresh context and loads one leaf
+  // into it, so there is never a second slot to leave behind.
   (void)SSL_CTX_clear_chain_certs(ctx);
   ERR_clear_error();   // so the peek below sees only our own errors
   X509Ptr leaf(PEM_read_bio_X509(b.get(), nullptr, nullptr, nullptr));
@@ -910,7 +915,9 @@ static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
                                : nullptr);
   if (!b) return false;
   (void)SSL_CTX_clear_chain_certs(ctx);   // same accumulation as loadCertChain
-                                          // (add1_chain_cert appends), #354
+                                          // (add1_chain_cert appends), #354;
+                                          // the selected key slot's chain, all
+                                          // a fresh context ever has
   PKCS12 *p12 = d2i_PKCS12_bio(b.get(), nullptr);
   if (!p12) return false;   // reason left queued for makeCtx (#352)
   EVP_PKEY *pkey = nullptr;
@@ -979,11 +986,11 @@ static bool applyClientVerify(SSL_CTX *ctx, const VqConfig *cfg) {
   return true;
 }
 
-// Drain the OpenSSL error queue into a readable reason (its newest entry),
-// leaving the queue empty. The loaders above report a bare bool, so the reason
-// has to be collected by the step that failed or it is lost -- which is why
-// every refused QUIC reload used to reach the operator as the same generic log
-// line (#352).
+// Drain the OpenSSL error queue into a readable reason (its oldest entry, which
+// ERR_get_error pops and is the one closest to the root cause), leaving the
+// queue empty. The loaders above report a bare bool, so the reason has to be
+// collected by the step that failed or it is lost -- which is why every refused
+// QUIC reload used to reach the operator as the same generic log line (#352).
 static std::string sslErrStr() {
   const unsigned long e = ERR_get_error();
   if (e == 0) return "";
@@ -991,6 +998,21 @@ static std::string sslErrStr() {
   ERR_error_string_n(e, buf, sizeof buf);
   ERR_clear_error();
   return std::string(buf);
+}
+
+// Why `path` cannot be opened for reading, or "" when it can (and "" for an
+// empty path, which means the material comes from elsewhere). A missing or
+// unreadable certificate/key FILE leaves nothing useful in OpenSSL's error
+// queue: the rejection reached the operator as "cannot load TLS
+// certificate/key: error:80000002:system library::No such file or directory",
+// naming neither the path nor which half of the pair failed. Mirrors the TCP
+// path's readMaterialFile, which prefixes the path and the OS reason (#377).
+static std::string fileOpenError(const char *path) {
+  if (!path || !path[0]) return "";
+  FILE *f = fopen(path, "rb");
+  if (!f) return std::string(strerror(errno));
+  fclose(f);
+  return "";
 }
 
 // --- process-wide TLS 1.3 session-ticket keys (#382) -----------------------
@@ -1131,13 +1153,22 @@ static std::string certValidityError(SSL_CTX *ctx) {
   X509 *x = SSL_CTX_get0_certificate(ctx);
   if (!x) return "no certificate";
   // X509_cmp_current_time returns < 0 for a time in the past, > 0 for one in
-  // the future, and 0 only when it cannot parse the field.
+  // the future, and 0 only when it cannot parse the field. A field that will
+  // not parse is a rejection too, not a pass: treating it as valid let a
+  // certificate whose notAfter OpenSSL cannot read install as if it were
+  // in-window, which is the one case where we know nothing about the window at
+  // all. The TCP side rejects it identically.
   ASN1_TIME *notAfter = X509_getm_notAfter(x);
-  if (notAfter && X509_cmp_current_time(notAfter) < 0)
-    return "certificate expired at " + asn1TimeStr(notAfter);
+  if (!notAfter) return "certificate has no notAfter";
+  const int after = X509_cmp_current_time(notAfter);
+  if (after < 0) return "certificate expired at " + asn1TimeStr(notAfter);
+  if (after == 0) return "certificate validity time could not be parsed";
   ASN1_TIME *notBefore = X509_getm_notBefore(x);
-  if (notBefore && X509_cmp_current_time(notBefore) > 0)
+  if (!notBefore) return "certificate has no notBefore";
+  const int before = X509_cmp_current_time(notBefore);
+  if (before > 0)
     return "certificate not valid until " + asn1TimeStr(notBefore);
+  if (before == 0) return "certificate validity time could not be parsed";
   return "";
 }
 
@@ -1153,6 +1184,22 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
     }
     ERR_clear_error();
     return nullptr;
+  };
+  // For a reason that does not come out of OpenSSL's queue (an unreadable file,
+  // a validity window), so it is reported verbatim instead of being glued to
+  // whatever happened to be queued.
+  auto failWith = [err](const std::string &why) -> SslCtxPtr {
+    if (err) *err = why;
+    ERR_clear_error();
+    return nullptr;
+  };
+  // "" when `path` can be read, else the message naming it and the OS reason:
+  // a material file diagnosed before OpenSSL loses the reason (#377).
+  auto unreadable = [](const char *path, const char *what) {
+    const std::string why = fileOpenError(path);
+    return why.empty() ? std::string()
+                       : "cannot read " + std::string(what) + " " +
+                             std::string(path) + ": " + why;
   };
   SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
   if (!ctx) return fail("SSL_CTX_new failed");
@@ -1192,19 +1239,30 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
   if ((cfg->pkcs12 && cfg->pkcs12_len) ||
       (cfg->pkcs12_file && cfg->pkcs12_file[0])) {
     // PKCS#12 bundle carries both cert and key (matches the TCP path's order).
+    if (!(cfg->pkcs12 && cfg->pkcs12_len)) {
+      const std::string why = unreadable(cfg->pkcs12_file, "PKCS#12 bundle");
+      if (!why.empty()) return failWith(why);
+    }
     ok = loadPkcs12(ctx.get(), cfg->pkcs12, cfg->pkcs12_len, cfg->pkcs12_file,
                     cfg->key_password);
   } else {
     // Cert: in-memory PEM takes precedence over the file (matches the TCP path).
     ok = true;
-    if (cfg->cert_pem && cfg->cert_pem[0])
+    if (cfg->cert_pem && cfg->cert_pem[0]) {
       ok = loadCertChain(ctx.get(), cfg->cert_pem);
-    else if (cfg->cert_file && cfg->cert_file[0])
+    } else if (cfg->cert_file && cfg->cert_file[0]) {
+      const std::string why = unreadable(cfg->cert_file, "certificate");
+      if (!why.empty()) return failWith(why);
       ok = SSL_CTX_use_certificate_chain_file(ctx.get(), cfg->cert_file) == 1;
+    }
     // Key: PEM blob or file, decrypted with key_password, never prompting.
-    if (ok && ((cfg->key_pem && cfg->key_pem[0]) ||
-               (cfg->key_file && cfg->key_file[0])))
+    if (ok && cfg->key_pem && cfg->key_pem[0]) {
       ok = loadKey(ctx.get(), cfg->key_pem, cfg->key_file, cfg->key_password);
+    } else if (ok && cfg->key_file && cfg->key_file[0]) {
+      const std::string why = unreadable(cfg->key_file, "private key");
+      if (!why.empty()) return failWith(why);
+      ok = loadKey(ctx.get(), cfg->key_pem, cfg->key_file, cfg->key_password);
+    }
   }
   // Fail closed: require a certificate AND a matching private key. Without this
   // a config that loaded neither (e.g. PKCS#12-only before this was wired, or an
@@ -1474,9 +1532,10 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_file,
   // documents (renew in place, then srv.reloadTls()) rotated HTTP/1.1 and
   // HTTP/2 and left HTTP/3 on the certificate loaded at startup until it
   // expired, at which point h3 broke on its own while the other protocols
-  // stayed healthy (#353). For material configured as PEM bytes or a PKCS#12
-  // blob there is nothing to re-read, so the rebuild is a no-op for the default
-  // certificate and still picks up per-host files replaced on disk.
+  // stayed healthy (#353). For material configured as PEM bytes or PKCS#12
+  // *bytes* there is nothing to re-read, so the rebuild is a no-op for the
+  // default certificate (a configured pkcs12_file IS re-read) and still picks
+  // up per-host files replaced on disk.
   const bool haveCert = cert_file && cert_file[0];
   const bool haveKey = key_file && key_file[0];
   Material m = e->def_material;
@@ -1487,6 +1546,18 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_file,
   // old pair (the bundle carries both halves and takes precedence, so the new
   // key would never be opened).
   const bool p12Sourced = !m.pkcs12.empty() || !m.pkcs12_file.empty();
+  if (haveCert && !haveKey && p12Sourced) {
+    // The mirror image of the key-only rejection below, and refused for the
+    // same reason: clearing the bundle leaves the key half with nothing to
+    // load, so makeCtx would report a bare "certificate/key mismatch" (or, on
+    // an engine with no key file at all, a certificate with no private key)
+    // instead of naming the one thing the operator has to change. Same wording
+    // as the TCP path's reloadTlsConfig.
+    e->last_error =
+        "a certificate-only reload cannot replace a PKCS#12 bundle; rotate "
+        "certFile and keyFile together";
+    return -1;
+  }
   if (haveCert) {
     m.cert_file = cert_file;
     m.cert_pem.clear();

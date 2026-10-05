@@ -544,7 +544,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   survives to the exception message (`bad decrypt` for a wrong passphrase), on
   key files and in-memory `keyPem` alike, and `lastErrorMsg` drains the queue it
   read from so one failed load cannot lend its reason to the next attempt on the
-  same thread. (#377)
+  same thread. The QUIC path names its files the same way: a missing or
+  unreadable certificate, key or PKCS#12 path was reported as `cannot load TLS
+  certificate/key: error:80000002:system library::No such file or directory`,
+  with neither the path nor which half of the pair failed in it, and now reads
+  `cannot read private key <path>: <reason>`. (#377)
 - TLS: SNI host matching on the TCP listener is ASCII-case-insensitive. Host
   names are case-insensitive (RFC 6066, and DNS generally), but `cstrEq` and
   `wildMatch` compared bytes, so a client that sent `Example.com` for a
@@ -665,11 +669,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passphrase -- and a reload with no paths rebuilds from it, re-reading any
   files, exactly as `reloadTlsConfig` does; what loads successfully becomes
   what the next bare reload re-reads. Explicit paths replace the configured
-  source under the same rules as the TCP path, including refusing a key-only
-  reload against a PKCS#12-sourced certificate. For material configured as PEM
-  bytes or a bundle there is nothing to re-read, so the rebuild is a correct
-  no-op for the default certificate and still refreshes the per-host files.
-  (#353)
+  source under the same rules as the TCP path, including refusing a one-sided
+  reload against a PKCS#12-sourced certificate: a `keyFile` without a
+  `certFile`, and now a `certFile` without a `keyFile` too, which cleared the
+  bundle and left the key half with nothing to load, so it came back as a bare
+  `certificate/key mismatch` instead of naming the one thing to change. For
+  material configured as PEM bytes or PKCS#12 *bytes* there is nothing to
+  re-read, so the rebuild is a correct no-op for the default certificate (a
+  configured `pkcs12File` is re-read like any other path) and still refreshes
+  the per-host files. (#353)
 - TLS, HTTP/3: certificate validity (`notBefore` / `notAfter`) is now checked
   wherever material is installed -- at startup and on reload, on the TCP path
   (`buildTlsCtx`) and the QUIC path alike, default and per-host certificates
@@ -689,6 +697,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now fails with `certificate validity time could not be parsed`.
   **Behaviour change**: a server that previously started while serving an
   expired certificate now refuses to start. (#379)
+  certificate left serving. A `notBefore`/`notAfter` that OpenSSL cannot parse
+  at all is a rejection too (`certificate validity time could not be parsed`)
+  rather than a pass: it is the one case where nothing is known about the
+  window. **Behaviour change**: a server that previously started while serving
+  an expired certificate now refuses to start. (#379)
 - HTTP/3: TLS 1.3 session resumption now works across loop threads. Each loop
   builds its own QUIC `SSL_CTX` and OpenSSL mints a random ticket key per
   context, so a ticket was only decryptable by the loop that issued it -- while

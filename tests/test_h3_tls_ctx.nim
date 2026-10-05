@@ -203,11 +203,31 @@ when not defined(plainHttp):
       check vqTestEngineUsable(e) == 1
       check "localhost" in subject(e)
 
-    test "a key file that cannot be read is refused":
+    test "a key file that cannot be read is refused, named, with the reason":
+      # A missing file puts nothing useful in OpenSSL's error queue, so this
+      # reached the operator as "cannot load TLS certificate/key:
+      # error:80000002:system library::No such file or directory" -- neither
+      # the path nor which half of the pair failed. Mirrors the TCP path's
+      # readMaterialFile (#377).
       let e = engineFromPem(startCert, startKey)
       check e != nil
       defer: vqEngineFree(e)
       check not reload(e, betaCert, dir / "no-such.key")
+      let why = $vqEngineLastError(e)
+      check "cannot read private key" in why
+      check (dir / "no-such.key") in why
+      check "No such file" in why
+      check vqTestEngineUsable(e) == 1
+      check "localhost" in subject(e)
+
+    test "a certificate file that cannot be read is named too":
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      check not reload(e, dir / "no-such.pem", betaKey)
+      let why = $vqEngineLastError(e)
+      check "cannot read certificate" in why
+      check (dir / "no-such.pem") in why
       check vqTestEngineUsable(e) == 1
       check "localhost" in subject(e)
 
@@ -304,6 +324,20 @@ when not defined(plainHttp):
       check "localhost" in subject(e)
       check reload(e)
       check "localhost" in subject(e)
+
+    test "a certificate-only reload against a PKCS#12 bundle is refused":
+      # The mirror image of the key-only case below. Clearing the bundle leaves
+      # the key half with nothing to load, so this used to come back as a bare
+      # "certificate/key mismatch" instead of naming the one thing the operator
+      # has to change.
+      let e = engineFromP12(dir / "bundle.p12")
+      check e != nil
+      defer: vqEngineFree(e)
+      check not reload(e, betaCert, "")
+      check "certificate-only reload cannot replace a PKCS#12 bundle" in
+        $vqEngineLastError(e)
+      check "localhost" in subject(e)
+      check vqTestEngineUsable(e) == 1
 
     test "a key-only reload against a PKCS#12 certificate is refused":
       # Mirrors reloadTlsConfig: the bundle carries both halves and takes
