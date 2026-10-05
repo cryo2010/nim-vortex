@@ -97,7 +97,8 @@ type
 {.push header: "vq_ngtcp2.h", cdecl.}
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
 proc vqEngineFree(e: ptr VqEngine) {.importc: "vq_engine_free".}
-proc vqEngineReloadCert(e: ptr VqEngine, certFile, keyFile: cstring): cint {.importc: "vq_engine_reload_cert".}
+proc vqEngineReloadCert(e: ptr VqEngine, certFile, keyFile: cstring,
+  sni: ptr VqSniCert, sniLen: csize_t): cint {.importc: "vq_engine_reload_cert".}
 proc vqEngineLastError(e: ptr VqEngine): cstring {.importc: "vq_engine_last_error".}
 proc vqEngineRecv(e: ptr VqEngine, pkt: ptr uint8, len: csize_t, peer: pointer,
   peerLen: csize_t, local: pointer, localLen: csize_t, nowNs: uint64) {.importc: "vq_engine_recv".}
@@ -625,6 +626,23 @@ proc cbSend(user: pointer, conn: ptr VqConn, data: ptr uint8, len: csize_t,
   if sendtoUdp(gUdpFd, data, len, cint(0), peer, cuint(peerLen)) < 0: cint(-1)
   else: cint(0)
 
+proc toVqSni(sni: openArray[H3SniCert]): seq[VqSniCert] =
+  ## Views into the caller's H3SniCert strings, valid as long as `sni` is: both
+  ## call sites hand the result straight to a synchronous shim call, and the
+  ## shim copies the material it keeps. Shared by ngSetup and ngReloadCert so
+  ## the field list exists once.
+  result = newSeq[VqSniCert](sni.len)
+  for i in 0 ..< sni.len:
+    result[i] = VqSniCert(
+      host: sni[i].host.cstring,
+      cert_file: sni[i].certFile.cstring, key_file: sni[i].keyFile.cstring,
+      cert_pem: sni[i].certPem.cstring, key_pem: sni[i].keyPem.cstring,
+      key_password: sni[i].keyPassword.cstring,
+      pkcs12_file: sni[i].pkcs12File.cstring,
+      pkcs12: (if sni[i].pkcs12.len > 0:
+                 cast[ptr uint8](unsafeAddr sni[i].pkcs12[0]) else: nil),
+      pkcs12_len: csize_t(sni[i].pkcs12.len))
+
 # --- transport drive (called by eventloop's ngtcp2 h3Drive branch) ----------
 proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
               maxBody, maxStreams, maxFieldSection: int,
@@ -679,19 +697,7 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   cfg.verify_client = cint(verifyClient)
   cfg.client_ca_file = clientCaFile.cstring
   cfg.client_ca_pem = clientCaPem.cstring
-  # Views into the caller's SniCert strings, valid for the vqEngineNew call
-  # (the shim copies the material it keeps), like the default cert fields above.
-  var sniC = newSeq[VqSniCert](sni.len)
-  for i in 0 ..< sni.len:
-    sniC[i] = VqSniCert(
-      host: sni[i].host.cstring,
-      cert_file: sni[i].certFile.cstring, key_file: sni[i].keyFile.cstring,
-      cert_pem: sni[i].certPem.cstring, key_pem: sni[i].keyPem.cstring,
-      key_password: sni[i].keyPassword.cstring,
-      pkcs12_file: sni[i].pkcs12File.cstring,
-      pkcs12: (if sni[i].pkcs12.len > 0:
-                 cast[ptr uint8](unsafeAddr sni[i].pkcs12[0]) else: nil),
-      pkcs12_len: csize_t(sni[i].pkcs12.len))
+  var sniC = toVqSni(sni)
   cfg.sni = (if sniC.len > 0: addr sniC[0] else: nil)
   cfg.sni_len = csize_t(sniC.len)
   cfg.max_idle_timeout_sec = uint64(max(0, maxIdleTimeout))
@@ -780,14 +786,20 @@ proc ngTimeoutMs*(): int =
   if e == high(uint64): -1
   elif e <= now: 0
   else: int((e - now) div 1_000_000) + 1
-proc ngReloadCert*(certFile, keyFile: string): bool =
+proc ngReloadCert*(certFile, keyFile: string,
+                   sni: openArray[H3SniCert] = []): bool =
   ## Rotate this loop's QUIC certificate from PEM file paths. Empty paths mean
   ## "rebuild from the configured material, re-reading any files" -- the bare
-  ## reloadTls() form (#353). The shim builds a replacement context and installs
-  ## it only if everything loaded, so false means nothing changed; ngLastError
-  ## says why.
-  gEngine != nil and
-    vqEngineReloadCert(gEngine, certFile.cstring, keyFile.cstring) == 0
+  ## reloadTls() form (#353). A non-empty `sni` replaces the per-host set
+  ## wholesale, host names included, which is the reloadTls(sni = ...) override
+  ## (#356); empty means "rebuild the configured per-host material". The shim
+  ## builds the replacement contexts and installs them only if everything
+  ## loaded, so false means nothing changed; ngLastError says why.
+  if gEngine == nil: return false
+  var sniC = toVqSni(sni)
+  vqEngineReloadCert(gEngine, certFile.cstring, keyFile.cstring,
+                     (if sniC.len > 0: addr sniC[0] else: nil),
+                     csize_t(sniC.len)) == 0
 proc ngLastError*(): string =
   ## Why this loop's last ngReloadCert was refused, or -- with no engine, i.e.
   ## after a failed ngSetup -- why the engine could not be built (#352). The

@@ -121,6 +121,63 @@ void vq_test_engine_host_subject(VqEngine *eng, char *buf, size_t len) {
   subjectOf(e->sni_ctx.empty() ? nullptr : e->sni_ctx[0].get(), buf, len);
 }
 
+// --- #356: a reload that REPLACES the per-host set -------------------------
+//
+// reloadTls(sni = ...) reached the TCP listener alone: the loops were signalled
+// with the cert/key paths only and rebuilt their host contexts from the
+// material vq_engine_new was given, so a host added through the override was
+// served the DEFAULT certificate over h3 (the #374 bug again, for any host
+// configured after startup) and one removed from it kept being served over h3
+// for the life of the process.
+//
+// `h1` comes from files, `h2` from in-memory PEM, so both material sources in a
+// replacement set are driven. An empty host skips that entry; no entries at all
+// means "keep the configured material". Returns the real ABI's return code.
+int vq_test_reload_with_sni(VqEngine *eng, const char *cert_file,
+                            const char *key_file, const char *h1,
+                            const char *c1, const char *k1, const char *h2,
+                            const char *p2, const char *pk2) {
+  VqSniCert sc[2]{};
+  size_t n = 0;
+  if (h1 && h1[0]) {
+    sc[n].host = h1;
+    sc[n].cert_file = c1;
+    sc[n].key_file = k1;
+    ++n;
+  }
+  if (h2 && h2[0]) {
+    sc[n].host = h2;
+    sc[n].cert_pem = p2;
+    sc[n].key_pem = pk2;
+    ++n;
+  }
+  return vq_engine_reload_cert(eng, cert_file, key_file, n ? sc : nullptr, n);
+}
+
+// How many per-host contexts the engine holds.
+int vq_test_engine_host_count(VqEngine *eng) {
+  return static_cast<int>(reinterpret_cast<Engine *>(eng)->sni.size());
+}
+
+// The subject the engine serves for the SNI name `name`, chosen exactly as
+// servernameCb chooses it: the per-host context whose host matches (exact over
+// wildcard), else the default one. The white-box view of what an h3 client
+// asking for that name is handed.
+void vq_test_sni_subject(VqEngine *eng, const char *name, char *buf,
+                         size_t len) {
+  auto *e = reinterpret_cast<Engine *>(eng);
+  SSL_CTX *sel = e->ssl_ctx.get();
+  const size_t n = e->sni_ctx.size();
+  size_t idx = n;
+  for (size_t i = 0; i < n; i++)
+    if (hostEq(name, e->sni[i].host)) { idx = i; break; }
+  if (idx == n)
+    for (size_t i = 0; i < n; i++)
+      if (hostWildMatch(name, e->sni[i].host)) { idx = i; break; }
+  if (idx < n) sel = e->sni_ctx[idx].get();
+  subjectOf(sel, buf, len);
+}
+
 // --- #382: one session-ticket key across engines, with rotation -----------
 //
 // Drives the ticket-key callback exactly as OpenSSL does, so the sharing and

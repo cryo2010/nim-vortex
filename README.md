@@ -329,12 +329,16 @@ initVortexConfig(certFile = "default.pem", keyFile = "default.key",
                                       certFile: "wild.pem", keyFile: "wild.key")])
 ```
 
-Per-host certificates rotate through `reloadTls` along with the default one: a
-bare `srv.reloadTls()` re-reads every per-host file as well, so one certbot
-deploy hook covers the whole set. Pass `sni = @[SniCertEntry(...)]` to replace
-the per-host material outright (adding or removing hosts, or handing over new
-in-memory PEM). A reload is all-or-nothing: one bad per-host certificate rejects
-it and leaves the default certificate and every host as they were.
+Per-host certificates rotate through `reloadTls` along with the default one, on
+both transports: a bare `srv.reloadTls()` re-reads every per-host file as well,
+so one certbot deploy hook covers the whole set. Pass
+`sni = @[SniCertEntry(...)]` to replace the per-host material outright, adding
+or removing hosts or handing over new in-memory PEM, and HTTP/3 takes the
+replacement set too, so a host added there is served its own certificate over
+QUIC and one removed there stops being served over QUIC. An empty `sni` means
+"keep what is configured" (there is no way to drop every host). A reload is
+all-or-nothing: one bad per-host certificate rejects it and leaves the default
+certificate and every host as they were.
 
 **TLS version range**: `minTlsVersion` (default `TlsVersion.V12`) floors it; `maxTlsVersion`
 (default `TlsVersion.None` = no cap) ceils it, e.g. `maxTlsVersion = TlsVersion.V12` to keep

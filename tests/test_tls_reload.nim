@@ -213,12 +213,15 @@ removeDir(sdir); createDir(sdir)
 genCert(sdir / "def.pem", sdir / "def.key", "default.vortex")
 genCert(sdir / "host.pem", sdir / "host.key", "alt.vortex")
 
-# http3 = false keeps the assertions about the TCP listener: the h3 engine
-# reloads asynchronously on its own loop tick, and test_tls_reload_h3.nim is
-# where that path is covered.
+# h3 is ON here even though the assertions below read the TCP listener: the
+# whole point is that every reload the suite issues is one the h3 loops can
+# apply too, now that the `sni` override reaches them (#356). A per-loop h3
+# failure would be logged by applyQuicReload, so a run with a clean stderr is
+# the evidence. What the h3 engine actually serves per host is asserted in
+# test_tls_reload_h3.nim and test_tls_h3_sni.nim.
 var ssrv = newVortex(RequestHandler(handler), initVortexConfig(
   numThreads = 1, certFile = sdir / "def.pem", keyFile = sdir / "def.key",
-  http3 = false,
+  http3 = true,
   sni = @[SniCertEntry(host: "alt.vortex", certFile: sdir / "host.pem",
                        keyFile: sdir / "host.key")])).start(0)
 let sport = $ssrv.port

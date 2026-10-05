@@ -1081,24 +1081,28 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
 # present the new cert; in-flight connections keep theirs.
 #
 # The main thread signals a reload through this plain-memory struct (fixed
-# buffers, never GC strings, so it is safe to read from the loop threads).
+# buffers and one `allocShared` blob, never GC strings, so it is safe to read
+# from the loop threads).
 
 const certPathMax = 4096            # PATH_MAX on Linux; macOS is 1024
 
 type
   CertReload* = object
     ## Main-thread -> loop-thread signal for a QUIC certificate reload. A Lock
-    ## makes the {generation, paths} update atomic as a unit, so a loop can
-    ## never read a path spliced from two overlapping reloads. Paths are fixed
-    ## buffers (never GC strings), so they are safe to read from the loop
-    ## threads without ORC refcount races.
+    ## makes the {generation, paths, per-host set} update atomic as a unit, so a
+    ## loop can never read material spliced from two overlapping reloads. The
+    ## paths are fixed buffers and the per-host set a serialised `allocShared`
+    ## blob (never GC strings), so they are safe to read from the loop threads
+    ## without ORC refcount races.
     lock: Lock
     gen: int
     certPath: array[certPathMax, char]
     keyPath: array[certPathMax, char]
+    sni: pointer            ## serialised replacement per-host set, or nil for
+                            ## "keep the configured material" (see encodeSni)
+    sniLen: int             ## byte length of `sni`
 
 proc initCertReload*(r: ptr CertReload) = initLock(r.lock)
-proc deinitCertReload*(r: ptr CertReload) = deinitLock(r.lock)
 
 proc setPath(dst: var array[certPathMax, char], s: string) =
   let n = min(s.len, certPathMax - 1)   # over-length paths truncate -> the
@@ -1111,28 +1115,114 @@ proc getPath(src: array[certPathMax, char]): string =
   result = newString(n)
   for i in 0 ..< n: result[i] = src[i]
 
-proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string) =
-  ## Main thread: publish the paths for a QUIC certificate reload and bump the
-  ## generation, as one locked update. Empty paths mean "re-read the configured
-  ## ones".
+# The replacement per-host set travels as one flat, GC-free blob: a 4-byte
+# entry count, then every entry's eight material fields as a 4-byte length plus
+# its bytes, in the order sniFields lists them. A serialised copy rather than a
+# seq of SniCerts because the loop threads decode it on their own threads, and
+# an ORC string handed across them would race its refcount -- the same reason
+# the paths above are fixed char buffers. The blob the main thread publishes is
+# freed by the next request (and by deinitCertReload), so a loop that never
+# woke for a generation does not leak it.
+
+proc sniFields(e: SniCert): array[8, string] =
+  [e.host, e.material.certFile, e.material.keyFile, e.material.certPem,
+   e.material.keyPem, e.material.keyPassword, e.material.pkcs12File,
+   e.material.pkcs12]
+
+proc putU32(buf: ptr UncheckedArray[byte], off: var int, v: int) =
+  buf[off] = byte(v and 0xff)
+  buf[off + 1] = byte((v shr 8) and 0xff)
+  buf[off + 2] = byte((v shr 16) and 0xff)
+  buf[off + 3] = byte((v shr 24) and 0xff)
+  off += 4
+
+proc getU32(buf: ptr UncheckedArray[byte], off: var int): int =
+  result = int(buf[off]) or (int(buf[off + 1]) shl 8) or
+           (int(buf[off + 2]) shl 16) or (int(buf[off + 3]) shl 24)
+  off += 4
+
+proc encodeSni(entries: openArray[SniCert]): (pointer, int) =
+  ## Main thread: serialise `entries` into one allocShared'd blob, or (nil, 0)
+  ## for an empty set. Allocated before the lock is taken, so the critical
+  ## section is a couple of stores.
+  if entries.len == 0: return (nil, 0)
+  var total = 4
+  for e in entries:
+    for f in sniFields(e): total += 4 + f.len
+  let buf = cast[ptr UncheckedArray[byte]](allocShared(total))
+  var off = 0
+  putU32(buf, off, entries.len)
+  for e in entries:
+    for f in sniFields(e):
+      putU32(buf, off, f.len)
+      if f.len > 0: copyMem(addr buf[off], unsafeAddr f[0], f.len)
+      off += f.len
+  (cast[pointer](buf), total)
+
+proc decodeSni(blob: pointer, len: int): seq[SniCert] =
+  ## Loop thread: the per-host set `blob` carries, as the TLS-layer SniCerts
+  ## eventloop converts for the h3 backend. An empty blob decodes to @[], which
+  ## every consumer reads as "keep the configured material".
+  if blob == nil or len < 4: return @[]
+  let buf = cast[ptr UncheckedArray[byte]](blob)
+  var off = 0
+  let n = getU32(buf, off)
+  result = newSeq[SniCert](n)
+  for i in 0 ..< n:
+    var f: array[8, string]
+    for j in 0 ..< f.len:
+      let flen = getU32(buf, off)
+      f[j] = newString(flen)
+      if flen > 0: copyMem(addr f[j][0], addr buf[off], flen)
+      off += flen
+    result[i] = SniCert(host: f[0], material: TlsMaterial(
+      certFile: f[1], keyFile: f[2], certPem: f[3], keyPem: f[4],
+      keyPassword: f[5], pkcs12File: f[6], pkcs12: f[7]))
+
+proc deinitCertReload*(r: ptr CertReload) =
+  if r.sni != nil:
+    deallocShared(r.sni)
+    r.sni = nil
+    r.sniLen = 0
+  deinitLock(r.lock)
+
+proc requestCertReload*(r: ptr CertReload, certFile, keyFile: string,
+                        sni: openArray[SniCert] = []) =
+  ## Main thread: publish the paths, and any replacement per-host set, for a
+  ## QUIC certificate reload and bump the generation, as one locked update.
+  ## Empty paths mean "re-read the configured ones"; an empty `sni` means "keep
+  ## the configured per-host material", exactly as on the TCP side (#356).
+  let (blob, blobLen) = encodeSni(sni)
   acquire(r.lock)
   defer: release(r.lock)
   setPath(r.certPath, certFile)
   setPath(r.keyPath, keyFile)
+  if r.sni != nil: deallocShared(r.sni)   # the previous request's, now stale
+  r.sni = blob
+  r.sniLen = blobLen
   inc r.gen
 
 proc pendingCertReload*(r: ptr CertReload, seen: int,
-                        certFile, keyFile: var string): int =
+                        certFile, keyFile: var string,
+                        sni: var seq[SniCert]): int =
   ## Loop thread: returns the current reload generation. When it differs from
-  ## `seen`, fills `certFile`/`keyFile` with the requested paths (a consistent
-  ## snapshot under the lock). The caller advances its own `seen` once it has
-  ## acted on the result.
+  ## `seen`, fills `certFile`/`keyFile` with the requested paths and `sni` with
+  ## the replacement per-host set (@[] when the request carried none) -- one
+  ## consistent snapshot under the lock. The caller advances its own `seen` once
+  ## it has acted on the result.
   acquire(r.lock)
   defer: release(r.lock)
   result = r.gen
   if result != seen:
     certFile = getPath(r.certPath)   # allocates: a raise here must not hold the lock
     keyFile = getPath(r.keyPath)
+    sni = decodeSni(r.sni, r.sniLen)
+
+proc pendingCertReload*(r: ptr CertReload, seen: int,
+                        certFile, keyFile: var string): int =
+  ## The paths alone, for a caller with no per-host material to apply.
+  var ignored: seq[SniCert]
+  pendingCertReload(r, seen, certFile, keyFile, ignored)
 
 
 proc ctxCertSubject*(cfg: ptr TlsConfig): string =

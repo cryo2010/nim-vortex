@@ -363,22 +363,18 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## bundle is one such rejection: the bundle carries both halves, so rotate
   ## both (`certFile` + `keyFile`) rather than the key alone.
   ##
-  ## Per-host (SNI) certificates rotate on the same call. Each one is rebuilt
-  ## from the material it was configured with, so a bare `reloadTls()` re-reads
-  ## the per-host files as well and a renewal that replaces them in place is
-  ## picked up without naming them. Pass `sni` to replace the per-host material
-  ## wholesale (adding or removing hosts, or supplying new in-memory PEM); it is
-  ## persisted only on success, like the default pair, and an empty `sni` means
-  ## "keep what is configured". The whole reload is all-or-nothing: one bad
-  ## per-host certificate rejects it and leaves the default certificate and
-  ## every host exactly as they were.
-  ##
-  ## One asymmetry to know about: the `sni` override reaches the TCP listener
-  ## only. The HTTP/3 engine rebuilds its own per-host contexts from *its*
-  ## configured material (a file re-read) on the same reload, which is how #374
-  ## already works, so per-host files renewed in place rotate on both transports
-  ## but in-memory material supplied here rotates on TCP alone. Reconfigure and
-  ## restart if h3 must pick up new in-memory per-host material.
+  ## Per-host (SNI) certificates rotate on the same call, on both transports.
+  ## Each one is rebuilt from the material it was configured with, so a bare
+  ## `reloadTls()` re-reads the per-host files as well and a renewal that
+  ## replaces them in place is picked up without naming them. Pass `sni` to
+  ## replace the per-host material wholesale -- the host set may change, and the
+  ## new material may be in-memory PEM -- and the HTTP/3 engine takes the
+  ## replacement set too, so a host added here is served its own certificate
+  ## over h3 and a host removed here stops being served over h3. It is persisted
+  ## only on success, like the default pair, and an empty `sni` means "keep what
+  ## is configured" (there is no spelling for "drop every host"). The whole
+  ## reload is all-or-nothing: one bad per-host certificate rejects it and
+  ## leaves the default certificate and every host exactly as they were.
   ##
   ## The stapled OCSP response rotates on the same call: `ocspResponse` supplies
   ## DER bytes, `ocspFile` a path read now (an unreadable one rejects the reload
@@ -386,7 +382,8 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
   ## a configured `ocspFile` is re-read best-effort (so a bare `reloadTls()`
   ## after certbot picks up a refreshed staple without failing on a stale one).
   ## Staple rotation covers the default cert only: SNI ctxs and HTTP/3 do not
-  ## staple, and the h3 reload signal below stays cert/key-only.
+  ## staple, so the h3 reload signal below carries the cert/key paths and the
+  ## per-host set, never a staple.
   ##
   ## Call from an ordinary thread (e.g. your own SIGHUP handling loop), not from
   ## inside a raw signal handler. Two threads may call it at once (a SIGHUP
@@ -414,8 +411,12 @@ proc reloadTls*(server: var Server, certFile = "", keyFile = "",
     # both. A per-loop h3 apply failure (e.g. a transient bad read) is logged by
     # the loop; re-issue reloadTls to retry it.
     if ok and server.quicReload != nil:
+      # The per-host override travels with the paths, so h3 ends up on the same
+      # host set and the same certificates as the TCP listener (#356). Converted
+      # by the same mapping the TCP reload above used.
       requestCertReload(cast[ptr CertReload](server.quicReload),
-                        certFile, keyFile)
+                        certFile, keyFile,
+                        toSniCerts(VortexConfig(sni: @sni)))
     ok
 
 proc lastTlsReloadError*(server: Server): string =

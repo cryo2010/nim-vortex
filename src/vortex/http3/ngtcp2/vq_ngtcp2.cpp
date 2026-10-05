@@ -1288,17 +1288,19 @@ static VqConfig ctxConfig(const Engine *e, const Material &m) {
   return c;
 }
 
-// (Re)build every per-host context from the stored material into `out`. All or
+// (Re)build a per-host context for every entry in `mats` into `out`. All or
 // nothing: nothing is written unless every host built, so a broken per-host
 // certificate cannot quietly drop that host back to the default certificate.
 // Writing into a caller-supplied vector is what lets a reload stage the
 // per-host contexts alongside the new default one and publish both together
-// (#352).
-static bool buildSniCtxs(Engine *e, std::vector<SslCtxPtr> &out,
+// (#352), and taking the material as a parameter is what lets it stage a
+// REPLACEMENT host set the same way (#356).
+static bool buildSniCtxs(Engine *e, const std::vector<Material> &mats,
+                         std::vector<SslCtxPtr> &out,
                          std::string *err = nullptr) {
   std::vector<SslCtxPtr> built;
-  built.reserve(e->sni.size());
-  for (const auto &m : e->sni) {
+  built.reserve(mats.size());
+  for (const auto &m : mats) {
     VqConfig c = ctxConfig(e, m);
     std::string why;
     SslCtxPtr hc = makeCtx(&c, &why);
@@ -1317,8 +1319,9 @@ static inline char lcAscii(char c) {
 }
 
 // Compare a NUL-terminated SNI name to a configured host, case-insensitively:
-// DNS names are case-insensitive and a client may send any casing. (The TCP
-// path's matching is byte-exact today, which is issue #358.)
+// DNS names are case-insensitive and a client may send any casing (RFC 6066).
+// The TCP path matches the same way, so a client sending API.Example.com gets
+// the same certificate on either transport (#358).
 static bool hostEq(const char *name, const std::string &host) {
   size_t i = 0;
   for (; i < host.size(); i++)
@@ -1429,7 +1432,7 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   // served the default certificate and aborted, while the same request over TCP
   // got the right one (#374).
   if (!e->sni.empty()) {
-    if (!buildSniCtxs(e.get(), e->sni_ctx, &gEngineError)) return nullptr;
+    if (!buildSniCtxs(e.get(), e->sni, e->sni_ctx, &gEngineError)) return nullptr;
     SSL_CTX_set_tlsext_servername_callback(e->ssl_ctx.get(), servernameCb);
     SSL_CTX_set_tlsext_servername_arg(e->ssl_ctx.get(), e.get());
   }
@@ -1450,7 +1453,8 @@ const char *vq_engine_last_error(VqEngine *eng) {
 }
 
 int vq_engine_reload_cert(VqEngine *eng, const char *cert_file,
-                          const char *key_file) {
+                          const char *key_file, const VqSniCert *sni,
+                          size_t sni_len) {
   auto *e = reinterpret_cast<Engine *>(eng);
   e->last_error.clear();
   // Build a complete replacement context and publish it only once every piece
@@ -1509,9 +1513,28 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_file,
   // The per-host rebuild joins the same transaction: a per-host certificate
   // rotated on disk by the same renewal is picked up with the default one
   // (#374), and a failure anywhere leaves EVERY context untouched.
+  //
+  // A non-empty `sni` REPLACES the per-host set wholesale, host names
+  // included, which is the override reloadTlsConfig takes on the TCP side.
+  // Before this it reached the TCP listener alone: the loops were signalled
+  // with the cert/key paths only and rebuilt their host contexts from the
+  // material vq_engine_new was given, so a host added through the override was
+  // served the DEFAULT certificate over h3 and every client that followed
+  // Alt-Svc failed on a name mismatch, while a host removed from it kept being
+  // served over h3 for the life of the process (#356, the #374 bug for any
+  // host configured after startup). An empty set still means "rebuild the
+  // configured per-host material, re-reading its files"; there is deliberately
+  // no spelling for "drop every host", matching the TCP path.
+  const std::vector<Material> sniM = [&] {
+    if (!sni_len) return e->sni;
+    std::vector<Material> v;
+    v.reserve(sni_len);
+    for (size_t i = 0; i < sni_len; i++) v.push_back(materialOf(&sni[i]));
+    return v;
+  }();
   std::vector<SslCtxPtr> freshSni;
-  if (!e->sni.empty()) {
-    if (!buildSniCtxs(e, freshSni, &e->last_error)) return -1;
+  if (!sniM.empty()) {
+    if (!buildSniCtxs(e, sniM, freshSni, &e->last_error)) return -1;
     SSL_CTX_set_tlsext_servername_callback(fresh.get(), servernameCb);
     SSL_CTX_set_tlsext_servername_arg(fresh.get(), e);
   }
@@ -1519,8 +1542,13 @@ int vq_engine_reload_cert(VqEngine *eng, const char *cert_file,
   // point of view. Releasing the engine's reference to the old context right
   // away is safe: SSL_new up-refs the SSL_CTX, so an in-flight connection holds
   // a reference of its own and keeps the certificate it handshook with until
-  // its SSL is freed.
-  if (!e->sni.empty()) e->sni_ctx = std::move(freshSni);
+  // its SSL is freed. The same goes for a per-host context a connection already
+  // switched to: SSL_set_SSL_CTX up-refs what it is handed, so a host dropped
+  // by the override here cannot pull the context out from under it.
+  if (!sniM.empty()) {
+    e->sni = sniM;
+    e->sni_ctx = std::move(freshSni);
+  }
   e->ssl_ctx = std::move(fresh);
   // Remember what was actually loaded, so the NEXT bare reload re-reads these
   // paths rather than the ones configured at startup. Nothing is persisted on a

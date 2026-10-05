@@ -257,13 +257,14 @@ one per-host certificate that fails to build rejects it and leaves the default
 certificate and every host exactly as they were, rather than half-rotating or
 silently dropping a host back to the default certificate, which the client
 would reject as a name mismatch. `reloadTls(sni = @[SniCertEntry(...)])`
-replaces the per-host material outright, so the host set may change; it is
-persisted only on success, and an empty `sni` means "keep what is configured".
-One asymmetry to know about: that override reaches the TCP listener only, while
-the HTTP/3 engine rebuilds its per-host contexts from *its* configured material
-(a file re-read) on the same reload. Renewed per-host files therefore reach both
-transports, but new in-memory per-host material supplied through `sni` reaches
-TCP alone.
+replaces the per-host material outright, so the host set may change on both
+transports: the HTTP/3 engine is handed the same replacement set and installs
+it in the same all-or-nothing transaction as its default certificate, so a host
+added through the override is served its own certificate over QUIC and one
+removed through it stops being served over QUIC instead of keeping its retired
+certificate for the life of the process. The set is persisted only on success,
+and an empty `sni` means "keep what is configured" (there is no way to drop
+every host).
 
 ## Deployment recipes
 

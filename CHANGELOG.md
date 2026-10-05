@@ -586,11 +586,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   released under `ctxLock`, which `servernameCb` now holds across its whole
   lookup, so a handshake can neither index a context array that disagrees with
   the host list it scanned nor have a context freed between the load and
-  `SSL_set_SSL_CTX` (which up-refs what it is handed). The `sni` override
-  reaches the TCP listener only: the HTTP/3 engine rebuilds its per-host
-  contexts from its own configured material on the same reload (#374), so
-  renewed per-host *files* rotate on both transports while new in-memory
-  per-host material rotates on TCP alone. (#356)
+  `SSL_set_SSL_CTX` (which up-refs what it is handed). The override reaches
+  HTTP/3 as well: the loops used to be signalled with the cert/key paths alone
+  and rebuilt their host contexts from the material the engine was configured
+  with, so a host *added* through `sni` was served the default certificate over
+  QUIC and every client that followed Alt-Svc failed on a name mismatch (the
+  #374 bug again, for any host configured after startup), while a host removed
+  from it kept being served its retired certificate over h3 for the life of the
+  process. `CertReload` now carries the replacement set across to the loop
+  threads as a serialised, GC-free blob published with the generation, and the
+  QUIC reload installs it in the same all-or-nothing transaction as the default
+  certificate, so the host set and the material are identical on both
+  transports. An empty `sni` still means "keep what is configured" on either
+  side; there is no spelling for "drop every host". (#356)
 - TLS: a rejected certificate reload says why. `reloadTlsConfig` caught the
   exception carrying the only diagnostic that existed and returned a bare
   false, which `server.reloadTls` passed on with nothing written anywhere and

@@ -36,7 +36,8 @@ when not defined(plainHttp):
   proc vqTestEngineHostSubject(e: pointer, buf: cstring, len: csize_t)
     {.importc: "vq_test_engine_host_subject", cdecl.}
   # The real reload ABI, driven directly.
-  proc vqEngineReloadCert(e: pointer, certFile, keyFile: cstring): cint
+  proc vqEngineReloadCert(e: pointer, certFile, keyFile: cstring,
+                          sni: pointer, sniLen: csize_t): cint
     {.importc: "vq_engine_reload_cert", cdecl.}
   proc vqEngineLastError(e: pointer): cstring
     {.importc: "vq_engine_last_error", cdecl.}
@@ -47,6 +48,15 @@ when not defined(plainHttp):
     {.importc: "vq_test_engine_no_ticket", cdecl.}
   proc vqTestTicketKeyCycle(): cint
     {.importc: "vq_test_ticket_key_cycle", cdecl.}
+  proc vqTestTicketHandshake(a, b: pointer): cint
+    {.importc: "vq_test_ticket_handshake", cdecl.}
+  proc vqTestReloadWithSni(e: pointer, certFile, keyFile, h1, c1, k1,
+                           h2, p2, pk2: cstring): cint
+    {.importc: "vq_test_reload_with_sni", cdecl.}
+  proc vqTestEngineHostCount(e: pointer): cint
+    {.importc: "vq_test_engine_host_count", cdecl.}
+  proc vqTestSniSubject(e: pointer, name: cstring, buf: cstring, len: csize_t)
+    {.importc: "vq_test_sni_subject", cdecl.}
 
   suite "ngtcp2 ossl backend initialization (#357)":
     test "the backend initializes successfully":
@@ -147,7 +157,21 @@ when not defined(plainHttp):
     $cast[cstring](addr buf[0])
 
   proc reload(e: pointer, cert = "", key = ""): bool =
-    vqEngineReloadCert(e, cert.cstring, key.cstring) == 0
+    vqEngineReloadCert(e, cert.cstring, key.cstring, nil, 0) == 0
+
+  proc sniSubject(e: pointer, name: string): string =
+    ## What an h3 client asking for `name` is served, per the shim's own
+    ## servername selection (per-host context if one matches, else the default).
+    var buf = newString(512)
+    vqTestSniSubject(e, name.cstring, buf.cstring, csize_t(buf.len))
+    $cast[cstring](addr buf[0])
+
+  proc reloadSni(e: pointer, cert = "", key = "", h1 = "", c1 = "", k1 = "",
+                 h2 = "", p2 = "", pk2 = ""): bool =
+    ## A reload carrying a replacement per-host set: `h1` from files, `h2` from
+    ## in-memory PEM.
+    vqTestReloadWithSni(e, cert.cstring, key.cstring, h1.cstring, c1.cstring,
+                        k1.cstring, h2.cstring, p2.cstring, pk2.cstring) == 0
 
   suite "QUIC certificate reload is all or nothing (#352)":
     ## The reload used to write into the live SSL_CTX, certificate first then
@@ -297,6 +321,88 @@ when not defined(plainHttp):
       defer: vqEngineFree(e)
       check reload(e, betaCert, betaKey)
       check "beta.vortex" in subject(e)
+
+  # Material for the replacement per-host sets below: one pair on disk, one
+  # that only ever exists in memory.
+  must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+       "/web.key -out " & dir & "/web.pem -days 2 -subj /CN=web.vortex")
+  must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+       "/memh.key -out " & dir & "/memh.pem -days 2 -subj /CN=memh.vortex")
+  must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+       "/old.key -out " & dir & "/old.pem -days 2 -subj /CN=old.vortex")
+  let memHostCert = readFile(dir / "memh.pem")
+  let memHostKey = readFile(dir / "memh.key")
+
+  proc engineWithOldHost(): pointer =
+    ## The starting point for the cases below: one configured host,
+    ## old.example.com, served a certificate the other suites do not rewrite.
+    engineFromPem(startCert, startKey, "old.example.com", dir / "old.pem",
+                  dir / "old.key")
+
+  suite "a QUIC reload can replace the per-host set (#356)":
+    ## reloadTls(sni = ...) reached the TCP listener alone: the loops were
+    ## signalled with the cert/key paths only and rebuilt their host contexts
+    ## from the material vq_engine_new was given. A host added through the
+    ## override was therefore served the DEFAULT certificate over h3 and every
+    ## client that followed Alt-Svc failed on a name mismatch (the #374 bug,
+    ## for any host configured after startup), while a host removed from it
+    ## kept being served over h3 for the life of the process.
+    test "the replacement set installs new hosts and drops the old one":
+      let e = engineWithOldHost()
+      check e != nil
+      defer: vqEngineFree(e)
+      check "old.vortex" in sniSubject(e, "old.example.com")
+      check reloadSni(e, h1 = "web.example.com", c1 = dir / "web.pem",
+                      k1 = dir / "web.key", h2 = "mem.example.com",
+                      p2 = memHostCert, pk2 = memHostKey)
+      check vqTestEngineHostCount(e) == 2
+      check "web.vortex" in sniSubject(e, "web.example.com")
+      check "memh.vortex" in sniSubject(e, "mem.example.com")   # in-memory PEM
+      # The replaced host is gone, so it falls back to the default certificate
+      # (which a client asking for it rejects -- that is the point of removing
+      # it, and pre-fix this is what EVERY newly added host got instead).
+      check "localhost" in sniSubject(e, "old.example.com")
+      check vqTestEngineUsable(e) == 1
+
+    test "an engine configured with no hosts at all gains them":
+      # The servername callback is installed on the replacement context, so a
+      # server that started with no `sni` and gained one through reloadTls
+      # serves it over h3 too.
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineHostCount(e) == 0
+      check "localhost" in sniSubject(e, "web.example.com")
+      check reloadSni(e, h1 = "web.example.com", c1 = dir / "web.pem",
+                      k1 = dir / "web.key")
+      check vqTestEngineHostCount(e) == 1
+      check "web.vortex" in sniSubject(e, "web.example.com")
+
+    test "one bad entry in the replacement set rejects the whole reload":
+      let e = engineWithOldHost()
+      check e != nil
+      defer: vqEngineFree(e)
+      check not reloadSni(e, cert = betaCert, key = betaKey,
+                          h1 = "web.example.com", c1 = dir / "web.pem",
+                          k1 = dir / "no-such.key")
+      check "web.example.com" in $vqEngineLastError(e)   # names the host
+      check "no-such.key" in $vqEngineLastError(e)       # and the file (#377)
+      check "localhost" in subject(e)                    # default untouched
+      check vqTestEngineHostCount(e) == 1                # host set untouched
+      check "old.vortex" in sniSubject(e, "old.example.com")
+
+    test "an empty replacement set still rebuilds the configured hosts":
+      # Nothing to replace means the bare-reload behaviour, so the per-host
+      # files are re-read: there is deliberately no spelling for "drop every
+      # host", matching the TCP path.
+      let e = engineWithOldHost()
+      check e != nil
+      defer: vqEngineFree(e)
+      must("openssl req -x509 -newkey rsa:2048 -nodes -keyout " & dir &
+           "/old.key -out " & dir & "/old.pem -days 2 -subj /CN=old2.vortex")
+      check reloadSni(e)
+      check vqTestEngineHostCount(e) == 1
+      check "old2.vortex" in sniSubject(e, "old.example.com")
 
   # Certificates with an explicitly stated validity window, for #379. Needs
   # openssl's -not_before/-not_after (3.5+); without them those cases are

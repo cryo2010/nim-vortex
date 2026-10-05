@@ -67,6 +67,16 @@ when not defined(plainHttp):
         pkcs12File: e.pkcs12File, pkcs12: e.pkcs12,
         keyPassword: e.keyPassword)
 
+  proc toH3SniCerts*(s: openArray[SniCert]): seq[H3SniCert] =
+    ## The same, for the replacement per-host set a reload carries over to the
+    ## loop threads: CertReload decodes its blob into TLS-layer SniCerts, and
+    ## applyQuicReload hands them on to the shim (#356).
+    for e in s:
+      result.add H3SniCert(host: e.host, certFile: e.material.certFile,
+        keyFile: e.material.keyFile, certPem: e.material.certPem,
+        keyPem: e.material.keyPem, pkcs12File: e.material.pkcs12File,
+        pkcs12: e.material.pkcs12, keyPassword: e.material.keyPassword)
+
   proc tlsMaxVer*(v: TlsVersion): clong =
     ## Map the max-version enum to an OpenSSL version number (0 = no cap).
     case v
@@ -2268,15 +2278,17 @@ proc applyQuicReload(loop: Loop) =
   ## Loop thread: apply a pending QUIC certificate reload to this loop's shim
   ## engine. The shim builds a replacement context and swaps it in, so new h3
   ## handshakes present the new cert and in-flight ones keep theirs. Empty paths
-  ## mean "re-read the configured material", as on the TCP side. A failed reload
-  ## keeps the running cert and is logged with its reason (not silently
+  ## mean "re-read the configured material", as on the TCP side, and an empty
+  ## per-host set means "rebuild the configured per-host material". A failed
+  ## reload keeps the running cert and is logged with its reason (not silently
   ## dropped); the generation is consumed either way, so a permanently-bad cert
   ## does not spin -- the operator fixes the files and re-issues the reload.
   when not defined(plainHttp):
     if loop.quicReload == nil or loop.udpFd < 0: return
     var cf, kf: string
+    var sni: seq[SniCert]
     let gen = pendingCertReload(cast[ptr CertReload](loop.quicReload),
-                                loop.quicReloadSeen, cf, kf)
+                                loop.quicReloadSeen, cf, kf, sni)
     if gen != loop.quicReloadSeen:
       # The paths go to the shim as paths: it owns the engine's configured
       # material and re-reads the files itself, so empty paths (a bare
@@ -2284,10 +2296,16 @@ proc applyQuicReload(loop: Loop) =
       # on the TCP side. This used to readFile(cf) with cf == "", which raised
       # and failed the reload, so the certbot pattern never rotated the h3
       # certificate (#353).
+      #
+      # A reloadTls(sni = ...) override arrives with them and replaces the
+      # engine's per-host set, hosts included. Before that the signal was
+      # cert/key-only: a host added through the override was served the default
+      # certificate over h3 and every client that followed Alt-Svc failed on a
+      # name mismatch, and a removed one kept being served over h3 (#356).
       var ok = false
       var why = ""
       try:
-        ok = ngReloadCert(cf, kf)
+        ok = ngReloadCert(cf, kf, toH3SniCerts(sni))
         if not ok: why = ngLastError()
       except CatchableError as err:
         ok = false
