@@ -543,7 +543,12 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   // Bound concurrent QUIC connections so a flood of Initial packets can't grow
   // unbounded per-connection state (each Conn is an ngtcp2_conn + SSL + h3 slot).
   // 0 = unlimited. A spoofed-address flood is still cheap here because we do not
-  // yet issue a Retry token (address validation) before committing state.
+  // yet issue a Retry token (address validation) before committing state: every
+  // Initial that gets this far allocates an ngtcp2_conn + SSL + h3 slot. What
+  // bounds the damage today is max_connections (above) plus the per-pass
+  // datagram budget on the Nim side (ngRecvBudget, #381), which keeps the flood
+  // from monopolising the loop thread; a Retry token would stop the state being
+  // committed at all and is the real fix, still outstanding.
   if (e->cfg.max_connections != 0 && e->conns.size() >= e->cfg.max_connections)
     return nullptr;
 

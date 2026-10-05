@@ -129,6 +129,15 @@ type
                                  # outside the input path (flushHook with fd < 0):
                                  # QUIC egress must be driven before the loop
                                  # sleeps again (#262). h3Drive clears it.
+    quicMorePending: bool        # the last ngReceive stopped on its per-pass
+                                 # datagram budget rather than on an empty
+                                 # socket, so QUIC ingress has more to read.
+                                 # While set the selector does not wait at all
+                                 # (the sslReady pattern below): the loop goes
+                                 # round, services its TCP fds, and comes back
+                                 # for the next budget, so a UDP flood costs
+                                 # bounded time per pass instead of pinning the
+                                 # thread inside the receive loop (#381)
     quicReload: pointer          # ptr CertReload: main-thread reload signal
     quicReloadSeen: int          # last reload generation this loop applied
     connCount: int               # live TCP connections (maxConnections cap)
@@ -1678,7 +1687,12 @@ when not defined(plainHttp):
     ## Advance the QUIC stack: the ngtcp2/nghttp3 shim accepts connections and
     ## parses HTTP/3 via its callbacks (which fill h3slots and the ready list);
     ## we drain UDP in, run timers, dispatch ready requests, and flush UDP out.
-    ngReceive()
+    ##
+    ## ngReceive takes at most ngRecvBudget datagrams and reports whether it
+    ## stopped on the budget rather than on an empty socket. Record that: the
+    ## selector must not wait while QUIC ingress still has work, or a flood's
+    ## backlog would be drained one budget per second-long sleep (#381).
+    loop.quicMorePending = ngReceive()
     for (slot, gen, sid) in ngTakeReady():
       if slot < loop.core.h3slots.len and
           loop.core.h3slots[slot].gen == gen and
@@ -2353,6 +2367,14 @@ proc run*(loop: Loop) =
       # this a body that paused and then resumed stalls until some unrelated
       # event happens to wake the loop (#366).
       timeoutMs = 0
+    when not defined(plainHttp):
+      if loop.quicMorePending:
+        # The previous pass hit ngReceive's datagram budget with the UDP socket
+        # still readable. Same rule as sslReady: there is known work in hand, so
+        # do not sleep on the selector. The point of the budget is to come back
+        # here between batches so this iteration's TCP fds get serviced; waiting
+        # would undo it (#381).
+        timeoutMs = 0
     var n = 0
     try:
       n = loop.selector.selectInto(timeoutMs, keys)

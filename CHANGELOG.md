@@ -493,6 +493,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   datagram the peer sends us and cost throughput on exactly those paths. On
   Linux the receive passes `MSG_TRUNC`, so a datagram that still does not fit is
   dropped and counted instead of being fed to ngtcp2 as line corruption. (#380)
+- HTTP/3: QUIC ingress now takes at most 256 datagrams per pass of the event
+  loop, so a UDP flood can no longer starve the HTTP/1.1 and HTTP/2 connections
+  on the same loop thread. `ngReceive` drained the socket with `while true`, and
+  every datagram is decrypted and parsed synchronously before the next
+  `recvfrom`, so a source whose datagrams cost the server more than they cost
+  the sender kept the thread inside the receive loop: TLS handshakes stalled,
+  responses did not flush, deadlines fired. Reproduced with a flood of Initial
+  packets naming an unsupported QUIC version (each answered with a Version
+  Negotiation packet, so each costs a parse plus a send): a plain HTTP/1.1
+  request on the same server went unserved past a 2 s client timeout, and now
+  completes in tens of milliseconds. The loop treats a spent budget the way it
+  treats its `sslReady` queue, going straight back round without waiting on the
+  selector, so the backlog is still drained promptly, just with the TCP fds
+  serviced between batches. Address validation (a Retry token) is still not
+  issued, so a spoofed-source flood can still make the shim commit
+  per-connection state up to `maxConnections`. (#381)
 
 ### Changed
 

@@ -718,9 +718,29 @@ proc ngTruncatedDrops*(): uint64 =
   ## one and goes to the engine, which drops it when AEAD fails.
   gTruncDrops
 
-proc ngReceive*() =
-  ## Drain all pending datagrams from the loop's (nonblocking) UDP socket into
-  ## the engine; the shim's callbacks populate connections and the ready list.
+const ngRecvBudget* = 256
+  ## Datagrams one ngReceive call will take off the UDP socket before handing the
+  ## loop thread back. Every datagram is decrypted and parsed synchronously
+  ## (vq_engine_recv -> ngtcp2_conn_read_pkt -> nghttp3), so an unbounded drain
+  ## let a UDP source at line rate keep the thread inside the receive loop and
+  ## starve every HTTP/1.1 and HTTP/2 fd it owns: TLS handshakes stalled,
+  ## responses did not flush, deadlines fired. Forging the datagrams is cheap
+  ## because a QUIC server commits per-connection state before validating the
+  ## peer's address (no Retry token yet; see acceptConn in the shim) (#381).
+  ##
+  ## 256 is a work quantum, not a rate limit: a legitimate burst is still fully
+  ## received, just across passes of the loop, and the budget only bounds how
+  ## long the TCP side waits. It is the shape of suspendAccept's accept-side
+  ## backoff, except that there is nothing to back off from here -- the next
+  ## pass simply continues.
+
+proc ngReceive*(): bool =
+  ## Drain pending datagrams from the loop's (nonblocking) UDP socket into the
+  ## engine, up to ngRecvBudget of them; the shim's callbacks populate
+  ## connections and the ready list. Returns true when the budget ran out before
+  ## the socket did, i.e. the caller should come back without waiting on the
+  ## selector. (The UDP fd is level-triggered, so a plain return re-fires too,
+  ## but the caller would first have blocked in select for up to a second.)
   ##
   ## The buffer is sized from the max_udp_payload_size we advertise, not from a
   ## path-MTU guess. A conforming client on a large-MTU path (a 9000-byte VPC
@@ -734,11 +754,13 @@ proc ngReceive*() =
   ## 64 KB of stack per call is not free.
   if gRecvBuf.len == 0: gRecvBuf = newSeq[uint8](ngMaxRecvUdpPayload())
   var peer: array[128, byte]
-  while true:
+  var budget = ngRecvBudget
+  while budget > 0:
     var plen = cuint(sizeof(peer))
     let n = recvfromUdp(gUdpFd, addr gRecvBuf[0], csize_t(gRecvBuf.len),
                         recvFlags, addr peer[0], addr plen)
-    if n <= 0: break
+    if n <= 0: return false            # socket drained: nothing left to come back for
+    dec budget
     if n > gRecvBuf.len:
       # MSG_TRUNC: recvfrom reported a datagram larger than it copied. Feeding
       # the prefix to ngtcp2 would just fail AEAD and look like line corruption,
@@ -747,6 +769,7 @@ proc ngReceive*() =
       continue
     vqEngineRecv(gEngine, addr gRecvBuf[0], csize_t(n), addr peer[0], csize_t(plen),
                  addr gLocalSa[0], csize_t(gLocalLen), ngNowNs())
+  true                                 # budget spent; the socket may hold more
 
 proc ngPump*() = vqEnginePump(gEngine, ngNowNs())
 proc ngHandleExpiry*() = vqEngineHandleExpiry(gEngine, ngNowNs())
