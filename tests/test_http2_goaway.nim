@@ -19,14 +19,6 @@ var srv = newVortex(RequestHandler(handler),
                                      bodyTimeout = 1,
                                      keepAliveTimeout = 1)).start(0)
 
-proc goawayLastStream(frames: seq[Frame]): int =
-  ## Last-stream-id of the first GOAWAY, or -1 if there is none. The payload is
-  ## lastStreamId(4) + errorCode(4) + optional debug data.
-  for f in frames:
-    if f.typ == uint8(ftGoaway) and f.payload.len >= 8:
-      return int(get32(f.payload, 0))
-  -1
-
 suite "HTTP/2 timeout closes announce a GOAWAY":
   test "an idle connection is closed with GOAWAY(NO_ERROR) naming the last stream":
     var c = newH2TestConn(srv.port)
@@ -35,7 +27,7 @@ suite "HTTP/2 timeout closes announce a GOAWAY":
     c.close()
     check frames.count(ftHeaders) == 1    # the request really was served
     check frames.goawayError() == int(errNoError)
-    check frames.goawayLastStream() == 1  # stream 1 was processed, retry above it
+    check frames.goawayLastStreamId() == 1  # stream 1 was processed, retry above it
     check frames[^1].typ == uint8(ftGoaway)   # last frame before EOF
 
   test "a stalled request body is closed with GOAWAY, not a bare EOF":
@@ -45,7 +37,7 @@ suite "HTTP/2 timeout closes announce a GOAWAY":
     c.close()
     check frames.count(ftHeaders) == 0    # the handler never ran
     check frames.goawayError() == int(errNoError)
-    check frames.goawayLastStream() == 1
+    check frames.goawayLastStreamId() == 1
 
 srv.close()
 echo "server shut down cleanly"
