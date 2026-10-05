@@ -72,6 +72,28 @@ Each run tears down its own network + image tags on exit (shared build-cache
 layers survive). Note: many concurrent runs contend for the host, so the
 throughput-sensitive streaming/h2 cells may slow down or time out.
 
+### The client image
+
+`client.Dockerfile` **pins** every client library (httpx, httpcore, anyio, h2,
+websockets, brotli, zstandard, aioquic) with `==`. A soak is a measurement, and
+a floating client silently changes what is being measured: #390 was a teardown
+race inside httpcore/anyio that failed a cell roughly one run in three, and
+reproducing it meant knowing which versions that day's rebuild had resolved to.
+Bump the pins deliberately, and re-run the soaks when you do.
+
+### Transfers at the deadline
+
+`streamupload` and `streamdownload` do one whole transfer per iteration, and a
+1 GiB transfer can outlive the run, so the last one is **abandoned** at the
+deadline rather than waited out: it is neither verified nor counted, and the
+cell's verdict rests on the transfers that did complete. Abandoning a transfer
+tears a connection down with a request still in flight, which is a path httpx
+does not always unwind cleanly (#390: anyio calls `transport.abort()` after
+asyncio already cleared the transport's loop, raising
+`AttributeError: 'NoneType' object has no attribute 'call_soon'`). The client
+treats that teardown artifact as the deadline expiry it is, but **only past the
+deadline** - before it, the same error still hard-fails the cell.
+
 ## Examples
 
 ```sh

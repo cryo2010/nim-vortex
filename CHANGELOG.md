@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stress harness: the `streamupload` cell no longer fails on a client-side
+  teardown race at the deadline. `w_streamupload` bounds an in-flight transfer
+  with `asyncio.wait_for`, and the cancellation that fires at the deadline runs
+  httpcore's `handle_async_request` `except BaseException` arm ->
+  `_response_closed()` -> `aclose()` -> anyio's `SocketStream.aclose()`, which
+  closes the asyncio transport, yields once and then calls `transport.abort()`.
+  If the loop ran the selector transport's `_call_connection_lost` inside that
+  yield it had already set `self._loop = None`, so `_force_close` raised
+  `AttributeError: 'NoneType' object has no attribute 'call_soon'`. That
+  replaced the `asyncio.TimeoutError` the deadline arm expects, and a healthy
+  10 s h1 cell failed about one run in three with
+  `FAIL streamupload: unexpected AttributeError` and a silent server log. The
+  client now skips starting a transfer that its own slowest completed transfer
+  says cannot finish (an optimization only: the first transfer of a cell has
+  nothing to measure against), and accepts that teardown `AttributeError` -- and
+  a `CancelledError` that leaks out with it -- as the expiry it is. The
+  tolerance is scoped to *after* the deadline, so the same error before it still
+  hard-fails the run; `streamdownload`, which abandons its last transfer the
+  same way, gets the same treatment. The client libraries in
+  `conformance/stress/client.Dockerfile` (httpx, httpcore, anyio, h2,
+  websockets, brotli, zstandard, aioquic) are now pinned with `==` so a soak's
+  client is reproducible instead of whatever the rebuild resolved to. Server
+  side there was nothing to fix. (#390)
 - SSE: `s.send("")` (a payload-free event) now reaches the client. An empty
   `data` goes on the wire as two empty `data:` fields rather than one: a client
   appends an LF to its data buffer per `data:` field and strips a single

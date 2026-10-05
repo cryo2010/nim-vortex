@@ -83,6 +83,32 @@ def print_cause(exc):
     traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stdout)
     sys.stdout.flush()
 
+def teardown_race(exc) -> bool:
+    """True when `exc` is the httpx/httpcore/anyio connection-teardown artifact.
+
+    Tearing a connection down while a request is still in flight -- which is
+    what bounding a transfer with `asyncio.wait_for` does at the deadline, and
+    what leaving the per-transfer `async with session()` on an undrained body
+    does -- runs httpcore's `handle_async_request` `except BaseException` arm,
+    which calls `_response_closed()` -> `aclose()` -> anyio's
+    `SocketStream.aclose()`. That closes the asyncio transport, yields once
+    (`await sleep(0)`) and then calls `transport.abort()`; if the loop ran the
+    selector transport's `_call_connection_lost` inside that yield it has
+    already set `self._loop = None`, so `_force_close` raises
+    `AttributeError: 'NoneType' object has no attribute 'call_soon'`.
+
+    That AttributeError REPLACES the `asyncio.TimeoutError` the caller expected,
+    so the deadline arm never ran and a healthy 10 s upload cell failed ~1 run
+    in 3 with `FAIL streamupload: unexpected AttributeError` (#390). It is a
+    client-library teardown artifact: the server is not involved, and nothing
+    about it is a defect under test. The callers accept it ONLY once the
+    deadline has actually passed, so a genuine AttributeError in a workload
+    still fails the run.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return True             # the cancellation itself, if it ever leaks out
+    return isinstance(exc, AttributeError) and "call_soon" in str(exc)
+
 def watch_task(name):
     """A done-callback that reports a background task's death on stdout.
 
@@ -125,7 +151,9 @@ def fmt_xfer(now: float) -> str:
     STREAM per completed transfer (aioquic buffers the whole body up front, so a
     queued-bytes rate would spike then read 0 while the wire drains). 0 MB/s
     means nothing moved in the interval -- a stall, or (h3 upload) a large
-    transfer still in flight with no completion yet."""
+    transfer still in flight with no completion yet, or (upload, final line) the
+    workers sitting out a tail too short for another transfer (see
+    w_streamupload)."""
     dt, db = now - _rate[0], xfer[0] - _rate[1]
     _rate[0], _rate[1] = now, xfer[0]
     rate = db / dt / MB if dt > 0 else 0.0
@@ -382,35 +410,61 @@ async def w_streamupload():
         st = await s.upload("/upload", {"x-sha1": "0" * 40}, wrong_sha_gen())
         if st != 400:
             raise Fail(f"upload negative probe: wrong x-sha1 accepted -> {st}")
+    # The slowest transfer this worker has actually completed, in seconds. The
+    # cheapest way to survive a transfer cancelled at the deadline is not to
+    # start one that cannot finish, so once there is a measurement to go on, sit
+    # out the tail of the run instead. This is only ever an optimization: the
+    # FIRST transfer of a cell has nothing to learn from, and a loaded host can
+    # make any transfer slower than every one before it, so the deadline can
+    # still land mid-upload -- hence the teardown handling below as well.
+    slowest = [0.0]
     async def once():
-        async with session() as s:
-            # `drive` checks the deadline only BETWEEN transfers, so bound this
-            # one by the time actually left -- see w_streamdownload's per-chunk
-            # check for why. On expiry, abandon it uncounted: leaving the
-            # `async with` tears the connection (and the stream) down, and
-            # neither bump(200) nor the xfer tally below runs for a transfer we
-            # did not verify. Truncating body_gen instead would send a short body
-            # and trip the 400 check below as if the server were at fault.
-            try:
-                st = await asyncio.wait_for(
-                    s.upload("/upload", {"x-sha1": sha}, body_gen()),
-                    timeout=max(0.0, deadline - time.monotonic()))
-            except asyncio.TimeoutError:
-                return
-            if st == 400: raise Fail("server rejected the SHA-1 (400)")
-            if st != 200: raise Fail(f"upload -> {st}")
-            bump(200)
-            if IS_H3: xfer[0] += STREAM   # h3 only: aioquic buffers the whole
-                                          # body up front, so a queued-bytes rate
-                                          # spikes then reads 0 while the wire
-                                          # drains. Count delivered on completion.
-                                          # h1/h2 already count sent bytes in
-                                          # body_gen (httpx streams).
+        left = deadline - time.monotonic()
+        if slowest[0] > 0.0 and left < slowest[0]:
+            await asyncio.sleep(max(0.0, left))   # `drive` would spin otherwise
+            return
+        try:
+            async with session() as s:
+                # `drive` checks the deadline only BETWEEN transfers, so bound
+                # this one by the time actually left -- see w_streamdownload's
+                # per-chunk check for why. On expiry, abandon it uncounted:
+                # leaving the `async with` tears the connection (and the stream)
+                # down, and neither bump(200) nor the xfer tally below runs for a
+                # transfer we did not verify. Truncating body_gen instead would
+                # send a short body and trip the 400 check below as if the server
+                # were at fault.
+                t0 = time.monotonic()
+                try:
+                    st = await asyncio.wait_for(
+                        s.upload("/upload", {"x-sha1": sha}, body_gen()),
+                        timeout=max(0.0, deadline - time.monotonic()))
+                except asyncio.TimeoutError:
+                    return
+                if st == 400: raise Fail("server rejected the SHA-1 (400)")
+                if st != 200: raise Fail(f"upload -> {st}")
+                bump(200)
+                slowest[0] = max(slowest[0], time.monotonic() - t0)
+                if IS_H3: xfer[0] += STREAM   # h3 only: aioquic buffers the whole
+                                              # body up front, so a queued-bytes rate
+                                              # spikes then reads 0 while the wire
+                                              # drains. Count delivered on completion.
+                                              # h1/h2 already count sent bytes in
+                                              # body_gen (httpx streams).
+        except (AttributeError, asyncio.CancelledError) as e:
+            # Past the deadline, the cancellation above (and the session exit it
+            # unwinds through) can surface as httpcore/anyio's teardown
+            # AttributeError instead of the asyncio.TimeoutError the arm above
+            # expects -- see teardown_race for the exact frame chain. Treat that
+            # as the expiry it is, uncounted, exactly like the TimeoutError.
+            # BEFORE the deadline this is a real defect and still fails the run
+            # (#390).
+            if time.monotonic() < deadline or not teardown_race(e):
+                raise
     await drive(once)
 
 async def w_streamdownload():
     want = expected_sha1()
-    async def once():
+    async def transfer():
         async with session() as s:
             gen = s.stream("GET", "/download")
             st = await gen.__anext__()
@@ -438,6 +492,19 @@ async def w_streamdownload():
             if got != STREAM or h.hexdigest() != want:
                 raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
             bump(200)
+    async def once():
+        try:
+            await transfer()
+        except (AttributeError, asyncio.CancelledError) as e:
+            # The same teardown race as the upload's (#390), reached by the other
+            # route: abandoning the body above leaves the response in flight, so
+            # closing the session unwinds through httpcore's `except
+            # BaseException` arm and can raise anyio's `transport.abort()`
+            # AttributeError instead of returning. Accepted only past the
+            # deadline -- the only time this workload abandons a transfer -- so a
+            # real AttributeError still fails the run. See teardown_race.
+            if time.monotonic() < deadline or not teardown_race(e):
+                raise
     await drive(once)
 
 async def w_methods():
