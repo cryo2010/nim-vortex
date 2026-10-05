@@ -443,9 +443,9 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
         # silently serving h1/h2 with a bound-but-unused UDP socket and no
         # Alt-Svc. h1/h2 keep working; only h3 is unavailable on this loop.
         try:
-          stderr.writeLine("vortex: HTTP/3 engine setup failed; serving " &
-                           "HTTP/1.1 and HTTP/2 only on this loop " &
-                           "(check the TLS certificate/key for QUIC)")
+          stderr.writeLine("vortex: HTTP/3 engine setup failed (" &
+                           ngLastError() & "); serving HTTP/1.1 and HTTP/2 " &
+                           "only on this loop")
         except IOError, OSError: discard
 
 const drainTimeoutSec = 5    # bound on how long a lingering close waits
@@ -2258,12 +2258,21 @@ proc applyQuicReload(loop: Loop) =
                                 loop.quicReloadSeen, cf, kf)
     if gen != loop.quicReloadSeen:
       var ok = false
-      try: ok = ngReloadCert(readFile(cf), readFile(kf))
-      except CatchableError: ok = false
+      var why = ""
+      try:
+        ok = ngReloadCert(readFile(cf), readFile(kf))
+        if not ok: why = ngLastError()
+      except CatchableError as err:
+        ok = false
+        why = err.msg
       if not ok:
+        # The reason comes from the shim (makeCtx's own diagnosis, or the
+        # per-host context that refused to build), so the operator learns what
+        # was wrong instead of only that something was (#352).
         try:
-          stderr.writeLine("vortex: HTTP/3 certificate reload failed; " &
-                           "keeping the current certificate on this loop")
+          stderr.writeLine("vortex: HTTP/3 certificate reload failed (" &
+                           (if why.len > 0: why else: "unknown reason") &
+                           "); keeping the current certificate on this loop")
         except IOError, OSError: discard
       loop.quicReloadSeen = gen
 

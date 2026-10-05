@@ -168,11 +168,25 @@ typedef struct {
 VqEngine *vq_engine_new(const VqConfig *cfg);
 void      vq_engine_free(VqEngine *e);
 
-/* Swap the TLS certificate/key in place (hot reload; PEM blobs). 0 on success.
+/* Hot-reload the TLS certificate/key (PEM blobs). 0 on success, -1 on failure.
+ * A fresh SSL_CTX is built from the new material plus the engine's retained TLS
+ * policy (passphrase, verify mode, cipher suites, version pinning, client CA)
+ * and installed only once the certificate and key both loaded and match, so a
+ * refused reload leaves the engine serving exactly what it was serving before.
  * Any per-host (SNI) contexts are rebuilt from the material they were
- * configured with, so a rotation of on-disk per-host certificates is picked up
- * with the default one; a failure there leaves every context as it was. */
+ * configured with in the same transaction, so a rotation of on-disk per-host
+ * certificates is picked up with the default one and a failure anywhere leaves
+ * every context as it was.
+ *
+ * In-flight connections keep the certificate they handshook with: SSL_new
+ * up-refs the SSL_CTX, so releasing the engine's reference here is a decrement
+ * and the old context lives as long as the sessions created on it. */
 int vq_engine_reload_cert(VqEngine *e, const char *cert_pem, const char *key_pem);
+
+/* Why the last vq_engine_reload_cert on `e` failed (empty if it succeeded), or,
+ * with e == NULL, why the last vq_engine_new on THIS thread failed. The string
+ * is owned by the shim; copy it before the next call on the same engine. */
+const char *vq_engine_last_error(VqEngine *e);
 
 /* Feed one received datagram. peer/local are sockaddr pointers (the shim copies
  * peer so on_send can address replies); now_ns is a monotonic timestamp. */

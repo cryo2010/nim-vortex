@@ -176,6 +176,7 @@ struct Material {
 struct Engine {
   VqConfig cfg{};
   SslCtxPtr ssl_ctx;                   // RAII: freed when the Engine is deleted
+  std::string last_error;  // why the last certificate reload was refused (#352)
   std::string key_pw;   // owns the passphrase (cfg.key_password char* may dangle)
   std::string cipher_suites;  // ditto for the TLS 1.3 suite list (#359)
   std::string client_ca_file, client_ca_pem;   // ... and the mTLS CA (#351)
@@ -843,7 +844,9 @@ static bool loadKey(SSL_CTX *ctx, const char *pem, const char *file,
   if (!b) return false;
   EvpPkeyPtr k(PEM_read_bio_PrivateKey(b.get(), nullptr, vqPasswdCb,
                                        const_cast<char *>(pw)));
-  if (!k) { ERR_clear_error(); return false; }
+  // The error queue is deliberately left alone: makeCtx reads the reason out of
+  // it so a refused reload can tell the operator what was wrong (#352).
+  if (!k) return false;
   return SSL_CTX_use_PrivateKey(ctx, k.get()) == 1;
 }
 
@@ -900,7 +903,7 @@ static bool loadPkcs12(SSL_CTX *ctx, const uint8_t *data, size_t len,
   (void)SSL_CTX_clear_chain_certs(ctx);   // same accumulation as loadCertChain
                                           // (add1_chain_cert appends), #354
   PKCS12 *p12 = d2i_PKCS12_bio(b.get(), nullptr);
-  if (!p12) { ERR_clear_error(); return false; }
+  if (!p12) return false;   // reason left queued for makeCtx (#352)
   EVP_PKEY *pkey = nullptr;
   X509 *cert = nullptr;
   STACK_OF(X509) *ca = nullptr;
@@ -967,9 +970,35 @@ static bool applyClientVerify(SSL_CTX *ctx, const VqConfig *cfg) {
   return true;
 }
 
-static SslCtxPtr makeCtx(const VqConfig *cfg) {
+// Drain the OpenSSL error queue into a readable reason (its newest entry),
+// leaving the queue empty. The loaders above report a bare bool, so the reason
+// has to be collected by the step that failed or it is lost -- which is why
+// every refused QUIC reload used to reach the operator as the same generic log
+// line (#352).
+static std::string sslErrStr() {
+  const unsigned long e = ERR_get_error();
+  if (e == 0) return "";
+  char buf[256];
+  ERR_error_string_n(e, buf, sizeof buf);
+  ERR_clear_error();
+  return std::string(buf);
+}
+
+// `err`, when given, is filled with the step that failed plus whatever OpenSSL
+// queued about it, so vq_engine_reload_cert / vq_engine_new can report a cause
+// instead of a bare failure.
+static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
+  auto fail = [err](const char *what) -> SslCtxPtr {
+    if (err) {
+      const std::string reason = sslErrStr();
+      *err = reason.empty() ? std::string(what)
+                            : std::string(what) + ": " + reason;
+    }
+    ERR_clear_error();
+    return nullptr;
+  };
   SslCtxPtr ctx(SSL_CTX_new(TLS_server_method()));
-  if (!ctx) return nullptr;
+  if (!ctx) return fail("SSL_CTX_new failed");
   // Protocol versions. QUIC mandates TLS 1.3 (RFC 9001 4.2), so both ends stay
   // pinned there: that clamps a configured minTlsVersion of TLS 1.2 up instead
   // of honoring it. A configured maxTlsVersion *below* 1.3 cannot be honored at
@@ -978,17 +1007,15 @@ static SslCtxPtr makeCtx(const VqConfig *cfg) {
   // policy. That combination is also rejected at config time (#359); this is
   // the fail-closed backstop.
   if (cfg->max_tls_version != 0 && cfg->max_tls_version < TLS1_3_VERSION)
-    return nullptr;
+    return fail("maxTlsVersion below TLS 1.3 cannot apply to QUIC");
   SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
   SSL_CTX_set_max_proto_version(ctx.get(), TLS1_3_VERSION);
   // TLS 1.3 cipher suites: the operator's list, or OpenSSL's default when
   // unset. The TLS <= 1.2 cipher list has no counterpart here (no QUIC
   // connection ever negotiates TLS 1.2), so it is not applied.
   if (cfg->tls_cipher_suites && cfg->tls_cipher_suites[0] &&
-      SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1) {
-    ERR_clear_error();
-    return nullptr;
-  }
+      SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1)
+    return fail("invalid TLS 1.3 cipher suites");
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);
@@ -1015,13 +1042,15 @@ static SslCtxPtr makeCtx(const VqConfig *cfg) {
   // empty/half TLS config) would yield a keyless SSL_CTX that vq_engine_new
   // accepts, so h3 would be advertised via Alt-Svc yet every handshake would
   // fail. check_private_key returns 1 only when both are set and they match.
-  if (ok) ok = SSL_CTX_check_private_key(ctx.get()) == 1;
+  if (!ok) return fail("cannot load TLS certificate/key");
+  if (SSL_CTX_check_private_key(ctx.get()) != 1)
+    return fail("certificate/key mismatch");
   // Client-certificate policy last, like the TCP path's buildTlsCtx. Fail
   // closed: a verifyClient config whose CA material will not load must not
   // yield an engine that accepts unauthenticated connections (#351).
-  if (ok) ok = applyClientVerify(ctx.get(), cfg);
-  if (!ok) { ERR_clear_error(); return nullptr; }  // unique_ptr frees the ctx
-  return ctx;
+  if (!applyClientVerify(ctx.get(), cfg))
+    return fail("cannot configure client verification / load client CA");
+  return ctx;   // unique_ptr frees the ctx on every failure path above
 }
 
 // --- SNI: one context per host, switched by the servername callback (#374) ---
@@ -1066,19 +1095,27 @@ static VqConfig ctxConfig(const Engine *e, const Material &m) {
   return c;
 }
 
-// (Re)build every per-host context from the stored material. All or nothing: on
-// any failure the engine keeps the contexts it had, so a broken per-host
+// (Re)build every per-host context from the stored material into `out`. All or
+// nothing: nothing is written unless every host built, so a broken per-host
 // certificate cannot quietly drop that host back to the default certificate.
-static bool buildSniCtxs(Engine *e) {
+// Writing into a caller-supplied vector is what lets a reload stage the
+// per-host contexts alongside the new default one and publish both together
+// (#352).
+static bool buildSniCtxs(Engine *e, std::vector<SslCtxPtr> &out,
+                         std::string *err = nullptr) {
   std::vector<SslCtxPtr> built;
   built.reserve(e->sni.size());
   for (const auto &m : e->sni) {
     VqConfig c = ctxConfig(e, m);
-    SslCtxPtr hc = makeCtx(&c);
-    if (!hc) return false;
+    std::string why;
+    SslCtxPtr hc = makeCtx(&c, &why);
+    if (!hc) {
+      if (err) *err = "per-host certificate for \"" + m.host + "\": " + why;
+      return false;
+    }
     built.push_back(std::move(hc));
   }
-  e->sni_ctx = std::move(built);
+  out = std::move(built);
   return true;
 }
 
@@ -1144,6 +1181,11 @@ static int gOsslInitRv = -1;
 static int gOsslInitRuns = 0;   // how many times the initializer actually ran
                                 // (the #357 invariant; see tests/vq_h3_tls_ctx.cpp)
 
+// Why the last vq_engine_new on this thread failed. The engine does not exist
+// on that path, so the reason cannot live on it, and one slot per loop thread
+// is enough: each thread builds exactly one engine (#352).
+static thread_local std::string gEngineError;
+
 static bool osslInitOnce() {
   std::call_once(gOsslInitOnce, [] {
     gOsslInitRv = ngtcp2_crypto_ossl_init();
@@ -1153,7 +1195,11 @@ static bool osslInitOnce() {
 }
 
 VqEngine *vq_engine_new(const VqConfig *cfg) {
-  if (!osslInitOnce()) return nullptr;
+  gEngineError.clear();
+  if (!osslInitOnce()) {
+    gEngineError = "ngtcp2 ossl backend initialization failed";
+    return nullptr;
+  }
   auto e = std::make_unique<Engine>();
   e->cfg = *cfg;
   e->key_pw = cfg->key_password ? cfg->key_password : "";
@@ -1173,7 +1219,7 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
     e->sni.push_back(materialOf(&cfg->sni[i]));
   e->cfg.sni = nullptr;
   e->cfg.sni_len = 0;
-  e->ssl_ctx = makeCtx(cfg);
+  e->ssl_ctx = makeCtx(cfg, &gEngineError);
   if (!e->ssl_ctx) return nullptr;   // unique_ptr frees the Engine on this path
   // Per-host certificates: a context each, selected by the servername callback
   // on the default context. Without this the QUIC side had one context and one
@@ -1181,7 +1227,7 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   // served the default certificate and aborted, while the same request over TCP
   // got the right one (#374).
   if (!e->sni.empty()) {
-    if (!buildSniCtxs(e.get())) return nullptr;
+    if (!buildSniCtxs(e.get(), e->sni_ctx, &gEngineError)) return nullptr;
     SSL_CTX_set_tlsext_servername_callback(e->ssl_ctx.get(), servernameCb);
     SSL_CTX_set_tlsext_servername_arg(e->ssl_ctx.get(), e.get());
   }
@@ -1195,23 +1241,52 @@ void vq_engine_free(VqEngine *eng) {
   delete reinterpret_cast<Engine *>(eng);
 }
 
+const char *vq_engine_last_error(VqEngine *eng) {
+  // No engine: the reason the last vq_engine_new on this thread failed.
+  if (!eng) return gEngineError.c_str();
+  return reinterpret_cast<Engine *>(eng)->last_error.c_str();
+}
+
 int vq_engine_reload_cert(VqEngine *eng, const char *cert_pem,
                           const char *key_pem) {
   auto *e = reinterpret_cast<Engine *>(eng);
-  bool ok = true;
-  if (cert_pem && cert_pem[0])
-    ok = ok && loadCertChain(e->ssl_ctx.get(), cert_pem);
-  // Reuse the passphrase from engine construction: a hot cert/key swap keeps the
-  // same encryption passphrase. loadKey never prompts on an encrypted key.
-  if (ok && key_pem && key_pem[0])
-    ok = ok && loadKey(e->ssl_ctx.get(), key_pem, nullptr, e->key_pw.c_str());
-  // Rebuild the per-host contexts from the material they were configured with,
-  // so a rotation that replaced the per-host certificate files on disk takes
-  // effect with the default certificate instead of leaving those hosts on the
-  // old material (#374). buildSniCtxs is all-or-nothing, and a failure here
-  // fails the reload with every context left as it was.
-  if (ok && !e->sni.empty()) ok = buildSniCtxs(e);
-  return ok ? 0 : -1;
+  e->last_error.clear();
+  // Build a complete replacement context and publish it only once every piece
+  // of material loaded and the key matches the certificate. The reload used to
+  // write into the LIVE ctx, certificate first then key, with no validation and
+  // no rollback: OpenSSL's ssl_set_cert silently frees the existing private key
+  // when the new leaf does not match it, and ssl_set_pkey silently frees the
+  // existing certificate when the new key does not match, so an unreadable,
+  // missing or mismatched key left the engine holding a certificate with no
+  // private key. Every later h3 handshake on that loop then failed, for good,
+  // while the caller was told the old certificate was still serving (#352).
+  Material m;
+  m.cert_pem = cert_pem ? cert_pem : "";
+  m.key_pem = key_pem ? key_pem : "";
+  // A hot cert/key swap keeps the passphrase the engine was built with, and
+  // ctxConfig carries over the verify policy, cipher suites, version pinning
+  // and client CA, so the replacement is the same context with new material.
+  m.key_password = e->key_pw;
+  VqConfig c = ctxConfig(e, m);
+  SslCtxPtr fresh = makeCtx(&c, &e->last_error);
+  if (!fresh) return -1;
+  // The per-host rebuild joins the same transaction: a per-host certificate
+  // rotated on disk by the same renewal is picked up with the default one
+  // (#374), and a failure anywhere leaves EVERY context untouched.
+  std::vector<SslCtxPtr> freshSni;
+  if (!e->sni.empty()) {
+    if (!buildSniCtxs(e, freshSni, &e->last_error)) return -1;
+    SSL_CTX_set_tlsext_servername_callback(fresh.get(), servernameCb);
+    SSL_CTX_set_tlsext_servername_arg(fresh.get(), e);
+  }
+  // Past this point nothing can fail, so the swap is atomic from the loop's
+  // point of view. Releasing the engine's reference to the old context right
+  // away is safe: SSL_new up-refs the SSL_CTX, so an in-flight connection holds
+  // a reference of its own and keeps the certificate it handshook with until
+  // its SSL is freed.
+  if (!e->sni.empty()) e->sni_ctx = std::move(freshSni);
+  e->ssl_ctx = std::move(fresh);
+  return 0;
 }
 
 void vq_engine_recv(VqEngine *eng, const uint8_t *pkt, size_t len,

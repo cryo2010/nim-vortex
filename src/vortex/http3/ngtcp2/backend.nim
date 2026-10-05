@@ -98,6 +98,7 @@ type
 proc vqEngineNew(cfg: ptr VqConfig): ptr VqEngine {.importc: "vq_engine_new".}
 proc vqEngineFree(e: ptr VqEngine) {.importc: "vq_engine_free".}
 proc vqEngineReloadCert(e: ptr VqEngine, certPem, keyPem: cstring): cint {.importc: "vq_engine_reload_cert".}
+proc vqEngineLastError(e: ptr VqEngine): cstring {.importc: "vq_engine_last_error".}
 proc vqEngineRecv(e: ptr VqEngine, pkt: ptr uint8, len: csize_t, peer: pointer,
   peerLen: csize_t, local: pointer, localLen: csize_t, nowNs: uint64) {.importc: "vq_engine_recv".}
 proc vqEnginePump(e: ptr VqEngine, nowNs: uint64) {.importc: "vq_engine_pump".}
@@ -781,6 +782,11 @@ proc ngTimeoutMs*(): int =
   else: int((e - now) div 1_000_000) + 1
 proc ngReloadCert*(certPem, keyPem: string): bool =
   gEngine != nil and vqEngineReloadCert(gEngine, certPem.cstring, keyPem.cstring) == 0
+proc ngLastError*(): string =
+  ## Why this loop's last ngReloadCert was refused, or -- with no engine, i.e.
+  ## after a failed ngSetup -- why the engine could not be built (#352). The
+  ## shim owns the buffer, so copy it out before the next call.
+  $vqEngineLastError(gEngine)
 proc ngTakeReady*(): seq[tuple[slot: int, gen: uint32, sid: uint64]] =
   result = gReady
   gReady.setLen(0)

@@ -618,6 +618,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   together with the old, no-longer-valid intermediates -- rejected outright by
   strict clients, a larger handshake for the rest -- and the chain grew again
   with every subsequent reload. (#354)
+- HTTP/3: a certificate hot reload now builds a complete replacement `SSL_CTX`
+  and installs it only once every piece of material loaded and the key matches
+  the certificate, so a refused reload leaves the engine serving exactly what
+  it was serving before. It used to write into the live context, certificate
+  first then key, with no validation and no rollback: OpenSSL's `ssl_set_cert`
+  silently frees the existing private key when the new leaf does not match it,
+  and `ssl_set_pkey` silently frees the existing certificate when the new key
+  does not match, so an unreadable, missing or mismatched key left the loop's
+  context holding one half of a pair and every later HTTP/3 handshake on it
+  failed until the process restarted -- while the operator was told the old
+  certificate was still serving. A cert-only reload was even reported as a
+  success. The per-host (SNI) rebuild is part of the same transaction, so a
+  failure anywhere leaves every context untouched, and the reload's failure
+  reason now reaches the log line instead of generic text: the shim's context
+  builder records which step failed plus whatever OpenSSL queued about it
+  (`vq_engine_last_error`), and the same reason is appended to the "HTTP/3
+  engine setup failed" line at startup. (#352)
 
 ### Changed
 
