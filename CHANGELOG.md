@@ -490,16 +490,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either end. Both numbers now come from one constant in the shim
   (`vq_max_recv_udp_payload`), so they cannot drift apart; the advertisement was
   deliberately NOT clamped down to the old buffer, which would have capped every
-  datagram the peer sends us and cost throughput on exactly those paths. On
-  Linux the receive passes `MSG_TRUNC`, so a datagram that still does not fit is
-  dropped and counted instead of being fed to ngtcp2 as line corruption. (#380)
-- HTTP/3: QUIC ingress now takes at most 256 datagrams per pass of the event
-  loop, so a UDP flood can no longer starve the HTTP/1.1 and HTTP/2 connections
-  on the same loop thread. `ngReceive` drained the socket with `while true`, and
-  every datagram is decrypted and parsed synchronously before the next
-  `recvfrom`, so a source whose datagrams cost the server more than they cost
-  the sender kept the thread inside the receive loop: TLS handshakes stalled,
-  responses did not flush, deadlines fired. Reproduced with a flood of Initial
+  datagram the peer sends us and cost throughput on exactly those paths. 65527
+  is also the largest a UDP payload can be, so nothing can arrive truncated any
+  more: the `MSG_TRUNC` the receive passes on Linux, and the `ngTruncatedDrops`
+  counter behind it, are a guard against a future smaller buffer rather than a
+  live path. That counter and `ngRecvBufSize` are shared `Atomic`s instead of a
+  threadvar and a plain global: read off the main thread a threadvar copy was
+  always the main thread's own and so always zero, which made the regression
+  test's assertion on it vacuous, and a plain global written by every loop
+  thread was a data race whatever the values. The two per-thread buffers are
+  released with the engine now (`ngEngineFree`), so a process that starts and
+  stops servers no longer leaks the 64 KiB receive buffer per loop thread per
+  cycle. (#380)
+- HTTP/3: QUIC ingress now takes at most 256 datagrams per drain of the UDP
+  socket (and the loop may drain up to four times per pass: `h3Drive` runs from
+  the outbox, the main drive, the tick's idle sweep and the end-of-pass flush
+  re-drive), so a UDP flood can no longer starve the HTTP/1.1 and HTTP/2
+  connections on the same loop thread. `ngReceive` drained the socket with
+  `while true`, and every datagram is decrypted and parsed synchronously
+  before the next `recvfrom`, so a source whose datagrams cost the server more
+  than they cost the sender kept the thread inside the receive loop: TLS
+  handshakes stalled, responses did not flush, deadlines fired. Reproduced with a flood of Initial
   packets naming an unsupported QUIC version (each answered with a Version
   Negotiation packet, so each costs a parse plus a send): a plain HTTP/1.1
   request on the same server went unserved past a 2 s client timeout, and now

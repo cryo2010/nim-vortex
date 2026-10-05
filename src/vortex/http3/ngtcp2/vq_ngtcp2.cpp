@@ -1512,7 +1512,8 @@ VqEngine *vq_engine_new(const VqConfig *cfg) {
   // served the default certificate and aborted, while the same request over TCP
   // got the right one (#374).
   if (!e->sni.empty()) {
-    if (!buildSniCtxs(e.get(), e->sni, e->sni_ctx, &gEngineError)) return nullptr;
+    if (!buildSniCtxs(e.get(), e->sni, e->sni_ctx, &gEngineError))
+      return nullptr;
     SSL_CTX_set_tlsext_servername_callback(e->ssl_ctx.get(), servernameCb);
     SSL_CTX_set_tlsext_servername_arg(e->ssl_ctx.get(), e.get());
   }

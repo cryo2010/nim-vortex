@@ -18,6 +18,11 @@
 ## the larger buffer still serves h3 normally, and that a > 2048-byte datagram
 ## arriving on the QUIC port (garbage, as a flood would be) is consumed without
 ## disturbing the connections on it.
+##
+## The buffer being the maximum possible UDP payload also means the MSG_TRUNC
+## branch (and `ngTruncatedDrops`) can never fire: it is a defensive guard
+## against a future smaller buffer, and the assertion on the counter is that it
+## stays dormant, not that it works.
 
 import std/[unittest, net, httpcore, os, nativesockets]
 import vortex/[settings, request, server]
@@ -63,8 +68,13 @@ when not defined(plainHttp):
       let (body, rc) = h3curl(h3curlBin, base & "/")
       check rc == 0
       check body == "payload ok"
-      # Nothing was truncated: the datagram fits the buffer now. (Only ever
-      # non-zero on Linux, where recvfrom honours MSG_TRUNC.)
+      # Nothing was truncated, and nothing ever can be: the buffer is 65527
+      # bytes, the largest a UDP payload can be. The MSG_TRUNC branch the
+      # counter sits behind is a guard against a future smaller buffer, so this
+      # asserts it stayed dormant. The counter is shared across the loop
+      # threads, not a threadvar: read from the main thread, a threadvar copy
+      # was always the main thread's own and so always zero, which made this
+      # assertion vacuous.
       check ngTruncatedDrops() == 0'u64
 
   srv.stop()

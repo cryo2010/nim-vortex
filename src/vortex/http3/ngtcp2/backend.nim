@@ -5,7 +5,7 @@
 ## (one engine per thread). Building HTTP/3 (any non -d:plainHttp build) links
 ## ngtcp2 + nghttp3 (see the passL below).
 
-import std/[tables, strutils, json, os, monotimes]
+import std/[tables, strutils, json, os, monotimes, atomics]
 import ../../connection
 import ../../fieldrules   # pseudo-header machine shared with the h2 codec
 import ../../websocket/codec as wscodec
@@ -192,15 +192,18 @@ var
   gRecvBuf {.threadvar.}: seq[uint8]         # ngReceive's datagram buffer, sized
                                              # from the max_udp_payload_size the
                                              # shim advertises (#380)
-  gTruncDrops {.threadvar.}: uint64          # datagrams dropped for not fitting
-                                             # that buffer; only observable where
-                                             # recvfrom honours MSG_TRUNC (Linux)
 
-# NOT a threadvar: the receive buffer size every loop thread settles on, stamped
-# by ngSetup so a test (and an operator at a REPL) can read it off the main
-# thread. Every loop writes the same number, computed from the one shim
-# constant, so the concurrent stores are benign (#380).
-var gRecvBufSize: int
+# NOT threadvars: the two numbers an operator (or a test) reads back off the
+# MAIN thread, where a threadvar copy is always the main thread's own and so
+# always zero. gRecvBufSize is the receive buffer size every loop thread
+# settles on, stamped by ngSetup; gTruncDrops counts datagrams dropped for not
+# fitting it, summed across the loops. Every loop writes gRecvBufSize the same
+# number, computed from the one shim constant, but a plain shared global written
+# from several threads is a data race whatever the values, so both are Atomics
+# (relaxed: neither orders anything) (#380).
+var
+  gRecvBufSize: Atomic[int]
+  gTruncDrops: Atomic[uint64]
 
 proc ngNowNs*(): uint64 = getMonoTime().ticks.uint64
   ## The one clock this loop thread hands ngtcp2 -- every entry point (recv,
@@ -709,26 +712,34 @@ proc ngSetup*(core: ptr LoopCore, udpFd: cint, certFile, keyFile: string,
   # here rather than lazily, so the two can never disagree while traffic flows
   # (#380). gRecvBufSize is the readable record of it.
   gRecvBuf = newSeq[uint8](ngMaxRecvUdpPayload())
-  gRecvBufSize = gRecvBuf.len
+  gRecvBufSize.store(gRecvBuf.len, moRelaxed)
   true
 
 proc ngRecvBufSize*(): int =
   ## The ngReceive buffer size the loops settled on, 0 before any ngSetup. It
   ## must equal ngMaxRecvUdpPayload(): that equality IS the #380 fix, and it is
   ## what the regression test asserts.
-  gRecvBufSize
+  gRecvBufSize.load(moRelaxed)
 
 proc ngTruncatedDrops*(): uint64 =
-  ## Datagrams this loop thread dropped because they did not fit the receive
-  ## buffer. Only ever non-zero on Linux, where MSG_TRUNC reports the real
+  ## Datagrams the loop threads dropped because they did not fit the receive
+  ## buffer. It should never move: the buffer is 65527 bytes, the largest a UDP
+  ## payload can be, so there is no datagram that can arrive truncated. The
+  ## MSG_TRUNC branch it counts is a guard against a future smaller buffer, not
+  ## a live path, and this is how a test asserts the guard stayed dormant. (It
+  ## could only ever move on Linux anyway, where MSG_TRUNC reports the real
   ## datagram length; elsewhere a truncated datagram cannot be told from a full
-  ## one and goes to the engine, which drops it when AEAD fails.
-  gTruncDrops
+  ## one and goes to the engine, which drops it when AEAD fails.)
+  gTruncDrops.load(moRelaxed)
 
 const ngRecvBudget* = 256
   ## Datagrams one ngReceive call will take off the UDP socket before handing the
-  ## loop thread back. Every datagram is decrypted and parsed synchronously
-  ## (vq_engine_recv -> ngtcp2_conn_read_pkt -> nghttp3), so an unbounded drain
+  ## loop thread back: a per-drain budget, and the loop may drain up to four
+  ## times per pass (h3Drive runs from processOutbox, the main drive, the tick's
+  ## sweepWsIdle and the end-of-pass flush re-drive), so the true per-pass
+  ## ceiling is four times this. Every datagram is decrypted and parsed
+  ## synchronously (vq_engine_recv -> ngtcp2_conn_read_pkt -> nghttp3), so an
+  ## unbounded drain
   ## let a UDP source at line rate keep the thread inside the receive loop and
   ## starve every HTTP/1.1 and HTTP/2 fd it owns: TLS handshakes stalled,
   ## responses did not flush, deadlines fired. Forging the datagrams is cheap
@@ -736,10 +747,10 @@ const ngRecvBudget* = 256
   ## peer's address (no Retry token yet; see acceptConn in the shim) (#381).
   ##
   ## 256 is a work quantum, not a rate limit: a legitimate burst is still fully
-  ## received, just across passes of the loop, and the budget only bounds how
-  ## long the TCP side waits. It is the shape of suspendAccept's accept-side
-  ## backoff, except that there is nothing to back off from here -- the next
-  ## pass simply continues.
+  ## received, just across drains of the loop, and the budget only bounds how
+  ## long the TCP side waits between them. It is the shape of suspendAccept's
+  ## accept-side backoff, except that there is nothing to back off from here --
+  ## the next pass simply continues.
 
 proc ngReceive*(): bool =
   ## Drain pending datagrams from the loop's (nonblocking) UDP socket into the
@@ -772,7 +783,7 @@ proc ngReceive*(): bool =
       # MSG_TRUNC: recvfrom reported a datagram larger than it copied. Feeding
       # the prefix to ngtcp2 would just fail AEAD and look like line corruption,
       # so drop it as the oversize datagram it is and count it.
-      inc gTruncDrops
+      discard gTruncDrops.fetchAdd(1, moRelaxed)
       continue
     vqEngineRecv(gEngine, addr gRecvBuf[0], csize_t(n), addr peer[0], csize_t(plen),
                  addr gLocalSa[0], csize_t(gLocalLen), ngNowNs())
@@ -809,7 +820,14 @@ proc ngTakeReady*(): seq[tuple[slot: int, gen: uint32, sid: uint64]] =
   result = gReady
   gReady.setLen(0)
 proc ngEngineFree*() =
+  ## Release everything this loop thread's h3 state owns. The two threadvar
+  ## seqs go with the engine: they are per-thread, so a process that starts and
+  ## stops servers leaked gRecvBuf's 64 KiB (plus whatever gReady had grown to)
+  ## per loop thread per cycle, which 25 cycles over 4 loops turned into 6 MiB
+  ## with nothing to free it.
   if gEngine != nil: vqEngineFree(gEngine); gEngine = nil
+  gRecvBuf = @[]
+  gReady = @[]
 
 # --- response emission (codec-compatible) -----------------------------------
 proc toVq(hdrs: seq[(string, string)]): seq[VqHeader] =
