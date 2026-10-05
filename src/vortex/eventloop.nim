@@ -100,17 +100,22 @@ type
   FdKind = enum fkListen, fkClient, fkWakeup, fkQuic
 
   AcceptDropCause* = enum
-    ## Why the accept path let go of a connection the kernel had already given
-    ## us. Each of these reaches the client as a connection that opened and then
-    ## died with nothing on it -- httpx reports an empty `ConnectError` -- which
-    ## is exactly what a network fault looks like, so each one is counted and
-    ## logged with a reason (#388).
+    ## Why the accept path gave up on a connection. The first three are
+    ## connections the kernel had already handed us and we let go of: each
+    ## reaches the client as a connection that opened and then died with nothing
+    ## on it -- httpx reports an empty `ConnectError` -- which is exactly what a
+    ## network fault looks like, so each one is counted and logged with a reason
+    ## (#388). `adSuspend` is the odd one out: nothing was accepted there, so it
+    ## counts events rather than connections (see below).
     adCap            ## `maxConnections` reached; accepted and closed at once
     adTls            ## `startTls` failed (newTlsSession returned nil)
     adRegister       ## the selector refused the fd (registerHandle raised)
-    adSuspend        ## accept() hit fd/memory exhaustion and the listener was
-                     ## suspended; the connections still in the backlog wait or
-                     ## time out
+    adSuspend        ## accept() itself failed with fd/memory exhaustion
+                     ## (EMFILE/ENFILE/ENOBUFS/ENOMEM) and the listener was
+                     ## suspended for ~1s. No connection was accepted or
+                     ## dropped: whatever is in the backlog waits for the
+                     ## listener to come back, or times out there. One count per
+                     ## backoff, not per waiting connection.
 
   AcceptDrops* = object
     ## Accept-path drop tally. Process-wide: summed over every loop thread of
@@ -122,8 +127,14 @@ type
     cap*: int            ## connections refused by the `maxConnections` cap
     tls*: int            ## connections dropped because TLS setup failed
     register*: int       ## connections dropped because the selector refused the fd
-    acceptSuspend*: int  ## times accept() hit fd/memory exhaustion
-    total*: int          ## sum of the above
+    acceptSuspend*: int  ## times accept() hit fd/memory exhaustion and the
+                         ## listener backed off for ~1s. An event count, not a
+                         ## connection count: nothing had been accepted, so this
+                         ## is deliberately NOT part of `total`. A rising
+                         ## `acceptSuspend` means raise the fd rlimit
+    total*: int          ## connections accepted and then dropped:
+                         ## `cap + tls + register`. `acceptSuspend` is excluded
+                         ## (it counts backoffs, not connections)
 
   Loop* = ref object
     selector: Selector[FdKind]
@@ -241,14 +252,20 @@ const acceptDropLogSec = 5
 
 proc acceptDrops*(): AcceptDrops =
   ## The process-wide accept-path drop tally (see `AcceptDrops`). Cheap: four
-  ## relaxed atomic loads. Also reachable as `server.acceptDrops()` /
-  ## `vortex.acceptDrops()`; the no-argument form exists because a `{.gcsafe.}`
-  ## handler cannot touch the `Vortex` ref.
+  ## relaxed atomic loads. `total` sums only the three causes that dropped an
+  ## accepted connection (`cap`, `tls`, `register`); `acceptSuspend` counts
+  ## accept() backoffs and is reported beside it. Also reachable as
+  ## `server.acceptDrops()` / `vortex.acceptDrops()`; the no-argument form
+  ## exists because a `{.gcsafe.}` handler cannot touch the `Vortex` ref.
   result.cap = gAcceptDrops[adCap].load(moRelaxed)
   result.tls = gAcceptDrops[adTls].load(moRelaxed)
   result.register = gAcceptDrops[adRegister].load(moRelaxed)
   result.acceptSuspend = gAcceptDrops[adSuspend].load(moRelaxed)
-  result.total = result.cap + result.tls + result.register + result.acceptSuspend
+  # `total` is connections accepted and then dropped. adSuspend is not one of
+  # those -- accept() itself failed, nothing was accepted, and the backlog waits
+  # for the listener to be re-armed -- so it stays out of the sum even though it
+  # shares the counter array and the rate-limited log line (#388).
+  result.total = result.cap + result.tls + result.register
 
 when defined(linux):
   const clockMonotonicCoarse = ClockId(6)

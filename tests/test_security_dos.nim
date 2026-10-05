@@ -212,9 +212,17 @@ suite "connection cap":
     let after = capSrv.acceptDrops()
     check after.cap - before.cap >= overCap
     check after.total >= after.cap
+    # `total` is connections accepted and then dropped, which is exactly these
+    # three causes. acceptSuspend used to be summed in as well, and it is not a
+    # dropped connection: accept() itself failed on fd exhaustion, nothing was
+    # accepted, and the backlog waits for the listener to be re-armed (#388).
+    check after.total == after.cap + after.tls + after.register
     # Process-wide by construction, so the no-argument form (what a {.gcsafe.}
-    # handler can call) reports the same numbers.
-    check acceptDrops().cap == after.cap
+    # handler can call) reports the same numbers. `>=`, not `==`: the counter is
+    # shared by every loop thread of every server in the process, so another
+    # suite's server (or a later read of this one) can only have bumped it
+    # between the two loads.
+    check acceptDrops().cap >= after.cap
     # Nothing else fired: these connections were refused by the cap, not by a
     # TLS failure or a selector refusal.
     #

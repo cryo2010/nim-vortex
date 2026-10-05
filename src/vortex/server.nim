@@ -80,12 +80,21 @@ proc requestShutdown*(server: var Server) =
 
 proc acceptDrops*(server: Server): AcceptDrops =
   ## Connections this process accepted and then dropped, per cause: the
-  ## `maxConnections` cap, a failed TLS session setup, a selector registration
-  ## the kernel refused, and accept() backing off on fd/memory exhaustion. Each
-  ## of those reaches the client as a connection that opened and died with
-  ## nothing on it, which is indistinguishable from a network fault -- sample
-  ## this to tell "the server refused you on purpose" from "the network broke"
-  ## (#388). Every drop also writes one rate-limited line to stderr saying why.
+  ## `maxConnections` cap (`cap`), a failed TLS session setup (`tls`), and a
+  ## selector registration the kernel refused (`register`). Each of those
+  ## reaches the client as a connection that opened and died with nothing on it,
+  ## which is indistinguishable from a network fault -- sample this to tell "the
+  ## server refused you on purpose" from "the network broke" (#388). `total`
+  ## sums exactly those three.
+  ##
+  ## `acceptSuspend` is reported alongside them but is NOT in `total`: it counts
+  ## the times accept() itself failed with fd/memory exhaustion and the listener
+  ## backed off for ~1s. Nothing was accepted there, so no connection was
+  ## dropped -- the backlog waits for the listener to come back, or times out in
+  ## it. Treat it as "the process is out of descriptors", i.e. raise the fd
+  ## rlimit.
+  ##
+  ## Every one of the four writes one rate-limited line to stderr saying why.
   ##
   ## The tally is process-wide, not per-server: the loop threads keep the
   ## counters and have no back-pointer to their `Server`. With one server per

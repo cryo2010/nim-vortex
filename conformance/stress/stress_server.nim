@@ -135,16 +135,20 @@ proc onTerm(sig: cint) {.noconv.} =
   terminating.store(true, moRelaxed)
 
 proc dropsText(): string {.gcsafe.} =
-  ## The accept-path drop tally as "cap=N tls=N register=N acceptSuspend=N
-  ## total=N". Served on /drops and printed on shutdown. Every one of these is a
-  ## connection the server accepted and then let go of on purpose, which at the
-  ## client is an empty `ConnectError` indistinguishable from a network fault --
-  ## the soak that chased that for an hour is why this is exposed (#388).
+  ## The accept-path drop tally as "cap=N tls=N register=N total=N
+  ## acceptSuspend=N". Served on /drops and printed on shutdown. `cap`, `tls`
+  ## and `register` are each a connection the server accepted and then let go of
+  ## on purpose, which at the client is an empty `ConnectError` indistinguishable
+  ## from a network fault -- the soak that chased that for an hour is why this is
+  ## exposed (#388); `total` is their sum. `acceptSuspend` is printed last
+  ## because it is a different kind of number: accept() itself failed on fd
+  ## exhaustion and the listener backed off for ~1s, so nothing was accepted and
+  ## it is not in `total`.
   ## Deliberately NOT folded into /stats: the client parses that as exactly
   ## three fields.
   let d = acceptDrops()
   "cap=" & $d.cap & " tls=" & $d.tls & " register=" & $d.register &
-    " acceptSuspend=" & $d.acceptSuspend & " total=" & $d.total
+    " total=" & $d.total & " acceptSuspend=" & $d.acceptSuspend
 
 # --- shared handler bodies (no await needed; identical sync/async) -----------
 

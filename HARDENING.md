@@ -58,7 +58,7 @@ coarse HTTP/1 analog of `h2StreamWindow` / `h3StreamWindow`.
 
 A connection the server refuses after accepting it looks, at the client, exactly
 like a network fault: the socket opens and then dies with nothing on it, which
-httpx and friends report as an empty `ConnectError`. Four paths do that, and each
+httpx and friends report as an empty `ConnectError`. Three paths do that, and each
 one keeps a counter plus one rate-limited `vortex:` line on stderr saying why:
 
 | `acceptDrops()` field | Cause |
@@ -66,11 +66,23 @@ one keeps a counter plus one rate-limited `vortex:` line on stderr saying why:
 | `cap` | `maxConnections` reached on that loop thread |
 | `tls` | the TLS session could not be created (the line carries the OpenSSL reason) |
 | `register` | the selector refused the accepted fd |
-| `acceptSuspend` | `accept()` hit fd/memory exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM) and the listener backed off for ~1s |
+| `total` | `cap + tls + register`, i.e. every connection accepted and then dropped |
+
+A fourth counter sits beside them and is **not** part of `total`:
+
+| `acceptDrops()` field | Cause |
+|-----------------------|-------|
+| `acceptSuspend` | `accept()` itself failed with fd/memory exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM) and the listener was deregistered for ~1s |
+
+Nothing is accepted or dropped on that path: the connections already in the
+kernel's backlog simply wait for the listener to come back (or time out there),
+so counting them as drops would be wrong. It is one count per backoff, not per
+waiting connection, and it reads "this process is out of descriptors".
 
 ```nim
 let d = srv.acceptDrops()     # also acceptDrops() with no argument
-echo "refused: cap=", d.cap, " tls=", d.tls, " register=", d.register
+echo "refused: ", d.total, " (cap=", d.cap, " tls=", d.tls,
+     " register=", d.register, ") accept backoffs: ", d.acceptSuspend
 ```
 
 The tally is process-wide and monotonic, so sample it and watch the rate. A

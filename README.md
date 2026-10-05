@@ -391,12 +391,16 @@ To accept a large upload without buffering it whole (so `maxBodySize` isn't the
 constraint), stream it instead; see [Upload](#upload).
 
 Connections refused *before* a request exists (the `maxConnections` cap, a
-failed TLS session setup, a selector refusal, `accept()` backing off on fd
-exhaustion) cannot be reported in a response, so they are counted instead:
+failed TLS session setup, a selector refusal) cannot be reported in a response,
+so they are counted instead:
 
 ```nim
-let d = srv.acceptDrops()   # cap / tls / register / acceptSuspend / total
+let d = srv.acceptDrops()   # total = cap + tls + register
 ```
+
+`d.acceptSuspend` sits beside that total without being part of it: it counts the
+times `accept()` itself failed on fd exhaustion and the listener backed off, so
+nothing was accepted and the kernel's backlog waited rather than being dropped.
 
 Each also writes one rate-limited `vortex:` line to stderr saying why. Sample
 the counters to tell "the server refused the connection on purpose" from "the
