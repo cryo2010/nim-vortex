@@ -29,7 +29,7 @@
 ## line in buildTlsCtx fails every ordering check; reverting the
 ## SSL_OP_PRIORITIZE_CHACHA line fails the unconfigured-list ones.
 
-import std/[unittest, os, osproc, strutils, httpcore, net, exitprocs]
+import std/[unittest, os, osproc, strutils, httpcore, net]
 import vortex/[settings, request, server]
 import vortex/transport/tls as tlstransport
 import ./helper
@@ -66,11 +66,11 @@ proc isTls12(proto: string): bool =
 let (cert, key) = makeCertPair("vortex_cipherorder_")
 let dir = cert.parentDir
 # The fixture directory holds unencrypted private keys, so remove it on every
-# exit path. A bare removeDir at the end of the module is skipped whenever an
-# exception escapes a suite body (a failing `check` does not escape, but a raise
-# from a server start or a context build does) and on an early `quit`; an exit
-# proc covers both. Nim does not allow `defer` at module level.
-addExitProc(proc() = removeDir(dir))
+# exit path: the suites below run inside a module-level try/finally, because a
+# bare removeDir at the end of the module is skipped whenever an exception
+# escapes a suite body (a failing `check` does not escape, but a raise from a
+# server start or a context build does). The two `quit 0` skips above happen
+# before the fixture exists. Nim does not allow `defer` at module level.
 
 const
   # Two TLS 1.2 suites an RSA certificate can serve, and three TLS 1.3 suites.
@@ -149,232 +149,238 @@ proc buildRefused(reason: var string, cipherList = "", cipherSuites = "",
     reason = e.msg
     true
 
-suite "TLS 1.2 cipher order is the server's (#375)":
-  test "the server's first choice wins over the client's":
-    # http3 = false goes with the TLS 1.2 ceiling: QUIC cannot negotiate below
-    # 1.3, so the pair is refused rather than half-applied (#359).
-    withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                http3 = false,
-                                maxTlsVersion = TlsVersion.V12,
-                                tlsCipherList = aes256 & ":" & aes128)):
-      let r = negotiated(srv.port, "-tls1_2 -cipher '" & aes128 & ":" & aes256 & "'")
-      check isTls12(r.proto)
-      check r.cipher == aes256          # pre-fix: aes128, the client's order
-
-  test "... and that is the server's order, not a fixed strength ranking":
-    # The same client preference against the opposite server list: whatever the
-    # operator wrote first is what is served.
-    withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                http3 = false,
-                                maxTlsVersion = TlsVersion.V12,
-                                tlsCipherList = aes128 & ":" & aes256)):
-      let r = negotiated(srv.port, "-tls1_2 -cipher '" & aes256 & ":" & aes128 & "'")
-      check isTls12(r.proto)
-      check r.cipher == aes128
-
-  test "the list is still an allow-set: a client offering only the second gets it":
-    # Server preference reorders the overlap, it does not narrow it. A client
-    # that cannot do the preferred suite still connects on the other one.
-    withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                http3 = false,
-                                maxTlsVersion = TlsVersion.V12,
-                                tlsCipherList = aes256 & ":" & aes128)):
-      let r = negotiated(srv.port, "-tls1_2 -cipher '" & aes128 & "'")
-      check r.cipher == aes128
-
-suite "TLS 1.3 ciphersuite order is the server's (#375)":
-  ## OpenSSL runs TLS 1.3 ciphersuite selection through the same preference pick
-  ## as TLS 1.2, so one option covers tlsCipherSuites too.
-  test "the server's first choice wins over the client's":
-    if not hasCiphersuitesFlag:
-      skip()   # LibreSSL s_client: no -ciphersuites
-    else:
+try:
+  suite "TLS 1.2 cipher order is the server's (#375)":
+    test "the server's first choice wins over the client's":
+      # http3 = false goes with the TLS 1.2 ceiling: QUIC cannot negotiate below
+      # 1.3, so the pair is refused rather than half-applied (#359).
       withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                  minTlsVersion = TlsVersion.V13,
-                                  tlsCipherSuites = suite256 & ":" & suiteChaCha)):
-        let r = negotiated(srv.port,
-          "-tls1_3 -ciphersuites '" & suiteChaCha & ":" & suite256 & "'")
-        check r.proto == "TLSv1.3"
-        check r.cipher == suite256      # pre-fix: ChaCha20, the client's order
+                                  http3 = false,
+                                  maxTlsVersion = TlsVersion.V12,
+                                  tlsCipherList = aes256 & ":" & aes128)):
+        let r = negotiated(srv.port, "-tls1_2 -cipher '" & aes128 & ":" & aes256 & "'")
+        check isTls12(r.proto)
+        check r.cipher == aes256          # pre-fix: aes128, the client's order
 
-  test "... and it follows the configured order when reversed":
-    if not hasCiphersuitesFlag:
-      skip()
-    else:
+    test "... and that is the server's order, not a fixed strength ranking":
+      # The same client preference against the opposite server list: whatever the
+      # operator wrote first is what is served.
       withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                  minTlsVersion = TlsVersion.V13,
-                                  tlsCipherSuites = suiteChaCha & ":" & suite256)):
-        let r = negotiated(srv.port,
-          "-tls1_3 -ciphersuites '" & suite256 & ":" & suiteChaCha & "'")
-        check r.proto == "TLSv1.3"
-        check r.cipher == suiteChaCha
+                                  http3 = false,
+                                  maxTlsVersion = TlsVersion.V12,
+                                  tlsCipherList = aes128 & ":" & aes256)):
+        let r = negotiated(srv.port, "-tls1_2 -cipher '" & aes256 & ":" & aes128 & "'")
+        check isTls12(r.proto)
+        check r.cipher == aes128
 
-suite "an unconfigured list keeps the ChaCha courtesy (#375)":
-  ## With neither tlsCipherList nor tlsCipherSuites set, the operator configured
-  ## nothing, yet the order now being imposed is OpenSSL's own: AES-256-GCM,
-  ## ChaCha20, AES-128-GCM. A client that offers ChaCha20-Poly1305 first is
-  ## telling us it has no AES hardware, and moving it onto software AES on
-  ## nobody's authority is both slower for it and more side-channel exposed.
-  ## SSL_OP_PRIORITIZE_CHACHA keeps the server's order for everyone else and
-  ## hands that client ChaCha, which is what Go's crypto/tls and the
-  ## BoringSSL-based servers do by default.
-  test "a ChaCha-first client gets ChaCha when no list is configured":
-    if not hasCiphersuitesFlag:
-      skip()
-    else:
+    test "the list is still an allow-set: a client offering only the second gets it":
+      # Server preference reorders the overlap, it does not narrow it. A client
+      # that cannot do the preferred suite still connects on the other one.
       withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                  minTlsVersion = TlsVersion.V13)):
-        let r = negotiated(srv.port,
-          "-tls1_3 -ciphersuites '" & suiteChaCha & ":" & suite256 & "'")
-        check r.proto == "TLSv1.3"
-        # Without SSL_OP_PRIORITIZE_CHACHA: TLS_AES_256_GCM_SHA384, OpenSSL's
-        # default order forced onto a client that asked for the opposite.
-        check r.cipher == suiteChaCha
+                                  http3 = false,
+                                  maxTlsVersion = TlsVersion.V12,
+                                  tlsCipherList = aes256 & ":" & aes128)):
+        let r = negotiated(srv.port, "-tls1_2 -cipher '" & aes128 & "'")
+        check r.cipher == aes128
 
-  test "an AES-first client still gets the server's default order":
-    # The courtesy is not a surrender: a client that leads with AES-128 does not
-    # get AES-128, it gets the server's first choice, AES-256-GCM.
-    if not hasCiphersuitesFlag:
-      skip()
-    else:
+  suite "TLS 1.3 ciphersuite order is the server's (#375)":
+    ## OpenSSL runs TLS 1.3 ciphersuite selection through the same preference pick
+    ## as TLS 1.2, so one option covers tlsCipherSuites too.
+    test "the server's first choice wins over the client's":
+      if not hasCiphersuitesFlag:
+        skip()   # LibreSSL s_client: no -ciphersuites
+      else:
+        withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                    minTlsVersion = TlsVersion.V13,
+                                    tlsCipherSuites = suite256 & ":" & suiteChaCha)):
+          let r = negotiated(srv.port,
+            "-tls1_3 -ciphersuites '" & suiteChaCha & ":" & suite256 & "'")
+          check r.proto == "TLSv1.3"
+          check r.cipher == suite256      # pre-fix: ChaCha20, the client's order
+
+    test "... and it follows the configured order when reversed":
+      if not hasCiphersuitesFlag:
+        skip()
+      else:
+        withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                    minTlsVersion = TlsVersion.V13,
+                                    tlsCipherSuites = suiteChaCha & ":" & suite256)):
+          let r = negotiated(srv.port,
+            "-tls1_3 -ciphersuites '" & suite256 & ":" & suiteChaCha & "'")
+          check r.proto == "TLSv1.3"
+          check r.cipher == suiteChaCha
+
+  suite "an unconfigured list keeps the ChaCha courtesy (#375)":
+    ## With neither tlsCipherList nor tlsCipherSuites set, the operator configured
+    ## nothing, yet the order now being imposed is OpenSSL's own: AES-256-GCM,
+    ## ChaCha20, AES-128-GCM. A client that offers ChaCha20-Poly1305 first is
+    ## telling us it has no AES hardware, and moving it onto software AES on
+    ## nobody's authority is both slower for it and more side-channel exposed.
+    ## SSL_OP_PRIORITIZE_CHACHA keeps the server's order for everyone else and
+    ## hands that client ChaCha, which is what Go's crypto/tls and the
+    ## BoringSSL-based servers do by default.
+    test "a ChaCha-first client gets ChaCha when no list is configured":
+      if not hasCiphersuitesFlag:
+        skip()
+      else:
+        withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                    minTlsVersion = TlsVersion.V13)):
+          let r = negotiated(srv.port,
+            "-tls1_3 -ciphersuites '" & suiteChaCha & ":" & suite256 & "'")
+          check r.proto == "TLSv1.3"
+          # Without SSL_OP_PRIORITIZE_CHACHA: TLS_AES_256_GCM_SHA384, OpenSSL's
+          # default order forced onto a client that asked for the opposite.
+          check r.cipher == suiteChaCha
+
+    test "an AES-first client still gets the server's default order":
+      # The courtesy is not a surrender: a client that leads with AES-128 does not
+      # get AES-128, it gets the server's first choice, AES-256-GCM.
+      if not hasCiphersuitesFlag:
+        skip()
+      else:
+        withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                                    minTlsVersion = TlsVersion.V13)):
+          let r = negotiated(srv.port,
+            "-tls1_3 -ciphersuites '" & suite128 & ":" & suite256 & "'")
+          check r.proto == "TLSv1.3"
+          check r.cipher == suite256
+
+    test "a configured list withholds it, and either list is enough":
+      # Once the operator wrote an order it is a policy statement, so a
+      # ChaCha-first client must not be able to reorder it. tlsCipherSuites alone
+      # withholds the courtesy for TLS 1.2 as well: one context, one policy.
+      let plain = tlstransport.newTlsConfig(cert, key, enableH2 = true)
+      defer: tlstransport.freeTlsConfig(plain)
+      check tlstransport.ctxPrefersServerOrder(plain)
+      check tlstransport.ctxPrioritizesChaCha(plain)
+
+      let byList = tlstransport.newTlsConfig(cert, key, enableH2 = true,
+                                             cipherList = aes256 & ":" & aes128)
+      defer: tlstransport.freeTlsConfig(byList)
+      check tlstransport.ctxPrefersServerOrder(byList)
+      check not tlstransport.ctxPrioritizesChaCha(byList)
+
+      let bySuites = tlstransport.newTlsConfig(cert, key, enableH2 = true,
+                                               cipherSuites = suite256)
+      defer: tlstransport.freeTlsConfig(bySuites)
+      check tlstransport.ctxPrefersServerOrder(bySuites)
+      check not tlstransport.ctxPrioritizesChaCha(bySuites)
+
+  suite "tlsCipherList is screened for HTTP/2 (#375)":
+    ## New footgun from enforcing the order. RFC 7540 Appendix A blacklists every
+    ## TLS 1.2 suite that is not an ephemeral-key AEAD one, and an h2 client that
+    ## sees a blacklisted suite closes the connection with INADEQUATE_SECURITY
+    ## (browsers show a protocol error). Before, a CBC-first tlsCipherList was
+    ## quietly rescued by every real client's own AEAD-first order; now the server
+    ## imposes it. Vortex used to check only that OpenSSL parsed the string, so the
+    ## operator got a server that negotiates h2 on a cipher no browser accepts.
+    test "a CBC-first list is refused at construction, with what to do about it":
+      var reason: string
+      check buildRefused(reason, cipherList = cbcSha & ":" & aes256)
+      check "tlsCipherList must lead with an ECDHE/DHE AEAD suite" in reason
+      check cbcSha in reason
+      check "RFC 7540 Appendix A" in reason
+      check "move an AEAD suite first or disable HTTP/2" in reason
+
+    test "an AEAD-first list that also contains CBC suites is accepted":
+      # The screen looks at the suite that will actually be chosen, not at the
+      # whole list: a CBC entry further down is reached only by a client that
+      # cannot do AEAD, and such a client is not an h2 client either.
+      var reason: string
+      check not buildRefused(reason, cipherList = aes256 & ":" & cbcSha & ":" & aes128)
+      check reason == ""
+
+    test "a non-ephemeral AEAD suite is refused too (no forward secrecy)":
+      # RFC 7540 Appendix A keeps static-RSA AEAD suites on the blacklist as well,
+      # so "is it AEAD" is not the whole test: the key exchange must be ECDHE/DHE.
+      var reason: string
+      check buildRefused(reason, cipherList = staticAead & ":" & aes256)
+      check staticAead in reason
+
+    test "it reaches the real server config path, not only the context builder":
+      # What an operator actually trips over: initVortexConfig + newVortex.
+      var raised = ""
+      try:
+        let srv = newVortex(RequestHandler(handler),
+          initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
+                           http3 = false, maxTlsVersion = TlsVersion.V12,
+                           tlsCipherList = cbcSha & ":" & aes256)).start(0)
+        srv.close()
+      except CatchableError as e:
+        raised = e.msg
+      check "RFC 7540 Appendix A" in raised
+
+    test "no HTTP/2 on the context, no screen":
+      # The suites are forbidden for h2 only. An HTTP/1.1-only listener may serve
+      # one, so a context that does not advertise h2 is left alone.
+      var reason: string
+      check not buildRefused(reason, cipherList = cbcSha, enableH2 = false)
+
+    test "a TLS 1.3-only version range skips the screen":
+      # tlsCipherList cannot be reached at all then, so a stale value left in the
+      # config must not refuse to start.
+      var reason: string
+      check not buildRefused(reason, cipherList = cbcSha,
+                             minProtoVersion = tlstransport.TLS1_3_VERSION)
+
+  suite "per-host (SNI) contexts and the preference (#375)":
+    test "the default context's copy governs an SNI connection too":
+      ## What this proves: a connection the servername callback switched to a
+      ## per-host certificate is still ordered by the server. It does NOT prove the
+      ## per-host context's own option bit did it. SSL_set_SSL_CTX does not re-read
+      ## options: a connection carries the option word SSL_new copied from the
+      ## context it was created on, which is always the default one. This case
+      ## would therefore pass even with buildSniCtxs' option missing, so the bit on
+      ## the per-host contexts is asserted directly in the next test.
+      genCert(dir / "api.pem", dir / "api.key", "api.example.com")
       withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                  minTlsVersion = TlsVersion.V13)):
-        let r = negotiated(srv.port,
-          "-tls1_3 -ciphersuites '" & suite128 & ":" & suite256 & "'")
-        check r.proto == "TLSv1.3"
-        check r.cipher == suite256
+                                  http3 = false,
+                                  maxTlsVersion = TlsVersion.V12,
+                                  tlsCipherList = aes256 & ":" & aes128,
+                                  sni = @[SniCertEntry(host: "api.example.com",
+                                                       certFile: dir / "api.pem",
+                                                       keyFile: dir / "api.key")])):
+        let r = negotiated(srv.port, "-tls1_2 -servername api.example.com -cipher '" &
+                                     aes128 & ":" & aes256 & "'")
+        check r.cipher == aes256
 
-  test "a configured list withholds it, and either list is enough":
-    # Once the operator wrote an order it is a policy statement, so a
-    # ChaCha-first client must not be able to reorder it. tlsCipherSuites alone
-    # withholds the courtesy for TLS 1.2 as well: one context, one policy.
-    let plain = tlstransport.newTlsConfig(cert, key, enableH2 = true)
-    defer: tlstransport.freeTlsConfig(plain)
-    check tlstransport.ctxPrefersServerOrder(plain)
-    check tlstransport.ctxPrioritizesChaCha(plain)
-
-    let byList = tlstransport.newTlsConfig(cert, key, enableH2 = true,
-                                           cipherList = aes256 & ":" & aes128)
-    defer: tlstransport.freeTlsConfig(byList)
-    check tlstransport.ctxPrefersServerOrder(byList)
-    check not tlstransport.ctxPrioritizesChaCha(byList)
-
-    let bySuites = tlstransport.newTlsConfig(cert, key, enableH2 = true,
-                                             cipherSuites = suite256)
-    defer: tlstransport.freeTlsConfig(bySuites)
-    check tlstransport.ctxPrefersServerOrder(bySuites)
-    check not tlstransport.ctxPrioritizesChaCha(bySuites)
-
-suite "tlsCipherList is screened for HTTP/2 (#375)":
-  ## New footgun from enforcing the order. RFC 7540 Appendix A blacklists every
-  ## TLS 1.2 suite that is not an ephemeral-key AEAD one, and an h2 client that
-  ## sees a blacklisted suite closes the connection with INADEQUATE_SECURITY
-  ## (browsers show a protocol error). Before, a CBC-first tlsCipherList was
-  ## quietly rescued by every real client's own AEAD-first order; now the server
-  ## imposes it. Vortex used to check only that OpenSSL parsed the string, so the
-  ## operator got a server that negotiates h2 on a cipher no browser accepts.
-  test "a CBC-first list is refused at construction, with what to do about it":
-    var reason: string
-    check buildRefused(reason, cipherList = cbcSha & ":" & aes256)
-    check "tlsCipherList must lead with an ECDHE/DHE AEAD suite" in reason
-    check cbcSha in reason
-    check "RFC 7540 Appendix A" in reason
-    check "move an AEAD suite first or disable HTTP/2" in reason
-
-  test "an AEAD-first list that also contains CBC suites is accepted":
-    # The screen looks at the suite that will actually be chosen, not at the
-    # whole list: a CBC entry further down is reached only by a client that
-    # cannot do AEAD, and such a client is not an h2 client either.
-    var reason: string
-    check not buildRefused(reason, cipherList = aes256 & ":" & cbcSha & ":" & aes128)
-    check reason == ""
-
-  test "a non-ephemeral AEAD suite is refused too (no forward secrecy)":
-    # RFC 7540 Appendix A keeps static-RSA AEAD suites on the blacklist as well,
-    # so "is it AEAD" is not the whole test: the key exchange must be ECDHE/DHE.
-    var reason: string
-    check buildRefused(reason, cipherList = staticAead & ":" & aes256)
-    check staticAead in reason
-
-  test "it reaches the real server config path, not only the context builder":
-    # What an operator actually trips over: initVortexConfig + newVortex.
-    var raised = ""
-    try:
-      let srv = newVortex(RequestHandler(handler),
-        initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                         http3 = false, maxTlsVersion = TlsVersion.V12,
-                         tlsCipherList = cbcSha & ":" & aes256)).start(0)
-      srv.close()
-    except CatchableError as e:
-      raised = e.msg
-    check "RFC 7540 Appendix A" in raised
-
-  test "no HTTP/2 on the context, no screen":
-    # The suites are forbidden for h2 only. An HTTP/1.1-only listener may serve
-    # one, so a context that does not advertise h2 is left alone.
-    var reason: string
-    check not buildRefused(reason, cipherList = cbcSha, enableH2 = false)
-
-  test "a TLS 1.3-only version range skips the screen":
-    # tlsCipherList cannot be reached at all then, so a stale value left in the
-    # config must not refuse to start.
-    var reason: string
-    check not buildRefused(reason, cipherList = cbcSha,
-                           minProtoVersion = tlstransport.TLS1_3_VERSION)
-
-suite "per-host (SNI) contexts and the preference (#375)":
-  test "the default context's copy governs an SNI connection too":
-    ## What this proves: a connection the servername callback switched to a
-    ## per-host certificate is still ordered by the server. It does NOT prove the
-    ## per-host context's own option bit did it. SSL_set_SSL_CTX does not re-read
-    ## options: a connection carries the option word SSL_new copied from the
-    ## context it was created on, which is always the default one. This case
-    ## would therefore pass even with buildSniCtxs' option missing, so the bit on
-    ## the per-host contexts is asserted directly in the next test.
-    genCert(dir / "api.pem", dir / "api.key", "api.example.com")
-    withServer(initVortexConfig(numThreads = 1, certFile = cert, keyFile = key,
-                                http3 = false,
-                                maxTlsVersion = TlsVersion.V12,
-                                tlsCipherList = aes256 & ":" & aes128,
-                                sni = @[SniCertEntry(host: "api.example.com",
-                                                     certFile: dir / "api.pem",
-                                                     keyFile: dir / "api.key")])):
-      let r = negotiated(srv.port, "-tls1_2 -servername api.example.com -cipher '" &
-                                   aes128 & ":" & aes256 & "'")
-      check r.cipher == aes256
-
-  test "every per-host context carries the bit anyway":
-    ## Defence in depth: inert at runtime today, for the reason above, and kept
-    ## so a refactor that creates the SSL from the host context (rather than
-    ## switching an existing one) cannot silently drop the policy.
-    genCert(dir / "api.pem", dir / "api.key", "api.example.com")
-    genCert(dir / "web.pem", dir / "web.key", "web.example.com")
-    let cfg = tlstransport.newTlsConfig(cert, key, enableH2 = true,
-      cipherList = aes256 & ":" & aes128,
-      sni = @[
-        SniCert(host: "api.example.com",
-                material: TlsMaterial(certFile: dir / "api.pem",
-                                      keyFile: dir / "api.key")),
-        SniCert(host: "web.example.com",
-                material: TlsMaterial(certFile: dir / "web.pem",
-                                      keyFile: dir / "web.key"))])
-    defer: tlstransport.freeTlsConfig(cfg)
-    check tlstransport.sniCtxCount(cfg) == 2
-    for i in 0 ..< 2:
-      check tlstransport.sniCtxPrefersServerOrder(cfg, i)
-
-  test "a per-host context is screened for HTTP/2 as well":
-    # buildSniCtxs goes through buildTlsCtx with the same cipher list, so a
-    # blacklisted lead is refused there too, named by host.
-    genCert(dir / "api.pem", dir / "api.key", "api.example.com")
-    var raised = ""
-    try:
+    test "every per-host context carries the bit anyway":
+      ## Defence in depth: inert at runtime today, for the reason above, and kept
+      ## so a refactor that creates the SSL from the host context (rather than
+      ## switching an existing one) cannot silently drop the policy.
+      genCert(dir / "api.pem", dir / "api.key", "api.example.com")
+      genCert(dir / "web.pem", dir / "web.key", "web.example.com")
       let cfg = tlstransport.newTlsConfig(cert, key, enableH2 = true,
-        cipherList = cbcSha & ":" & aes256,
-        sni = @[SniCert(host: "api.example.com",
-                        material: TlsMaterial(certFile: dir / "api.pem",
-                                              keyFile: dir / "api.key"))])
-      tlstransport.freeTlsConfig(cfg)
-    except CatchableError as e:
-      raised = e.msg
-    check "RFC 7540 Appendix A" in raised
+        cipherList = aes256 & ":" & aes128,
+        sni = @[
+          SniCert(host: "api.example.com",
+                  material: TlsMaterial(certFile: dir / "api.pem",
+                                        keyFile: dir / "api.key")),
+          SniCert(host: "web.example.com",
+                  material: TlsMaterial(certFile: dir / "web.pem",
+                                        keyFile: dir / "web.key"))])
+      defer: tlstransport.freeTlsConfig(cfg)
+      check tlstransport.sniCtxCount(cfg) == 2
+      for i in 0 ..< 2:
+        check tlstransport.sniCtxPrefersServerOrder(cfg, i)
+
+    test "a per-host context is screened for HTTP/2 as well":
+      # buildSniCtxs goes through buildTlsCtx with the same cipher list, so a
+      # blacklisted lead is refused there too, named by host.
+      genCert(dir / "api.pem", dir / "api.key", "api.example.com")
+      var raised = ""
+      try:
+        let cfg = tlstransport.newTlsConfig(cert, key, enableH2 = true,
+          cipherList = cbcSha & ":" & aes256,
+          sni = @[SniCert(host: "api.example.com",
+                          material: TlsMaterial(certFile: dir / "api.pem",
+                                                keyFile: dir / "api.key"))])
+        tlstransport.freeTlsConfig(cfg)
+      except CatchableError as e:
+        raised = e.msg
+      check "RFC 7540 Appendix A" in raised
+finally:
+  # Runs before the module globals are destroyed. An exit proc (the first
+  # version of this cleanup) ran after ORC had already freed `dir` and ASan
+  # flagged the read as a use-after-free in CI.
+  removeDir(dir)
