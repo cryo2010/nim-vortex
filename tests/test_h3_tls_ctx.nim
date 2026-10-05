@@ -26,8 +26,8 @@ when not defined(plainHttp):
                                    times: cint): cint
     {.importc: "vq_test_p12_chain_len_after_loads", cdecl.}
   proc vqTestEngineNewC(certFile, keyFile, certPem, keyPem, pkcs12File,
-                        keyPassword, host, hostCertFile,
-                        hostKeyFile: cstring): pointer
+                        keyPassword, host, hostCertFile, hostKeyFile,
+                        tlsCipherSuites: cstring): pointer
     {.importc: "vq_test_engine_new", cdecl.}
   proc vqTestEngineUsable(e: pointer): cint
     {.importc: "vq_test_engine_usable", cdecl.}
@@ -46,6 +46,10 @@ when not defined(plainHttp):
     {.importc: "vq_test_ticket_key_name", cdecl.}
   proc vqTestEngineNoTicket(e: pointer): cint
     {.importc: "vq_test_engine_no_ticket", cdecl.}
+  proc vqTestEngineServerPref(e: pointer): cint
+    {.importc: "vq_test_engine_server_pref", cdecl.}
+  proc vqTestEngineChaChaPref(e: pointer): cint
+    {.importc: "vq_test_engine_chacha_pref", cdecl.}
   proc vqTestTicketKeyCycle(): cint
     {.importc: "vq_test_ticket_key_cycle", cdecl.}
   proc vqTestTicketHandshake(a, b: pointer): cint
@@ -132,19 +136,20 @@ when not defined(plainHttp):
   let betaKey = dir / "beta.key"
 
   proc engineFromPem(cert, key: string, host = "", hostCert = "",
-                     hostKey = ""): pointer =
+                     hostKey = "", suites = ""): pointer =
     vqTestEngineNewC("".cstring, "".cstring, cert.cstring, key.cstring,
                      "".cstring, "".cstring, host.cstring, hostCert.cstring,
-                     hostKey.cstring)
+                     hostKey.cstring, suites.cstring)
 
   proc engineFromFiles(cert, key: string): pointer =
     vqTestEngineNewC(cert.cstring, key.cstring, "".cstring, "".cstring,
-                     "".cstring, "".cstring, "".cstring, "".cstring, "".cstring)
+                     "".cstring, "".cstring, "".cstring, "".cstring, "".cstring,
+                     "".cstring)
 
   proc engineFromP12(p12File: string): pointer =
     vqTestEngineNewC("".cstring, "".cstring, "".cstring, "".cstring,
                      p12File.cstring, "".cstring, "".cstring, "".cstring,
-                     "".cstring)
+                     "".cstring, "".cstring)
 
   proc subject(e: pointer): string =
     var buf = newString(512)
@@ -472,6 +477,74 @@ when not defined(plainHttp):
         check "certificate expired at" in $vqEngineLastError(e)
         check "localhost" in subject(e)
         check vqTestEngineUsable(e) == 1
+
+  suite "QUIC honours the operator's ciphersuite order (#375)":
+    ## SSL_OP_CIPHER_SERVER_PREFERENCE was never set anywhere, so OpenSSL picked
+    ## the first entry of the CLIENT's list that our tlsCipherSuites allowed:
+    ## the configured order was accepted, applied and then inverted by any
+    ## client that disagreed with it. tests/test_tls_cipher_order.nim proves the
+    ## option changes a real handshake; here it is the context bit, because a
+    ## QUIC client whose ciphersuite order we control is not something the Nim
+    ## test harness has.
+    test "the default context picks ciphersuites in the server's order":
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineServerPref(e) == 1
+
+    test "per-host contexts carry the bit too, at startup and after a reload":
+      # Defence in depth, not a runtime invariant: SSL_set_SSL_CTX does not
+      # re-read options, so an SNI connection is ordered by the copy SSL_new took
+      # from the DEFAULT context and the per-host bit never governs a handshake.
+      # Per-host contexts go through makeCtx via ctxConfig, so the bit is there;
+      # pinning it means a refactor that creates the SSL from a host context
+      # cannot silently drop the policy.
+      let e = engineFromPem(startCert, startKey, "api.example.com",
+                            dir / "api.pem", dir / "api.key")
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineHostCount(e) == 1
+      check vqTestEngineServerPref(e) == 1
+      check reloadSni(e, h1 = "web.example.com", c1 = dir / "web.pem",
+                      k1 = dir / "web.key")
+      check vqTestEngineHostCount(e) == 1
+      check vqTestEngineServerPref(e) == 1
+
+    test "an unconfigured ciphersuite list keeps the ChaCha courtesy":
+      # With tlsCipherSuites unset the order being enforced is OpenSSL's own
+      # (AES-256-GCM, ChaCha20, AES-128-GCM), not the operator's, so a client
+      # that puts ChaCha20-Poly1305 first -- the "no AES hardware" signal a
+      # phone sends -- still gets it. Without SSL_OP_PRIORITIZE_CHACHA such a
+      # client is moved onto software AES by a policy nobody wrote.
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineChaChaPref(e) == 1
+
+    test "a configured ciphersuite list withholds it":
+      # Now the order IS the operator's policy statement, so a ChaCha-first
+      # client must not be able to reorder it.
+      let e = engineFromPem(startCert, startKey, suites =
+        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineChaChaPref(e) == 0
+      check vqTestEngineServerPref(e) == 1
+
+    test "per-host contexts agree about the courtesy, configured or not":
+      # vq_test_engine_chacha_pref returns 2 when the default and per-host
+      # contexts disagree, which no configuration should produce.
+      let e = engineFromPem(startCert, startKey, "api.example.com",
+                            dir / "api.pem", dir / "api.key")
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineChaChaPref(e) == 1
+      let e2 = engineFromPem(startCert, startKey, "api.example.com",
+                             dir / "api.pem", dir / "api.key",
+                             suites = "TLS_CHACHA20_POLY1305_SHA256")
+      check e2 != nil
+      defer: vqEngineFree(e2)
+      check vqTestEngineChaChaPref(e2) == 0
 
   suite "the QUIC session-ticket key is process-wide and rotates (#382)":
     ## Each loop builds its own SSL_CTX, and OpenSSL mints a random ticket key

@@ -74,7 +74,8 @@ VqEngine *vq_test_engine_new(const char *cert_file, const char *key_file,
                              const char *cert_pem, const char *key_pem,
                              const char *pkcs12_file, const char *key_password,
                              const char *host, const char *host_cert_file,
-                             const char *host_key_file) {
+                             const char *host_key_file,
+                             const char *tls_cipher_suites) {
   VqConfig cfg{};
   cfg.cert_file = cert_file;
   cfg.key_file = key_file;
@@ -82,6 +83,10 @@ VqEngine *vq_test_engine_new(const char *cert_file, const char *key_file,
   cfg.key_pem = key_pem;
   cfg.pkcs12_file = pkcs12_file;
   cfg.key_password = key_password;
+  // "" means "leave it unset", which is what an operator who configured no
+  // ciphersuite list has: the #375 ChaCha courtesy turns on exactly there.
+  if (tls_cipher_suites && tls_cipher_suites[0])
+    cfg.tls_cipher_suites = tls_cipher_suites;
   VqSniCert sc{};
   if (host && host[0]) {
     sc.host = host;
@@ -200,6 +205,46 @@ void vq_test_ticket_key_name(char *buf, size_t len) {
 int vq_test_engine_no_ticket(VqEngine *eng) {
   auto *e = reinterpret_cast<Engine *>(eng);
   return (SSL_CTX_get_options(e->ssl_ctx.get()) & SSL_OP_NO_TICKET) ? 1 : 0;
+}
+
+// --- #375: the operator's tlsCipherSuites order is the server's preference --
+//
+// Non-zero if the default context, AND every per-host context, picks the TLS
+// 1.3 ciphersuite from OUR list's order rather than the client's. A QUIC client
+// cannot be made to disagree on cipher order from Nim (curl offers whatever its
+// TLS build offers), so the option bit is what is pinned; the TCP suite proves
+// the same option changes a real handshake's outcome.
+//
+// The per-host half is defence in depth, not a runtime invariant: SSL_set_SSL_CTX
+// does not re-read options, so an SNI connection is governed by the copy SSL_new
+// took from the DEFAULT context. The bit is checked on the host contexts anyway,
+// so a refactor that creates the SSL from a host context cannot silently lose
+// the policy.
+int vq_test_engine_server_pref(VqEngine *eng) {
+  auto *e = reinterpret_cast<Engine *>(eng);
+  if (!(SSL_CTX_get_options(e->ssl_ctx.get()) & SSL_OP_SERVER_PREFERENCE))
+    return 0;
+  for (const auto &c : e->sni_ctx)
+    if (!(SSL_CTX_get_options(c.get()) & SSL_OP_SERVER_PREFERENCE))
+      return 0;
+  return 1;
+}
+
+// ... and the ChaCha courtesy that rides along with it. Non-zero if the default
+// context, AND every per-host context, still lets a client whose own first
+// choice is ChaCha20-Poly1305 have it (SSL_OP_PRIORITIZE_CHACHA). Expected set
+// when the operator configured no tlsCipherSuites -- the order being enforced is
+// then only OpenSSL's built-in one, so there is no policy of theirs to defend --
+// and clear once they write a list. 2 if the two halves disagree, which is a
+// failure however it is read.
+int vq_test_engine_chacha_pref(VqEngine *eng) {
+  auto *e = reinterpret_cast<Engine *>(eng);
+  const int dflt =
+      (SSL_CTX_get_options(e->ssl_ctx.get()) & SSL_OP_PRIORITIZE_CHACHA) ? 1 : 0;
+  for (const auto &c : e->sni_ctx)
+    if (((SSL_CTX_get_options(c.get()) & SSL_OP_PRIORITIZE_CHACHA) ? 1 : 0) != dflt)
+      return 2;
+  return dflt;
 }
 
 // Bits:

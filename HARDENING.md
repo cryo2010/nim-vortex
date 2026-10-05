@@ -153,8 +153,8 @@ blasting (`tests/test_h3_udp_flood.nim` asserts it, with a 5 s bound).
 | `pkcs12File` / `pkcs12` / `keyPassword` | "" | PKCS#12 bundle and passphrase |
 | `minTlsVersion` | `V12` | Lowest accepted TLS version (`V12` or `V13`); 1.0/1.1 always refused; QUIC is always 1.3 |
 | `maxTlsVersion` | `None` (no cap) | Highest accepted TLS version; `V12` requires `http3 = false` (QUIC cannot negotiate below 1.3) |
-| `tlsCipherList` | "" | OpenSSL cipher list for TLS 1.2 ("" keeps OpenSSL's default); TCP only, no TLS 1.2 on QUIC |
-| `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default); applies to HTTP/1.1, HTTP/2 and HTTP/3 |
+| `tlsCipherList` | "" | OpenSSL cipher list for TLS 1.2 ("" keeps OpenSSL's default); the order is enforced as the **server's** preference order, not an unordered allow-set (still an allow-set: a client that cannot do the preferred entry connects on another); **lead with an ECDHE/DHE AEAD suite** -- the first mutually supported entry is now forced, and HTTP/2 clients refuse the non-AEAD suites RFC 7540 Appendix A blacklists, so a blacklisted lead is rejected at startup; TCP only, no TLS 1.2 on QUIC |
+| `tlsCipherSuites` | "" | OpenSSL cipher suites for TLS 1.3 ("" keeps OpenSSL's default); server preference order likewise, and likewise still an allow-set (a client that cannot do the preferred entry connects on another); every TLS 1.3 suite is AEAD, so there is no HTTP/2 blacklist to avoid here; applies to HTTP/1.1, HTTP/2 and HTTP/3 |
 | `verifyClient` | `None` | mTLS: `None` / `Optional` / `Require` client-cert policy; enforced on HTTP/1.1, HTTP/2 and HTTP/3 |
 | `clientCaFile` / `clientCaPem` | "" | CA to verify client certs against (**required** when `verifyClient != None`: a config with neither is rejected at startup, since it would verify against an empty trust store) |
 | `sni` | `@[]` | Per-hostname certificates (`SniCertEntry`, wildcard `*.example.com` supported); served on HTTP/1.1, HTTP/2 and HTTP/3 |
@@ -171,6 +171,42 @@ blasting (`tests/test_h3_udp_flood.nim` asserts it, with a 5 s bound).
 | `trustedProxies` | `@[]` | IPs/CIDRs allowed to supply a PROXY header, and whose `X-Forwarded-*` / RFC 7239 `Forwarded` headers `req.scheme` / `req.host` / `req.clientIp` will believe. Empty = a PROXY header is trusted from any direct peer (safe only if the listener isn't public), but forwarded **headers** are ignored entirely (fail-safe), so `req.clientIp` can't be spoofed without a configured proxy |
 | `decompressRequest` | `false` | Decode gzip/br/zstd request bodies, bounded by `maxBodySize` |
 | `compress` | `false` | gzip/brotli-compress eligible responses |
+
+Both cipher settings are enforced as the server's preference order
+(`SSL_OP_SERVER_PREFERENCE`, the same option bit OpenSSL < 3.5 spelled
+`SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first entry both ends support is what
+gets negotiated whatever order the client offered. Three consequences worth
+knowing before you write a list:
+
+- **It is wider than ciphers.** On OpenSSL 3.5+, which is the project minimum,
+  that one option means "when choosing a cipher, signature, (TLS 1.2) curve or
+  (TLS 1.3) group, use the server's preferences", so ECDH group, TLS 1.2 curve
+  and signature-algorithm selection follow the server's order too. There is no
+  cipher-only variant to ask for instead, and the wider policy is the one a
+  server wants. It costs no round trip: the server's group list is OpenSSL's
+  default unless an embedder configures one, and a client key share for the
+  server's preferred group is still used, so no extra HelloRetryRequest appears.
+- **An unconfigured list keeps the ChaCha courtesy.** With both settings empty
+  the operator stated no policy, and the order being enforced would just be
+  OpenSSL's built-in one (AES-256-GCM, ChaCha20, AES-128-GCM). A client that puts
+  ChaCha20-Poly1305 first is signalling that it has no AES hardware, so vortex
+  sets `SSL_OP_PRIORITIZE_CHACHA` in exactly that case and hands it ChaCha
+  instead of software AES, the way Go's `crypto/tls` and the BoringSSL-based
+  servers do by default. Everyone else still gets the server's order. Writing
+  *either* list withholds the courtesy, because then the order is a policy
+  statement a ChaCha-first client must not be able to reorder. One edge: QUIC
+  never sees `tlsCipherList`, so an operator who sets only that gets strict
+  server order on TCP for both TLS versions while HTTP/3, which has no TLS 1.2
+  to order, keeps the courtesy.
+- **A `tlsCipherList` that leads with a non-AEAD or non-ephemeral suite is
+  rejected at startup.** RFC 7540 Appendix A blacklists those for HTTP/2, and an
+  h2 client that is served one closes the connection with `INADEQUATE_SECURITY`.
+  Before the order was enforced such a list was quietly rescued by every real
+  client's own AEAD-first preference; now the server imposes it, so the
+  configuration is refused with the suite named instead. The screen looks only at
+  the suite that would actually be chosen, so AEAD-first lists with CBC
+  fallbacks further down are fine, and it is skipped when the version range
+  excludes TLS 1.2.
 
 TLS renegotiation is refused on every context (`SSL_OP_NO_RENEGOTIATION`), and
 there is no setting to allow it. A renegotiation is a full ECDHE key agreement

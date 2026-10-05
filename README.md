@@ -345,7 +345,27 @@ certificate and every host as they were.
 a client on 1.2. QUIC/HTTP/3 is always 1.3, so a 1.2 floor is raised to 1.3 there, and a 1.2
 *ceiling* needs `http3 = false` (the combination is refused rather than quietly ignored on
 HTTP/3). `tlsCipherSuites` (TLS 1.3) applies to both transports; `tlsCipherList` is TLS 1.2
-only, so HTTP/3 never consults it.
+only, so HTTP/3 never consults it. Both are preference *orders*, not unordered allow-sets:
+vortex sets `SSL_OP_SERVER_PREFERENCE` (the same option bit OpenSSL < 3.5 spelled
+`SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first entry both ends support is what gets
+negotiated, whatever order the client offers. They remain allow-*sets* as well: a client
+that cannot do the preferred entry still connects on another.
+
+On OpenSSL 3.5+ (the project minimum) the same option also makes ECDH group, TLS 1.2 curve
+and signature-algorithm selection follow the server's order; the server's group list is
+OpenSSL's default unless configured, and a client key share for the server's preferred group
+is still used, so no extra round trip appears. With *both* lists empty the operator
+configured no policy, so vortex also sets `SSL_OP_PRIORITIZE_CHACHA`: a client that offers
+ChaCha20-Poly1305 first (the "no AES hardware" signal) gets ChaCha rather than software AES,
+as Go's `crypto/tls` does, while everyone else still gets the server's order. Writing either
+list withholds that courtesy. QUIC never sees `tlsCipherList`, so setting only that one
+leaves HTTP/3 with the courtesy while TCP enforces strict order.
+
+One thing to get right in a `tlsCipherList`: **lead with an ECDHE/DHE AEAD suite.** The
+first mutually supported entry is now forced, and HTTP/2 clients refuse the non-AEAD and
+non-ephemeral suites RFC 7540 Appendix A blacklists (`INADEQUATE_SECURITY`). A list whose
+first TLS 1.2 suite is blacklisted is rejected at startup, naming the suite, instead of
+producing a server browsers cannot talk h2 to. CBC fallbacks further down the list are fine.
 
 **OCSP stapling**: hand clients a cached OCSP response in the handshake so they
 don't query the responder. Provide the DER bytes; vortex doesn't fetch OCSP
