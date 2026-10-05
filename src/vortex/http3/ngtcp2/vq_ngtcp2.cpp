@@ -24,6 +24,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1118,8 +1119,29 @@ static int servernameCb(SSL *ssl, int * /*al*/, void *arg) {
   return SSL_TLSEXT_ERR_OK;
 }
 
+// ngtcp2_crypto_ossl_init is a once-per-process initializer: it allocates an
+// OpenSSL ex_data index and parks it in a library-level global, and it is not
+// thread safe. vq_engine_new runs once per loop thread, concurrently, so
+// calling it there directly raced -- N-1 indices leaked, and a session
+// configured under index i could be read back under index j, which yields a
+// null crypto context and a failed handshake (#357). Run it exactly once and
+// hand every engine the same verdict, so a failure fails them all instead of
+// leaving some threads on a half-initialized backend.
+static std::once_flag gOsslInitOnce;
+static int gOsslInitRv = -1;
+static int gOsslInitRuns = 0;   // how many times the initializer actually ran
+                                // (the #357 invariant; see tests/vq_h3_tls_ctx.cpp)
+
+static bool osslInitOnce() {
+  std::call_once(gOsslInitOnce, [] {
+    gOsslInitRv = ngtcp2_crypto_ossl_init();
+    ++gOsslInitRuns;
+  });
+  return gOsslInitRv == 0;
+}
+
 VqEngine *vq_engine_new(const VqConfig *cfg) {
-  if (ngtcp2_crypto_ossl_init() != 0) return nullptr;
+  if (!osslInitOnce()) return nullptr;
   auto e = std::make_unique<Engine>();
   e->cfg = *cfg;
   e->key_pw = cfg->key_password ? cfg->key_password : "";

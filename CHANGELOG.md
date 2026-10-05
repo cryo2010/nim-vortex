@@ -596,6 +596,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a hook that ignores the bool still leaves a trace. Read the reason back with
   `server.lastTlsReloadError` / `vortex.lastTlsReloadError` (present and
   constant under `-d:plainHttp`); a successful reload clears it. (#378)
+- HTTP/3: the ngtcp2 ossl crypto backend is initialized exactly once per
+  process instead of once per QUIC engine. `ngtcp2_crypto_ossl_init` allocates
+  an OpenSSL `ex_data` index and parks it in a library-level global, and is
+  documented as a once-per-process, not-thread-safe initializer -- yet
+  `vq_engine_new` ran it on every loop thread as the loops came up, all at the
+  same time. Each extra call leaked an index, and while they raced a session
+  configured under one index could be read back under another, which yields a
+  null crypto context and a failed handshake: non-deterministic, only during
+  startup of a `numThreads > 1` server, and indistinguishable from a flaky
+  client. The initializer now runs under a `std::call_once` and every engine
+  sees the same verdict, so a failure fails them all rather than leaving some
+  loops on a half-initialized backend. (#357)
 
 ### Changed
 

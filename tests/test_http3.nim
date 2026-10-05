@@ -322,5 +322,25 @@ withServer(RequestHandler(handler),
       check rc == 0
       check ("h3=\":" & $srv.port & "\"") in output
 
+suite "HTTP/3 on a multi-threaded server (#357)":
+  ## Every loop thread builds its own QUIC engine, and vq_engine_new used to run
+  ## the ngtcp2 ossl backend's once-per-process initializer on each of them,
+  ## concurrently. That initializer is documented as once-per-process and is not
+  ## thread safe. The race itself cannot be provoked on demand (the once-only
+  ## invariant is pinned white-box in tests/test_h3_tls_ctx.nim); what this
+  ## covers is that a server with several loops starts and answers h3 on
+  ## whichever loop the kernel's SO_REUSEPORT hash hands each connection to.
+  test "four loops all start and serve h3":
+    var srv = newVortex(RequestHandler(handler),
+      initVortexConfig(numThreads = 4, workerThreads = 2, certFile = certFile,
+                       keyFile = keyFile, maxBodySize = 1024 * 1024)).start(0)
+    defer: srv.close()
+    let multiBase = "https://localhost:" & $srv.port
+    for i in 0 ..< 12:
+      let (output, rc) = helper.h3curl(h3curlBin,
+        "-w '|%{http_version}' " & multiBase & "/")
+      check rc == 0
+      check output == "hello h3|3"
+
 removeDir(certDir)
 echo "server shut down cleanly"
