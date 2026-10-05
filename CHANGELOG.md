@@ -67,22 +67,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and ENHANCE_YOUR_CALM for the cap, so a client can tell a server-side close
   from a network fault and retry what was never processed. (#342)
 - HTTP/2: the refused-`HEADERS` accounting that made a `REFUSED_STREAM` a
-  stream-level event (#242) is re-audited, and two paths that still skipped it
-  are fixed. A `HEADERS` on a half-closed(remote) stream reset the stream and
-  returned before the field block was buffered, so the block was never
-  HPACK-decoded (RFC 9113 4.3 and 5.1 both require decoding a block that is
-  discarded) and `contStream` was never set: a client that split that block
-  across a `CONTINUATION` had the whole connection taken down with
-  GOAWAY(PROTOCOL_ERROR), and its dynamic table desynced from the server's. And
-  a refusal on a stream the client had not finished (no `END_STREAM`) left the
-  id outside the racing-frame tolerance, so a trailer section already pipelined
-  behind it was a connection error rather than the `RST_STREAM` RFC 9113 5.1
-  asks for; the id is now remembered like a server-early-closed one. A `GOAWAY`
-  after the final one also no longer raises the last-stream-id already
-  announced, which RFC 9113 6.8 forbids and which advancing `lastStreamId` for
-  refused ids had made possible. A new frame-level suite covers the cap, the
-  self-dependency, the `CONTINUATION` and pipelined-frame cases, and the
-  dynamic-table entry a refused block adds. (#233)
+  stream-level event (#242) is re-audited, and three residual gaps are fixed. A
+  `HEADERS` on a half-closed(remote) stream reset the stream and returned before
+  the field block was buffered, so the block was never HPACK-decoded (RFC 9113
+  4.3 and 5.1 both require decoding a block that is discarded) and `contStream`
+  was never set: a client that split that block across a `CONTINUATION` had the
+  whole connection taken down with GOAWAY(PROTOCOL_ERROR), and its dynamic table
+  desynced from the server's. That same refusal is now charged to the
+  control-frame budget, as every other `RST_STREAM`-emitting refusal already was,
+  and the field block is captured from the receive buffer *before* the reset, so
+  the teardown callbacks it fires cannot move the buffer under the copy. Second,
+  a refusal on a stream the client had not finished (no `END_STREAM`) left the id
+  outside the racing-frame tolerance, so a trailer section already pipelined
+  behind it was a connection error rather than the `RST_STREAM` RFC 9113 5.1 asks
+  for; the id is now remembered like a server-early-closed one, except for a
+  self-dependency refusal, which is the client's own violation and so may not
+  churn that bounded window. Third, a `GOAWAY` sent after the final one no longer
+  raises the last-stream-id already announced, which RFC 9113 6.8 forbids and
+  which advancing `lastStreamId` for refused ids had made possible; a connection
+  error freezes the announced cutoff itself rather than relying on the parse loop
+  stopping. A new frame-level suite covers the cap, the self-dependency, the
+  `CONTINUATION` and pipelined-frame cases, the dynamic-table entry a refused
+  block adds, and -- over the real graceful drain, with the write side stalled --
+  the drain refusal and the frozen `GOAWAY` cutoff. (#233)
 - HTTP/1 streaming: every clear of a paused body read now releases the loop's
   paused-connection slot. A response applied from a worker or async completion
   while the read was still paused leaked the count and pinned that loop thread

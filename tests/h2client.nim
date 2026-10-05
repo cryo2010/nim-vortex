@@ -227,6 +227,20 @@ proc goawayError*(frames: seq[Frame]): int =
       return int(get32(f.payload, 4))
   -1
 
+proc goaways*(frames: seq[Frame]): seq[tuple[lastId: int, err: int]] =
+  ## Every GOAWAY in arrival order as (last-stream-id, error code). RFC 9113 6.8
+  ## forbids a later GOAWAY from naming a HIGHER last-stream-id than one already
+  ## sent, so checking that rule needs the whole sequence, not just the first.
+  for f in frames:
+    if f.typ == uint8(ftGoaway) and f.payload.len >= 8:
+      result.add (int(get32(f.payload, 0)), int(get32(f.payload, 4)))
+
+proc goawayLastStreamId*(frames: seq[Frame]): int =
+  ## Last-stream-id of the first GOAWAY, or -1 if there is none: the highest
+  ## stream this server processed, so a client may retry everything above it.
+  let gs = frames.goaways()
+  if gs.len == 0: -1 else: gs[0].lastId
+
 proc count*(frames: seq[Frame], typ: FrameType): int =
   for f in frames:
     if f.typ == uint8(typ): inc result
