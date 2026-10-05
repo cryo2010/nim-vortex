@@ -82,9 +82,27 @@ suite "PKCS#12 reload":
     # the key recorded during the ignored call.
     check not srv.reloadTls(certFile = dir / "rot.pem")
     check "localhost" in subject()
+    # ...and it says which configuration mistake it was. This used to clear the
+    # bundle fields and then fall into loadCertKey with an empty keyFile, whose
+    # reason was `cannot read private key : cannot open:`: a blank path and a
+    # blank OS reason, naming neither the key nor the bundle.
+    let certOnly = srv.lastTlsReloadError
+    check "certificate-only reload cannot replace a PKCS#12 bundle" in certOnly
+    check "cannot read private key" notin certOnly
     # Rotating both halves replaces the bundle and does take effect.
     check srv.reloadTls(certFile = dir / "rot.pem", keyFile = dir / "rotkey.pem")
     check "rotated.vortex" in subject()
+
+  test "material with no private key at all names what is missing":
+    # The same hole reached through the config rather than a reload: an empty
+    # key path is a configuration gap, not a file error, so readMaterialFile
+    # refuses it by name instead of asking the OS to open "".
+    var msg = ""
+    try:
+      discard tlstransport.newTlsConfig(cert, "")
+    except CatchableError as e:
+      msg = e.msg
+    check "no private key configured" in msg
 
 suite "mTLS":
   test "require: connection without a client cert is refused":

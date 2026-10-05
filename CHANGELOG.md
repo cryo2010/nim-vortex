@@ -707,6 +707,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the PEM loaders already did, so a rejected bundle, cipher string or protocol
   version is not reported with a leftover from unrelated OpenSSL work either.
   (#377, #388)
+- TLS: a certificate-only `reloadTls(certFile = ...)` against material that came
+  from a PKCS#12 bundle is rejected with a reason, the way the key-only case
+  already was. The bundle carries both halves, so clearing the bundle fields for
+  a lone certificate left no private key at all: the reload did fail, but its
+  reason was `cannot read private key : cannot open:` -- the path and the OS
+  reason both blank, naming neither the key nor the bundle. It is now refused
+  before anything is built, with `a certificate-only reload cannot replace a
+  PKCS#12 bundle: rotate certFile and keyFile together, or reconfigure with a
+  new bundle`, and an empty key or bundle path reaching the loader anywhere else
+  reports `no private key configured` rather than asking the OS to open `""`.
+  (#377, #378)
 
 ### Changed
 

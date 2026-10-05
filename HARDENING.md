@@ -230,8 +230,9 @@ A rejected reload says why. `server.lastTlsReloadError` (and
 returned false, "" after one that succeeded, and the same reason goes to stderr
 as a single `vortex: TLS reload failed: <reason>` line, so a deploy hook that
 ignores the bool still leaves a trace in the log. Every rejection is covered:
-unreadable or mismatched material, a key-only rotation against a PKCS#12
-bundle, contradictory OCSP arguments, an unreadable explicit `ocspFile`, and a
+unreadable or mismatched material, a certificate-only or key-only rotation
+against a PKCS#12 bundle (rotate both halves, or reconfigure with a new
+bundle), contradictory OCSP arguments, an unreadable explicit `ocspFile`, and a
 per-host certificate that fails to build (which names the host).
 
 Per-host (SNI) certificates rotate on the same call: each per-host context is

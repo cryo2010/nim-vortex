@@ -576,6 +576,13 @@ proc readMaterialFile(path, what: string): string =
   ## without this it surfaced as "unknown TLS error", the same lost-reason shape
   ## as a key the decoder rejected (#377). (A missing certFile is read by
   ## OpenSSL itself and already reports its own reason.)
+  ##
+  ## An empty path is a configuration hole, not a file error: `readFile("")`
+  ## produced `cannot read private key : cannot open:`, with the path and the OS
+  ## reason both blank, which is what a certificate-only reload against PKCS#12
+  ## material used to report. Say what is missing instead.
+  if path.len == 0:
+    raise newException(CatchableError, "no " & what & " configured")
   try: readFile(path)
   except CatchableError as e:
     raise newException(CatchableError,
@@ -928,6 +935,16 @@ proc reloadTlsConfig*(cfg: ptr TlsConfig, certFile = "", keyFile = "",
       newSniMaterial.add sc.material
   let p12Sourced = m.pkcs12.len > 0 or m.pkcs12File.len > 0
   if certFile.len > 0:
+    # The mirror image of the keyFile-only rejection below, and for the same
+    # reason: a PKCS#12 bundle carries both halves, so clearing the bundle
+    # fields for a lone certFile leaves no private key at all. That reached
+    # loadCertKey with an empty keyFile and reported `cannot read private key :
+    # cannot open:` -- a blank path and a blank OS reason, with nothing to say
+    # the bundle was the problem. Reject it before anything is built.
+    if keyFile.len == 0 and p12Sourced:
+      return reloadFailed(cfg, "a certificate-only reload cannot replace a " &
+        "PKCS#12 bundle: rotate certFile and keyFile together, or " &
+        "reconfigure with a new bundle")
     m.certFile = certFile; m.certPem = ""; m.pkcs12File = ""; m.pkcs12 = ""
   if keyFile.len > 0:
     # A key-only rotation cannot apply to a PKCS#12-sourced certificate: the
