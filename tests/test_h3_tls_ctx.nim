@@ -46,6 +46,8 @@ when not defined(plainHttp):
     {.importc: "vq_test_ticket_key_name", cdecl.}
   proc vqTestEngineNoTicket(e: pointer): cint
     {.importc: "vq_test_engine_no_ticket", cdecl.}
+  proc vqTestEngineServerPref(e: pointer): cint
+    {.importc: "vq_test_engine_server_pref", cdecl.}
   proc vqTestTicketKeyCycle(): cint
     {.importc: "vq_test_ticket_key_cycle", cdecl.}
   proc vqTestTicketHandshake(a, b: pointer): cint
@@ -472,6 +474,34 @@ when not defined(plainHttp):
         check "certificate expired at" in $vqEngineLastError(e)
         check "localhost" in subject(e)
         check vqTestEngineUsable(e) == 1
+
+  suite "QUIC honours the operator's ciphersuite order (#375)":
+    ## SSL_OP_CIPHER_SERVER_PREFERENCE was never set anywhere, so OpenSSL picked
+    ## the first entry of the CLIENT's list that our tlsCipherSuites allowed:
+    ## the configured order was accepted, applied and then inverted by any
+    ## client that disagreed with it. tests/test_tls_cipher_order.nim proves the
+    ## option changes a real handshake; here it is the context bit, because a
+    ## QUIC client whose ciphersuite order we control is not something the Nim
+    ## test harness has.
+    test "the default context picks ciphersuites in the server's order":
+      let e = engineFromPem(startCert, startKey)
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineServerPref(e) == 1
+
+    test "per-host contexts inherit it, at startup and after a reload":
+      # Per-host contexts go through makeCtx via ctxConfig, so a host added at
+      # startup or installed by a reload must not drift from the default one.
+      let e = engineFromPem(startCert, startKey, "api.example.com",
+                            dir / "api.pem", dir / "api.key")
+      check e != nil
+      defer: vqEngineFree(e)
+      check vqTestEngineHostCount(e) == 1
+      check vqTestEngineServerPref(e) == 1
+      check reloadSni(e, h1 = "web.example.com", c1 = dir / "web.pem",
+                      k1 = dir / "web.key")
+      check vqTestEngineHostCount(e) == 1
+      check vqTestEngineServerPref(e) == 1
 
   suite "the QUIC session-ticket key is process-wide and rotates (#382)":
     ## Each loop builds its own SSL_CTX, and OpenSSL mints a random ticket key

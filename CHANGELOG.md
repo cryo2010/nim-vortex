@@ -782,6 +782,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held only on a busy server, and a ticket minted at t=0 was still accepted at
   t=10h if no ticket had been issued in between. 0-RTT early data is not
   offered on any protocol and is unaffected. (#382)
+- TLS: `tlsCipherList` and `tlsCipherSuites` are now enforced as the server's
+  preference order. `SSL_OP_CIPHER_SERVER_PREFERENCE` was never set, so OpenSSL
+  walked the *client's* list and took the first entry the server also allowed:
+  the configured order was accepted, applied, and then silently inverted by any
+  client that disagreed with it. An operator writing
+  `"ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256"` to prefer AES-256
+  got AES-128 on every connection from every AES-128-first client. The option
+  governs TLS 1.3 ciphersuite selection as well as TLS 1.2 cipher selection, and
+  it is set on the QUIC context and every per-SNI context too, so HTTP/3 orders
+  `tlsCipherSuites` the same way HTTP/1.1 and HTTP/2 do. The lists are still
+  allow-sets: a client that cannot do the preferred entry still connects on
+  another one. `SSL_OP_PRIORITIZE_CHACHA` is deliberately not set, so a
+  ChaCha-first client cannot reorder the list back. (#375)
 
 ### Changed
 

@@ -345,7 +345,9 @@ certificate and every host as they were.
 a client on 1.2. QUIC/HTTP/3 is always 1.3, so a 1.2 floor is raised to 1.3 there, and a 1.2
 *ceiling* needs `http3 = false` (the combination is refused rather than quietly ignored on
 HTTP/3). `tlsCipherSuites` (TLS 1.3) applies to both transports; `tlsCipherList` is TLS 1.2
-only, so HTTP/3 never consults it.
+only, so HTTP/3 never consults it. Both are preference *orders*, not unordered allow-sets:
+vortex sets `SSL_OP_CIPHER_SERVER_PREFERENCE`, so the first entry both ends support is what
+gets negotiated, whatever order the client offers.
 
 **OCSP stapling**: hand clients a cached OCSP response in the handshake so they
 don't query the responder. Provide the DER bytes; vortex doesn't fetch OCSP

@@ -1242,6 +1242,16 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
   if (cfg->tls_cipher_suites && cfg->tls_cipher_suites[0] &&
       SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1)
     return fail("invalid TLS 1.3 cipher suites");
+  // That list is a preference order, not a set. Without
+  // SSL_OP_CIPHER_SERVER_PREFERENCE OpenSSL walks the CLIENT's ciphersuite list
+  // and takes the first entry we also allow, so tlsCipherSuites would be an
+  // unordered allow-set here and an ordered preference on TCP: the same
+  // configuration, two answers, depending only on which transport the client
+  // picked (#375). SSL_OP_NO_RENEGOTIATION has no counterpart to add -- QUIC is
+  // TLS 1.3 only and TLS 1.3 has no renegotiation. Every per-host (SNI) context
+  // is built by this same function via ctxConfig, so they inherit the option
+  // rather than needing it re-applied.
+  SSL_CTX_set_options(ctx.get(), SSL_OP_CIPHER_SERVER_PREFERENCE);
   // The ossl backend has no CTX-level configure; per-connection setup happens in
   // ngtcp2_crypto_ossl_configure_server_session(ssl) at accept time.
   SSL_CTX_set_alpn_select_cb(ctx.get(), alpnSelect, nullptr);

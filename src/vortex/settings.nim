@@ -160,9 +160,12 @@ type
     ocspResponse*: string     ## DER OCSP response to staple (in-memory bytes;
                               ## rotate at runtime via reloadTls(ocspResponse=...))
     tlsCipherList*: string    ## OpenSSL cipher list for TLS <= 1.2 ("" = default).
-                              ## TCP only: a QUIC handshake is never TLS 1.2
+                              ## TCP only: a QUIC handshake is never TLS 1.2.
+                              ## The order is the server's preference order and
+                              ## wins over the client's (#375)
     tlsCipherSuites*: string  ## OpenSSL cipher suites for TLS 1.3 ("" = default).
-                              ## Applies to HTTP/1.1, HTTP/2 and HTTP/3
+                              ## Applies to HTTP/1.1, HTTP/2 and HTTP/3, and its
+                              ## order is the server's preference order too
 
 proc initVortexConfig*(
     port = Port(8080),

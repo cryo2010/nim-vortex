@@ -202,6 +202,23 @@ int vq_test_engine_no_ticket(VqEngine *eng) {
   return (SSL_CTX_get_options(e->ssl_ctx.get()) & SSL_OP_NO_TICKET) ? 1 : 0;
 }
 
+// --- #375: the operator's tlsCipherSuites order is the server's preference --
+//
+// Non-zero if the default context, AND every per-host context, picks the TLS
+// 1.3 ciphersuite from OUR list's order rather than the client's. A QUIC client
+// cannot be made to disagree on cipher order from Nim (curl offers whatever its
+// TLS build offers), so the option bit is what is pinned; the TCP suite proves
+// the same option changes a real handshake's outcome.
+int vq_test_engine_server_pref(VqEngine *eng) {
+  auto *e = reinterpret_cast<Engine *>(eng);
+  if (!(SSL_CTX_get_options(e->ssl_ctx.get()) & SSL_OP_CIPHER_SERVER_PREFERENCE))
+    return 0;
+  for (const auto &c : e->sni_ctx)
+    if (!(SSL_CTX_get_options(c.get()) & SSL_OP_CIPHER_SERVER_PREFERENCE))
+      return 0;
+  return 1;
+}
+
 // Bits:
 //   1   the encrypt side succeeded
 //   2   the name it stamped decrypts (rv 1)

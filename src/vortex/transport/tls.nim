@@ -54,6 +54,7 @@ const
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
   SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
   SSL_OP_NO_RENEGOTIATION = uint64(1) shl 30   # <openssl/ssl.h> SSL_OP_BIT(30)
+  SSL_OP_CIPHER_SERVER_PREFERENCE = uint64(1) shl 22   # ditto, SSL_OP_BIT(22)
   SSL_SESS_CACHE_SERVER = clong(0x0002)
   CRYPTO_EX_INDEX_SSL_CTX = cint(1)   # ex_data class for SSL_CTX (crypto/ex_data)
 
@@ -705,7 +706,21 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   # a pre-3.0 libssl does not have, so state the policy here rather than
   # inherit it. OpenSSL answers a renegotiation attempt with a warning-level
   # no_renegotiation alert, leaving the connection usable.
-  discard SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION)
+  #
+  # Pick ciphers in the order the operator wrote them. Without
+  # SSL_OP_CIPHER_SERVER_PREFERENCE OpenSSL walks the *client's* list and takes
+  # the first entry we also allow, which turns tlsCipherList and
+  # tlsCipherSuites into unordered allow-sets: a list of
+  # "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256" is accepted,
+  # applied, and then silently inverted by any client that happens to put
+  # AES-128 first (#375). One option covers both, because OpenSSL runs TLS 1.2
+  # cipher selection and TLS 1.3 ciphersuite selection through the same
+  # ssl3_choose_cipher preference pick. The ordering is a policy statement, not
+  # a hint, so the server's list wins; we deliberately do NOT set
+  # SSL_OP_PRIORITIZE_CHACHA, which would let a ChaCha-first client reorder it
+  # again.
+  discard SSL_CTX_set_options(ctx,
+      SSL_OP_NO_RENEGOTIATION or SSL_OP_CIPHER_SERVER_PREFERENCE)
   if minProtoVersion != 0:
     if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION,
                     minProtoVersion, nil) != 1:
