@@ -1,9 +1,12 @@
 ## Minimal frame-level HTTP/2 client for security tests: connect, send the
-## preface, and build/inject individual frames (HEADERS, RST_STREAM, PING,
-## SETTINGS), then read and classify what the server sends back. Built on
-## src/vortex/http2/frames; requests use three static-table HPACK indexes
-## (:method GET / :scheme http / :path /) plus a literal :authority (RFC 9113
-## 8.3.1 requires one for http(s) schemes), so no encoder is needed.
+## preface, and build/inject individual frames (HEADERS, CONTINUATION,
+## RST_STREAM, PING, SETTINGS), then read and classify what the server sends
+## back. Built on src/vortex/http2/frames; requests use three static-table HPACK
+## indexes (:method GET / :scheme http / :path /) plus a literal :authority (RFC
+## 9113 8.3.1 requires one for http(s) schemes), so no encoder is needed. The
+## two hand-rolled HPACK primitives below (incremental indexing, indexed field)
+## are the exception: they exist so a suite can observe the server's dynamic
+## table across blocks.
 
 import std/[net, posix, oserrors]
 import vortex/http2/frames
@@ -119,6 +122,41 @@ proc addRequest*(buf: var string, sid: uint32,
   let flags = flagEndHeaders or (if endStream: flagEndStream else: 0'u8)
   buf.addFrameHeader(hb.len, ftHeaders, flags, sid)
   buf.add hb
+
+proc addRawHeaders*(buf: var string, sid: uint32, fragment: string,
+                    flags: uint8) =
+  ## HEADERS frame with an arbitrary (already HPACK-encoded) field-block fragment
+  ## and arbitrary flags: for a block that deliberately omits END_HEADERS (a
+  ## CONTINUATION follows), carries the PRIORITY flag (the 5-byte dependency
+  ## prefix belongs at the front of `fragment`), or moves the server's HPACK
+  ## dynamic table.
+  buf.addFrameHeader(fragment.len, ftHeaders, flags, sid)
+  buf.add fragment
+
+proc addContinuation*(buf: var string, sid: uint32, fragment: string,
+                      endHeaders = true) =
+  ## CONTINUATION frame carrying the rest of a field block (RFC 9113 6.10).
+  buf.addFrameHeader(fragment.len, ftContinuation,
+                     (if endHeaders: flagEndHeaders else: 0'u8), sid)
+  buf.add fragment
+
+proc addIndexedLiteral*(buf: var string, name, value: string) =
+  ## HPACK "literal header field with incremental indexing" (RFC 7541 6.2.1):
+  ## the peer's decoder MUST insert (name, value) at the front of its dynamic
+  ## table, so the entry is index 62 for every later block on the connection.
+  ## The project's encoder only emits literals without indexing, so the suites
+  ## that need the server's decoder state to actually move encode this by hand.
+  encodeInt(buf, 0, 6, 0x40)            # 01 pattern, new (literal) name
+  encodeInt(buf, name.len, 7, 0x00)     # H=0: raw
+  buf.add name
+  encodeInt(buf, value.len, 7, 0x00)
+  buf.add value
+
+proc addDynamicIndex*(buf: var string, index = 62) =
+  ## HPACK "indexed header field" (RFC 7541 6.1). 62 is the newest dynamic-table
+  ## entry, so a block using it decodes only if the peer decoded the block that
+  ## added it.
+  encodeInt(buf, index, 7, 0x80)
 
 proc addData*(buf: var string, sid: uint32, payload: string,
               endStream = false) =

@@ -112,6 +112,12 @@ type
     earlyClosed*: HashSet[uint32]
     earlyClosedQ*: Deque[uint32]
     goingAway*: bool          ## our own drain: final GOAWAY sent, refuse new streams
+    goawayLastId*: uint32     ## last-stream-id the final GOAWAY announced. RFC 9113
+                              ## 6.8 forbids RAISING that id in a later GOAWAY (the
+                              ## peer may already have retried everything above it
+                              ## elsewhere), and lastStreamId keeps advancing after
+                              ## the cutoff because a REFUSED id must advance it
+                              ## (#233), so every GOAWAY after the first repeats it.
     drainNoticeSent*: bool    ## initial GOAWAY(2^31-1) sent (graceful drain notice);
                               ## new/racing streams are still processed until the
                               ## final GOAWAY(lastStreamId) sets goingAway
@@ -283,8 +289,18 @@ proc sendOurSettings(c: ptr Connection) =
   if connGrow > 0:
     c.wbuf.addWindowUpdate(0, connGrow)
 
+proc goawayLast(h2: H2Conn): uint32 {.inline.} =
+  ## The last-stream-id to put in a GOAWAY. Normally the high-water mark, but once
+  ## the final GOAWAY has announced a cutoff it is frozen: RFC 9113 6.8 says an
+  ## endpoint MUST NOT increase the value it sends, because the peer may already
+  ## have retried every stream above it on another connection. lastStreamId does
+  ## keep moving after the cutoff -- a refused id must advance it so the frames
+  ## pipelined behind it are not read as frames on an idle stream (#233) -- so the
+  ## two have to be tracked separately.
+  if h2.goingAway: h2.goawayLastId else: h2.lastStreamId
+
 proc connError(h2: H2Conn, c: ptr Connection, err: uint32) =
-  c.wbuf.addGoaway(h2.lastStreamId, err)
+  c.wbuf.addGoaway(h2.goawayLast, err)
   c.closeAfterFlush = true
   c.state = csClosing
 
@@ -311,7 +327,8 @@ proc h2Goaway*(c: ptr Connection, err = errNoError) =
   let h2 = h2Conn(c)
   if h2 == nil or h2.goingAway: return
   h2.goingAway = true
-  c.wbuf.addGoaway(h2.lastStreamId, err)
+  h2.goawayLastId = h2.lastStreamId   # the cutoff; no later GOAWAY may exceed it
+  c.wbuf.addGoaway(h2.goawayLastId, err)
 
 proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe, raises: [].}
 
@@ -1672,8 +1689,19 @@ proc handleHeaders(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       h2.connError(c, errProtocol); return   # HEADERS while mid-request
     if h2.streams[sid].endStreamSeen:
       # HEADERS on a half-closed(remote) stream: RFC 9113 5.1 mandates a
-      # STREAM error STREAM_CLOSED, not a connection teardown (#239).
-      h2.streamError(c, sid, errStreamClosed); return
+      # STREAM error STREAM_CLOSED, not a connection teardown (#239). Reset it
+      # now -- that removes the stream, so the decode below cannot mistake this
+      # block for a trailer section -- but do NOT return: this is a refusal like
+      # the three in the `else` branch, so the field block still has to be
+      # buffered, tracked across CONTINUATION and HPACK-decoded (RFC 9113 4.3
+      # and 5.1 both require a block we discard to update the compression
+      # state), or the dynamic table desyncs and the client's mandatory
+      # CONTINUATION arrives with contStream == 0 and takes the whole
+      # connection down with GOAWAY(PROTOCOL_ERROR) (#233).
+      h2.streamError(c, sid, errStreamClosed)
+      if c.state == csClosing: return     # a teardown callback closed us out
+      # refuseErr stays 0: the RST is already on the wire, and the stream is now
+      # gone from the table, so finishHeaders decodes and dispatches nothing.
     # else: trailers (allowed); the deprecated priority flag is ignored
   elif sid <= h2.lastStreamId:
     if sid in h2.earlyClosed:
@@ -1700,6 +1728,19 @@ proc handleHeaders(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
         h2.activeStreams >= h2.maxConcurrentStreams:
       refuseErr = errRefusedStream
     h2.lastStreamId = sid
+    if refuseErr != 0 and (fh.flags and flagEndStream) == 0:
+      # We are about to reset a stream the client still believes it may write
+      # to, so the DATA and trailer section it already pipelined behind this
+      # HEADERS race our RST_STREAM. RFC 9113 5.1 requires an endpoint that sent
+      # RST_STREAM to minimally process and discard those frames (updating the
+      # header-compression state for a HEADERS among them) for a period, not to
+      # treat them as a violation. Record the id so the racing trailer section
+      # takes the earlyClosed branch above (decode, then RST_STREAM) instead of
+      # a GOAWAY that aborts every other request on the connection -- the
+      # HEADERS flavour of the pipelined-frame teardown in #233. An END_STREAM
+      # refusal needs no tolerance: the client has nothing left to send, so a
+      # later HEADERS on that id stays a connection error (#239).
+      h2.recordEarlyClosed(sid)
     if refuseErr == 0:
       h2.streams[sid] = H2Stream(
         sendWindow: h2.peerInitialWindow, contentLength: -1,
