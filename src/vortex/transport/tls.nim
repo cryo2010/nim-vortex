@@ -415,16 +415,24 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
   ## default ctx when none matches.
   ##
   ## Runs on a loop thread, and since #356 a reload replaces the per-host table
-  ## underneath it, so `cfg.ctxLock` covers the whole lookup rather than just
-  ## the ctx load. A reload swaps sniHosts/sniCtx/sniMaterial under that same
-  ## lock and releases the displaced ctxs only after it, which gives two things:
-  ## the host list we scan always matches the ctx array we index, and
-  ## SSL_set_SSL_CTX (which up-refs the ctx it is handed) takes a reference of
-  ## our own before the reload's release can turn into a destroy. The hold is a
-  ## scan of a handful of short host names plus one up-ref, once per handshake.
+  ## underneath it, so `cfg.ctxLock` covers the whole *lookup*: the host scan and
+  ## an up-ref of the ctx it picks. A reload swaps sniHosts/sniCtx/sniMaterial
+  ## under that same lock and releases the displaced ctxs only after it, which
+  ## gives two things: the host list we scan always matches the ctx array we
+  ## index, and we hold a reference of our own before the reload's release can
+  ## turn into a destroy.
+  ##
+  ## `SSL_set_SSL_CTX` runs *outside* the lock, because in OpenSSL 3 it is not a
+  ## pointer store: it `ssl_cert_dup`s the entire CERT of the ctx it is handed
+  ## (an allocation plus an up-ref per chain entry and per key slot) and frees
+  ## the connection's old one. `acquireCtx` takes this same lock on every
+  ## accept, so holding it across that call serialised every loop's accept path
+  ## behind one SNI handshake's certificate duplication. The call up-refs the
+  ## ctx itself, so our own reference is dropped immediately afterwards.
   let cfg = cast[ptr TlsConfig](arg)
   let name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)
   if name != nil:
+    var hostCtx: SslCtxPtr = nil
     acquire(cfg.ctxLock)
     var idx = -1
     for i in 0 ..< cfg.sniHosts.len:
@@ -432,8 +440,13 @@ proc servernameCb(ssl: SslPtr, al: ptr cint, arg: pointer): cint {.cdecl.} =
     if idx < 0:
       for i in 0 ..< cfg.sniHosts.len:
         if wildMatch(name, cfg.sniHosts[i]): idx = i; break
-    if idx >= 0: discard SSL_set_SSL_CTX(ssl, cfg.sniCtx[idx])
+    if idx >= 0:
+      hostCtx = cfg.sniCtx[idx]
+      discard SSL_CTX_up_ref(hostCtx)   # ours until the swap takes its own
     release(cfg.ctxLock)
+    if hostCtx != nil:
+      discard SSL_set_SSL_CTX(ssl, hostCtx)
+      SSL_CTX_free(hostCtx)
   SSL_TLSEXT_ERR_OK
 
 proc ocspExFree(parent, p: pointer, ad: pointer, idx: cint,

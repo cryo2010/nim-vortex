@@ -718,6 +718,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new bundle`, and an empty key or bundle path reaching the loader anywhere else
   reports `no private key configured` rather than asking the OS to open `""`.
   (#377, #378)
+- TLS: an SNI handshake no longer serialises every loop's accept path. The
+  servername callback held the config's context lock across `SSL_set_SSL_CTX`,
+  which in OpenSSL 3 is not a pointer store: it duplicates the entire CERT of
+  the context it is handed (an allocation plus an up-ref per chain entry and per
+  key slot) and frees the connection's old one. `acquireCtx` takes that same
+  lock on every accept, so every accepted connection on every loop thread
+  queued behind each SNI handshake's certificate duplication. The lock now
+  covers only the host scan and an up-ref of the chosen context -- which is what
+  keeps a concurrent reload from releasing it -- while the switch itself runs
+  outside the lock and the callback's own reference is dropped straight
+  afterwards. (#356)
 
 ### Changed
 

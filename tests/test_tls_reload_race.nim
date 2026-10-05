@@ -143,9 +143,13 @@ removeDir(bdir)
 # servernameCb reads the per-host table (host names, contexts) on a loop thread
 # and hands one of those contexts to SSL_set_SSL_CTX. Since #356 a reload
 # replaces that whole table and releases the displaced contexts straight
-# afterwards, so the callback holds `ctxLock` across the lookup: without it a
-# handshake could scan a host list that no longer matches the context array it
-# indexes, or have its chosen context freed between the load and the up-ref.
+# afterwards, so the callback holds `ctxLock` across the lookup and the up-ref
+# of the context it picks: without it a handshake could scan a host list that no
+# longer matches the context array it indexes, or have its chosen context freed
+# between the load and the up-ref. SSL_set_SSL_CTX itself runs outside the lock
+# (it duplicates the whole CERT, which would serialise every loop's accept path
+# behind it), so the reference the callback takes for itself is what keeps the
+# context alive across that call.
 # Like the tests above this cannot be asserted directly: hammer it, require
 # every reload to succeed and the right certificate to come back, and let
 # NIM_SANITIZE=1 turn a use-after-free into an abort.
