@@ -72,6 +72,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   short default for `mixed` -- and an explicit `VORTEX_STREAM_BYTES` from the
   caller still wins everywhere. (#394)
 
+- Tests: `test_h3_idle_keepalive` now pins the server's half of the h3
+  keep-alive, not just the transport parameter it is derived from. The suite
+  passed with the `ngtcp2_conn_set_keep_alive_timeout` arming deleted from the
+  shim, because curl's own QUIC stack sends keep-alive PINGs and a received
+  packet refreshes our idle timer (RFC 9000 10.1) whether we send anything or
+  not -- so the one thing the suite existed to protect was the one thing it
+  could not see, and only the h3 stress cells (driven by aioquic, which does not
+  PING) would have caught a regression. The shim grows a test-only observation
+  hook behind `-d:vortexH3FrameLog` (`tests/test_h3_idle_keepalive.nims` sets
+  it): ngtcp2's frame logger is installed, the PING frames we *transmit* in a
+  packet that carries no ACK are counted into an atomic, and `ngPingsSent()`
+  reads it back -- with the PINGs that rode *with* an ACK counted apart, as
+  `ngPingsSentWithAck()`, so an undercounted run can be told from a connection
+  that never armed a keep-alive at all. Frame lines are matched positionally
+  (`frm` and `tx` and the frame name in their fixed token slots) rather than by
+  substring, because a peer-controlled `CONNECTION_CLOSE` reason string is
+  logged verbatim. The ACK-less condition is what makes the number a keep-alive
+  pin: ngtcp2 also appends a PING to a packet that would otherwise be
+  non-ack-eliciting, which answering the client's keep-alives produces two of
+  per quiet gap, and path-MTU probes are padded PINGs (that build turns PMTUD
+  off as well, so nothing in the suite pins a PMTUD interaction). What is left
+  is a lower bound on keep-alives -- one that fires while an ACK is pending
+  rides in that packet and is not counted -- and an upper bound once PTO probes,
+  ACK-less too, are included. So the slow-exchange test now also asserts >= 3
+  transmitted ACK-less PINGs across the 9 s `/slow` gap (six are observed, one
+  per `keepAliveTimeout / 3`, while a PTO burst is two), and a fast exchange is
+  held to <= 2; both print their counts and the gap through `checkpoint` for
+  triage. Deleting the arming fails the former with zero. A normal build is
+  untouched: no log callback is installed, the counters read 0 and ngtcp2's
+  logging stays off, and the suite skips in the zero-dependency `plainHttp`
+  build like its h3 siblings. (#347)
+
 ### Fixed
 
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no

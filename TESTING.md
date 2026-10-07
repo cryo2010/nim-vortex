@@ -103,6 +103,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | Test | Verifies |
 |------|----------|
 | `test_http3.nim` | HTTP/3 integration over QUIC (via an HTTP/3-capable curl; skips if absent), including a streaming route's declared `content-length` against the body received |
+| `test_h3_idle_keepalive.nim` | `keepAliveTimeout` reaches the QUIC transport parameters, a narrow idle window neither breaks a normal exchange nor truncates a slower-than-idle one, and the server itself PINGs through the quiet gap (>= 3 ACK-less transmitted PINGs, six observed; a fast exchange is held to <= 2) -- counted with the shim's `-d:vortexH3FrameLog` frame-log hook, which the suite's `.nims` sidecar switches on. The count is a lower bound on keep-alives (one coalesced with an ACK is counted apart) and an upper bound including PTO probes (#347) |
 
 ### WebSockets
 

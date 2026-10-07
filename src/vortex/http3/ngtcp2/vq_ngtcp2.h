@@ -287,6 +287,31 @@ void *vq_conn_ssl(VqConn *conn);
  * truncated and dropped (#380). */
 size_t vq_max_recv_udp_payload(void);
 
+/* ACK-less PING frames this process has TRANSMITTED, across every engine
+ * (every loop thread) since start, or 0 in a normal build. Monotonically
+ * increasing: nothing ever decrements it, so two readings can be subtracted.
+ *
+ * A test-only observation hook: the counter is fed by an ngtcp2 frame-log
+ * callback that the shim installs ONLY when compiled with -DVQ_FRAME_LOG (Nim:
+ * -d:vortexH3FrameLog). It counts a transmitted PING only when the packet
+ * carrying it has no ACK in it, which is what separates the keep-alive from the
+ * PING ngtcp2 appends to an otherwise non-ack-eliciting packet; that build also
+ * disables path-MTU discovery, whose probes are padded PINGs. So this is a
+ * LOWER bound on keep-alives (one that fires while an ACK is pending rides in
+ * that packet and is not counted) and an UPPER bound once PTO probes -- also
+ * ACK-less -- are included. Without the define no callback is installed,
+ * nothing counts, and this returns 0: a pin for the keep-alive the shim arms
+ * per connection, not a production metric (#347). */
+uint64_t vq_ping_tx_count(void);
+
+/* The other half of the same hook: transmitted PINGs that rode in a packet
+ * which also carried an ACK, and so were NOT counted by vq_ping_tx_count. Most
+ * are the PING ngtcp2 appends to an otherwise non-ack-eliciting packet, but a
+ * keep-alive that fired with an ACK pending lands here too, which is why a test
+ * prints it -- it tells an undercounted run from a run with no keep-alive at
+ * all. Same build rules, same monotonicity, 0 in a normal build (#347). */
+uint64_t vq_ping_tx_with_ack_count(void);
+
 #ifdef __cplusplus
 }
 #endif
