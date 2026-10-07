@@ -1,25 +1,38 @@
 #!/bin/sh
-# Per-workload stress soak (pass/fail). Builds the vortex server (protocol ×
-# server-runtime) and a Python load client, drives ONE workload
-# (VORTEX_WORKLOAD) at the server for VORTEX_SECONDS, and verifies it: checksums
-# and echoes **hard-fail** (the client's non-zero exit propagates out). Responses
-# are discarded, so memory stays flat; the server's CPU/RSS is printed each
+# Stress soak (pass/fail). Builds the vortex server (protocol × server-runtime)
+# and a Python load client, drives the chosen workload (VORTEX_WORKLOAD) at the
+# server for VORTEX_SECONDS, and verifies it: checksums and echoes **hard-fail**
+# (the client's non-zero exit propagates out). Responses are discarded, so
+# memory stays flat; the server's CPU/RSS is printed each
 # VORTEX_REPORT_SECONDS. Not a CI gate (Docker, long runtimes, big transfers).
+#
+# One workload per cell, except VORTEX_WORKLOAD=mixed, which drives all five at
+# one server at the same time (see the client's w_mixed and VORTEX_MIX).
 #
 # Usage:  VORTEX_WORKLOAD=streamdownload sh conformance/stress/run.sh
 #         (normally via `nimble stressRequests` / `stressWs` / `stressSse` /
-#          `stressStreamUpload` / `stressStreamDownload`, or `nimble stress`)
+#          `stressStreamUpload` / `stressStreamDownload` / `stressMixed`, or
+#          `nimble stress`)
 # Needs: docker.
 #
 # Env (mirrors nim-navi's NAVI_*):
-#   VORTEX_WORKLOAD  requests | ws | sse | streamupload | streamdownload
+#   VORTEX_WORKLOAD  requests | ws | sse | streamupload | streamdownload |
+#                    mixed (all five at once)
+#   VORTEX_MIX       mixed only: the worker split, e.g.
+#                    requests=40,ws=20,sse=20,streamupload=10,streamdownload=10
+#                    (the default); 0 drops a workload from the cell
 #   VORTEX_PROTO     h1 | h2 | h3 | all           (default h2; all = h1 h2 h3)
 #   VORTEX_SERVER    sync | async | async-await | chronos | chronos-await | all
 #   VORTEX_SECONDS / VORTEX_REPORT_SECONDS / VORTEX_CONCURRENCY / VORTEX_CLIENTS
 #   VORTEX_REQ_COMPRESSION / VORTEX_RESP_COMPRESSION   none | gzip | br | zstd
-#   VORTEX_STREAM_BYTES   streaming transfer size (default 1 GiB for a run of
-#                    VORTEX_SECONDS >= 300, else 64 MiB: a 1 GiB h3 transfer
-#                    takes ~125-163 s and cannot finish in a short smoke)
+#   VORTEX_STREAM_BYTES   streaming transfer size. Default 1 GiB for a run of
+#                    VORTEX_SECONDS >= 1200, else 64 MiB: a 1 GiB h3 transfer
+#                    takes ~125-163 s and cannot finish in a short smoke.
+#                    `mixed` follows the same rule at its own measured sizes,
+#                    16 MiB and 2 MiB, because its streaming slices share a
+#                    client event loop with 30 request/ws/sse workers (see the
+#                    sbytes block below). An explicit value always wins, and
+#                    `nimble stress` inlines a per-cell smoke size.
 #   VORTEX_RUN_ID    isolation id for the docker network/container/image names,
 #                    so runs can go in parallel (default: this run's PID)
 #   VORTEX_CHAOS     none | all | CSV of slowread,slowwrite,idle,abort,vanish
@@ -33,7 +46,7 @@
 #   VORTEX_CHAOS_GATE_SECONDS  how long to wait for the sidecar's fd baseline
 #                    before giving up on the cell (default 180; see run_cell)
 #   VORTEX_CHAOS_DRAIN_SECONDS how long to wait for the sidecar to exit after
-#                    the canary passed (default 90; see run_cell)
+#                    the canary passed (default 150; see run_cell)
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -52,29 +65,110 @@ clients=${VORTEX_CLIENTS:-3}
 reqc=${VORTEX_REQ_COMPRESSION:-gzip}
 respc=${VORTEX_RESP_COMPRESSION:-gzip}
 
-# Streaming transfer size, used by streamupload / streamdownload. An explicit
-# VORTEX_STREAM_BYTES ALWAYS wins; with none set the default is scaled by the
-# run length, because the 1 GiB soak default cannot complete even ONE transfer
-# in a short run. Measured: 125 s per transfer on streamupload h3 and 163 s on
-# streamdownload h3, versus 4-15 s on h1/h2 (the only reason those cells ever
-# passed). So `VORTEX_SECONDS=10 nimble stressStreamUpload` abandoned every
-# transfer at the deadline, counted none, and reported
+# Reject a non-integer VORTEX_SECONDS / VORTEX_STREAM_BYTES HERE, before the
+# `-lt` comparison and fmt_stream's `$(( ))` below reach it. Under `set -eu`
+# both abort the script with a bare `arithmetic syntax error` / `bad number`
+# from /bin/sh, naming neither the knob nor the value -- and `VORTEX_SECONDS=2h`
+# (a perfectly natural way to write "two hours") is exactly the shape that
+# produces it. Fail fast and say which knob, before any docker build burns
+# minutes on a run that cannot size itself.
+#
+# The message goes to STDOUT, not stderr: the harness is driven as
+# `nimble stress | tee stress.log`, which tees stdout only, so a config error on
+# stderr never reaches the archived log and the run looks like it simply died
+# (the same reason the clients print their causes on stdout -- #387).
+need_uint() {
+  case "$2" in
+    ''|*[!0-9]*)
+      echo "$1 must be a non-negative integer (got '$2')"
+      exit 2 ;;
+  esac
+}
+need_uint VORTEX_SECONDS "$seconds"
+if [ -n "${VORTEX_STREAM_BYTES:-}" ]; then
+  need_uint VORTEX_STREAM_BYTES "$VORTEX_STREAM_BYTES"
+fi
+
+# Streaming transfer size, used by streamupload / streamdownload / mixed. An
+# explicit VORTEX_STREAM_BYTES ALWAYS wins; with none set the default is scaled
+# by the run length, because the 1 GiB soak default cannot complete even ONE
+# transfer in a short run. Measured: 125 s per transfer on streamupload h3 and
+# 163 s on streamdownload h3, versus 4-15 s on h1/h2 (the only reason those
+# cells ever passed). So `VORTEX_SECONDS=10 nimble stressStreamUpload` abandoned
+# every transfer at the deadline, counted none, and reported
 # `FAIL streamupload: no successful iterations` with nothing wrong on either
 # side -- a sizing accident that reads as a server defect (#393).
 #
 # Counting iterations needs a comfortable MULTIPLE of one transfer time, not a
-# bare one: 300 s is a little under 2x the slowest measured h3 transfer on an
-# idle host, and these soaks are deliberately run oversubscribed where a
-# transfer can take several times its measured best. At or above that the
-# default stays 1 GiB (a real soak, where the big transfer is the point);
-# below it the default drops to 64 MiB, which is exactly what the `nimble
-# stress` smoke already passes explicitly and what passes on all three
-# protocols in a 10 s cell.
+# bare one, so the threshold is 1200 s: about 7x the slowest measured h3
+# transfer (163 s on streamdownload) on an IDLE host. The multiple is the whole
+# point of the knob -- these soaks are deliberately run oversubscribed (the
+# matrix fans 8+ cells at one host, where load averages of 20-50 are normal and
+# a transfer takes several times its measured best), and a run that completes
+# one or two transfers has measured almost nothing even when it technically
+# passes. 300 s, the first cut at this, was 1.84x the measured worst case: under
+# its own stated requirement, and an h3 cell at 1.5x host contention would still
+# have failed on a size the harness chose for it. At or above 1200 s the default
+# stays 1 GiB (a real soak, where the big transfer is the point); below it the
+# default drops to 64 MiB, which is exactly what the `nimble stress` smoke has
+# always passed explicitly and what passes on all three protocols in a 10 s
+# cell.
+#
+# `mixed` follows the SAME duration rule at its own, much smaller pair of sizes.
+# 64 MiB and 1 GiB are both far too big for it, because a mixed cell's streaming
+# slices share ONE python event loop with 30 request/ws/sse workers that between
+# them drive ~900 echoes/s, ~1900 ws messages/s and ~24000 SSE events/s. The
+# download slice gets whatever loop time is left.
+#
+# MEASURED, h3 + sync server, 10 s, 3x32, chaos on, one upload and one download
+# transfer in flight per client (3 each per cell):
+#
+#   size     up xfers   down xfers   download bytes moved
+#   64 MiB      0           0            6.6 MB
+#   32 MiB      0           0            6.2 MB
+#   16 MiB      0           0            6.3 MB
+#    8 MiB      0           0            5.9 MB
+#    4 MiB      4           0            6.8 MB
+#    2 MiB      6           3            PASS (6 MB, all verified)
+#
+# The download figure barely moves across a 32x range of body sizes: aggregate
+# download throughput in a mixed h3 cell is ~0.6 MB/s over the three in-flight
+# transfers, i.e. ~0.2 MB/s each, essentially INDEPENDENT of the body size. So
+# the ceiling is per-stream bandwidth under a saturated client loop, not
+# per-transfer overhead, and the largest body finishing inside a 10 s cell is
+# 2 MiB (~10 s per download; uploads are ~2x faster, since aioquic buffers the
+# body and the server drains it). For scale, the DEDICATED h3 download cell on
+# the same host moves 42 MB/s -- ~70x -- so what mixed is short of is client
+# loop time, not server or network. h1 and h2 are one to two orders of magnitude
+# cheaper per transfer and pass far above this; h3 sets the default.
+#
+# The long default is 16 MiB, also measured: a 300 s h3 mixed cell completed 9
+# downloads and 35 uploads, the downloads landing in three clean rounds of three
+# at t=90s, t=181s and t=272s -- ~90 s per 16 MiB download (uploads ~25 s). That
+# leaves ~13x margin at the 1200 s threshold, the same kind of comfortable
+# multiple the 1 GiB/64 MiB pair gets, on a host that is routinely
+# oversubscribed. 32 MiB extrapolates to ~180 s per download, under 7x; it
+# clears the bar on paper and nothing else, so it is not the default. 1 GiB at
+# this rate is ~90 MINUTES per transfer and is simply not a mixed size.
+#
+# A mixed cell is about the INTERACTION between the five workloads, and 16 MiB
+# is a long transfer next to short requests and a real bulk buffer on the
+# server's write path, which is what #394 was filed to exercise. For a
+# bigger-transfer mixed soak set VORTEX_STREAM_BYTES explicitly and give it the
+# seconds to match -- margin comes from VORTEX_SECONDS, not from a smaller body.
 stream_long=1073741824          # 1 GiB: the real-soak default
 stream_short=67108864           # 64 MiB: short-run default
-stream_long_seconds=300         # below this, a 1 GiB h3 transfer cannot finish
+stream_mixed_long=16777216      # 16 MiB: mixed, real soak (see above)
+stream_mixed_short=2097152      # 2 MiB:  mixed, short run (see above)
+stream_long_seconds=1200        # below this, 1 GiB leaves no margin on h3
 if [ -n "${VORTEX_STREAM_BYTES:-}" ]; then
   sbytes="$VORTEX_STREAM_BYTES"
+elif [ "$workload" = mixed ]; then
+  if [ "$seconds" -lt "$stream_long_seconds" ]; then
+    sbytes="$stream_mixed_short"
+  else
+    sbytes="$stream_mixed_long"
+  fi
 elif [ "$seconds" -lt "$stream_long_seconds" ]; then
   sbytes="$stream_short"
 else
@@ -120,19 +214,35 @@ chaosdrain="${VORTEX_CHAOS_DRAIN_SECONDS:-150}"
 id="${VORTEX_RUN_ID:-$$}"
 export VORTEX_RUN_ID="$id"
 
-# The `stress` smoke runs every workload, short, and fails on any.
+# The `stress` smoke runs every workload, short, and fails on any: the five
+# single-workload cells plus `mixed`, which drives all five at one server at
+# once. `mixed` is in the loop because it is the cell most likely to catch a
+# regression the others miss (cross-workload interaction), and it costs one more
+# short cell per matrix entry (#394).
 #
-# The re-exec below passes the environment through untouched, so each cell
-# resolves VORTEX_STREAM_BYTES itself from the same VORTEX_SECONDS (and an
-# explicit VORTEX_STREAM_BYTES, which `nimble stress` always sets, is inherited
-# verbatim). Nothing is exported here on purpose: the default is per-workload
-# (see the sbytes block above), and exporting the parent's answer would freeze
-# every cell at it.
+# Each cell is re-exec'd with the PER-CELL smoke size inlined, and the rule is
+# exactly this: the five single-workload cells run at $stream_short (64 MiB) at
+# ANY duration, and the mixed cell at $stream_mixed_short, unless the CALLER set
+# VORTEX_STREAM_BYTES, which wins everywhere as always (`${VAR:-default}` below,
+# evaluated in this shell, so one explicit value still reaches every cell).
+#
+# 64 MiB at any duration is `nimble stress`'s historical behaviour, kept
+# deliberately: the smoke's job is to prove every workload still works end to
+# end, in minutes, and it is run at longer durations too (`VORTEX_SECONDS=600
+# nimble stress`) without becoming a 1 GiB soak by accident. Letting each cell
+# fall through to the duration-scaled default would do exactly that above
+# $stream_long_seconds. The mixed cell cannot use 64 MiB at all (see the sbytes
+# block above), which is why this is per cell rather than one exported value.
 if [ "${STRESS_SMOKE:-0}" = "1" ]; then
   rc=0
-  for w in requests ws sse streamupload streamdownload; do
+  for w in requests ws sse streamupload streamdownload mixed; do
+    case "$w" in
+      mixed) wbytes="$stream_mixed_short" ;;
+      *)     wbytes="$stream_short" ;;
+    esac
     echo; echo "########## smoke: $w ##########"
-    STRESS_SMOKE=0 VORTEX_WORKLOAD="$w" sh "$0" || rc=1
+    STRESS_SMOKE=0 VORTEX_WORKLOAD="$w" \
+      VORTEX_STREAM_BYTES="${VORTEX_STREAM_BYTES:-$wbytes}" sh "$0" || rc=1
   done
   echo
   [ "$rc" = 0 ] && echo "== stress smoke: all workloads passed ==" \
@@ -194,8 +304,20 @@ codec_flags() {
 # the size is now a default that depends on VORTEX_SECONDS and the workload
 # (see the sbytes block above), so reading it back out of the log is the only
 # way to tell a 64 MiB smoke from a 1 GiB soak after the fact (#393).
+#
+# Never emits an EMPTY segment: `stream=` with nothing after it would read as a
+# harness bug in the one line that exists to record the size, and `$(( ))` on a
+# non-integer would abort the cell outright under `set -eu`. need_uint above
+# already rejects a bad VORTEX_STREAM_BYTES, so this arm is the belt to that
+# braces -- it fires only if a future caller routes some other value here.
 fmt_stream() {
-  if [ $(( $1 % 1048576 )) = 0 ]; then echo "$(( $1 / 1048576 ))MiB"; else echo "${1}B"; fi
+  case "${1:-}" in
+    ''|*[!0-9]*) echo "'${1:-}'(not a byte count)"; return ;;
+  esac
+  if [ "$1" = 0 ]; then echo "0B"
+  elif [ $(( $1 % 1048576 )) = 0 ]; then echo "$(( $1 / 1048576 ))MiB"
+  else echo "${1}B"
+  fi
 }
 
 run_cell() {
@@ -208,7 +330,7 @@ run_cell() {
   # banner so anything matching the existing prefix still matches.
   sbanner=""
   case "$workload" in
-    streamupload|streamdownload) sbanner=", stream=$(fmt_stream "$sbytes")" ;;
+    streamupload|streamdownload|mixed) sbanner=", stream=$(fmt_stream "$sbytes")" ;;
   esac
   echo
   echo "=== $workload [proto=$p server=$s] : ${seconds}s, ${clients}x${conc}${sbanner} ==="
@@ -271,6 +393,7 @@ run_cell() {
     -e STRESS_BASE="$scheme://server:$port" \
     -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
     -e VORTEX_CONCURRENCY="$conc" -e VORTEX_CLIENTS="$clients" \
+    -e VORTEX_MIX="${VORTEX_MIX:-}" \
     -e VORTEX_REQ_COMPRESSION="$reqc" -e VORTEX_RESP_COMPRESSION="$respc" \
     -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" 2>&1
   crc=$?

@@ -4,7 +4,7 @@ description: >-
   Start and monitor a vortex Dockerized stress soak from a plain-English prompt, fanning the
   protocol × server matrix out to one parallel opus agent per cell.
   prompt (string): stress run details. Understood hints:
-  workload = requests|websockets|sse|stream upload|stream download;
+  workload = requests|websockets|sse|stream upload|stream download|mixed;
   protocol = h1|h2|h3|all; server = sync|async|async-await|chronos|chronos-await|all;
   duration = e.g. "8 hours", "30m", "90s"; plus optional clients/concurrency/compression/stream bytes.
   Example: "/vortex-stress Stress websockets for 8 hours over all protocols on the chronos server".
@@ -35,19 +35,22 @@ cell and not the total time of all cells. Rely on harness defaults for everythin
 | sse, server-sent, events | `stressSse` |
 | upload, stream up | `stressStreamUpload` |
 | download, stream down | `stressStreamDownload` |
+| mixed, all workloads at once, interaction, cross-workload | `stressMixed` |
 | (unspecified) | `stress` |
 
 Follow the described **workload**, not any task name the user happens to type. "Stress
 websockets" → `stressWs` even if the user wrote `stressRequests`. (`nimble stress` runs a short
-smoke of all five; use it only if the prompt clearly asks for an all-workloads smoke.)
+smoke of all six, `mixed` included; use it only if the prompt clearly asks for an all-workloads
+smoke. `stressMixed` is different: it drives all five workloads at ONE server at the same time,
+for the full duration, which is the soak that finds cross-workload interactions.)
 
 Some simple ways to distribute the work are by workload, server and/or protocol.
 
 **Env knobs** (set only when named in the prompt):
 
-- `VORTEX_PROTO` = `all` | `h1` | `h2` | `h3` — from "all protocols"→`all`, "h2"/"http/2"→`h2`,
+- `VORTEX_PROTO` = `all` | `h1` | `h2` | `h3` -- from "all protocols"→`all`, "h2"/"http/2"→`h2`,
   "http/3"/"h3"/"quic"→`h3`, "http/1"/"h1"→`h1`. Default (unset) is `h2`. (`all` = h1 + h2 + h3.)
-- `VORTEX_SERVER` = `sync` | `async` | `async-await` | `chronos` | `chronos-await` | `all` — the
+- `VORTEX_SERVER` = `sync` | `async` | `async-await` | `chronos` | `chronos-await` | `all` -- the
   handler runtime, from "chronos server"→`chronos`, "async"→`async`, "sync"→`sync`, "all
   runtimes"/"all servers"→`all`. `async` = `vortex/asyncdispatch`, `chronos` = `vortex/chronos`;
   the `-await` variants use the await-style API. Default (unset) is `sync`.
@@ -55,7 +58,7 @@ Some simple ways to distribute the work are by workload, server and/or protocol.
   "90 minutes"/"90m"→`5400`, "30m"→`1800`, "90s"/"90 seconds"→`90`. Default `60`.
 - `VORTEX_REPORT_SECONDS` = **derived, always set it**: `clamp(round(VORTEX_SECONDS / 32), 60, 900)`.
   (28800/32 = 900; short runs floor at 60.) The harness default is a flat 60, which floods a
-  multi-hour soak with report lines — deriving it keeps the cadence sane.
+  multi-hour soak with report lines -- deriving it keeps the cadence sane.
 - `VORTEX_CHAOS` = `all` | `none` | CSV of `slowread,slowwrite,idle,abort,vanish`: the chaos
   sidecar, a second, **unverified** misbehaving client per cell (slow readers, stalling uploads,
   idle holds, mid-transfer aborts, vanishing connections) running alongside the verified canary.
@@ -65,16 +68,30 @@ Some simple ways to distribute the work are by workload, server and/or protocol.
   workload-targeted variants picked automatically by the workload (e.g. vanishing SSE clients
   under `stressSse`), nothing to configure. Verdicts are canary-first: the sidecar can only add
   failures (e.g. an fd leak), never mask one.
+- `VORTEX_MIX` = the `stressMixed` worker split, e.g.
+  `requests=40,ws=20,sse=20,streamupload=10,streamdownload=10` (the default). Set it only if the
+  prompt asks for a shaped mix or for a subset ("mixed without websockets" → `ws=0`). The values
+  are weights, normalized by the sum of the weights that compete for the same workers, not
+  percentages (`requests=100` alone is not "100%"); for `streamupload`/`streamdownload` the
+  weight is presence-only (any value > 0 runs that slice at one transfer in flight per client,
+  `0` drops it). `VORTEX_CONCURRENCY` must be at least the number of workloads in the mix.
 - Optional pass-throughs, only if the prompt names them: `VORTEX_CLIENTS`, `VORTEX_CONCURRENCY`,
   `VORTEX_REQ_COMPRESSION`, `VORTEX_RESP_COMPRESSION` (`none`|`gzip`|`br`|`zstd`),
-  `VORTEX_STREAM_BYTES` (streaming transfer size, default 1 GiB), `VORTEX_CHAOS_CONC` (sidecar
-  workers, default 8), `VORTEX_CHAOS_SEED` (a fixed seed replays an identical chaos schedule;
-  set it when reproducing a chaos-correlated failure).
+  `VORTEX_CHAOS_CONC` (sidecar workers, default 8), `VORTEX_CHAOS_SEED` (a fixed seed replays an
+  identical chaos schedule; set it when reproducing a chaos-correlated failure).
+- `VORTEX_STREAM_BYTES` = the streaming transfer size. **Leave it unset** unless the prompt names
+  a size: `run.sh` already scales the default per workload and per duration, and one pinned value
+  applies to every cell of the matrix. The defaults are 1 GiB for a run of `VORTEX_SECONDS` >=
+  1200 and 64 MiB below that; `stressMixed` follows the same rule at its own measured sizes,
+  16 MiB and 2 MiB, because its streaming slices share one client event loop with 30
+  request/ws/sse workers. `nimble stress` sizes each smoke cell itself (64 MiB for the five
+  single-workload cells at any duration, 2 MiB for `mixed`). Each cell prints the size it ran at
+  in its banner (`stream=64MiB`), so the log records it.
 
-**Expand the matrix into cells.** The skill — not run.sh — walks the matrix: expand
+**Expand the matrix into cells.** The skill -- not run.sh -- walks the matrix: expand
 `VORTEX_PROTO=all` → `h1 h2 h3` and `VORTEX_SERVER=all` → `sync async async-await chronos
 chronos-await`, then take the cross product. `all × all` = 15 cells (h1/sync, h1/async, …,
-h3/chronos-await); a fully pinned prompt ("h2 on chronos") is a 1-cell matrix — same flow, one
+h3/chronos-await); a fully pinned prompt ("h2 on chronos") is a 1-cell matrix -- same flow, one
 agent. Each cell gets:
 
 - `VORTEX_PROTO` and `VORTEX_SERVER` pinned to its single value.
@@ -102,12 +119,12 @@ Only include the env vars you actually set (plus the always-set `VORTEX_REPORT_S
 
 Launch **one Agent per cell** (`subagent_type: claude`, `model: opus`), **all in a single
 message** so they run concurrently. Before launching, mind the worktree: the docker builds
-**copy the live worktree** — run only on a committed, consistent tree, and do **not** edit
-`.nim` source while any cell is building (torn-read compile errors — the
+**copy the live worktree** -- run only on a committed, consistent tree, and do **not** edit
+`.nim` source while any cell is building (torn-read compile errors -- the
 `stress-builds-from-worktree` navi memory; with all cells launching at once, every build is in
 flight in the first minutes). Non-source scratch files (logs, `*.md`) are safe to write. The
 per-cell image tags are distinct but share docker's layer cache, so concurrent builds dedupe;
-the first round of builds can still take minutes — that's expected.
+the first round of builds can still take minutes -- that's expected.
 
 Each cell agent's prompt must contain:
 
@@ -127,7 +144,7 @@ Each cell agent's prompt must contain:
     `assert`, `Killed`, `server did not start`, `chaos sidecar FAILED`, `FAIL chaos:`
   - Guard against a silently frozen pipe: if the log stops growing, confirm liveness with
     `docker ps --filter name=vortex-stress-server-<VORTEX_RUN_ID>`; a frozen pipe with no live
-    container means the run really stopped — treat as FAIL.
+    container means the run really stopped -- treat as FAIL.
   - Chaos-sidecar log shape (present unless `VORTEX_CHAOS=none`): the cell ends with a
     `--- chaos sidecar ---` block holding tally lines (`ok: vanish=6 … | err: …`) and
     `== chaos sidecar passed (fds N -> M) ==`. Expect a quiet gap of up to ~30 s of finishing
@@ -137,18 +154,18 @@ Each cell agent's prompt must contain:
 - **On FAIL, preserve evidence before teardown**: while containers are up, grab
   `docker logs vortex-stress-server-<VORTEX_RUN_ID>` and
   `docker logs vortex-stress-chaos-<VORTEX_RUN_ID>` into the scratchpad, and snapshot the cell
-  log's tail. Then clean up the cell's resources (ignore errors — run.sh's own trap may have
+  log's tail. Then clean up the cell's resources (ignore errors -- run.sh's own trap may have
   removed them): `docker rm -f vortex-stress-server-<id> vortex-stress-chaos-<id>`,
   `docker network rm vortex-stress-<id>`,
   `docker rmi -f vortex-stress-server-img-<id> vortex-stress-client-img-<id>`.
-- **Hard rules**: never edit source, never commit, never attempt a fix — run, observe, report.
+- **Hard rules**: never edit source, never commit, never attempt a fix -- run, observe, report.
 - **Return a structured verdict**: the cell (workload × proto × server), PASS or FAIL, the
   terminal signature line, a one-line failure reason (if any), the final
   `RSS … | heap … | fds …` report line, and the scratchpad paths of any preserved evidence.
 
 ## 3. Parent monitoring
 
-Cell agents notify on completion — collect verdicts as they finish. Also set a `ScheduleWakeup`
+Cell agents notify on completion -- collect verdicts as they finish. Also set a `ScheduleWakeup`
 (~1200s) fallback heartbeat in case a cell hangs. On each wake, if cells are still running,
 sample the latest `[wl proto server] 200x… | RSS … | heap … | t=…s` lines across the per-cell
 logs in the scratchpad and check `docker ps --filter name=vortex-stress-server-` so you can
@@ -156,7 +173,7 @@ show progress, per-cell liveness, and the memory-flatness trend.
 
 **Wait for every cell to reach a terminal state before acting on failures.** The round restarts
 whole-matrix anyway, letting in-flight cells finish collects the full failure set in one
-iteration — and it guarantees no builds are copying the worktree when fix agents start editing
+iteration -- and it guarantees no builds are copying the worktree when fix agents start editing
 `.nim`.
 
 ## 4. All cells PASS → report and finish
@@ -171,7 +188,7 @@ Go to section 6.
    every later fix): `git checkout -b fix/stress-<workload>-<shortslug>` off `main`. If it
    already exists this session, stay on it.
 3. **Dispatch an opus fix Agent** (`subagent_type: claude`, `model: opus`) per distinct
-   failure, **serially — one at a time**: fix agents share the worktree and each validates
+   failure, **serially -- one at a time**: fix agents share the worktree and each validates
    with its own build, so they must not overlap each other (or any still-running soak). Give
    each the failing cell, the verdict, and the preserved evidence paths. Tell the agent to:
    - Root-cause and fix the issue in the vortex source. When the failure is
@@ -180,11 +197,11 @@ Go to section 6.
    - **Validate with a short, focused run** before committing: same workload, pinned to the
      failing `VORTEX_PROTO` and `VORTEX_SERVER`, `VORTEX_SECONDS=120`, its own `VORTEX_RUN_ID`.
      Do **not** edit `.nim` while a stress build is copying the worktree
-     (`stress-builds-from-worktree` memory) — only build when no run is active.
+     (`stress-builds-from-worktree` memory) -- only build when no run is active.
    - Commit on the session branch: **one commit per fix**, semantic message, **no AI
      attribution** of any kind (`no-claude-attribution` memory). Do **not** push.
    - Return the root cause (one line) and the commit sha.
-4. **Restart the entire fan-out** — all cells, full duration — from section 2, and resume
+4. **Restart the entire fan-out** -- all cells, full duration -- from section 2, and resume
    monitoring at section 3.
 5. **Repeat** until a complete round ends with every cell reporting PASS.
 
