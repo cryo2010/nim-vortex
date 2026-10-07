@@ -271,7 +271,7 @@ Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = **h1 + h2 only**; h3 is opt-in and drives QUIC via aioquic - `requests`/`sse`/`streamdownload` run, `ws` and `streamupload` skip, see the stress README) |
+| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3; h3 drives QUIC via aioquic and runs all five workloads, `ws` over RFC 9220 Extended CONNECT; h3 cells reuse the h2 server image, so the extra cost is one client run per cell, see the stress README) |
 | `VORTEX_SERVER` | `sync` | Handler runtime: `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` (`async`/`chronos` = `vortex/asyncdispatch` / `vortex/chronos` without an in-handler `await`; the `-await` variants exercise the `await` path) |
 | `VORTEX_SECONDS` | `60` | Runtime per cell, in seconds |
 | `VORTEX_REPORT_SECONDS` | `60` | Cadence of the status-code + server-RSS report |
