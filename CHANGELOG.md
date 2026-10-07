@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
+  longer fails its h3 cell at a transfer size it cannot finish.
+  `conformance/stress/run.sh` defaulted `VORTEX_STREAM_BYTES` to 1 GiB for every
+  run, and one 1 GiB transfer over aioquic takes about 125 s on `streamupload`
+  and 163 s on `streamdownload` (4-15 s on h1/h2, which is the only reason those
+  cells passed). So `VORTEX_SECONDS=10 nimble stressStreamUpload` abandoned
+  every h3 transfer at the deadline as designed, counted none, and reported
+  `FAIL streamupload: no successful iterations` with nothing wrong on either
+  side; only `nimble stress` escaped it, because that wrapper passes 64 MiB
+  explicitly. The default is now scaled by the run length -- 1 GiB at
+  `VORTEX_SECONDS` >= 300, 64 MiB below it, since counting iterations needs a
+  comfortable multiple of one transfer time and these soaks are run
+  oversubscribed, where a transfer can take several times its measured best --
+  and an explicit `VORTEX_STREAM_BYTES` still always wins. Each cell banner now
+  prints the size it ran at (`stream=64MiB`), so a log says which one it was.
+  The client also tells the two diagnoses apart: with nothing completed but at
+  least one transfer started and abandoned at the deadline it prints
+  `no transfer of N bytes completed within S s on h3 (K abandoned at the
+  deadline); lower VORTEX_STREAM_BYTES or raise VORTEX_SECONDS` instead of the
+  generic message, and keeps the generic one for a run where nothing ever
+  worked. It stays a failure, not a skip: a soak that verified zero bytes must
+  not read as a pass. Server side there was nothing to fix. (#393)
 - Stress harness: the `streamupload` cell no longer fails on a client-side
   teardown race at the deadline. `w_streamupload` bounds an in-flight transfer
   with `asyncio.wait_for`, and the cancellation that fires at the deadline runs

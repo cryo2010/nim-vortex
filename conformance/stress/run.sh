@@ -17,7 +17,9 @@
 #   VORTEX_SERVER    sync | async | async-await | chronos | chronos-await | all
 #   VORTEX_SECONDS / VORTEX_REPORT_SECONDS / VORTEX_CONCURRENCY / VORTEX_CLIENTS
 #   VORTEX_REQ_COMPRESSION / VORTEX_RESP_COMPRESSION   none | gzip | br | zstd
-#   VORTEX_STREAM_BYTES   streaming transfer size (default 1 GiB)
+#   VORTEX_STREAM_BYTES   streaming transfer size (default 1 GiB for a run of
+#                    VORTEX_SECONDS >= 300, else 64 MiB: a 1 GiB h3 transfer
+#                    takes ~125-163 s and cannot finish in a short smoke)
 #   VORTEX_RUN_ID    isolation id for the docker network/container/image names,
 #                    so runs can go in parallel (default: this run's PID)
 #   VORTEX_CHAOS     none | all | CSV of slowread,slowwrite,idle,abort,vanish
@@ -49,7 +51,35 @@ conc=${VORTEX_CONCURRENCY:-32}
 clients=${VORTEX_CLIENTS:-3}
 reqc=${VORTEX_REQ_COMPRESSION:-gzip}
 respc=${VORTEX_RESP_COMPRESSION:-gzip}
-sbytes=${VORTEX_STREAM_BYTES:-1073741824}
+
+# Streaming transfer size, used by streamupload / streamdownload. An explicit
+# VORTEX_STREAM_BYTES ALWAYS wins; with none set the default is scaled by the
+# run length, because the 1 GiB soak default cannot complete even ONE transfer
+# in a short run. Measured: 125 s per transfer on streamupload h3 and 163 s on
+# streamdownload h3, versus 4-15 s on h1/h2 (the only reason those cells ever
+# passed). So `VORTEX_SECONDS=10 nimble stressStreamUpload` abandoned every
+# transfer at the deadline, counted none, and reported
+# `FAIL streamupload: no successful iterations` with nothing wrong on either
+# side -- a sizing accident that reads as a server defect (#393).
+#
+# Counting iterations needs a comfortable MULTIPLE of one transfer time, not a
+# bare one: 300 s is a little under 2x the slowest measured h3 transfer on an
+# idle host, and these soaks are deliberately run oversubscribed where a
+# transfer can take several times its measured best. At or above that the
+# default stays 1 GiB (a real soak, where the big transfer is the point);
+# below it the default drops to 64 MiB, which is exactly what the `nimble
+# stress` smoke already passes explicitly and what passes on all three
+# protocols in a 10 s cell.
+stream_long=1073741824          # 1 GiB: the real-soak default
+stream_short=67108864           # 64 MiB: short-run default
+stream_long_seconds=300         # below this, a 1 GiB h3 transfer cannot finish
+if [ -n "${VORTEX_STREAM_BYTES:-}" ]; then
+  sbytes="$VORTEX_STREAM_BYTES"
+elif [ "$seconds" -lt "$stream_long_seconds" ]; then
+  sbytes="$stream_short"
+else
+  sbytes="$stream_long"
+fi
 chaos=$(printf '%s' "${VORTEX_CHAOS:-all}" | tr 'A-Z' 'a-z')
 chaosconc="${VORTEX_CHAOS_CONC:-8}"
 chaosseed="${VORTEX_CHAOS_SEED:-1}"
@@ -91,6 +121,13 @@ id="${VORTEX_RUN_ID:-$$}"
 export VORTEX_RUN_ID="$id"
 
 # The `stress` smoke runs every workload, short, and fails on any.
+#
+# The re-exec below passes the environment through untouched, so each cell
+# resolves VORTEX_STREAM_BYTES itself from the same VORTEX_SECONDS (and an
+# explicit VORTEX_STREAM_BYTES, which `nimble stress` always sets, is inherited
+# verbatim). Nothing is exported here on purpose: the default is per-workload
+# (see the sbytes block above), and exporting the parent's answer would freeze
+# every cell at it.
 if [ "${STRESS_SMOKE:-0}" = "1" ]; then
   rc=0
   for w in requests ws sse streamupload streamdownload; do
@@ -152,13 +189,29 @@ codec_flags() {
   done
 }
 
+# The stream size for the cell banner: MiB when it divides evenly, bytes
+# otherwise. Printed so a log says which size the cell actually ran at --
+# the size is now a default that depends on VORTEX_SECONDS and the workload
+# (see the sbytes block above), so reading it back out of the log is the only
+# way to tell a 64 MiB smoke from a 1 GiB soak after the fact (#393).
+fmt_stream() {
+  if [ $(( $1 % 1048576 )) = 0 ]; then echo "$(( $1 / 1048576 ))MiB"; else echo "${1}B"; fi
+}
+
 run_cell() {
   p="$1"; s="$2"
   proto_cfg "$p"; codec_flags
   compress=0; [ "$respc" != none ] && [ "$respc" != "" ] && compress=1
   bflags="$pflags$cflags${VORTEX_EXTRA_FLAGS:+ ${VORTEX_EXTRA_FLAGS}}"
+  # Only the workloads that actually stream a transfer mention the size; on
+  # `requests` / `ws` / `sse` it would be noise. Appended at the END of the
+  # banner so anything matching the existing prefix still matches.
+  sbanner=""
+  case "$workload" in
+    streamupload|streamdownload) sbanner=", stream=$(fmt_stream "$sbytes")" ;;
+  esac
   echo
-  echo "=== $workload [proto=$p server=$s] : ${seconds}s, ${clients}x${conc} ==="
+  echo "=== $workload [proto=$p server=$s] : ${seconds}s, ${clients}x${conc}${sbanner} ==="
 
   echo "building server image (BUILD_FLAGS='${bflags:-none}' RUNTIME=$s)..."
   docker build -f "$here/Dockerfile" -t "$simg" $basearg \

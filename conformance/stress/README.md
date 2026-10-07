@@ -44,7 +44,7 @@ incompressible store-fallback.
 | `VORTEX_CLIENTS` | `3` | client workers per cell |
 | `VORTEX_REQ_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - client encodes the request body; the server decompresses |
 | `VORTEX_RESP_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - the server compresses the response |
-| `VORTEX_STREAM_BYTES` | `1073741824` | streaming transfer size (1 GiB; lower for a smoke) |
+| `VORTEX_STREAM_BYTES` | `1073741824` (`67108864` under 300 s) | streaming transfer size: 1 GiB for a real soak, 64 MiB when `VORTEX_SECONDS` is under 300 - see [Sizing a short streaming smoke](#sizing-a-short-streaming-smoke). An explicit value always wins |
 | `VORTEX_RUN_ID` | this run's PID | isolation id for the docker network / container / image names, so runs can go **in parallel** |
 | `VORTEX_CHAOS` | `all` | `none` \| `all` \| CSV of `slowread,slowwrite,idle,abort,vanish` - launches an **unverified misbehaving** sidecar client per cell (see [Chaos sidecar](#chaos-sidecar)); `none` = no sidecar (and no drain pause), the pre-chaos behavior |
 | `VORTEX_CHAOS_CONC` | `8` | chaos sidecar worker count |
@@ -94,6 +94,43 @@ asyncio already cleared the transport's loop, raising
 treats that teardown artifact as the deadline expiry it is, but **only past the
 deadline** - before it, the same error still hard-fails the cell.
 
+### Sizing a short streaming smoke
+
+A transfer that cannot finish inside `VORTEX_SECONDS` is never counted, so a
+cell whose transfers are all too big completes **zero** iterations and fails -
+with nothing wrong on either side. Measured per 1 GiB transfer:
+
+| Workload | h1 / h2 | h3 (aioquic) |
+|----------|---------|--------------|
+| `streamupload` | 4-15 s | ~125 s |
+| `streamdownload` | 4-15 s | ~163 s |
+
+So `VORTEX_SECONDS=10 nimble stressStreamUpload` at the 1 GiB soak default
+passed h1 and h2 and failed h3 every time with `no successful iterations`
+(#393) - the h1/h2 cells only passed because their transfers happen to be two
+orders of magnitude faster.
+
+`run.sh` therefore **scales the default**: with no `VORTEX_STREAM_BYTES` set it
+uses 1 GiB for a run of 300 s or more and **64 MiB** below that (the size
+`nimble stress` has always passed for its smoke cells, and the size that passes
+on all three protocols in a 10 s cell). 300 s is a little under 2x the slowest
+measured h3 transfer, and counting iterations needs a comfortable multiple of
+one transfer, not a bare one - these soaks are deliberately run oversubscribed,
+where a transfer can take several times its measured best. An explicit
+`VORTEX_STREAM_BYTES` always wins, and the size each cell ran at is printed in
+its banner (`stream=64MiB`).
+
+If you do override it and the run is too short for even one transfer, the
+client now says which knob to turn instead of the generic message:
+
+```
+FAIL streamupload: no transfer of 1073741824 bytes completed within 10 s on h3
+(3 abandoned at the deadline); lower VORTEX_STREAM_BYTES or raise VORTEX_SECONDS
+```
+
+That is still a **failure** (exit 1), not a skip: a soak that verified zero
+bytes must not read as a pass.
+
 ## Examples
 
 ```sh
@@ -108,6 +145,10 @@ VORTEX_SERVER=all VORTEX_STREAM_BYTES=8388608 VORTEX_SECONDS=5 nimble stressStre
 
 # Requests over both protocols with brotli response compression
 VORTEX_PROTO=all VORTEX_RESP_COMPRESSION=br nimble stressRequests
+
+# Short streaming smoke over every protocol: no VORTEX_STREAM_BYTES, so the
+# 64 MiB short-run default applies and the h3 cell can finish a transfer
+VORTEX_PROTO=all VORTEX_SECONDS=10 VORTEX_REPORT_SECONDS=2 nimble stressStreamUpload
 ```
 
 ## HTTP/3

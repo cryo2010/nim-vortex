@@ -279,7 +279,7 @@ Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 | `VORTEX_CLIENTS` | `3` | Client workers per cell |
 | `VORTEX_REQ_COMPRESSION` | `gzip` | Request-body encoding the client sends (server decompresses): `none` \| `gzip` \| `br` \| `zstd` |
 | `VORTEX_RESP_COMPRESSION` | `gzip` | Response encoding the server applies: `none` \| `gzip` \| `br` \| `zstd` |
-| `VORTEX_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB; lower for a smoke) |
+| `VORTEX_STREAM_BYTES` | `1073741824`, or `67108864` when `VORTEX_SECONDS` < 300 | Streaming transfer size in bytes: 1 GiB for a real soak, 64 MiB for a short run, because one 1 GiB transfer takes ~125 s on `streamupload` h3 and ~163 s on `streamdownload` h3 (4-15 s on h1/h2) and a cell that finishes none counts none. An explicit value always wins; each cell prints the size it ran at in its banner |
 | `VORTEX_RUN_ID` | this run's PID | Isolation id for the docker network / container / image names, so several runs can go in parallel without clobbering one another |
 | `VORTEX_CHAOS` | `all` | Chaos sidecar: `none` \| `all` \| CSV of `slowread` \| `slowwrite` \| `idle` \| `abort` \| `vanish`. Launches a second, **unverified** misbehaving client per cell alongside the verified canary (see below); `none` = no sidecar (and no drain pause), the behavior from before the knob existed |
 | `VORTEX_CHAOS_CONC` | `8` | Chaos sidecar worker count |

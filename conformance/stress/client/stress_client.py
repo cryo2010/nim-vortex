@@ -42,6 +42,15 @@ class Fail(Exception):
     """A fatal defect (corruption, bad status, or a transport error). Ends the
     run non-zero at once; never retried or tallied."""
 codes = Counter()
+# Streaming transfers STARTED and then abandoned at the deadline: the wait_for
+# expiry (and the teardown-race arm that can replace it) in w_streamupload, and
+# the per-chunk deadline return in w_streamdownload. Tallied so that a run where
+# nothing completed can say WHY. A 1 GiB transfer takes ~125 s on streamupload
+# h3 and ~163 s on streamdownload h3 versus 4-15 s on h1/h2, so a short cell at
+# the big default abandons every transfer and used to report the generic
+# `no successful iterations` -- which reads as a server defect and sent people
+# looking for one that was not there (#393).
+abandoned = [0]
 _rate = [0.0, 0]       # [last report monotonic, bytes at last report] for MB/s
 _ops = [0.0, 0]        # [last report monotonic, 2xx count at last report] for ops/s
 start = 0.0
@@ -439,6 +448,7 @@ async def w_streamupload():
                         s.upload("/upload", {"x-sha1": sha}, body_gen()),
                         timeout=max(0.0, deadline - time.monotonic()))
                 except asyncio.TimeoutError:
+                    abandoned[0] += 1     # started, never finished: see `abandoned`
                     return
                 if st == 400: raise Fail("server rejected the SHA-1 (400)")
                 if st != 200: raise Fail(f"upload -> {st}")
@@ -460,11 +470,14 @@ async def w_streamupload():
             # (#390).
             if time.monotonic() < deadline or not teardown_race(e):
                 raise
+            abandoned[0] += 1   # the deadline expiry by its other route (#390)
     await drive(once)
 
 async def w_streamdownload():
     want = expected_sha1()
-    async def transfer():
+    async def transfer() -> bool:
+        """One whole transfer. True when it was abandoned at the deadline (see
+        the per-chunk check below), False when it completed and was verified."""
         async with session() as s:
             gen = s.stream("GET", "/download")
             st = await gen.__anext__()
@@ -488,13 +501,18 @@ async def w_streamdownload():
                 # genuinely wedged stream delivers no chunk, so it never reaches
                 # here and main()'s wait_for still catches it.
                 if time.monotonic() >= deadline:
-                    return
+                    return True
             if got != STREAM or h.hexdigest() != want:
                 raise Fail(f"download mismatch: {got} bytes, sha {h.hexdigest()} != {want}")
             bump(200)
+            return False
     async def once():
         try:
-            await transfer()
+            # Tally the abandonment (see `abandoned`): with nothing completed,
+            # "the transfers were too big for the run" and "the server never
+            # served one" are different diagnoses and must read differently.
+            if await transfer():
+                abandoned[0] += 1
         except (AttributeError, asyncio.CancelledError) as e:
             # The same teardown race as the upload's (#390), reached by the other
             # route: abandoning the body above leaves the response in flight, so
@@ -505,6 +523,10 @@ async def w_streamdownload():
             # real AttributeError still fails the run. See teardown_race.
             if time.monotonic() < deadline or not teardown_race(e):
                 raise
+            # The same abandonment the `return True` above reports, reached by
+            # the teardown race instead; transfer() never returned, so this
+            # cannot double-count it.
+            abandoned[0] += 1
     await drive(once)
 
 async def w_methods():
@@ -631,6 +653,24 @@ async def main():
         pass
     report_line("final ", rss, heap, fds)
     if total == 0:
+        # Two different diagnoses, and the generic one used to swallow the
+        # other. When at least one transfer was STARTED and abandoned at the
+        # deadline, nothing is wrong with the server: the transfer size does not
+        # fit the run length (a 1 GiB body is ~125 s on streamupload h3, ~163 s
+        # on streamdownload h3, so a 10 s cell can never finish one). Say which
+        # knob to turn instead of making the operator hunt a defect (#393).
+        #
+        # It stays a FAILURE (exit 1), not a skip: a soak that verified zero
+        # bytes must not read as a pass -- that is how an unsized cell silently
+        # becomes permanent missing coverage. run.sh's defaults keep a short run
+        # from landing here in the first place; this message is for the runs that
+        # override them.
+        if abandoned[0] > 0:
+            print(f"FAIL {WORKLOAD}: no transfer of {STREAM} bytes completed "
+                  f"within {SECONDS} s on {PROTO} ({abandoned[0]} abandoned at "
+                  f"the deadline); lower VORTEX_STREAM_BYTES or raise "
+                  f"VORTEX_SECONDS", flush=True)
+            return 1
         print(f"FAIL {WORKLOAD}: no successful iterations", flush=True); return 1
     print(f"== {WORKLOAD} {SERVER} {PROTO} passed ({total} {UNIT}) ==", flush=True)
     return 0
