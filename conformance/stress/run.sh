@@ -1,10 +1,15 @@
 #!/bin/sh
 # Stress soak (pass/fail). Builds the vortex server (protocol × server-runtime)
-# and a Python load client, drives the chosen workload (VORTEX_WORKLOAD) at the
+# and a load client, drives the chosen workload (VORTEX_WORKLOAD) at the
 # server for VORTEX_SECONDS, and verifies it: checksums and echoes **hard-fail**
 # (the client's non-zero exit propagates out). Responses are discarded, so
 # memory stays flat; the server's CPU/RSS is printed each
 # VORTEX_REPORT_SECONDS. Not a CI gate (Docker, long runtimes, big transfers).
+#
+# The client is an axis too (VORTEX_CLIENT): the Python httpx/websockets/aioquic
+# canary is the default and the interop reference, and the compiled Nim navi
+# client is the alternative for the cells where the Python loop, not vortex, is
+# the ceiling. Both verify the same contract and print the same line grammar.
 #
 # One workload per cell, except VORTEX_WORKLOAD=mixed, which drives all five at
 # one server at the same time (see the client's w_mixed and VORTEX_MIX).
@@ -23,6 +28,18 @@
 #                    (the default); 0 drops a workload from the cell
 #   VORTEX_PROTO     h1 | h2 | h3 | all           (default h2; all = h1 h2 h3)
 #   VORTEX_SERVER    sync | async | async-await | chronos | chronos-await | all
+#   VORTEX_CLIENT    python | navi | all          (default python; all runs
+#                    every cell twice, python then navi)
+#   VORTEX_NAVI_BACKEND  chronos | asyncdispatch  (default chronos). The
+#                    navi client backend the image is BUILT with, so it is fixed
+#                    per image, not per cell.
+#   VORTEX_NAVI_REF  nim-navi git ref the navi client image is built from; empty
+#                    uses the sha pinned in client/navi/Dockerfile. Pinned so a
+#                    navi change cannot silently move vortex's numbers.
+#   VORTEX_NAVI_COLLECT_SECONDS  how often the navi client forces an ORC cycle
+#                    collection (default 1; 0 leaves it to the runtime, whose
+#                    adaptive trigger stops firing in an async program and let
+#                    an sse h1 cell reach 15 GB RSS). navi client only.
 #   VORTEX_SECONDS / VORTEX_REPORT_SECONDS / VORTEX_CONCURRENCY / VORTEX_CLIENTS
 #   VORTEX_REQ_COMPRESSION / VORTEX_RESP_COMPRESSION   none | gzip | br | zstd
 #   VORTEX_STREAM_BYTES   streaming transfer size. Default 1 GiB for a run of
@@ -64,6 +81,33 @@ conc=${VORTEX_CONCURRENCY:-32}
 clients=${VORTEX_CLIENTS:-3}
 reqc=${VORTEX_REQ_COMPRESSION:-gzip}
 respc=${VORTEX_RESP_COMPRESSION:-gzip}
+# Which load client drives the cells. Case-insensitive like proto/server, so a
+# stray capital cannot hard-exit a run before anything starts.
+client=$(printf '%s' "${VORTEX_CLIENT:-python}" | tr 'A-Z' 'a-z')
+navibackend=$(printf '%s' "${VORTEX_NAVI_BACKEND:-chronos}" | tr 'A-Z' 'a-z')
+naviref="${VORTEX_NAVI_REF:-}"
+# A git ref is one word of [A-Za-z0-9._/-]. It is spliced into a `docker build`
+# argv below unquoted (an EMPTY ref must contribute no argument at all), so a
+# value with a space would split into two words and a `*` would glob against
+# the repo root -- either way docker dies with a usage error that names neither
+# the knob nor the value. Reject anything else here, on stdout, exit 2.
+case "$naviref" in
+  *[!A-Za-z0-9._/-]*)
+    echo "VORTEX_NAVI_REF must be a git ref ([A-Za-z0-9._/-]), got '$naviref'"
+    exit 2 ;;
+esac
+# Validated HERE, before any docker build burns minutes on a run that will not
+# produce the cells the operator asked for. On STDOUT with exit 2, the same
+# reasoning as need_uint below: a config error on stderr never reaches the log.
+case "$client" in
+  python|navi|all) ;;
+  *) echo "unknown VORTEX_CLIENT: $client (python | navi | all)"; exit 2 ;;
+esac
+case "$navibackend" in
+  asyncdispatch|chronos) ;;
+  *) echo "unknown VORTEX_NAVI_BACKEND: $navibackend (chronos | asyncdispatch)"
+     exit 2 ;;
+esac
 
 # Reject a non-integer VORTEX_SECONDS / VORTEX_STREAM_BYTES HERE, before the
 # `-lt` comparison and fmt_stream's `$(( ))` below reach it. Under `set -eu`
@@ -233,7 +277,23 @@ export VORTEX_RUN_ID="$id"
 # fall through to the duration-scaled default would do exactly that above
 # $stream_long_seconds. The mixed cell cannot use 64 MiB at all (see the sbytes
 # block above), which is why this is per cell rather than one exported value.
+#
+# The client images are kept ACROSS the six re-execs and removed once, here,
+# when the smoke ends: each child is a full run.sh with its own EXIT trap, and
+# left to itself every one of them would `docker rmi` the shared client tags on
+# the way out and the next workload would rebuild them -- a cache hit under
+# BuildKit, but under the legacy builder removing the tag drops the final
+# compile layer too, and six navi compiles per smoke is the per-cell cost the
+# build-once rule exists to avoid. The children see STRESS_SMOKE_KEEP_CLIENTS
+# and leave the tags alone (see cleanup); the server image is still per cell
+# (its flags change with the proto) and stays theirs to remove.
 if [ "${STRESS_SMOKE:-0}" = "1" ]; then
+  export STRESS_SMOKE_KEEP_CLIENTS=1
+  smoke_cleanup() {
+    docker rmi -f "vortex-stress-client-img-$id" "vortex-stress-navi-img-$id" \
+      >/dev/null 2>&1 || true
+  }
+  trap smoke_cleanup EXIT INT TERM
   rc=0
   for w in requests ws sse streamupload streamdownload mixed; do
     case "$w" in
@@ -256,7 +316,14 @@ net=vortex-stress-$id
 srvc=vortex-stress-server-$id
 chc=vortex-stress-chaos-$id
 simg=vortex-stress-server-img-$id
-cimg=vortex-stress-client-img-$id
+# Two client images, one tag each. They are not interchangeable: the python
+# image is also the chaos sidecar's image (chaos.py is the misbehaving-CLIENT
+# model and is client-independent by design), so a `navi` run with chaos on
+# needs both tags, while a `navi` run with VORTEX_CHAOS=none builds no Python
+# image at all. `$pimg` keeps the historical tag name so a python-only run is
+# unchanged down to the resource names.
+pimg=vortex-stress-client-img-$id
+nimg=vortex-stress-navi-img-$id
 
 docker network create "$net" >/dev/null 2>&1 || true
 # Tear down everything this run created -- the network and the per-run image
@@ -268,12 +335,46 @@ cleanup() {
   docker rm -f "$srvc" >/dev/null 2>&1 || true
   docker rm -f "$chc" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
-  docker rmi -f "$simg" "$cimg" >/dev/null 2>&1 || true
+  docker rmi -f "$simg" >/dev/null 2>&1 || true
+  # Under `nimble stress` the parent smoke loop owns the client tags and removes
+  # them once at the end (see the STRESS_SMOKE block), so six re-execs share
+  # one build instead of each tearing it down for the next.
+  if [ "${STRESS_SMOKE_KEEP_CLIENTS:-0}" != 1 ]; then
+    docker rmi -f "$pimg" "$nimg" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
-echo "building client image..."
-docker build -f "$here/client.Dockerfile" -t "$cimg" "$root" >/dev/null
+# Client image build phase. Built ONCE before the cell loop, as before: the
+# navi image is about a minute with no cache (the -d:naviHttp3 compile itself
+# 10-12 s), which is nothing per run and would dwarf a 10 s cell if paid per
+# cell. Under `nimble stress` the tags also survive the per-workload re-execs
+# (see the STRESS_SMOKE block), so a smoke builds each client image once.
+need_python=0
+need_navi=0
+case "$client" in
+  python) need_python=1 ;;
+  navi)   need_navi=1 ;;
+  all)    need_python=1; need_navi=1 ;;
+esac
+# The chaos sidecar runs `python chaos.py`, so the python image is needed
+# whenever chaos is on, whichever client drives the canary.
+if [ "$chaos" != "none" ]; then need_python=1; fi
+
+if [ "$need_python" = 1 ]; then
+  echo "building client image..."
+  docker build -f "$here/client.Dockerfile" -t "$pimg" "$root" >/dev/null
+fi
+if [ "$need_navi" = 1 ]; then
+  # An empty VORTEX_NAVI_REF means "use the sha pinned in the Dockerfile", so
+  # the arg is only passed when it was actually set: passing NAVI_REF="" would
+  # override the pin with nothing and fail the checkout.
+  refarg=""
+  if [ -n "$naviref" ]; then refarg="--build-arg NAVI_REF=$naviref"; fi
+  echo "building client image (navi/$navibackend @ ${naviref:-pinned})..."
+  docker build -f "$here/client/navi/Dockerfile" -t "$nimg" $basearg $refarg \
+    --build-arg NAVI_BACKEND="$navibackend" "$root" >/dev/null
+fi
 
 # proto -> build flags / port / scheme / QUIC toggle
 proto_cfg() {
@@ -321,8 +422,20 @@ fmt_stream() {
 }
 
 run_cell() {
-  p="$1"; s="$2"
+  p="$1"; s="$2"; c="$3"
   proto_cfg "$p"; codec_flags
+  # Which image the canary runs. The sidecar always runs the python image (see
+  # the build phase above), so this is the only place the client axis reaches
+  # into run_cell: nothing else about the cell -- readiness, the sidecar gate,
+  # the canary-wins rule, the server-log dump, the teardown order -- branches on
+  # it, because both clients present the same contract and the same exit codes.
+  case "$c" in
+    navi) canaryimg="$nimg"; cbanner=" client=navi/$navibackend" ;;
+    # No `client=python` segment under python: the python log must stay
+    # byte-identical to what it was before the client axis existed, so every
+    # archived log and every watcher pattern keeps matching.
+    *)    canaryimg="$pimg"; cbanner="" ;;
+  esac
   compress=0; [ "$respc" != none ] && [ "$respc" != "" ] && compress=1
   bflags="$pflags$cflags${VORTEX_EXTRA_FLAGS:+ ${VORTEX_EXTRA_FLAGS}}"
   # Only the workloads that actually stream a transfer mention the size; on
@@ -333,7 +446,7 @@ run_cell() {
     streamupload|streamdownload|mixed) sbanner=", stream=$(fmt_stream "$sbytes")" ;;
   esac
   echo
-  echo "=== $workload [proto=$p server=$s] : ${seconds}s, ${clients}x${conc}${sbanner} ==="
+  echo "=== $workload [proto=$p server=$s$cbanner] : ${seconds}s, ${clients}x${conc}${sbanner} ==="
 
   echo "building server image (BUILD_FLAGS='${bflags:-none}' RUNTIME=$s)..."
   docker build -f "$here/Dockerfile" -t "$simg" $basearg \
@@ -363,7 +476,7 @@ run_cell() {
       -e VORTEX_WORKLOAD="$workload" \
       -e STRESS_BASE="$scheme://server:$port" \
       -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
-      -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" python chaos.py >/dev/null
+      -e VORTEX_STREAM_BYTES="$sbytes" "$pimg" python chaos.py >/dev/null
     # Wait for the sidecar's fd baseline so it is sampled before the canary
     # connects. chaos.py prints "chaos: baseline fds=N" once, before it starts
     # inducing chaos; cap at $chaosgate seconds (see the default above for why it
@@ -394,8 +507,9 @@ run_cell() {
     -e VORTEX_SECONDS="$seconds" -e VORTEX_REPORT_SECONDS="$report" \
     -e VORTEX_CONCURRENCY="$conc" -e VORTEX_CLIENTS="$clients" \
     -e VORTEX_MIX="${VORTEX_MIX:-}" \
+    -e VORTEX_NAVI_COLLECT_SECONDS="${VORTEX_NAVI_COLLECT_SECONDS:-}" \
     -e VORTEX_REQ_COMPRESSION="$reqc" -e VORTEX_RESP_COMPRESSION="$respc" \
-    -e VORTEX_STREAM_BYTES="$sbytes" "$cimg" 2>&1
+    -e VORTEX_STREAM_BYTES="$sbytes" "$canaryimg" 2>&1
   crc=$?
   set -e
 
@@ -466,9 +580,18 @@ run_cell() {
 
 case "$proto"  in all) protos="h1 h2 h3" ;; *) protos="$proto" ;; esac
 case "$server" in all) servers="sync async async-await chronos chronos-await" ;; *) servers="$server" ;; esac
+# VORTEX_CLIENT=all runs every cell twice, python then navi. The client loop is
+# the INNERMOST of the three so the two clients hit the same freshly-built server
+# image back to back: that is the only arrangement in which a python/navi
+# comparison is a comparison and not a measurement of two different builds on a
+# differently-loaded host. The server image build is cached between them, so the
+# second cell pays nothing for it.
+case "$client" in all) clientlist="python navi" ;; *) clientlist="$client" ;; esac
 
 rc=0
-for p in $protos; do for s in $servers; do run_cell "$p" "$s" || rc=1; done; done
+for p in $protos; do for s in $servers; do for c in $clientlist; do
+  run_cell "$p" "$s" "$c" || rc=1
+done; done; done
 
 echo
 [ "$rc" = 0 ] && echo "== $workload: all cells passed ==" \

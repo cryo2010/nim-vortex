@@ -221,6 +221,12 @@ task loadtest, "Configurable k6 load test with live Grafana/Prometheus charts (D
 # measured pair, 16 MiB and 2 MiB under 1200 s), VORTEX_MIX (stressMixed's
 # worker split), VORTEX_CHAOS[,_CONC,_SEED] (misbehaving-client sidecar; default
 # all, VORTEX_CHAOS=none for a chaos-free run). Local-only.
+# The load client is an axis too: VORTEX_CLIENT (python|navi|all, default
+# python -- the httpx/websockets/aioquic canary; navi is the compiled Nim client
+# for the cells where the Python loop, not vortex, is the ceiling), with
+# VORTEX_NAVI_BACKEND (chronos|asyncdispatch) and VORTEX_NAVI_REF (nim-navi git
+# ref; empty uses the sha pinned in the client image) selecting how that image
+# is built.
 # See conformance/stress/README.md.
 
 task stressRequests, "Stress soak: buffered GET/POST/PUT with compression (Docker)":

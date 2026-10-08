@@ -256,8 +256,10 @@ Focused soak tests that drive **one workload** at a vortex server, sustained, an
 **verify** it: streaming transfers are checksummed and any mismatch, echo
 mismatch, non-2xx, or missing SSE event **hard-fails**. Responses are discarded
 so memory stays flat; the server's CPU/RSS is printed each interval. Each task
-builds the server (a **protocol × server-runtime** matrix) and a Python load
-client (httpx + websockets). Local-only. See `conformance/stress/README.md`.
+builds the server (a **protocol × server-runtime** matrix) and a load client,
+which is an axis of its own (`VORTEX_CLIENT`): the Python canary (httpx +
+websockets + aioquic) by default, or a compiled Nim navi client. Local-only. See
+`conformance/stress/README.md`.
 
 | Task | Workload |
 |------|----------|
@@ -288,6 +290,9 @@ Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 |-----|---------|-------------|
 | `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3; h3 drives QUIC via aioquic and runs all six workloads, `mixed` included, with `ws` over RFC 9220 Extended CONNECT; h3 cells reuse the h2 server image, so the extra cost is one client run per cell, see the stress README) |
 | `VORTEX_SERVER` | `sync` | Handler runtime: `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` (`async`/`chronos` = `vortex/asyncdispatch` / `vortex/chronos` without an in-handler `await`; the `-await` variants exercise the `await` path) |
+| `VORTEX_CLIENT` | `python` | Which load client drives the cells: `python` \| `navi` \| `all`. `python` is the httpx + websockets + aioquic canary, the default and the harness's interop reference (and its only non-ngtcp2 QUIC stack); `navi` is the compiled Nim client, for the cells where the Python event loop and not vortex is the ceiling; `all` runs every cell **twice**, python then navi, with the client as the innermost loop so both hit the same freshly built server image. The chaos sidecar stays Python either way |
+| `VORTEX_NAVI_BACKEND` | `chronos` | `chronos` \| `asyncdispatch`: the navi client backend the binary is **built** against. A docker build arg, so it is fixed per image rather than per cell |
+| `VORTEX_NAVI_REF` | the sha pinned in `conformance/stress/client/navi/Dockerfile` (nim-navi `62244a8`) | nim-navi ref the navi client image is built from; empty keeps the pin. Pinned, not latest, so a navi change cannot silently move vortex's numbers. Pass a **sha**: a branch or tag name is frozen by the docker build cache at its first build on that host |
 | `VORTEX_SECONDS` | `60` | Runtime per cell, in seconds |
 | `VORTEX_REPORT_SECONDS` | `60` | Cadence of the status-code + server-RSS report |
 | `VORTEX_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width); under `mixed` this is the per-client worker budget, **split** across the five workloads rather than given to each, and it must be at least the number of workloads in the mix (5 by default) -- a smaller value is refused with exit 2 instead of overshot |
@@ -306,6 +311,38 @@ Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 The `VORTEX_SERVER` axis runs each soak against the sync, `vortex/asyncdispatch`,
 and `vortex/chronos` servers - e.g. `VORTEX_SERVER=chronos nimble stressWs`
 exercises chronos's WebSocket path under load.
+
+`VORTEX_CLIENT` makes the **load client** an axis as well. The Python canary is
+the default and stays the interop reference: a green run proves vortex serves a
+widely deployed third-party stack (httpx, h2, websockets, aioquic) under load,
+and aioquic is the only QUIC implementation in the harness that is not ngtcp2.
+`VORTEX_CLIENT=navi` swaps in a compiled Nim client built on navi
+(`conformance/stress/client/navi/`) that verifies exactly the same contract and
+prints exactly the same line grammar - the same three-token
+`[<workload> <proto> <server>]` report prefix, the same pass/`FAIL` banners, the
+same exit codes, config errors on stdout with exit 2 - so a watcher written
+against a python log works on a navi log unchanged; the client is named by the
+cell banner's `client=navi/<backend>` token and by a `client: navi/<backend>
+<sha>` header line, never by a fourth prefix token; the navi client also prints
+its own `client: rss ... heap ...` footprint beside each report line, and its
+backend defaults to chronos because navi's asyncdispatch timeout guard pins
+completed requests for the timeout window (nim-navi #468), and it forces an
+ORC cycle collection every second because the runtime's adaptive trigger stops
+firing in an async program (an `sse` h1 cell reached 15 GB RSS in 120 s without
+it). Reach for it when the
+question is vortex's own throughput, h3 behaviour under a peer that is not the
+bottleneck, or a cross-check against an independent HTTP implementation:
+measured back to back in 60 s cells on one host, navi completed 5.2x the h2
+`requests` of python (673968 against 130464) and moved 5.8-5.9x the bytes on the
+h3 streaming cells (245 and 437 MB/s against 42 and 74 MB/s), so most of the
+harness's h3 figures were aioquic's. Two caveats go with it. vortex and navi share an
+author and the ngtcp2 + nghttp3 QUIC stack, so a cell that passes only under navi
+is not interop evidence and a navi h3 pass is not foreign-stack evidence; and a
+failure under navi has two suspects, so re-run the cell with
+`VORTEX_CLIENT=python` and reproduce the request with `curl` / `h2load` / the
+Python client before touching vortex. The sizing figures above and the 1200 s
+`VORTEX_STREAM_BYTES` threshold were measured at the **Python** client, and the
+defaults stay client-agnostic until navi figures exist.
 
 `VORTEX_CHAOS` adds a **chaos sidecar**: a second client container that
 misbehaves on purpose (slow reads, drip-fed uploads, idle connections,
