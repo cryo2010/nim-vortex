@@ -1967,6 +1967,13 @@ proc handleWindowUpdate(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       # flood. Spend the credit the DATA we sent earned, charge the budget past
       # that (#335): charging every one of these tore working downloads down
       # with GOAWAY after ~1000 frames.
+      #
+      # No h2ResumeProducers here, deliberately: this branch is the flood path,
+      # and the scan it would add is O(streams) on EVERY connection-level update
+      # including the dribbles. A producer parked on the connection write buffer
+      # is resumed by the socket drain (h2DrainResume) or by the scheduler pass
+      # the branch above runs; connection credit that unblocks nothing frees
+      # neither, so there is nothing here for the scan to find.
       h2.noteIdleWindowUpdate(c)
       if c.state == csClosing: return
   elif fh.streamId in h2.streams:
@@ -2181,13 +2188,32 @@ proc h2CheckCounters*(c: ptr Connection) =
   when not defined(release):
     if c.h2 == nil: return
     let h2 = h2Conn(c)
-    var awaiting, backlogged, blocked = 0
+    var awaiting, backlogged, blocked, parked = 0
     var buffered = 0
+    var orphaned = -1
+    let emptyOut = pendingOut(c) == 0
     for sid, st in h2.streams.mpairs:   # mpairs: no per-stream value copy
       if not st.endStreamSeen: inc awaiting
       if st.pendingBody.len > st.pendingPos:
         inc backlogged
         if st.sendWindow <= 0: inc blocked
+      if st.respBackedUp: inc parked
+      # A drain callback registered on a stream nobody marked backed up, with
+      # NOTHING queued anywhere, is owed no event at all: no socket drain, no
+      # WINDOW_UPDATE and no scheduler pass will ever fire it, since
+      # h2ResumeProducers only looks at marked streams. That is the state #399
+      # hung in, and the state the read-ahead gate's deferred half
+      # (request.pullAfterWrite) exists to keep sendFile out of.
+      #
+      # Deliberately limited to the empty case. A callback registered while the
+      # backlog is non-zero but still under the mark is just as unfireable, but
+      # `res.drained()` registers exactly there on purpose (it short-circuits
+      # only at bufferedAmount == 0), so asserting on it would fail a public API
+      # rather than a bug in this file. A WebSocket stream is exempt: its
+      # pendingBody is a frame queue and its drain is wsDrained's, not this one.
+      if orphaned < 0 and st.rs.onRespDrain != nil and not st.respBackedUp and
+          emptyOut and st.pendingBody.len == st.pendingPos and st.ws == nil:
+        orphaned = int(sid)
       buffered += st.bufferedCounted
     assert awaiting == h2.awaitingClientStreams,
       "h2 awaitingClientStreams drift: " & $h2.awaitingClientStreams & " vs " & $awaiting
@@ -2197,6 +2223,10 @@ proc h2CheckCounters*(c: ptr Connection) =
       "h2 windowBlockedStreams drift: " & $h2.windowBlockedStreams & " vs " & $blocked
     assert buffered == h2.bufferedBytes,
       "h2 bufferedBytes drift: " & $h2.bufferedBytes & " vs " & $buffered
+    assert parked == h2.backedUpProducers,
+      "h2 backedUpProducers drift: " & $h2.backedUpProducers & " vs " & $parked
+    assert orphaned < 0,
+      "h2 stream " & $orphaned & " parked an onDrain nothing will fire"
 
 proc h2StreamAlive*(c: ptr Connection, sid: uint32): bool =
   c.h2 != nil and sid in h2Conn(c).streams

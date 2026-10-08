@@ -950,9 +950,22 @@ The same block works synchronously (`discard res.write(...)` inside it).
 `text/*` type to keep compression on).
 
 **Backpressure.** `res.write` returns `false` once the unsent backlog reaches
-`respHighWater` (256 KiB). `await res.write` awaits the drain for you; a sync
+`respHighWater` (64 KiB). `await res.write` awaits the drain for you; a sync
 producer that outruns a slow client should instead pause and resume from
 `res.onDrain` (`res.bufferedAmount` reports the current backlog).
+
+A single chunk larger than the high-water mark is accepted whole: `write` never
+takes part of a chunk and never refuses one, so the backlog can overshoot the
+mark by up to one chunk. The verdict is then taken on what is left when the
+call returns, not on what the chunk added: `write` returns `false` only if the
+stream's backlog or the connection's write buffer is *still* at or above the
+mark at that point. A fast peer can absorb a whole 1 MiB chunk inside the call
+and get `true` back, which is the common case on HTTP/2 with a wide peer
+window. When it does return `false`, `onDrain` fires once both the stream
+backlog and the connection write buffer are under the mark again. Chunk size is
+purely a memory / callback trade-off -- a 1 MiB chunk retains more per stream
+and earns fewer drain callbacks than a 64 KiB one -- and no chunk size can
+stall the stream.
 
 `false` is not exclusively backpressure: a dead connection and a call from off
 the loop thread also return it. Streaming is loop-thread only (the handler, an

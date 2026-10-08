@@ -8,7 +8,7 @@
 ## are the exception: they exist so a suite can observe the server's dynamic
 ## table across blocks.
 
-import std/[net, posix, oserrors, tables]
+import std/[net, posix, oserrors, tables, times]
 import vortex/http2/frames
 import vortex/http2/hpack
 import ./helper
@@ -345,3 +345,27 @@ proc streamData*(c: var H2TestConn, sid: uint32,
 
 proc close*(c: var H2TestConn) =
   c.sock.close()
+
+# --- shared send helper -----------------------------------------------------
+
+proc rawSend*(c: var H2TestConn, data: string, timeout = 5.0): bool =
+  ## Send with a bounded retry, returning false once the peer is gone.
+  ## std/net's `Socket.send(string)` cannot be used for this: under its default
+  ## SafeDisconn flag a disconnect is swallowed silently and the same buffer is
+  ## retried forever, so a server that GOAWAYs or stalls mid-download (exactly
+  ## the #335 and #399 failures) would spin the calling thread at 100% CPU
+  ## instead of failing the check. `timeout` bounds the wait for a socket that
+  ## is merely full, so it has to outlast a loaded host: a couple of seconds is
+  ## not enough while a stress soak is running beside the suite.
+  var off = 0
+  let limit = epochTime() + timeout
+  while off < data.len:
+    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
+    if n > 0:
+      off += n
+    else:
+      let e = osLastError().cint
+      if e == EINTR: continue
+      if (e == EAGAIN or e == EWOULDBLOCK) and epochTime() < limit: continue
+      return false
+  true

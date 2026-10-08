@@ -279,6 +279,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nor a fallback resolving to the wrong bit can pass. It is a separate binary
   from `tests/test_h3_tls_ctx.nim` because both include the shim's translation
   unit. (#398)
+- HTTP/2: a streamed response written in chunks larger than `respHighWater`
+  (64 KiB) no longer stalls partway through, with no RST_STREAM and no GOAWAY.
+  `res.write` accepts a chunk whole, so a 1 MiB write parks most of itself in the
+  stream's `pendingBody`; the flush that `write` then runs drains up to
+  `h2MaxRefillRounds` x `respHighWater` (1 MiB) of that straight to the socket,
+  so with a peer whose window is wider than the response -- curl, which returns
+  no WINDOW_UPDATE at all for a 4 MiB download -- the chunk was routinely gone by
+  the time the call returned. The backpressure verdict, though, was taken on the
+  backlog `h2StreamWrite` had reported BEFORE that flush, so the producer was
+  marked backed up with an empty backlog and an empty write buffer: no socket
+  drain, no WINDOW_UPDATE and no scheduler pass was left to come, every path that
+  re-arms a parked producer is driven by one of those three events, and the
+  registered `onDrain` could never fire again. 64 KiB chunks completed because
+  the direct-emit path leaves no backlog, so `write` kept returning true and the
+  producer never parked at all. The verdict now reads the live backlog, the same
+  way it already read the live `pendingOut`, so backpressure is reported only
+  while one of the two caps is genuinely exceeded -- and then the socket or the
+  peer's window still owes the event that resumes it. It reads that backlog
+  under `h2StreamWrite`'s own guards, so a `write` after `finish()` with the
+  final DATA still queued no longer re-marks a finished stream, and a
+  WebSocket-over-h2 stream's frame queue is not mistaken for a response backlog.
+  The re-arm condition is unchanged (a producer is invited back only once its own
+  backlog is under the mark, so a slow peer cannot be fed another megabyte per
+  drain). HTTP/1 and HTTP/3 were never affected.
+
+  `res.sendFile` had the same stall one layer down. Its read-ahead gate ran
+  before the arrived chunk was written and, when the backlog was already at the
+  budget, parked the next disk read on `onDrain` -- relying on the write that
+  followed to report backpressure and arm it. On a wide peer window that write
+  now routinely reports writable with everything already flushed, so the parked
+  read was owed no event at all and the download stopped mid-file. The gate's
+  dispatch half still runs before the write (the disk read overlaps the socket
+  write, #340); the decision to wait moved after it and is taken from the
+  write's own verdict, which also closes the same hole on HTTP/1 (whose drain
+  path needs `c.respBackedUp`) and HTTP/3 (whose `on_stream_writable` only fires
+  on an ack that may already have happened).
+
+  The contract is documented on `res.write` and in the README: a chunk above the
+  mark is accepted whole, so the backlog can overshoot by one chunk, and the
+  verdict is taken on what is LEFT when the call returns -- false only while the
+  stream backlog or the connection write buffer is still at or above the mark, so
+  a fast peer that absorbs a whole 1 MiB chunk inside the call gets true back.
+  `onDrain` then fires once both are under the mark again. Chunk size trades
+  memory for callbacks and can never stall the stream. The debug-only
+  `h2CheckCounters` audit now also covers `backedUpProducers` and asserts that no
+  stream parks a drain callback with nothing queued to fire it. (#399)
 
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
   longer fails its h3 cell at a transfer size it cannot finish.

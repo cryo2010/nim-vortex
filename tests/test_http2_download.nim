@@ -5,7 +5,7 @@
 ## returns the credit as WINDOW_UPDATEs, keeping the send windows small so the
 ## server's per-stream backlog never reaches zero.
 
-import std/[unittest, net, httpcore, strutils, atomics, posix, times, oserrors, os]
+import std/[unittest, net, httpcore, strutils, atomics, posix, times, os]
 import vortex/[settings, request, server, routing, staticfiles]
 import vortex/asyncdispatch
 import vortex/http2/frames
@@ -172,25 +172,6 @@ var budgetSrv = newVortex(rt.toHandler,
   initVortexConfig(numThreads = 1, maxControlFrames = budget)).start(0)
 
 type DlResult = tuple[bytes: int, goaway: int, connUpdates: int]
-
-proc rawSend(c: var H2TestConn, data: string): bool =
-  ## Send with a bounded retry, returning false once the peer is gone.
-  ## std/net's `Socket.send(string)` cannot be used here: under its default
-  ## SafeDisconn flag a disconnect is swallowed silently and the same buffer is
-  ## retried forever, so a server that GOAWAYs mid-download (exactly the #335
-  ## failure) would spin this thread at 100% CPU instead of failing the check.
-  var off = 0
-  let limit = epochTime() + 2.0
-  while off < data.len:
-    let n = posix.send(c.sock.getFd, unsafeAddr data[off], data.len - off, 0)
-    if n > 0:
-      off += n
-    else:
-      let e = osLastError().cint
-      if e == EINTR: continue
-      if (e == EAGAIN or e == EWOULDBLOCK) and epochTime() < limit: continue
-      return false
-  true
 
 proc download(port: Port, connCreditChunk: int, connGrant = 0): DlResult =
   ## Fetch /big, returning the credit as WINDOW_UPDATEs. `connCreditChunk`
