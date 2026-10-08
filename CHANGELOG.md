@@ -9,6 +9,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Stress harness: `VORTEX_CLIENT=python|navi|all`, which makes the **load
+  client** an axis of the soak matrix beside `VORTEX_PROTO` and `VORTEX_SERVER`.
+  The Python canary (httpx + websockets + aioquic) stays the default and the
+  interop reference; `navi` swaps in a new compiled Nim client
+  (`conformance/stress/client/navi/stress_navi.nim`, built on nim-navi) that
+  reproduces the canary's contract exactly: the same typed payload catalogue and
+  `Content-Type` round-trip, the same download SHA-1 and upload 200-vs-400
+  negative probe, the same SSE id order and 20-event batches, the same
+  abandon-at-deadline semantics, the same per-workload progress check. The
+  Python client caps what the harness can measure and test. It is one asyncio
+  loop per container behind the GIL with QUIC crypto and framing done in Python,
+  so on the hot cells the soak measures aioquic at least as much as vortex, and
+  the client's own failure modes land in the log as vortex failures (#390 was a
+  teardown race inside httpcore/anyio that failed a healthy cell one run in
+  three; the loop watchdog exists because a wedged Python loop trips the
+  server's idle timeout and reads as a server stall). navi is also a second,
+  independent HTTP/1.1, HTTP/2, HTTP/3, WebSocket and SSE implementation with
+  its own HPACK, h2 framing and flow control, so where the two clients agree a
+  vortex pass means more, and it streams its request bodies, which removes the
+  one undecidable arm of the no-progress diagnosis (aioquic buffers an h3 upload
+  body up front, so that cell counts bytes only on completion and cannot tell a
+  stall from a slow transfer; under navi the message is always the decidable
+  one). Measured in 60 s cells at the sync server, python then navi back to
+  back on one server image: `requests` h2 673968 requests under navi against
+  130464 under python (5.2x), `streamdownload` h3 at 64 MiB 245 MB/s against
+  42 MB/s (5.8x), `streamupload` h3 437 MB/s against 74 MB/s (5.9x), and the
+  mixed h3 cell completes nine 16 MiB downloads in 10 s where python completes
+  none -- the first measurement of how much of the harness's h3 numbers was
+  aioquic. One-minute cells on a shared host, so a reason to run a navi cell,
+  not a benchmark of either side; the sizing defaults stay client-agnostic and
+  the README now carries the navi tables beside the Python ones.
+  The **output grammar is unchanged**, deliberately: the harness is read by
+  watchers that match exact line forms, so the navi client prints the same lines
+  on stdout -- the three-token `[<workload> <proto> <server>]` report prefix (no
+  fourth token), the `final ` line, `== <workload> <server> <proto> passed
+  (<tally>) ==`, `FAIL <workload>: <cause> (<codes>)`, config errors on stdout
+  with exit 2, and the exit codes 0/1/2 -- and a `grep` that works on a python
+  log works on a navi log unchanged. The client is named by `run.sh`'s cell
+  banner (`=== requests [proto=h2 server=sync client=navi/chronos] : 10s,
+  3x32 ===`) and by one `client: navi/<backend> <sha>` header line the binary
+  prints first; there is no `client=python` token, so a python log stays
+  byte-identical to what it was before this axis existed. The one line the
+  navi client adds is its own footprint, `client: rss <n>MB heap <n>MB fds <n>
+  t=<n>s`, beside every report line: a 30-minute h3 mixed soak ended in a bare
+  `FAILED (exit 137)` because the kernel OOM-killed the client container, and
+  nothing in the log could say so. That OOM is why the default backend is
+  **chronos**: navi's asyncdispatch total-timeout guard never clears its timer
+  when the request wins, so a completed request stays reachable until the
+  timer fires (nim-navi #468), which is memory proportional to request rate x
+  timeout (a 750 MB plateau on `requests`, and every download's buffers pinned
+  until the end of the run when the timer is the time left); chronos cancels
+  its timer, and downloads carry no total timeout on either backend since the
+  per-chunk deadline check is their abandon mechanism. The client also forces
+  an ORC cycle collection every second (`VORTEX_NAVI_COLLECT_SECONDS`): the
+  runtime's own trigger is a root-count threshold that grows 1.5x after every
+  collection that frees less than half of what it touched, which in an async
+  program is every collection, so it effectively stops; an `sse` h1 cell at
+  ~16k short streams a second reached 15 GB RSS in 120 s of collectable
+  garbage, and with the explicit collection the full h3 mix holds at ~200 MB.
+  `VORTEX_NAVI_BACKEND=chronos|asyncdispatch` selects which navi client the
+  single binary is compiled against and `VORTEX_NAVI_REF` which nim-navi tree,
+  both **build**-time, so the image is built once per run and never per cell
+  (about a minute with no cache on a 14-cpu arm64 host, the `-d:naviHttp3`
+  compile itself 10-12 s; the compile layer depends on the six codec modules
+  only, not on all of `src/`, and `nimble stress` keeps the client tags across
+  its six per-workload re-execs so a smoke builds each once); an unknown
+  `VORTEX_CLIENT` or `VORTEX_NAVI_BACKEND`, or a `VORTEX_NAVI_REF` that is not
+  one git-ref word, is rejected on stdout with exit 2 before any docker build
+  burns minutes. nim-navi is **pinned by sha** (`62244a8`), not latest,
+  because an unpinned client silently changes the thing being measured: the
+  bench client image installs latest and that is exactly what made its numbers
+  move under it. The pin is consumed as a `git clone` + `git checkout --detach`
+  worktree reached with `--path:/navi/src` rather than `nimble install
+  navi@#<sha>`, because navi's package spec omits the HTTP/3 driver's own
+  `h3client.h`, so an installed package's `-d:naviHttp3` build fails at the C++
+  step -- a navi packaging gap (nim-navi #465), and a stricter pin in the
+  meantime. The binary is built `-d:release` with stack/line traces, not
+  `-d:danger` like the bench client and not `--panics:on` like the server's
+  soak profile: a verifier has to say where it died, and it prints its cause
+  and trace on stdout because stderr is not teed (#387), which a Defect made
+  fatal at the raise site would never reach. Workers are waited on first
+  failure wins, as `asyncio.gather` does, so the first defect ends the cell
+  with its own cause rather than whichever worker happened to finish first. It links all
+  three codecs with `run.sh`'s own `codec_flags`, so it compresses request
+  bodies with vortex's own encoders, and it runs with navi's retries and
+  redirects **off**, since navi retries 5xx by default and that would mask
+  exactly what the soak exists to catch. `VORTEX_REQ_COMPRESSION` and
+  `VORTEX_RESP_COMPRESSION` mean what they mean under python, with no skip
+  notice: navi adds its default `accept-encoding` only when the caller sent
+  none, and an explicit `content-type` on a string body survives verbatim,
+  multipart boundary included. The chaos sidecar is **unaffected and stays
+  Python** -- `chaos.py` models a misbehaving *client* and is client-independent
+  by design -- so it runs unchanged from the python image beside a navi canary,
+  which means a navi run with chaos on builds both client images and
+  `VORTEX_CLIENT=navi VORTEX_CHAOS=none` builds no Python image at all.
+  `VORTEX_CLIENT=all` runs every cell twice, python then navi, with the client
+  as the innermost loop so the two hit the same freshly built server image back
+  to back, the only arrangement in which the comparison is a comparison. The
+  sizing tables and the 1200 s `VORTEX_STREAM_BYTES` threshold were measured at
+  the Python client and the defaults are kept client-agnostic until navi figures
+  exist; every number in the stress README is now labelled by client. (#397)
+
 - Stress harness: `nimble stressMixed`, a soak that drives all five verified
   workloads -- `requests`, `ws`, `sse`, `streamupload`, `streamdownload` -- at
   ONE server process at the same time, over the same protocol x server-runtime

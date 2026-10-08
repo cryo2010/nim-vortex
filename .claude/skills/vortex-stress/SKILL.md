@@ -75,7 +75,9 @@ Some simple ways to distribute the work are by workload, server and/or protocol.
   percentages (`requests=100` alone is not "100%"); for `streamupload`/`streamdownload` the
   weight is presence-only (any value > 0 runs that slice at one transfer in flight per client,
   `0` drops it). `VORTEX_CONCURRENCY` must be at least the number of workloads in the mix.
-- Optional pass-throughs, only if the prompt names them: `VORTEX_CLIENTS`, `VORTEX_CONCURRENCY`,
+- Optional pass-throughs, only if the prompt names them: `VORTEX_CLIENT` (`python`|`navi`|`all`,
+  the load client; default python), `VORTEX_NAVI_BACKEND` (`chronos`|`asyncdispatch`, default chronos),
+  `VORTEX_NAVI_REF` (a nim-navi sha), `VORTEX_CLIENTS`, `VORTEX_CONCURRENCY`,
   `VORTEX_REQ_COMPRESSION`, `VORTEX_RESP_COMPRESSION` (`none`|`gzip`|`br`|`zstd`),
   `VORTEX_CHAOS_CONC` (sidecar workers, default 8), `VORTEX_CHAOS_SEED` (a fixed seed replays an
   identical chaos schedule; set it when reproducing a chaos-correlated failure).
@@ -157,7 +159,7 @@ Each cell agent's prompt must contain:
   log's tail. Then clean up the cell's resources (ignore errors -- run.sh's own trap may have
   removed them): `docker rm -f vortex-stress-server-<id> vortex-stress-chaos-<id>`,
   `docker network rm vortex-stress-<id>`,
-  `docker rmi -f vortex-stress-server-img-<id> vortex-stress-client-img-<id>`.
+  `docker rmi -f vortex-stress-server-img-<id> vortex-stress-client-img-<id> vortex-stress-navi-img-<id>`.
 - **Hard rules**: never edit source, never commit, never attempt a fix -- run, observe, report.
 - **Return a structured verdict**: the cell (workload × proto × server), PASS or FAIL, the
   terminal signature line, a one-line failure reason (if any), the final
