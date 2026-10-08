@@ -54,9 +54,14 @@ const
   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER = clong(2)
   SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
   SSL_OP_NO_RENEGOTIATION = uint64(1) shl 30   # <openssl/ssl.h> SSL_OP_BIT(30)
-  # SSL_OP_BIT(22). OpenSSL >= 3.5 spells this `SSL_OP_SERVER_PREFERENCE` and
-  # keeps `SSL_OP_CIPHER_SERVER_PREFERENCE` as a backwards-compatible alias for
-  # the same bit, so both names find it in a 3.6 <openssl/ssl.h> (#375).
+  # SSL_OP_BIT(22). OpenSSL 3.5, this project's minimum, spells this bit only
+  # `SSL_OP_CIPHER_SERVER_PREFERENCE`; 3.6.0 introduced
+  # `SSL_OP_SERVER_PREFERENCE` as the preferred name for it and kept the old one
+  # as a backwards-compatible alias, so both names find it in a 3.6
+  # <openssl/ssl.h> and only the old one exists in 3.5's (#375, #398). The value
+  # is declared here rather than taken from a header, so the Nim side builds on
+  # either; the ngtcp2 shim, which does read the name out of <openssl/ssl.h>,
+  # carries a fallback define for 3.5.
   SSL_OP_SERVER_PREFERENCE = uint64(1) shl 22
   SSL_OP_PRIORITIZE_CHACHA = uint64(1) shl 21   # ditto, SSL_OP_BIT(21)
   SSL_SESS_CACHE_SERVER = clong(0x0002)
@@ -768,26 +773,29 @@ proc buildTlsCtx(meth: pointer, m: TlsMaterial, verify: cint,
   # no_renegotiation alert, leaving the connection usable.
   #
   # Pick ciphers in the order the operator wrote them. Without
-  # SSL_OP_SERVER_PREFERENCE (the OpenSSL >= 3.5 name for the bit also spelled
-  # SSL_OP_CIPHER_SERVER_PREFERENCE) OpenSSL walks the *client's* list and takes
-  # the first entry we also allow, which turns tlsCipherList and
-  # tlsCipherSuites into unordered allow-sets: a list of
-  # "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256" is accepted,
-  # applied, and then silently inverted by any client that happens to put
-  # AES-128 first (#375). One option covers both cipher generations, because
-  # OpenSSL runs TLS 1.2 cipher selection and TLS 1.3 ciphersuite selection
-  # through the same preference pick.
+  # SSL_OP_SERVER_PREFERENCE (the name OpenSSL 3.6.0 introduced for the bit that
+  # 3.5, this project's minimum, spells only SSL_OP_CIPHER_SERVER_PREFERENCE)
+  # OpenSSL walks the *client's* list and takes the first entry we also allow,
+  # which turns tlsCipherList and tlsCipherSuites into unordered allow-sets: a
+  # list of "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256" is
+  # accepted, applied, and then silently inverted by any client that happens
+  # to put AES-128 first (#375). One option covers both cipher generations,
+  # because OpenSSL runs TLS 1.2 cipher selection and TLS 1.3 ciphersuite
+  # selection through the same preference pick.
   #
-  # Be honest about how wide that is. On OpenSSL >= 3.5, which is this project's
-  # minimum, the option is documented as "when choosing a cipher, signature,
-  # (TLS 1.2) curve or (TLS 1.3) group, use the server's preferences", so the
-  # same bit also makes ECDH group, TLS 1.2 curve and signature-algorithm
-  # selection follow the server's order. There is no cipher-only variant to ask
-  # for instead, and the wider policy is the right one for a server: the server
-  # decides. It costs nothing at the handshake level either -- our group list is
-  # OpenSSL's default unless an embedder configures one, and OpenSSL still uses
-  # a group the client sent a key share for when that group is in our list, so
-  # no extra HelloRetryRequest round trip appears.
+  # Be honest about how wide that is. OpenSSL 3.5, which is this project's
+  # minimum, already extended the bit to cover server-side TLS 1.3 key exchange
+  # group selection, and 3.6 documents the full scope: "when choosing a cipher,
+  # signature, (TLS 1.2) curve or (TLS 1.3) group, use the server's
+  # preferences", so the same bit also makes ECDH group, TLS 1.2 curve and
+  # signature-algorithm selection follow the server's order. (3.5's own manual
+  # still describes it as cipher selection only, under the old name; its
+  # changelog is where the group half is recorded.) There is no cipher-only
+  # variant to ask for instead, and the wider policy is the right one for a
+  # server: the server decides. It costs nothing at the handshake level either
+  # -- our group list is OpenSSL's default unless an embedder configures one,
+  # and OpenSSL still uses a group the client sent a key share for when that
+  # group is in our list, so no extra HelloRetryRequest round trip appears.
   #
   # The ChaCha courtesy. SSL_OP_PRIORITIZE_CHACHA says: keep the server's order,
   # except that a client whose *own* first choice is ChaCha20-Poly1305 gets

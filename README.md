@@ -346,14 +346,18 @@ a client on 1.2. QUIC/HTTP/3 is always 1.3, so a 1.2 floor is raised to 1.3 ther
 *ceiling* needs `http3 = false` (the combination is refused rather than quietly ignored on
 HTTP/3). `tlsCipherSuites` (TLS 1.3) applies to both transports; `tlsCipherList` is TLS 1.2
 only, so HTTP/3 never consults it. Both are preference *orders*, not unordered allow-sets:
-vortex sets `SSL_OP_SERVER_PREFERENCE` (the same option bit OpenSSL < 3.5 spelled
-`SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first entry both ends support is what gets
-negotiated, whatever order the client offers. They remain allow-*sets* as well: a client
-that cannot do the preferred entry still connects on another.
+vortex sets `SSL_OP_SERVER_PREFERENCE` (the name OpenSSL 3.6.0 introduced for the option bit
+that 3.5, the project minimum, spells only `SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first
+entry both ends support is what gets negotiated, whatever order the client offers. They
+remain allow-*sets* as well: a client that cannot do the preferred entry still connects on
+another.
 
-On OpenSSL 3.5+ (the project minimum) the same option also makes ECDH group, TLS 1.2 curve
-and signature-algorithm selection follow the server's order; the server's group list is
-OpenSSL's default unless configured, and a client key share for the server's preferred group
+That option is wider than ciphers. OpenSSL 3.5 (the project minimum) extended it to
+server-side TLS 1.3 key exchange group selection, and 3.6 documents the whole of it: "when
+choosing a cipher, signature, (TLS 1.2) curve or (TLS 1.3) group, use the server's
+preferences". So ECDH group, TLS 1.2 curve and signature-algorithm selection follow the
+server's order too; the server's group list is OpenSSL's default unless
+configured, and a client key share for the server's preferred group
 is still used, so no extra round trip appears. With *both* lists empty the operator
 configured no policy, so vortex also sets `SSL_OP_PRIORITIZE_CHACHA`: a client that offers
 ChaCha20-Poly1305 first (the "no AES hardware" signal) gets ChaCha rather than software AES,

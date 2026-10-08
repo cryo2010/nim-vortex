@@ -251,6 +251,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send, as the docs say, so a handler on a route it registered itself still owes
   a non-handshake an answer -- the sync stress server's `/ws` handler does that
   check explicitly now, so all five of its runtime builds behave alike. (#400)
+- HTTP/3: the ngtcp2 shim compiles against OpenSSL 3.5 again, the version
+  README.md, HARDENING.md and CONTRIBUTING.md all give as the project minimum.
+  `src/vortex/http3/ngtcp2/vq_ngtcp2.cpp` took the server-preference option
+  straight from `<openssl/ssl.h>` as `SSL_OP_SERVER_PREFERENCE`, and that name
+  only arrived in OpenSSL 3.6.0 ("Introduced `SSL_OP_SERVER_PREFERENCE`,
+  superseding misleadingly named `SSL_OP_CIPHER_SERVER_PREFERENCE`"): 3.5
+  defines nothing but the old spelling, so the translation unit did not build
+  on the documented minimum at all. Nobody saw it, because the vortex images are
+  Arch-based and carry a newer OpenSSL, and nim-navi's stress image had papered
+  over it with `--passC:-DSSL_OP_SERVER_PREFERENCE=SSL_OP_CIPHER_SERVER_PREFERENCE`.
+  The shim now carries a fallback define for the older spelling, and since the
+  Nim side was never affected -- `transport/tls.nim` declares the bit itself as
+  `uint64(1) shl 22` instead of reading a header -- that one define covers the
+  whole build; the minimum stays at 3.5 rather than being raised to match the
+  code. The comments and docs that explained the two names had it backwards,
+  saying 3.5 introduced the new name and kept the old one as an alias when it is
+  3.6 that does so, and they overstated the bit's reach: 3.5 extended it to
+  cover server-side TLS 1.3 key exchange group selection while 3.5's own manual
+  still describes it as cipher selection only, and 3.6 is where the full
+  "cipher, signature, (TLS 1.2) curve or (TLS 1.3) group" wording is documented.
+  Both claims are corrected in the shim, `transport/tls.nim`, README.md,
+  HARDENING.md and `tests/test_tls_cipher_order.nim`, and the build is pinned by
+  `tests/test_h3_tls_ossl35.nim`, whose harness rewrites the macros to the
+  single spelling 3.5's header has, compiles the shim against them, and checks
+  the context it builds still carries `SSL_OP_BIT(22)`, so neither a lost define
+  nor a fallback resolving to the wrong bit can pass. It is a separate binary
+  from `tests/test_h3_tls_ctx.nim` because both include the shim's translation
+  unit. (#398)
 
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
   longer fails its h3 cell at a transfer size it cannot finish.

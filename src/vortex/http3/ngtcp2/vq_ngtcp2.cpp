@@ -19,6 +19,18 @@
 #include <openssl/pkcs12.h>
 #include <openssl/x509.h>
 
+// SSL_OP_SERVER_PREFERENCE is the name OpenSSL 3.6.0 introduced for the option
+// bit it had always called SSL_OP_CIPHER_SERVER_PREFERENCE; both spellings are
+// SSL_OP_BIT(22) and 3.6's <openssl/ssl.h> keeps the old one as an alias for
+// the new. OpenSSL 3.5, this project's documented minimum, defines only the
+// old name, so taking the new one straight from the header stopped this
+// translation unit compiling there (#398). Nothing else in vortex reads the
+// name out of a header -- transport/tls.nim declares the bit itself -- so one
+// fallback here covers the whole build.
+#ifndef SSL_OP_SERVER_PREFERENCE
+#define SSL_OP_SERVER_PREFERENCE SSL_OP_CIPHER_SERVER_PREFERENCE
+#endif
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -1404,24 +1416,28 @@ static SslCtxPtr makeCtx(const VqConfig *cfg, std::string *err = nullptr) {
       SSL_CTX_set_ciphersuites(ctx.get(), cfg->tls_cipher_suites) != 1)
     return fail("invalid TLS 1.3 cipher suites");
   // That list is a preference order, not a set. Without
-  // SSL_OP_SERVER_PREFERENCE (the OpenSSL >= 3.5 name for the bit also spelled
-  // SSL_OP_CIPHER_SERVER_PREFERENCE) OpenSSL walks the CLIENT's ciphersuite list
-  // and takes the first entry we also allow, so tlsCipherSuites would be an
-  // unordered allow-set here and an ordered preference on TCP: the same
-  // configuration, two answers, depending only on which transport the client
-  // picked (#375). SSL_OP_NO_RENEGOTIATION has no counterpart to add -- QUIC is
+  // SSL_OP_SERVER_PREFERENCE (the name OpenSSL 3.6.0 introduced for the bit
+  // that 3.5, this project's minimum, spells only
+  // SSL_OP_CIPHER_SERVER_PREFERENCE; see the fallback define at the top of this
+  // file) OpenSSL walks the CLIENT's ciphersuite list and takes the first entry
+  // we also allow, so tlsCipherSuites would be an unordered allow-set here and
+  // an ordered preference on TCP: the same configuration, two answers,
+  // depending only on which transport the client picked (#375).
+  // SSL_OP_NO_RENEGOTIATION has no counterpart to add -- QUIC is
   // TLS 1.3 only and TLS 1.3 has no renegotiation. Nor is there a counterpart to
   // the TCP side's RFC 7540 Appendix A screen of tlsCipherList: QUIC never
   // negotiates TLS 1.2, and every TLS 1.3 ciphersuite is AEAD, so a QUIC
   // handshake cannot land on a suite HTTP/2 (or HTTP/3) refuses.
   //
-  // On OpenSSL >= 3.5, this project's minimum, the same bit is documented more
-  // widely: "when choosing a cipher, signature, (TLS 1.2) curve or (TLS 1.3)
-  // group, use the server's preferences". So ECDH group and
-  // signature-algorithm selection follow our order too. That is the policy we
-  // want (the server decides) and it costs no round trip: the group list here is
-  // OpenSSL's default, and OpenSSL still picks a group the client sent a key
-  // share for when that group is in our list, so no HelloRetryRequest appears.
+  // The bit is wider than ciphers. OpenSSL 3.5, this project's minimum, already
+  // extended it to cover server-side TLS 1.3 key exchange group selection, and
+  // 3.6 documents the whole scope: "when choosing a cipher, signature, (TLS
+  // 1.2) curve or (TLS 1.3) group, use the server's preferences". So ECDH group
+  // and signature-algorithm selection follow our order too. That is the policy
+  // we want (the server decides) and it costs no round trip: the group list
+  // here is OpenSSL's default, and OpenSSL still picks a group the client sent
+  // a key share for when that group is in our list, so no HelloRetryRequest
+  // appears.
   //
   // SSL_OP_PRIORITIZE_CHACHA keeps our order except for a client whose own first
   // choice is ChaCha20-Poly1305, which in practice means a client with no AES

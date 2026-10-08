@@ -134,6 +134,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_tls_reload_h3.nim` | Certificate hot-reload for HTTP/3 (QUIC), cross-thread reload signal |
 | `test_tls_h3_material.nim` | TLS key/cert material matrix (files, in-memory PEM, encrypted keys) actually reaching the HTTP/3 (QUIC) engine, not just h1 |
 | `test_tls_helpers.nim` | TLS deployment helpers: `res.redirect`, `req.isSecure` (SEC5) |
+| `test_h3_tls_ossl35.nim` | The ngtcp2 shim compiles against OpenSSL 3.5, the documented minimum: the harness rewrites `SSL_OP_SERVER_PREFERENCE` away and checks the context still carries `SSL_OP_BIT(22)` |
 
 ### Routing, adapters & core API
 

@@ -173,19 +173,22 @@ blasting (`tests/test_h3_udp_flood.nim` asserts it, with a 5 s bound).
 | `compress` | `false` | gzip/brotli-compress eligible responses |
 
 Both cipher settings are enforced as the server's preference order
-(`SSL_OP_SERVER_PREFERENCE`, the same option bit OpenSSL < 3.5 spelled
+(`SSL_OP_SERVER_PREFERENCE`, the name OpenSSL 3.6.0 introduced for the option
+bit that 3.5, the project minimum, spells only
 `SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first entry both ends support is what
 gets negotiated whatever order the client offered. Three consequences worth
 knowing before you write a list:
 
-- **It is wider than ciphers.** On OpenSSL 3.5+, which is the project minimum,
-  that one option means "when choosing a cipher, signature, (TLS 1.2) curve or
-  (TLS 1.3) group, use the server's preferences", so ECDH group, TLS 1.2 curve
-  and signature-algorithm selection follow the server's order too. There is no
-  cipher-only variant to ask for instead, and the wider policy is the one a
-  server wants. It costs no round trip: the server's group list is OpenSSL's
-  default unless an embedder configures one, and a client key share for the
-  server's preferred group is still used, so no extra HelloRetryRequest appears.
+- **It is wider than ciphers.** OpenSSL 3.5, which is the project minimum,
+  extended that one option to server-side TLS 1.3 key exchange group selection,
+  and 3.6 documents its whole scope: "when choosing a cipher, signature, (TLS
+  1.2) curve or (TLS 1.3) group, use the server's preferences", so ECDH group,
+  TLS 1.2 curve and signature-algorithm selection follow the server's order too.
+  There is no cipher-only variant to ask for instead, and the wider policy is
+  the one a server wants. It costs no round trip: the server's group list is
+  OpenSSL's default unless an embedder configures one, and a client key share
+  for the server's preferred group is still used, so no extra HelloRetryRequest
+  appears.
 - **An unconfigured list keeps the ChaCha courtesy.** With both settings empty
   the operator stated no policy, and the order being enforced would just be
   OpenSSL's built-in one (AES-256-GCM, ChaCha20, AES-128-GCM). A client that puts
