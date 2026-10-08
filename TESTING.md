@@ -33,9 +33,10 @@ nimble testchronos     # chronos async adapter (needs chronos)
 nimble h1spec h2spec h3spec h3websocket autobahn redbot \
        zap testssl h2load h3load interop brotli fuzz
 
-# Per-workload stress soaks (pass/fail, checksum-verified; Docker):
+# Stress soaks (pass/fail, checksum-verified; Docker):
 nimble stressRequests stressWs stressSse stressStreamUpload stressStreamDownload
-nimble stress          # short smoke of all five
+nimble stressMixed     # all five at one server at the same time
+nimble stress          # short smoke of all six
 
 # Interactive load/stress with live Grafana charts (the stack stays up):
 nimble loadtest        # k6: hold a load, chart latency + server CPU/mem  (localhost:3000)
@@ -102,6 +103,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | Test | Verifies |
 |------|----------|
 | `test_http3.nim` | HTTP/3 integration over QUIC (via an HTTP/3-capable curl; skips if absent), including a streaming route's declared `content-length` against the body received |
+| `test_h3_idle_keepalive.nim` | `keepAliveTimeout` reaches the QUIC transport parameters, a narrow idle window neither breaks a normal exchange nor truncates a slower-than-idle one, and the server itself PINGs through the quiet gap (>= 3 ACK-less transmitted PINGs, six observed; a fast exchange is held to <= 2) -- counted with the shim's `-d:vortexH3FrameLog` frame-log hook, which the suite's `.nims` sidecar switches on. The count is a lower bound on keep-alives (one coalesced with an ACK is counted apart) and an upper bound including PTO probes (#347) |
 
 ### WebSockets
 
@@ -248,7 +250,7 @@ Details for each live in the matching `conformance/<name>/README.md`.
 
 ---
 
-## Stress soaks (per-workload, pass/fail)
+## Stress soaks (pass/fail)
 
 Focused soak tests that drive **one workload** at a vortex server, sustained, and
 **verify** it: streaming transfers are checksummed and any mismatch, echo
@@ -264,26 +266,42 @@ client (httpx + websockets). Local-only. See `conformance/stress/README.md`.
 | `nimble stressSse` | SSE subscribe; server drops mid-stream; reconnect + Last-Event-ID |
 | `nimble stressStreamUpload` | stream up; the **server** verifies the SHA-1 |
 | `nimble stressStreamDownload` | stream down; the **client** verifies the SHA-1 |
-| `nimble stress` | short smoke of all five (default 20 s, 64 MiB; honors an explicit `VORTEX_SECONDS` / `VORTEX_STREAM_BYTES`); fails on any |
+| `nimble stressMixed` | **all five of the above at one server at the same time**, with the cell's workers split across them -- one transfer in flight per client for each streaming slice, the rest shared by `requests`/`ws`/`sse` (`VORTEX_MIX`); progress is checked per workload |
+| `nimble stress` | short smoke of all six (default 20 s; honors an explicit `VORTEX_SECONDS` / `VORTEX_STREAM_BYTES`); fails on any. `run.sh` inlines a per-cell smoke size: 64 MiB for the five single-workload cells at **any** smoke duration, and the `mixed` short default (2 MiB) for `mixed` |
+
+`nimble stressMixed` is the only soak that drives more than one workload at a
+time, so it is the only one that can see interactions *between* workloads: a
+bulk transfer competing with short requests for a loop thread, an idle SSE
+stream next to a busy upload on one QUIC connection, h2 flow control shared
+between one big stream and many small ones. The chaos sidecar has always
+generated such traffic but never verified it (it swallows its errors by
+design), so the bytes went unchecked. `nimble stress` runs it as a sixth short
+cell per matrix entry. Its report line carries a per-interval delta next to each
+slice's cumulative tally, so a slice that stops counting is visible without
+diffing successive lines; a slice that wedges outright blocks the cell and trips
+the client's `deadline + 60 s` stall net, exactly as in a single-workload soak.
 
 Configured by `VORTEX_*` env (mirrors nim-navi's `NAVI_*`); the matrix is
 `VORTEX_PROTO` × `VORTEX_SERVER`:
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3; h3 drives QUIC via aioquic and runs all five workloads, `ws` over RFC 9220 Extended CONNECT; h3 cells reuse the h2 server image, so the extra cost is one client run per cell, see the stress README) |
+| `VORTEX_PROTO` | `h2` | Transport: `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3; h3 drives QUIC via aioquic and runs all six workloads, `mixed` included, with `ws` over RFC 9220 Extended CONNECT; h3 cells reuse the h2 server image, so the extra cost is one client run per cell, see the stress README) |
 | `VORTEX_SERVER` | `sync` | Handler runtime: `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` (`async`/`chronos` = `vortex/asyncdispatch` / `vortex/chronos` without an in-handler `await`; the `-await` variants exercise the `await` path) |
 | `VORTEX_SECONDS` | `60` | Runtime per cell, in seconds |
 | `VORTEX_REPORT_SECONDS` | `60` | Cadence of the status-code + server-RSS report |
-| `VORTEX_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
+| `VORTEX_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width); under `mixed` this is the per-client worker budget, **split** across the five workloads rather than given to each, and it must be at least the number of workloads in the mix (5 by default) -- a smaller value is refused with exit 2 instead of overshot |
 | `VORTEX_CLIENTS` | `3` | Client workers per cell |
 | `VORTEX_REQ_COMPRESSION` | `gzip` | Request-body encoding the client sends (server decompresses): `none` \| `gzip` \| `br` \| `zstd` |
 | `VORTEX_RESP_COMPRESSION` | `gzip` | Response encoding the server applies: `none` \| `gzip` \| `br` \| `zstd` |
-| `VORTEX_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB; lower for a smoke) |
+| `VORTEX_STREAM_BYTES` | `1073741824`, or `67108864` when `VORTEX_SECONDS` < 1200; `mixed`: `16777216`, or `2097152` when `VORTEX_SECONDS` < 1200 | Streaming transfer size in bytes: 1 GiB for a real soak, 64 MiB for a short run, because one 1 GiB transfer takes ~125 s on `streamupload` h3 and ~163 s on `streamdownload` h3 (4-15 s on h1/h2) and a cell that finishes none counts none. The 1200 s threshold is ~7x that worst case: counting iterations needs a comfortable multiple of one transfer, and these soaks are run oversubscribed (eight or more cells at one host), where a transfer takes several times its measured best. `mixed` follows the same rule at 16 MiB / 2 MiB: its streaming slices share one client event loop with 30 request/ws/sse workers, so a mixed h3 download moves ~0.2 MB/s whatever the body size, which is ~10 s for 2 MiB and ~90 s for 16 MiB. An explicit value always wins; each cell prints the size it ran at in its banner, and `nimble stress` inlines a per-cell smoke size |
+| `VORTEX_MIX` | `requests=40,ws=20,sse=20,streamupload=10,streamdownload=10` | `mixed` only: how one cell's worker budget splits across the five workloads. Weights, normalized by the sum of the weights that compete for the same workers (so `requests=100` alone is not "100%"); an omitted workload keeps its default and an explicit `0` drops it from the cell (and from the progress check). For `streamupload`/`streamdownload` the weight is **presence-only**: they are fixed at one transfer in flight per client. The rest is allocated by largest remainder with a floor of one worker each. A repeated key or a non-integer weight exits 2 |
 | `VORTEX_RUN_ID` | this run's PID | Isolation id for the docker network / container / image names, so several runs can go in parallel without clobbering one another |
 | `VORTEX_CHAOS` | `all` | Chaos sidecar: `none` \| `all` \| CSV of `slowread` \| `slowwrite` \| `idle` \| `abort` \| `vanish`. Launches a second, **unverified** misbehaving client per cell alongside the verified canary (see below); `none` = no sidecar (and no drain pause), the behavior from before the knob existed |
 | `VORTEX_CHAOS_CONC` | `8` | Chaos sidecar worker count |
 | `VORTEX_CHAOS_SEED` | `1` | Seed for the sidecar's per-worker RNG, so a failing chaos schedule replays exactly |
+| `VORTEX_CHAOS_GATE_SECONDS` | `180` | How long a cell waits for the sidecar's `chaos: baseline fds=N` line before giving up on the cell; its pre-baseline warm-up takes minutes on a loaded h3 host |
+| `VORTEX_CHAOS_DRAIN_SECONDS` | `150` | How long a cell waits for the sidecar to exit after a passing canary (drain pause plus settle re-sampling); on cap the cell fails as a sidecar watchdog (exit 3) |
 
 The `VORTEX_SERVER` axis runs each soak against the sync, `vortex/asyncdispatch`,
 and `vortex/chronos` servers - e.g. `VORTEX_SERVER=chronos nimble stressWs`
@@ -301,7 +319,8 @@ On top of the five generic behaviors, the sidecar runs **workload-targeted**
 variants selected by `VORTEX_WORKLOAD` (slow, idle, and vanishing SSE clients
 for `stressSse`, half-closing WebSocket clients for `stressWs`, mid-body-dying
 uploaders for `stressStreamUpload`, ...); enabling a style enables both its
-generic and targeted forms. Chaos is on by default; `VORTEX_CHAOS=none` gives a
+generic and targeted forms, and `stressMixed` gets **every** targeted variant
+since it drives every route at once. Chaos is on by default; `VORTEX_CHAOS=none` gives a
 chaos-free run (no sidecar, no drain pause). See `conformance/stress/README.md`
 for the behavior catalog, exit codes, and per-transport degraded modes.
 

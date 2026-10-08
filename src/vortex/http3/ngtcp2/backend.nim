@@ -15,6 +15,13 @@ import ../../websocket/codec as wscodec
 # Nim's generated .c files). -lstdc++ links the C++ runtime the shim needs.
 {.passC: "-I" & currentSourcePath().parentDir.}
 {.passL: "-lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -lssl -lcrypto -lstdc++".}
+when defined(vortexH3FrameLog):
+  # Test-only build knob (tests/test_h3_idle_keepalive.nims): compile the shim's
+  # frame-log hook, which counts the QUIC PING frames the server transmits so
+  # the keep-alive arming can be pinned from a test (ngPingsSent, #347). It also
+  # turns path-MTU discovery off, whose probes are padded PINGs. Off by default:
+  # a normal build installs no ngtcp2 log callback and keeps PMTUD.
+  {.passC: "-DVQ_FRAME_LOG".}
 {.compile: "vq_ngtcp2.cpp".}
 
 # --- shim ABI ---------------------------------------------------------------
@@ -124,6 +131,8 @@ proc vqConnClose(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close".}
 proc vqConnCloseGraceful(conn: ptr VqConn, appErr: uint64) {.importc: "vq_conn_close_graceful".}
 proc vqConnSsl(conn: ptr VqConn): pointer {.importc: "vq_conn_ssl".}
 proc vqMaxRecvUdpPayload(): csize_t {.importc: "vq_max_recv_udp_payload".}
+proc vqPingTxCount(): uint64 {.importc: "vq_ping_tx_count".}
+proc vqPingTxWithAckCount(): uint64 {.importc: "vq_ping_tx_with_ack_count".}
 {.pop.}
 
 # --- H3 state (codec-compatible surface) ------------------------------------
@@ -731,6 +740,39 @@ proc ngTruncatedDrops*(): uint64 =
   ## datagram length; elsewhere a truncated datagram cannot be told from a full
   ## one and goes to the engine, which drops it when AEAD fails.)
   gTruncDrops.load(moRelaxed)
+
+proc ngPingsSent*(): uint64 =
+  ## ACK-less PING frames the server has TRANSMITTED, across every loop thread:
+  ## a LOWER bound on keep-alives, an UPPER bound once PTO probes are included.
+  ## 0 unless the build set -d:vortexH3FrameLog. Only ever increases, so two
+  ## readings can be subtracted.
+  ##
+  ## A test hook, not a metric: under that define the shim installs an ngtcp2
+  ## frame-log callback and counts the PINGs we write in a packet that carries no
+  ## ACK, which is the only way to observe from a test that the keep-alive the
+  ## shim arms per connection actually emits anything. A black-box h3 test
+  ## cannot: curl sends keep-alive PINGs of its own, and those refresh our idle
+  ## timer whether we send any or not, so the exchange succeeds either way. The
+  ## ACK-less condition is what rejects the PING ngtcp2 appends to an otherwise
+  ## non-ack-eliciting packet; it also means a keep-alive that fired while an ACK
+  ## was pending is missing from this count (it rode with the ACK -- see
+  ## ngPingsSentWithAck) and that a PTO probe, which is ACK-less too, is in it.
+  ## The shim has the full case list (#347). The counter is shim-side (a C++
+  ## std::atomic) rather than a Nim Atomic like gTruncDrops because the frames
+  ## are counted where they are written, inside the engine.
+  vqPingTxCount()
+
+proc ngPingsSentWithAck*(): uint64 =
+  ## The companion to ngPingsSent: transmitted PINGs that rode in a packet which
+  ## also carried an ACK, and so are NOT in that count. Same define, same
+  ## monotonicity, 0 in a normal build.
+  ##
+  ## Mostly the PING ngtcp2 appends to an otherwise non-ack-eliciting packet,
+  ## but a keep-alive whose timer happened to fire with an ACK pending lands
+  ## here, which is why a test prints it next to ngPingsSent: a run that
+  ## undercounted keep-alives looks different from a run that never armed one
+  ## (#347).
+  vqPingTxWithAckCount()
 
 const ngRecvBudget* = 256
   ## Datagrams one ngReceive call will take off the UDP socket before handing the

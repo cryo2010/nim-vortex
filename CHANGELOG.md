@@ -7,8 +7,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Stress harness: `nimble stressMixed`, a soak that drives all five verified
+  workloads -- `requests`, `ws`, `sse`, `streamupload`, `streamdownload` -- at
+  ONE server process at the same time, over the same protocol x server-runtime
+  matrix, with the same chaos sidecar, checksum/echo hard-fails and tee-friendly
+  stdout as the per-workload soaks. Every soak before this one drove one
+  workload at a server, so nothing ever verified the bytes when a bulk transfer,
+  a sendFile download, an idle SSE feed and a busy `/echo` stream share a server
+  -- which is where several recent fixes lived or nearly lived (loop-thread
+  starvation and deadline credit, QUIC idle reap and h3 keep-alive next to a
+  busy upload, h2 flow-control fairness between one big stream and many small
+  ones). The chaos sidecar already produced mixed traffic, but it is unverified
+  by design: it swallows its errors and asserts only the fd count.
+  A mixed cell runs the same `VORTEX_CLIENTS x VORTEX_CONCURRENCY` workers as
+  any other cell and SPLITS them across the five, so it is not a
+  five-times-heavier cell. The two streaming slices are fixed at ONE worker
+  each when present -- one whole transfer in flight per client, which is exactly
+  what the dedicated `stressStreamUpload` / `stressStreamDownload` soaks run,
+  since they take their parallelism from `VORTEX_CLIENTS` -- and `requests`,
+  `ws` and `sse` split what is left by weight (40/20/20, normalized by the sum
+  of just those three, largest remainder, floor of one each), which is 15/8/7/1/1
+  per client at the default `3x32`. `VORTEX_MIX=requests=40,ws=20,...`
+  overrides it, `0` drops a workload, and for the two streaming slices the
+  weight is presence-only. A `VORTEX_CONCURRENCY` below the number of slices in
+  the mix is refused on stdout with exit 2 rather than silently overshot. Each
+  slice reuses its single-workload coroutine unchanged and opens connections
+  exactly as it does alone, so this is all five at one *server*, not down one
+  connection. "No successful iterations" is checked PER WORKLOAD rather than on
+  the sum, so a stalled SSE feed cannot hide behind a healthy `/echo` counter,
+  and the report line keeps the `[mixed <proto> <server>]` prefix watchers match
+  while listing each workload with its cumulative tally AND its per-interval
+  delta, so a slice that stops counting is visible without diffing successive
+  lines (measured, h3 + sync, 10 s at the 2 MiB short default, t=11s):
+  `req 8820 (+340/s) | ws 17378 msgs (+803/s) | sse 219600 ev (+10052/s) |
+  up 6 xfers 12MB (+0) | down 3 xfers 6.0MB (+3)`. The pass banner keeps the
+  cumulative figures; a hard failure appends them in brackets, since the cell
+  ends before its final report line. A slice that wedges outright needs no
+  separate verdict: it blocks the supervisor's `gather` and trips the client's
+  `deadline + 60 s` stall net, as in any single-workload soak. `nimble stress`
+  runs `mixed` as a sixth short cell per matrix entry, and the chaos sidecar
+  gives a mixed cell every one of its workload-targeted variants, since it is
+  the one cell that drives every route at once (uniform over entries, so with
+  `VORTEX_CHAOS=all` that pool is 15 entries where `vanish` is 27% of the picks
+  and the generic catalog 33%).
+  `VORTEX_STREAM_BYTES` follows the same duration rule for `mixed` as for the
+  streaming soaks, at its own measured pair of sizes: 16 MiB at
+  `VORTEX_SECONDS` >= 1200 and 2 MiB below it. Measured on 10 s h3 mixed cells
+  (sync server, `3x32`, chaos on), the download slice moved 5.9-6.8 MB whatever
+  the body size -- 64, 32, 16, 8 and 4 MiB all completed zero downloads, and
+  2 MiB completed three, one per client. So aggregate mixed h3 download
+  throughput is ~0.6 MB/s over the three in-flight transfers, ~0.2 MB/s each and
+  essentially independent of the body size: the ceiling is per-stream bandwidth
+  under a client event loop also driving ~900 echoes/s, ~1900 ws messages/s and
+  ~24000 SSE events/s, not per-transfer overhead. A 300 s cell then completed 9
+  downloads and 35 uploads at 16 MiB, the downloads in three clean rounds at
+  t=90s, t=181s and t=272s, i.e. ~90 s each and ~13x margin at the 1200 s
+  threshold; 32 MiB would be ~180 s, under 7x, and 1 GiB ~90 minutes, so neither
+  is the default. `nimble stress` no longer pins one size for the whole smoke:
+  `run.sh` inlines a per-cell smoke size instead -- 64 MiB for the five
+  single-workload cells at ANY smoke duration (the task's historical behaviour,
+  so a long smoke does not silently become a 1 GiB soak) and the 2 MiB mixed
+  short default for `mixed` -- and an explicit `VORTEX_STREAM_BYTES` from the
+  caller still wins everywhere. (#394)
+
+- Tests: `test_h3_idle_keepalive` now pins the server's half of the h3
+  keep-alive, not just the transport parameter it is derived from. The suite
+  passed with the `ngtcp2_conn_set_keep_alive_timeout` arming deleted from the
+  shim, because curl's own QUIC stack sends keep-alive PINGs and a received
+  packet refreshes our idle timer (RFC 9000 10.1) whether we send anything or
+  not -- so the one thing the suite existed to protect was the one thing it
+  could not see, and only the h3 stress cells (driven by aioquic, which does not
+  PING) would have caught a regression. The shim grows a test-only observation
+  hook behind `-d:vortexH3FrameLog` (`tests/test_h3_idle_keepalive.nims` sets
+  it): ngtcp2's frame logger is installed, the PING frames we *transmit* in a
+  packet that carries no ACK are counted into an atomic, and `ngPingsSent()`
+  reads it back -- with the PINGs that rode *with* an ACK counted apart, as
+  `ngPingsSentWithAck()`, so an undercounted run can be told from a connection
+  that never armed a keep-alive at all. Frame lines are matched positionally
+  (`frm` and `tx` and the frame name in their fixed token slots) rather than by
+  substring, because a peer-controlled `CONNECTION_CLOSE` reason string is
+  logged verbatim. The ACK-less condition is what makes the number a keep-alive
+  pin: ngtcp2 also appends a PING to a packet that would otherwise be
+  non-ack-eliciting, which answering the client's keep-alives produces two of
+  per quiet gap, and path-MTU probes are padded PINGs (that build turns PMTUD
+  off as well, so nothing in the suite pins a PMTUD interaction). What is left
+  is a lower bound on keep-alives -- one that fires while an ACK is pending
+  rides in that packet and is not counted -- and an upper bound once PTO probes,
+  ACK-less too, are included. So the slow-exchange test now also asserts >= 3
+  transmitted ACK-less PINGs across the 9 s `/slow` gap (six are observed, one
+  per `keepAliveTimeout / 3`, while a PTO burst is two), and a fast exchange is
+  held to <= 2; both print their counts and the gap through `checkpoint` for
+  triage. Deleting the arming fails the former with zero. A normal build is
+  untouched: no log callback is installed, the counters read 0 and ngtcp2's
+  logging stays off, and the suite skips in the zero-dependency `plainHttp`
+  build like its h3 siblings. (#347)
+
 ### Fixed
 
+- Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
+  longer fails its h3 cell at a transfer size it cannot finish.
+  `conformance/stress/run.sh` defaulted `VORTEX_STREAM_BYTES` to 1 GiB for every
+  run, and one 1 GiB transfer over aioquic takes about 125 s on `streamupload`
+  and 163 s on `streamdownload` (4-15 s on h1/h2, which is the only reason those
+  cells passed). So `VORTEX_SECONDS=10 nimble stressStreamUpload` abandoned
+  every h3 transfer at the deadline as designed, counted none, and reported
+  `FAIL streamupload: no successful iterations` with nothing wrong on either
+  side; only `nimble stress` escaped it, because that wrapper passes 64 MiB
+  explicitly. The default is now scaled by the run length -- 1 GiB at
+  `VORTEX_SECONDS` >= 1200, 64 MiB below it -- and an explicit
+  `VORTEX_STREAM_BYTES` still always wins. 1200 s is about 7x the slowest
+  measured h3 transfer, because counting iterations needs a comfortable multiple
+  of one transfer time, not a bare one: these soaks are deliberately run
+  oversubscribed (eight or more cells at one host, load averages of 20-50),
+  where a transfer takes several times its measured best, and a cell that
+  completed one transfer has measured almost nothing even when it passes. Each
+  cell banner now prints the size it ran at (`stream=64MiB`), so a log says
+  which one it was.
+  The client also tells the diagnoses apart, and on the right evidence: an
+  abandoned transfer alone proves nothing, since a wedged server abandons at the
+  deadline exactly like an oversized transfer does. The discriminator is the
+  bytes that actually moved, and the figure is in the message either way. With
+  bytes moved it prints `no transfer of N bytes completed within S s on h3
+  (K abandoned at the deadline, B bytes moved); the transfers are too big for
+  this run: lower VORTEX_STREAM_BYTES or raise VORTEX_SECONDS`; with none moved
+  it says `the server delivered nothing, a stall rather than a sizing problem;
+  check the server log` and drops the sizing advice. An h3 *upload* with no
+  bytes moved is the one undecidable case (aioquic buffers the body up front, so
+  that workload counts bytes only on completion), and there the message names
+  both possibilities instead of guessing. The generic `no successful iterations`
+  remains for a run where no transfer was ever started. It stays a failure, not
+  a skip: a soak that verified zero bytes must not read as a pass. Server side
+  there was nothing to fix. Also fixed in passing: `run.sh` now rejects a
+  non-integer `VORTEX_SECONDS` / `VORTEX_STREAM_BYTES` on stdout with exit 2
+  instead of aborting mid-script on a bare `arithmetic syntax error` after a
+  docker build (`VORTEX_SECONDS=2h` is a natural way to write it), and
+  `w_streamupload` no longer counts one abandoned transfer twice when its
+  deadline arm unwinds through the #390 teardown arm. (#393)
 - Stress harness: the `streamupload` cell no longer fails on a client-side
   teardown race at the deadline. `w_streamupload` bounds an in-flight transfer
   with `asyncio.wait_for`, and the cancellation that fires at the deadline runs

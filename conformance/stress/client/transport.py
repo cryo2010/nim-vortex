@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Shared transport + config for the vortex load clients.
+"""Shared transport + config for the vortex stress load clients.
 
-Owns everything the correctness client (stress_client.py) and the performance
-client (conformance/bench/client/bench_client.py) need identically: the VORTEX_*
-env config, the deterministic byte generator, request-body compression, and the
-transport sessions (httpx for h1/h2, aioquic for h3 via h3.py). Each client adds
-its own workload loops and reporting on top. Kept separate so the correctness
-verifier and the perf harness never share workload/reporting code -- only the
-wire.
+Owns what the clients under conformance/stress/client need identically -- the
+verified canary (stress_client.py) and the misbehaving sidecar (chaos.py): the
+VORTEX_* env config, the deterministic byte generator, request-body
+compression, and the transport sessions (httpx for h1/h2, aioquic for h3 via
+h3.py). Each client adds its own workload loops and reporting on top.
+
+Nothing outside conformance/stress/client imports this module. It once also fed
+a Python bench client; the performance harness is now the compiled Nim navi
+client (conformance/bench/client/navi), which shares no code with these, so the
+correctness verifier and the perf harness still have only the wire in common.
 """
 import gzip, hashlib, json, os, urllib.parse
+from collections import Counter
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 import httpx
@@ -35,10 +39,33 @@ MB = 1024 * 1024
 IS_H3 = PROTO == "h3"
 UNIT = {"requests": "requests", "methods": "requests", "ws": "messages",
         "sse": "events", "streamupload": "transfers",
-        "streamdownload": "transfers"}.get(WORKLOAD, "ok")
+        "streamdownload": "transfers",
+        # `mixed` drives all five workloads at one server, so there is no one
+        # unit for it: its report line and pass banner list each workload's own
+        # tally instead of a headline rate (see stress_client's mix_segments),
+        # and this is only the fallback the rare generic phrasing uses.
+        "mixed": "ops"}.get(WORKLOAD, "ok")
+# `mixed` is NOT streaming: only a slice of its workers drives the transfer
+# routes, so a cumulative MB/s headline would describe a tenth of the cell. Its
+# streaming slices are reported as transfer counts in the per-workload segment.
 STREAMING = WORKLOAD in ("streamupload", "streamdownload")
 
 xfer = [0]              # cumulative bytes streamed (upload sent / download received)
+# The same bytes, PER SLICE, for the `mixed` soak only. "Nothing completed" is
+# checked per workload there, and the reason a slice completed nothing is told
+# apart by whether its bytes actually moved (see stress_client's no_progress),
+# which the cell-wide total cannot answer when five workloads share it.
+#
+# stress_client installs `xfer_tag[0]` (its workload contextvar's getter) under
+# `mixed` and leaves it None otherwise, so the five single-workload soaks pay
+# one `is not None` test per chunk and keep their old hot path.
+xfer_by = Counter()
+xfer_tag = [None]
+
+def add_xfer(n: int):
+    """Count `n` bytes on the wire, cell-wide and (under `mixed`) per slice."""
+    xfer[0] += n
+    if xfer_tag[0] is not None: xfer_by[xfer_tag[0]()] += n
 
 # --- deterministic byte generator: byte i = i mod 256 (matches the server) ---
 _PAT = bytes(range(256))
@@ -63,7 +90,7 @@ async def body_gen():
         # bytes yielded ~= bytes sent, an accurate live upload rate. h3 (aioquic)
         # buffers the whole body up front, so there yielded != sent; count h3
         # upload progress on completion instead (see the upload workloads).
-        if not IS_H3: xfer[0] += n
+        if not IS_H3: add_xfer(n)
 
 # --- request-body compression (server decompresses via decompressRequest) ----
 def compress(raw: bytes):

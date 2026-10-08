@@ -8,9 +8,10 @@ that a well-behaved client never touches. Each of the five styles has a generic
 form (the fixed all-routes catalog) and, for some workloads, a targeted form
 picked by VORTEX_WORKLOAD (slow/idle/vanishing SSE clients under the sse soak,
 half-closing WebSocket clients under ws, mid-body deaths under streamupload,
-...). Enabling a style enables BOTH forms; the per-iteration pick pool is the
-flattened generic+targeted set, uniformly weighted (see build_pool). This client is **unverified by
-construction**: every induced transport error (a reset, a refused read, a
+...), or ALL targeted forms at once under the `mixed` workload, which drives
+every route at once. Enabling a style enables BOTH forms; the per-iteration pick
+pool is the flattened generic+targeted set, uniformly weighted (see build_pool).
+This client is **unverified by construction**: every induced transport error (a reset, a refused read, a
 half-open abort, a torn-down connection) is EXPECTED, so the worker loop tallies
 it and swallows it. Nothing here hard-fails on a wire error the way the canary's
 drive() does -- the canary is the correctness oracle and its contract must stay
@@ -622,13 +623,34 @@ BEHAVIORS = {
 def build_pool(enabled):
     """The per-iteration pick pool: each enabled style contributes its generic
     entry plus, when one exists for this cell's VORTEX_WORKLOAD, its targeted
-    entry, uniformly weighted (generic + targeted at full weight, a user-locked
-    decision). An unknown workload matches no targeted key and degrades to
-    generic-only, no crash."""
+    entry. The pick is UNIFORM OVER ENTRIES -- generic and targeted at full
+    weight, a user-locked decision -- so what a style's share of the schedule
+    works out to depends on how many entries it contributes. An unknown workload
+    matches no targeted key and degrades to generic-only, no crash.
+
+    For a single-workload cell that is at most two entries per style, so the
+    styles stay near-even. `mixed` is the one workload that drives every route
+    at once, so it takes EVERY targeted variant of each enabled style rather
+    than one: the canary has WebSocket, SSE, upload and download traffic live
+    simultaneously, and targeting only the generic catalog there would leave the
+    mixed cell with less route-specific abuse than any of the single-workload
+    cells (#394). Uniform over entries then means uniform over a LONGER and
+    unevenly shaped pool: with VORTEX_CHAOS=all the mixed pool is 15 entries (5
+    generic + 10 targeted), where `vanish` has 4 of them (27% of the picks) and
+    `idle` 3, while the 5 generic entries together are 33%. That is the intended
+    trade -- the mixed cell gets the whole catalog -- but it is not an even split
+    across styles, and a mixed cell's tally should not be compared with a
+    single-workload cell's as if it were.
+
+    The pool is built from BEHAVIORS in insertion order, so a fixed
+    VORTEX_CHAOS_SEED still replays the same schedule.
+    """
     pool = []
     for style in enabled:
         pool.append((style, "generic"))
-        if (style, WORKLOAD) in BEHAVIORS:
+        if WORKLOAD == "mixed":
+            pool.extend(k for k in BEHAVIORS if k[0] == style and k[1] != "generic")
+        elif (style, WORKLOAD) in BEHAVIORS:
             pool.append((style, WORKLOAD))
     return pool
 

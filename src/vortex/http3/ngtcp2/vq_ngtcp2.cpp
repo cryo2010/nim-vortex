@@ -35,6 +35,13 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef VQ_FRAME_LOG
+// Only the test-only frame observation hook below needs these (#347); the
+// production build does not pull them in.
+#include <atomic>
+#include <cstdarg>
+#endif
+
 namespace {
 
 constexpr size_t kMaxUdpPayload = 1452;   // conservative IPv4 path MTU
@@ -545,6 +552,149 @@ int cbExtendMaxStreamData(ngtcp2_conn *, int64_t stream_id, uint64_t,
   return 0;
 }
 
+// --- test-only frame observation (VQ_FRAME_LOG) -----------------------------
+
+#ifdef VQ_FRAME_LOG
+// Count the keep-alive PING frames this process TRANSMITS, so a test can pin
+// that the keep-alive armed in acceptConn actually puts packets on the wire --
+// not merely that the idle window reached the transport parameters, which is
+// all a black-box h3 test can see when the client (curl) sends keep-alive
+// PINGs of its own and refreshes our idle timer for us (#347).
+//
+// ngtcp2's only per-frame hook is its logger: ngtcp2_settings.log_printf, a
+// printf-style callback it calls for every frame it reads and writes, on the
+// thread that owns the conn (for us the loop thread). (1.23.0 deprecates it for
+// log_write, which hands over the rendered line instead; log_printf is the one
+// that exists in every 1.x, and a test hook has no business pinning the build
+// to a minimum ngtcp2.) The lines this cares about are fixed-position (as
+// observed on ngtcp2 1.25.0):
+//
+//   I00001337 0x5f3a..  pkt tx pkn=3 dcid=0x37b4.. type=1RTT k=0
+//   I00001337 0x5f3a..  pkt read packet 1200 left 0
+//   I00001337 0x5f3a..  frm tx 3 1RTT PING(0x1)
+//   I00001337 0x5f3a..  frm tx 3 1RTT ACK(0x2) largest_ack=5 ...
+//
+// that is, `<ts> <scid> <category> <dir> <pkn> <type> <NAME>(0x..)`, so the
+// frame test below is positional: token 2 == "frm", token 3 == "tx", token 6
+// starting "PING(" or "ACK(". Positional rather than a substring search on
+// purpose: a peer-controlled CONNECTION_CLOSE reason string is logged
+// verbatim (`reason=[..]`) and could otherwise spell any of those tokens. A
+// PING we *received* is the same line with `rx` in place of `tx`, and never
+// counts, which is what excludes the client's own keep-alives.
+//
+// A transmitted PING is still not the same thing as a keep-alive, because
+// ngtcp2 writes one in three places (lib/ngtcp2_conn.c, conn_write_pkt):
+//
+//   (a) it appends a PING to a packet that would otherwise be non-ack-eliciting
+//       (a run of pure ACKs) and is older than the smoothed RTT, so the run
+//       still gets acknowledged and keeps yielding RTT samples. Answering the
+//       client's own keep-alive is such a run: it produced two PINGs per quiet
+//       gap here with the server's arming removed;
+//   (b) the keep-alive expiry, the one under test. It is written alone (PING +
+//       PADDING, no ACK: there was nothing to acknowledge, which is why the
+//       timer fired) -- unless an ACK happens to be pending, in which case it
+//       rides with it and looks exactly like (a);
+//   (c) a PTO probe (RFC 9002 6.2.4), also ACK-less, and two to a burst.
+//
+// So the rule is "a tx PING in a packet with no ACK frame in it", which rejects
+// (a) exactly and keeps (b) and (c). gPingTx is therefore a LOWER bound on
+// keep-alives -- one that rode with a pending ACK is not in it -- and an UPPER
+// bound once PTO probes are counted in; the suite's scope paragraph sets its
+// thresholds from both. gPingTxWithAck counts the other shape, so a run that
+// undercounted can be told from one with no keep-alive at all. Path-MTU
+// probes are padded PINGs too, and the define switches PMTUD off rather than
+// lean on any distinction there.
+//
+// Per-packet state is thread_local: the logger is called synchronously from the
+// engine that owns the connection, one packet at a time, on the loop thread.
+// Within a packet ngtcp2 logs a PING it appends after that packet's ACK frames
+// (conn_write_pkt writes the ACK first), and a `pkt` line always precedes its
+// own frames, so the one-pass "has an ACK been seen in this packet" flag is
+// enough -- across 784 logged lines of 4 connections no PING was ever logged
+// before its packet's ACK. Both counters only ever increase, so a test can
+// subtract two readings.
+//
+// Compiled only under -DVQ_FRAME_LOG (Nim: -d:vortexH3FrameLog). In a normal
+// build nothing here exists, no callback is installed, and ngtcp2's logging
+// stays off -- the field is left NULL, which is how it ships.
+std::atomic<uint64_t> gPingTx{0};         // ACK-less transmitted PINGs
+std::atomic<uint64_t> gPingTxWithAck{0};  // transmitted PINGs riding an ACK
+thread_local bool tlPktHasAck = false;    // this tx packet carries an ACK
+
+struct LogTok {
+  const char *p;
+  size_t n;
+};
+
+// Split `s` into at most `max` whitespace-delimited tokens and return how many
+// were filled. Nothing is copied: each token points into `s`.
+size_t logTokens(const char *s, LogTok *out, size_t max) {
+  size_t cnt = 0;
+  const char *p = s;
+  while (*p && cnt < max) {
+    while (*p == ' ' || *p == '\t') ++p;
+    if (!*p) break;
+    const char *start = p;
+    while (*p && *p != ' ' && *p != '\t') ++p;
+    out[cnt].p = start;
+    out[cnt].n = static_cast<size_t>(p - start);
+    ++cnt;
+  }
+  return cnt;
+}
+
+bool tokIs(const LogTok &t, const char *lit) {
+  const size_t n = std::strlen(lit);
+  return t.n == n && std::strncmp(t.p, lit, n) == 0;
+}
+
+bool tokStartsWith(const LogTok &t, const char *lit) {
+  const size_t n = std::strlen(lit);
+  return t.n >= n && std::strncmp(t.p, lit, n) == 0;
+}
+
+// ngtcp2_printf: void (*)(void *user_data, const char *fmt, ...) with ngtcp2's
+// own format strings, so the text has to be rendered before it can be read.
+// Most of what ngtcp2 logs is neither a packet header nor a frame, so the cheap
+// substring reject runs FIRST and only what survives it is tokenized.
+void frameLogPrintf(void *, const char *fmt, ...) {
+  char line[512];
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = vsnprintf(line, sizeof line, fmt, ap);
+  va_end(ap);
+  if (n <= 0) return;
+  if (std::strstr(line, " pkt ") == nullptr &&
+      std::strstr(line, " frm ") == nullptr)
+    return;
+
+  LogTok t[7];
+  const size_t nt = logTokens(line, t, 7);
+  if (nt < 4) return;
+  // A `pkt` line ends the previous packet's frame list: both the header shape
+  // (`pkt tx pkn=..` / `pkt rx pkn=..`) and the `pkt read packet 1200 left 0`
+  // shape count, and no such line ever appears between the frames of one
+  // packet.
+  if (tokIs(t[2], "pkt")) {
+    tlPktHasAck = false;
+    return;
+  }
+  if (nt < 7 || !tokIs(t[2], "frm") || !tokIs(t[3], "tx")) return;
+  if (tokStartsWith(t[6], "ACK(")) {
+    // ngtcp2 logs a line per ACK range after the frame's own line, so this is
+    // often already set: it is a flag, not a count.
+    tlPktHasAck = true;
+    return;
+  }
+  // PING(0x1) in one ngtcp2 and PING(0x01) in another, hence the prefix.
+  if (!tokStartsWith(t[6], "PING(")) return;
+  if (tlPktHasAck)
+    gPingTxWithAck.fetch_add(1, std::memory_order_relaxed);
+  else
+    gPingTx.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
+
 // --- connection creation ----------------------------------------------------
 
 Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
@@ -606,6 +756,17 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   ngtcp2_settings settings;
   ngtcp2_settings_default(&settings);
   settings.initial_ts = now_ns;
+#ifdef VQ_FRAME_LOG
+  // Test-only observation of the frames we transmit (see frameLogPrintf). Path
+  // MTU discovery goes with it: ngtcp2 probes the path by sending a PING padded
+  // to the candidate size, which is a transmitted PING that has nothing to do
+  // with the keep-alive, arrives on every connection, and would make the
+  // keep-alive count unreadable. Both are confined to this define (#347) -- the
+  // flip side being that the suite runs against a transport config the shipped
+  // server never has, so nothing it observes pins a PMTUD interaction.
+  settings.log_printf = frameLogPrintf;
+  settings.no_pmtud = 1;
+#endif
 
   ngtcp2_transport_params tp;
   ngtcp2_transport_params_default(&tp);
@@ -1956,5 +2117,21 @@ void *vq_conn_ssl(VqConn *conn) {
 }
 
 size_t vq_max_recv_udp_payload(void) { return kMaxRecvUdpPayload; }
+
+uint64_t vq_ping_tx_count(void) {
+#ifdef VQ_FRAME_LOG
+  return gPingTx.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
+}
+
+uint64_t vq_ping_tx_with_ack_count(void) {
+#ifdef VQ_FRAME_LOG
+  return gPingTxWithAck.load(std::memory_order_relaxed);
+#else
+  return 0;
+#endif
+}
 
 }  // extern "C"
