@@ -542,6 +542,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
 | `req.blocking(vals…): body` | `macro` | run `body` on the worker pool; named `vals` are moved in and usable by name (see above) |
 | `req.isWebSocketUpgrade` | `bool` | is this request a WebSocket handshake (see [WebSockets](#websockets)) |
+| `req.isWebSocketIntent` | `bool` | did it ask for a WebSocket at all, handshake complete or not (426 vs 400) |
 | `req.acceptWebSocket(protocols = [])` | `WebSocket` | complete the WebSocket handshake (see [WebSockets](#websockets)) |
 | `req.onBody(cb, manualAck = false)` | `void` | register an inbound body sink (see [Upload](#upload)) |
 | `req.ackBody(n)` | `void` | grant flow-control credit for consumed body bytes (see [Upload](#upload)) |
@@ -1122,6 +1123,39 @@ proc chat(req: Request, res: Response) {.async.} =
 router.ws("/chat", chat)
 ```
 
+`router.ws` registers both spellings of the handshake for the path: the HTTP/1.1
+`GET` with `Upgrade: websocket`, and the Extended CONNECT (`:protocol
+websocket`) that an h2 or h3 client sends instead, so one call serves every
+transport. The path therefore lists `CONNECT` in the `Allow` header of a 405 or
+an automatic `OPTIONS`. Both legs are screened before the handler, so a request
+that is not a handshake never reaches it: one that asked for a WebSocket but
+offered no supported `Sec-WebSocket-Version` gets a `426 Upgrade Required` with
+`Sec-WebSocket-Version: 13` (RFC 6455 4.2.2(4), which RFC 8441 keeps for h2 and
+h3), and one that never asked at all -- an HTTP/1.1 proxy-style `CONNECT`, a
+plain `GET` or `HEAD` -- gets a 400.
+
+Because `ws` registers the `CONNECT` leg itself, an app that used to add it by
+hand beside `ws` (the pre-`ws` workaround) must drop that `addRoute`: the
+duplicate raises `RouteConflictError` at startup, like any other duplicate
+route. If you register a WebSocket route by hand instead of using `ws`, wrap the
+handler with `wsToHandler` and not `toHandler`, and do the screening yourself --
+`acceptWebSocket` refuses a non-handshake (the handle comes back dead) but sends
+no response, because the response is yours to send:
+
+```nim
+proc chatLeg(req: Request, res: Response) {.async.} =
+  if req.isWebSocketUpgrade:
+    await chat(req, res)
+  elif req.isWebSocketIntent:
+    # It asked for a WebSocket, but the version is missing or unsupported.
+    res.send(Http426, "426 Upgrade Required",
+             %*{"Sec-WebSocket-Version": "13"})
+  else:
+    res.send(Http400, "400 Bad Request")      # not a handshake at all
+
+router.addRoute(HttpConnect, "/chat", wsToHandler(chatLeg))
+```
+
 When you push faster than a peer can read, `ws.send` parks the overflow in the
 write buffer: `ws.bufferedAmount` reports that backlog (bytes) and `ws.onDrain`
 fires when it empties, so you can throttle a producer and resume from the drain
@@ -1140,7 +1174,14 @@ The same handler API also serves WebSockets over **HTTP/2 (RFC 8441)** and
 with ordinary requests on the connection. `isWebSocketUpgrade` /
 `acceptWebSocket` transparently handle all three transports, so the same
 `onMessage` / `ws.send` / `ws.blocking:` / permessage-deflate code works over h1,
-h2, and h3. WebSocket behavior is validated against the
+h2, and h3. With a single handler (no router) there is nothing to register and
+all three arrive at it; on a router, `router.ws` registers both legs, while a
+plain sync handler needs the CONNECT leg added by hand beside its `get`
+(`app.addRoute(HttpConnect, "/chat", handler)`) and must then screen the request
+itself, since nothing else does: a handler reached on either leg answers a
+request that is not a handshake rather than calling `acceptWebSocket`, exactly
+as the hand-registered example above does. WebSocket behavior is validated
+against the
 [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
 (`nimble autobahn`); h2 and h3 WebSockets are covered by `nimble h2spec`-adjacent
 suites and `nimble h3websocket` (aioquic).

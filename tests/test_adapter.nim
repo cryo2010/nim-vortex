@@ -11,6 +11,7 @@ import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
 import ./helper                              # macro would clash with the async
+import ./h2client
 import ./wsclient
 when defined(vortexChronos):
   import vortex/chronos as nhsasync          # adapter's; Request/Response via facade
@@ -290,6 +291,18 @@ withServer(appRouter.toHandler,
       check s.recvFrame().payload == "echo: one"
       s.sendText("two")
       check s.recvFrame().payload == "echo: two"
+
+    test "router.ws also serves the h2 Extended CONNECT leg (#400)":
+      # Same route, the other spelling of the handshake: `:method CONNECT` plus
+      # `:protocol websocket` (RFC 8441), with WebSocket framing inside DATA.
+      var c = newH2TestConn(srv.port)
+      defer: c.close()
+      check c.extendedConnect(1, "/wsmsg") == "200"
+      c.sendData(1, buildFrame(0x1, "over-h2"))
+      let msgs = parseFrames(c.streamData(1, firstWsFrame))[0]
+      check msgs.len >= 1
+      check msgs[0].op == 0x1
+      check msgs[0].payload == "echo: over-h2"
 
     test "an idle awaited WebSocket still wakes promptly once the loop sleeps":
       # A parked `ws.messages` receive can only be completed by a core callback

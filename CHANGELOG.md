@@ -208,6 +208,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async adapters: a `router.ws` route now serves the HTTP/2 and HTTP/3 spelling
+  of the handshake too, and `wsToHandler` is exported for a route an app
+  registers by hand. `ws` registered only `HttpGet`, which is the HTTP/1.1
+  upgrade; over h2 and h3 a WebSocket arrives as `:method CONNECT` with
+  `:protocol websocket` (RFC 8441 / RFC 9220), so an h2 or h3 client reaching an
+  `rt.ws("/ws", h)` route got a 405 and never touched the handler. Registering
+  the CONNECT leg by hand was the workaround, but `wsToHandler` -- the wrapper
+  that closes the socket with 1011 instead of writing an HTTP 500 into an
+  already upgraded stream, exactly what `ws`'s own doc comment warns about --
+  was private, so the only wrapper available was the wrong one (`toHandler`) and
+  the handler had to catch every `CatchableError` itself. `ws` now registers
+  `HttpGet` and `HttpConnect` for the path, both with WebSocket completion
+  semantics, and `wsToHandler` is public for a `streamRoute`-style predicate, a
+  custom method, or any other hand-registered leg. The HEAD-for-GET fallback and
+  the 405/OPTIONS `Allow` builder work off the per-method handler slots, so the
+  path simply also advertises `CONNECT`. Because `ws` registers that leg itself,
+  an app that already added it by hand beside `ws` -- the documented workaround
+  -- must drop that `addRoute`, or `ws` raises `RouteConflictError` at startup
+  like any other duplicate route; the loud failure is deliberate, and a test
+  pins it. The stress target server drops its hand-written CONNECT route for
+  `rt.ws`, and `conformance/h3websocket`'s echo server moves onto `rt.ws` too,
+  so `nimble h3websocket` covers the router path over h3 instead of only a bare
+  handler.
+  Both legs are now screened by one wrapper, and `acceptWebSocket` enforces its
+  own documented contract. Each leg can be matched by a request that is not a
+  handshake -- HTTP/1.1 has a CONNECT of its own (the proxy tunnel of RFC 9110
+  9.3.6), a plain `GET` (or a `HEAD`, which falls back to the GET slot) matches
+  the GET leg, and the h2/h3 codecs classify an Extended CONNECT on `:protocol`
+  alone, so one with a missing or unsupported `Sec-WebSocket-Version` reaches
+  the route as well. None of those reach the handler any more. A request that
+  asked for a WebSocket but cannot be upgraded is answered `426 Upgrade
+  Required` with the `Sec-WebSocket-Version: 13` this server speaks (RFC 6455
+  4.2.2(4), which RFC 8441 5 keeps for h2 and h3), and one that never asked at
+  all gets a 400. `isWebSocketIntent` is exported for a hand-registered leg that
+  wants the same rule. Underneath, `acceptWebSocket` returns a dead handle
+  (`ws.isAlive == false`) for any request `isWebSocketUpgrade` rejects, on every
+  transport, and sends nothing: before, h1 wrote `101 Switching Protocols` with
+  a `Sec-WebSocket-Accept` computed over an empty key and switched the
+  connection into WebSocket mode off a plain GET, while h2 and h3 answered their
+  200 for a version-less Extended CONNECT. The response stays the caller's to
+  send, as the docs say, so a handler on a route it registered itself still owes
+  a non-handshake an answer -- the sync stress server's `/ws` handler does that
+  check explicitly now, so all five of its runtime builds behave alike. (#400)
+
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
   longer fails its h3 cell at a transfer size it cannot finish.
   `conformance/stress/run.sh` defaulted `VORTEX_STREAM_BYTES` to 1 GiB for every

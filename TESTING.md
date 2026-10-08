@@ -117,7 +117,7 @@ WebSocket client: upgrade handshake + full RFC 6455 frame codec).
 | `test_websocket_backpressure.nim` | Backpressure introspection (`bufferedAmount`) |
 | `test_websocket_blocking.nim` | Per-connection backpressure for `ws.blocking` |
 | `test_websocket_async.nim` | `ws.doAsync` (asyncdispatch adapter) |
-| `test_ws_messages.nim` | `ws.messages` async iterator, from a plain async handler / `router.ws` |
+| `test_ws_messages.nim` | `ws.messages` async iterator, from a plain async handler / `router.ws`; both legs `router.ws` registers (h1 GET upgrade, h2 Extended CONNECT) and `wsToHandler` on a hand-registered route; the refusals on both legs (426 + `Sec-WebSocket-Version` for a bad/missing version, 400 for no handshake intent) and `acceptWebSocket`'s dead handle |
 | `test_ws_idle.nim` | Idle keepalive sweep for h2/h3 WebSocket streams |
 | `test_ws_origin.nim` | Origin allowlisting (SEC4, CSWSH defense) |
 | `test_shutdown_ws.nim` | Server-initiated WebSocket close (1001) on graceful shutdown |

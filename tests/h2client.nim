@@ -8,10 +8,11 @@
 ## are the exception: they exist so a suite can observe the server's dynamic
 ## table across blocks.
 
-import std/[net, posix, oserrors]
+import std/[net, posix, oserrors, tables]
 import vortex/http2/frames
 import vortex/http2/hpack
 import ./helper
+import ./wsclient                      # WebSocket framing inside DATA payloads
 
 const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 const getRequest = "\x82\x86\x84\x01\x09localhost"
@@ -22,6 +23,8 @@ type
   H2TestConn* = object
     sock*: Socket
     buf: string                      # unparsed received bytes
+    data: Table[uint32, string]      # DATA payload bytes, per stream
+    resp: Table[uint32, seq[(string, string)]]  # response fields, per stream
 
 proc setTimeout(c: var H2TestConn, ms: int) =
   c.sock.setRecvTimeout(ms)
@@ -263,6 +266,82 @@ proc headerPayload*(frames: seq[Frame], sid: uint32): string =
   ## ("" if none), for assertions about the encoding itself.
   for f in frames:
     if f.typ == uint8(ftHeaders) and f.streamId == sid: return f.payload
+
+# --- Extended CONNECT (RFC 8441) streams ------------------------------------
+
+proc keepData(c: var H2TestConn, frames: seq[Frame]) =
+  ## Retain every DATA payload, per stream: one read batch may interleave
+  ## streams, so a later read for another stream still finds its bytes.
+  for f in frames:
+    if f.typ == uint8(ftData): c.data.mgetOrPut(f.streamId, "").add f.payload
+
+proc extendedConnect*(c: var H2TestConn, sid: uint32, path: string,
+                      extra: openArray[(string, string)] = [],
+                      version = "13"): string =
+  ## Open an RFC 8441 Extended CONNECT stream (`:method CONNECT`,
+  ## `:protocol websocket`) for `path` and return the negotiated `:status`
+  ## ("" if the server answered with no HEADERS). The handshake is END_HEADERS
+  ## without END_STREAM, so the stream stays open for WebSocket framing in DATA;
+  ## any DATA already alongside the handshake is kept for `streamData`, and the
+  ## response fields for `respField`.
+  ##
+  ## `version` is the `Sec-WebSocket-Version` offered, omitted entirely when
+  ## empty: the two shapes RFC 6455 4.2.2(4) refuses are an unsupported version
+  ## and no version at all.
+  var hdrs = @[(":method", "CONNECT"), (":protocol", "websocket"),
+               (":scheme", "http"), (":path", path), (":authority", "x")]
+  if version.len > 0: hdrs.add ("sec-websocket-version", version)
+  for e in extra: hdrs.add e
+  var f = ""
+  f.addExtendedConnect(sid, hdrs)
+  c.sendRaw(f)
+  let frames = c.readFrames(1500, until = proc(fr: seq[Frame]): bool =
+    for x in fr:
+      if x.typ == uint8(ftHeaders) and x.streamId == sid: return true
+    false)
+  c.keepData(frames)
+  for x in frames:
+    if x.typ == uint8(ftHeaders) and x.streamId == sid:
+      let fields = decodeHeaders(x.payload)
+      c.resp[sid] = fields
+      for (n, v) in fields:
+        if n == ":status": result = v
+
+proc respField*(c: H2TestConn, sid: uint32, name: string): string =
+  ## A field of the response HEADERS `extendedConnect` read on `sid` ("" if the
+  ## server did not send it), for a refusal that carries one -- RFC 6455
+  ## 4.2.2(4)'s `Sec-WebSocket-Version` on a 426. Names are HPACK-lowercase.
+  for (n, v) in c.resp.getOrDefault(sid):
+    if n == name: return v
+
+proc firstWsFrame*(acc: string): bool =
+  ## A `streamData` predicate: at least one complete WebSocket frame has
+  ## arrived in the stream's accumulated DATA bytes.
+  parseFrames(acc)[0].len >= 1
+
+proc sendData*(c: var H2TestConn, sid: uint32, payload: string) =
+  ## One DATA frame on `sid` (no END_STREAM): the carrier for WebSocket frames.
+  var f = ""
+  f.addData(sid, payload)
+  c.sendRaw(f)
+
+proc streamData*(c: var H2TestConn, sid: uint32,
+                 ready: proc(acc: string): bool, tries = 30): string =
+  ## Every DATA byte received on `sid` so far, reading more until `ready`
+  ## accepts the accumulation (e.g. "a complete WebSocket frame has arrived")
+  ## or the server goes quiet. Deterministic like `readFrames`'s `until`: it
+  ## stops on the expected outcome, not on a fixed wait.
+  var left = tries
+  while left > 0:
+    if ready(c.data.getOrDefault(sid)): break
+    dec left
+    let frames = c.readFrames(1000, until = proc(fr: seq[Frame]): bool =
+      for f in fr:
+        if f.typ == uint8(ftData) and f.streamId == sid: return true
+      false)
+    c.keepData(frames)
+    if frames.len == 0: break
+  c.data.getOrDefault(sid)
 
 proc close*(c: var H2TestConn) =
   c.sock.close()

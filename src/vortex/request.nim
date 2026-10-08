@@ -2904,13 +2904,42 @@ proc isWebSocketUpgrade*(req: Request): bool =
   req.header("sec-websocket-version") == "13" and
   req.header("sec-websocket-key").len > 0
 
+proc isWebSocketIntent*(req: Request): bool =
+  ## True when the request *asks* for a WebSocket, whether or not the handshake
+  ## is one this server can complete: an HTTP/1.1 `Upgrade: websocket`, or an
+  ## Extended CONNECT with `:protocol = websocket` over HTTP/2 / HTTP/3. Every
+  ## `isWebSocketUpgrade` request is also an intent; the gap between the two is
+  ## a handshake that is missing or misstating a field, most usefully
+  ## `Sec-WebSocket-Version`.
+  ##
+  ## Use it to pick the refusal when `isWebSocketUpgrade` is false. RFC 6455
+  ## 4.2.2(4) -- which RFC 8441 5 keeps for h2/h3 -- answers a missing or
+  ## unsupported version with an error such as `426 Upgrade Required` carrying
+  ## a `Sec-WebSocket-Version` header naming the versions the server speaks, so
+  ## an intent gets a 426 and no intent at all (an HTTP/1.1 proxy-style CONNECT,
+  ## a plain GET) a 400. `Router.ws` applies exactly that rule on both legs.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      return req.method == HttpConnect and
+        h3FieldOf(req, ":protocol") == "websocket"
+    else:
+      return false
+  if req.httpVersion == 2:
+    return req.method == HttpConnect and
+      h2Field(conn(req.core, req.fd, req.gen), req.stream, ":protocol") ==
+        "websocket"
+  req.httpVersion == 1 and
+  "websocket" in req.header("upgrade").toLowerAscii
+
 proc acceptWebSocket*(req: Request,
                       protocols: openArray[string] = []): WebSocket =
   ## Complete the handshake and switch to WebSocket mode. Loop thread only;
   ## call from the handler after `isWebSocketUpgrade`. Set `onMessage` /
-  ## `onClose` on the returned handle. If the request is not upgradeable or
-  ## already answered, the handle is dead (`ws.isAlive == false`) and the
-  ## caller should send a normal response.
+  ## `onClose` on the returned handle. If the request is not a WebSocket
+  ## handshake (`isWebSocketUpgrade` is false) or has already been answered,
+  ## nothing is written and nothing is upgraded: the handle is dead
+  ## (`ws.isAlive == false`) and the caller still owns the response, which it
+  ## should send itself (a 426 or a 400, as `isWebSocketIntent` describes).
   ##
   ## `protocols` is the server's supported subprotocols in preference
   ## order; the first that the client also offered is negotiated and echoed
@@ -2918,6 +2947,12 @@ proc acceptWebSocket*(req: Request,
   ## the loop thread (it reports "" off-loop, like the other accessors).
   result = WebSocket(core: req.core, fd: req.fd, gen: req.gen,
                      stream: req.stream)
+  # The documented contract, enforced for every transport rather than trusted
+  # to the handler. h1 would otherwise answer `101 Switching Protocols` with a
+  # `Sec-WebSocket-Accept` computed over an empty key off a plain GET, and the
+  # h2/h3 codecs classify an Extended CONNECT on `:protocol` alone, so a
+  # handshake with no `Sec-WebSocket-Version` reached their 200 as well (#400).
+  if not req.isWebSocketUpgrade: return
   if req.fd < 0:
     # HTTP/3 (RFC 9220): reply 200 on the QUIC stream and attach a WsConn.
     when not defined(plainHttp):
