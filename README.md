@@ -346,14 +346,18 @@ a client on 1.2. QUIC/HTTP/3 is always 1.3, so a 1.2 floor is raised to 1.3 ther
 *ceiling* needs `http3 = false` (the combination is refused rather than quietly ignored on
 HTTP/3). `tlsCipherSuites` (TLS 1.3) applies to both transports; `tlsCipherList` is TLS 1.2
 only, so HTTP/3 never consults it. Both are preference *orders*, not unordered allow-sets:
-vortex sets `SSL_OP_SERVER_PREFERENCE` (the same option bit OpenSSL < 3.5 spelled
-`SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first entry both ends support is what gets
-negotiated, whatever order the client offers. They remain allow-*sets* as well: a client
-that cannot do the preferred entry still connects on another.
+vortex sets `SSL_OP_SERVER_PREFERENCE` (the name OpenSSL 3.6.0 introduced for the option bit
+that 3.5, the project minimum, spells only `SSL_OP_CIPHER_SERVER_PREFERENCE`), so the first
+entry both ends support is what gets negotiated, whatever order the client offers. They
+remain allow-*sets* as well: a client that cannot do the preferred entry still connects on
+another.
 
-On OpenSSL 3.5+ (the project minimum) the same option also makes ECDH group, TLS 1.2 curve
-and signature-algorithm selection follow the server's order; the server's group list is
-OpenSSL's default unless configured, and a client key share for the server's preferred group
+That option is wider than ciphers. OpenSSL 3.5 (the project minimum) extended it to
+server-side TLS 1.3 key exchange group selection, and 3.6 documents the whole of it: "when
+choosing a cipher, signature, (TLS 1.2) curve or (TLS 1.3) group, use the server's
+preferences". So ECDH group, TLS 1.2 curve and signature-algorithm selection follow the
+server's order too; the server's group list is OpenSSL's default unless
+configured, and a client key share for the server's preferred group
 is still used, so no extra round trip appears. With *both* lists empty the operator
 configured no policy, so vortex also sets `SSL_OP_PRIORITIZE_CHACHA`: a client that offers
 ChaCha20-Poly1305 first (the "no AES hardware" signal) gets ChaCha rather than software AES,
@@ -542,6 +546,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
 | `req.blocking(vals…): body` | `macro` | run `body` on the worker pool; named `vals` are moved in and usable by name (see above) |
 | `req.isWebSocketUpgrade` | `bool` | is this request a WebSocket handshake (see [WebSockets](#websockets)) |
+| `req.isWebSocketIntent` | `bool` | did it ask for a WebSocket at all, handshake complete or not (426 vs 400) |
 | `req.acceptWebSocket(protocols = [])` | `WebSocket` | complete the WebSocket handshake (see [WebSockets](#websockets)) |
 | `req.onBody(cb, manualAck = false)` | `void` | register an inbound body sink (see [Upload](#upload)) |
 | `req.ackBody(n)` | `void` | grant flow-control credit for consumed body bytes (see [Upload](#upload)) |
@@ -945,9 +950,22 @@ The same block works synchronously (`discard res.write(...)` inside it).
 `text/*` type to keep compression on).
 
 **Backpressure.** `res.write` returns `false` once the unsent backlog reaches
-`respHighWater` (256 KiB). `await res.write` awaits the drain for you; a sync
+`respHighWater` (64 KiB). `await res.write` awaits the drain for you; a sync
 producer that outruns a slow client should instead pause and resume from
 `res.onDrain` (`res.bufferedAmount` reports the current backlog).
+
+A single chunk larger than the high-water mark is accepted whole: `write` never
+takes part of a chunk and never refuses one, so the backlog can overshoot the
+mark by up to one chunk. The verdict is then taken on what is left when the
+call returns, not on what the chunk added: `write` returns `false` only if the
+stream's backlog or the connection's write buffer is *still* at or above the
+mark at that point. A fast peer can absorb a whole 1 MiB chunk inside the call
+and get `true` back, which is the common case on HTTP/2 with a wide peer
+window. When it does return `false`, `onDrain` fires once both the stream
+backlog and the connection write buffer are under the mark again. Chunk size is
+purely a memory / callback trade-off -- a 1 MiB chunk retains more per stream
+and earns fewer drain callbacks than a 64 KiB one -- and no chunk size can
+stall the stream.
 
 `false` is not exclusively backpressure: a dead connection and a call from off
 the loop thread also return it. Streaming is loop-thread only (the handler, an
@@ -1122,6 +1140,39 @@ proc chat(req: Request, res: Response) {.async.} =
 router.ws("/chat", chat)
 ```
 
+`router.ws` registers both spellings of the handshake for the path: the HTTP/1.1
+`GET` with `Upgrade: websocket`, and the Extended CONNECT (`:protocol
+websocket`) that an h2 or h3 client sends instead, so one call serves every
+transport. The path therefore lists `CONNECT` in the `Allow` header of a 405 or
+an automatic `OPTIONS`. Both legs are screened before the handler, so a request
+that is not a handshake never reaches it: one that asked for a WebSocket but
+offered no supported `Sec-WebSocket-Version` gets a `426 Upgrade Required` with
+`Sec-WebSocket-Version: 13` (RFC 6455 4.2.2(4), which RFC 8441 keeps for h2 and
+h3), and one that never asked at all -- an HTTP/1.1 proxy-style `CONNECT`, a
+plain `GET` or `HEAD` -- gets a 400.
+
+Because `ws` registers the `CONNECT` leg itself, an app that used to add it by
+hand beside `ws` (the pre-`ws` workaround) must drop that `addRoute`: the
+duplicate raises `RouteConflictError` at startup, like any other duplicate
+route. If you register a WebSocket route by hand instead of using `ws`, wrap the
+handler with `wsToHandler` and not `toHandler`, and do the screening yourself --
+`acceptWebSocket` refuses a non-handshake (the handle comes back dead) but sends
+no response, because the response is yours to send:
+
+```nim
+proc chatLeg(req: Request, res: Response) {.async.} =
+  if req.isWebSocketUpgrade:
+    await chat(req, res)
+  elif req.isWebSocketIntent:
+    # It asked for a WebSocket, but the version is missing or unsupported.
+    res.send(Http426, "426 Upgrade Required",
+             %*{"Sec-WebSocket-Version": "13"})
+  else:
+    res.send(Http400, "400 Bad Request")      # not a handshake at all
+
+router.addRoute(HttpConnect, "/chat", wsToHandler(chatLeg))
+```
+
 When you push faster than a peer can read, `ws.send` parks the overflow in the
 write buffer: `ws.bufferedAmount` reports that backlog (bytes) and `ws.onDrain`
 fires when it empties, so you can throttle a producer and resume from the drain
@@ -1140,7 +1191,14 @@ The same handler API also serves WebSockets over **HTTP/2 (RFC 8441)** and
 with ordinary requests on the connection. `isWebSocketUpgrade` /
 `acceptWebSocket` transparently handle all three transports, so the same
 `onMessage` / `ws.send` / `ws.blocking:` / permessage-deflate code works over h1,
-h2, and h3. WebSocket behavior is validated against the
+h2, and h3. With a single handler (no router) there is nothing to register and
+all three arrive at it; on a router, `router.ws` registers both legs, while a
+plain sync handler needs the CONNECT leg added by hand beside its `get`
+(`app.addRoute(HttpConnect, "/chat", handler)`) and must then screen the request
+itself, since nothing else does: a handler reached on either leg answers a
+request that is not a handshake rather than calling `acceptWebSocket`, exactly
+as the hand-registered example above does. WebSocket behavior is validated
+against the
 [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite)
 (`nimble autobahn`); h2 and h3 WebSockets are covered by `nimble h2spec`-adjacent
 suites and `nimble h3websocket` (aioquic).

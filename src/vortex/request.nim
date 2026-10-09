@@ -1608,15 +1608,42 @@ proc kickConn(res: Response) {.raises: [].} =
   try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0)
   except Exception: discard
 
-proc h2Writable(res: Response, backlog: int): bool =
+proc h2Writable(res: Response): bool =
   ## Backpressure verdict for an HTTP/2 streamed write: writable only when both
-  ## the stream send window (empty `backlog`) and the connection write buffer
-  ## (`pendingOut`) have room. Unlike HTTP/1 (which is capped by the socket), a
-  ## large peer window lets sendData move a whole response into c.wbuf, so
-  ## without the pendingOut cap one stream could buffer it all in RAM. When
-  ## backed up, mark the stream so flushOut's drain (h2DrainResume) resumes it.
+  ## the stream's unsent backlog and the connection write buffer (`pendingOut`)
+  ## have room. Unlike HTTP/1 (which is capped by the socket), a large peer
+  ## window lets sendData move a whole response into c.wbuf, so without the
+  ## pendingOut cap one stream could buffer it all in RAM. When backed up, mark
+  ## the stream so flushOut's drain (h2DrainResume) resumes it.
+  ##
+  ## Both limits are read AFTER the flush, which is the whole point (#399). The
+  ## backlog used to be the value h2StreamWrite returned BEFORE flushConn ran,
+  ## and a single write larger than respHighWater parks most of itself in
+  ## pendingBody: the flush that follows drains up to h2MaxRefillRounds x
+  ## respHighWater (1 MiB) of it straight to the socket, so a 1 MiB chunk was
+  ## routinely gone by the time the verdict was taken. Parking the producer on
+  ## that stale number marked a stream backed up with an empty backlog and an
+  ## empty write buffer, i.e. with no drain, no WINDOW_UPDATE and no scheduler
+  ## pass left to come -- the producer's onDrain could never fire again and the
+  ## response stopped mid-body. A verdict taken on the live numbers reports
+  ## backpressure only while one of the two caps is genuinely exceeded, and then
+  ## the socket or the peer's window still owes an event that resumes it.
   let c = conn(res.core, res.fd, res.gen)     # flush may have closed the conn
   if c == nil: return false
+  var backlog = 0
+  let st = h2Stream(c, res.stream)
+  if st != nil and st.respPhase == rpStreaming and not st.isHead and
+      st.ws == nil:
+    backlog = st.pendingBody.len - st.pendingPos
+  # Those are h2StreamWrite's own guards, so the verdict is taken on the backlog
+  # the write it follows could actually have added to, and only on that: a
+  # stream that is gone (a HEAD closed at its head, an abort, a peer reset), one
+  # past rpStreaming (the final DATA of a finish() still queued), a HEAD, or an
+  # Extended CONNECT stream whose pendingBody is a WebSocket frame queue and not
+  # a response backlog at all, all contribute 0 and let the connection cap
+  # decide -- which is what lets `write` on a HEAD response still report
+  # writable, and keeps `write` after finish() from re-marking a finished stream
+  # backed up with a producer that will never be resumed.
   if backlog >= respHighWater or pendingOut(c) >= respHighWater:
     h2MarkRespBackedUp(c, res.stream)
     return false
@@ -1739,6 +1766,19 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
   ## returning false, so false is not exclusively backpressure. Use
   ## `req.isAlive` to tell a dead connection from a full backlog, and don't
   ## stream from off the loop thread at all.
+  ##
+  ## A single chunk LARGER than `respHighWater` is accepted whole: `write` never
+  ## writes a partial chunk and never refuses one, so the backlog can exceed the
+  ## mark by up to one chunk. The verdict is taken on what is LEFT when the call
+  ## returns, not on what the chunk added: false only if the stream's backlog or
+  ## the connection write buffer is still at or above the mark at that point
+  ## (#399). A fast peer can absorb a whole 1 MiB chunk inside the call -- on
+  ## HTTP/2 with a wide peer window that is the usual outcome -- and the call
+  ## returns true. When it does return false, `onDrain` fires once BOTH the
+  ## stream backlog and the connection write buffer are back under the mark.
+  ## Chunk size is therefore purely a memory / callback trade-off: bigger chunks
+  ## retain more per stream and yield fewer drain callbacks, smaller chunks the
+  ## reverse, and neither can stall the stream.
   ## `{.raises: [].}` (the body is contained) so it composes in strict-effect
   ## async bodies -- a producer's `if not res.write(chunk): await res.drained()`.
   try:
@@ -1763,12 +1803,12 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
         if st != nil and st.rs.respComp != nil:
           let z = compChunk(st.rs.respComp, data, false)
           if z.len == 0: return true
-          let backlog = h2StreamWrite(c, res.stream, z)
+          discard h2StreamWrite(c, res.stream, z)
           flushConn(res)
-          return h2Writable(res, backlog)
-      let backlog = h2StreamWrite(c, res.stream, data)
+          return h2Writable(res)
+      discard h2StreamWrite(c, res.stream, data)
       flushConn(res)
-      return h2Writable(res, backlog)
+      return h2Writable(res)
     if not c.rs.respStreaming: return false
     if c.parser.httpMethod == HttpHead: return true   # no body on HEAD
     c.respBodyWritten += data.len   # reconciled vs respContentLength at finish() (#248)
@@ -2741,26 +2781,64 @@ const fileReadAhead = fileChunkCap
   ## end of that outbox batch, so it cannot be held back). Read-ahead throttling
   ## can only stop the read AFTER that one.
   ##
-  ## It must stay >= respHighWater: parking relies on the preceding write having
-  ## reported backpressure (write() -> h2Writable / c.respBackedUp), which is
-  ## what arms the drain callback pullNext registers. A budget below the
-  ## high-water mark could park a producer that was never marked backed up, and
-  ## no drain would ever resume the read.
+  ## It must stay >= respHighWater, but for a different reason than it used to.
+  ## Parking no longer relies on the budget implying a write that reported
+  ## backpressure -- the deferred half of the gate asks the write itself
+  ## (pullAfterWrite, #399), because that assumption was false and stalled the
+  ## transfer. What the budget still has to guarantee is the converse: a `write`
+  ## that reports writable leaves both caps under respHighWater, so with the
+  ## budget at or above the mark that verdict also satisfies the gate, and
+  ## pullAfterWrite can dispatch on it without overshooting the budget.
 
-proc pullNext(res: Response, nextRead: string, reader: pointer) =
+proc parkNextRead(res: Response, nextRead: string, reader: pointer) =
+  ## Hang the next disk read off the response's drain callback. Only correct
+  ## when the write that just ran reported backpressure, which is what arms the
+  ## callback: see pullAfterWrite.
+  let held = nextRead
+  let r = reader
+  res.onDrain(proc(res2: Response) {.gcsafe.} =
+    dispatchNextRead(res2, held, r))
+
+proc pullNext(res: Response, nextRead: string, reader: pointer): bool =
   ## Prefetch the next chunk to overlap its disk read with the current chunk's
-  ## socket write. If the response backlog is already at the read-ahead budget,
-  ## wait for it to drain first so a slow reader cannot make us buffer without
-  ## bound (bufferedAmount covers the h1 wbuf and the h2/h3 per-stream backlog).
-  ## Called BEFORE the freshly-arrived chunk is written (see applyFileChunk), so
-  ## the worker's read runs while the loop thread pushes that chunk to the socket.
-  if res.bufferedAmount() < fileReadAhead:
+  ## socket write, and report whether it did. Called BEFORE the freshly-arrived
+  ## chunk is written (see applyFileChunk), so the worker's read runs while the
+  ## loop thread pushes that chunk to the socket (#340).
+  ##
+  ## This is only the DISPATCH half of the read-ahead gate. False means the
+  ## backlog is already at the budget, so a slow reader must throttle us (issue
+  ## #273) -- but the decision of HOW to wait belongs after the write, in
+  ## pullAfterWrite, because only the write's own verdict says whether a drain
+  ## is still owed (#399). `bufferedAmount` covers the h1 wbuf and the h2/h3
+  ## per-stream backlog.
+  result = res.bufferedAmount() < fileReadAhead
+  if result: dispatchNextRead(res, nextRead, reader)
+
+proc pullAfterWrite(res: Response, nextRead: string, reader: pointer,
+                    writable: bool) =
+  ## The DEFER half of the read-ahead gate, run once the chunk has been written:
+  ## `writable` is what `res.write` returned.
+  ##
+  ## Parking used to be decided before the write, on the assumption that a
+  ## backlog at the budget (>= respHighWater) meant the following write would
+  ## report backpressure and arm the callback. One flush can drain up to
+  ## h2MaxRefillRounds x respHighWater (1 MiB) straight to the socket, so on a
+  ## wide peer window the write routinely comes back TRUE with the backlog and
+  ## the connection write buffer both empty: no socket drain, no WINDOW_UPDATE
+  ## and no scheduler pass is left to come, and the registered callback is never
+  ## fired -- the download stops dead with no RST_STREAM and no GOAWAY, which is
+  ## #399 one layer down from res.write. The same hole existed on h1 (whose
+  ## drain path needs c.respBackedUp) and on h3 (whose on_stream_writable only
+  ## fires on an ack that may already have happened).
+  ##
+  ## So: a false verdict means the producer was marked backed up and an event is
+  ## owed, which is exactly when parking is safe. A true verdict means both caps
+  ## are under respHighWater, hence under fileReadAhead, so the gate would pass
+  ## now anyway -- dispatch instead of parking on an event that will never come.
+  if writable:
     dispatchNextRead(res, nextRead, reader)
   else:
-    let held = nextRead
-    let r = reader
-    res.onDrain(proc(res2: Response) {.gcsafe.} =
-      dispatchNextRead(res2, held, r))
+    parkNextRead(res, nextRead, reader)
 
 proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
                      reader: pointer, last: bool) =
@@ -2777,6 +2855,11 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## without this chunk, which is why the budget dropped to one chunk to keep the
   ## same ceiling (see fileReadAhead).
   ##
+  ## When the gate does NOT pass, the wait is decided AFTER the write instead
+  ## (pullAfterWrite, #399): parking on a drain is only safe once the write has
+  ## actually reported backpressure, and nothing is lost by deferring it because
+  ## that branch dispatches nothing to overlap with in the first place.
+  ##
   ## `n == fileChunkFailed` means the read failed or came up short of what the
   ## declared Content-Length still owes: abort (HTTP/1 closes the connection,
   ## HTTP/2 and /3 reset the stream) so the peer sees a cut-short transfer,
@@ -2784,10 +2867,20 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   if n == fileChunkFailed:
     res.abort()
     return
-  if not last:
-    pullNext(res, nextRead, reader)
+  # `deferred` = the gate held the read back; pullAfterWrite then decides how to
+  # wait, from the write's own verdict.
+  var deferred = not last and not pullNext(res, nextRead, reader)
   if buf != nil and n > 0:
-    discard res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
+    let writable =
+      res.write(toOpenArray(cast[ptr UncheckedArray[char]](buf), 0, n - 1))
+    if deferred:
+      pullAfterWrite(res, nextRead, reader, writable)
+      deferred = false
+  if deferred:
+    # An empty non-final chunk: no write ran, so there is no verdict to read and
+    # nothing changed either. The bytes the gate saw are still queued and still
+    # owe their drain, so the pre-#399 behaviour is the right one here.
+    parkNextRead(res, nextRead, reader)
   if last:
     res.finish()
 
@@ -2802,9 +2895,10 @@ proc applyFileStart*(res: Response, status: int, contentType: string,
   ## applyFileChunk).
   res.sendHead(HttpCode(status), contentType, headers,
                contentLength = int(totalLen))
-  if not last:
-    pullNext(res, nextRead, reader)
-  discard res.write(firstChunk)
+  let deferred = not last and not pullNext(res, nextRead, reader)
+  let writable = res.write(firstChunk)
+  if deferred:
+    pullAfterWrite(res, nextRead, reader, writable)   # #399, as applyFileChunk
   if last:
     res.finish()
 
@@ -2904,13 +2998,42 @@ proc isWebSocketUpgrade*(req: Request): bool =
   req.header("sec-websocket-version") == "13" and
   req.header("sec-websocket-key").len > 0
 
+proc isWebSocketIntent*(req: Request): bool =
+  ## True when the request *asks* for a WebSocket, whether or not the handshake
+  ## is one this server can complete: an HTTP/1.1 `Upgrade: websocket`, or an
+  ## Extended CONNECT with `:protocol = websocket` over HTTP/2 / HTTP/3. Every
+  ## `isWebSocketUpgrade` request is also an intent; the gap between the two is
+  ## a handshake that is missing or misstating a field, most usefully
+  ## `Sec-WebSocket-Version`.
+  ##
+  ## Use it to pick the refusal when `isWebSocketUpgrade` is false. RFC 6455
+  ## 4.2.2(4) -- which RFC 8441 5 keeps for h2/h3 -- answers a missing or
+  ## unsupported version with an error such as `426 Upgrade Required` carrying
+  ## a `Sec-WebSocket-Version` header naming the versions the server speaks, so
+  ## an intent gets a 426 and no intent at all (an HTTP/1.1 proxy-style CONNECT,
+  ## a plain GET) a 400. `Router.ws` applies exactly that rule on both legs.
+  if req.fd < 0:
+    when not defined(plainHttp):
+      return req.method == HttpConnect and
+        h3FieldOf(req, ":protocol") == "websocket"
+    else:
+      return false
+  if req.httpVersion == 2:
+    return req.method == HttpConnect and
+      h2Field(conn(req.core, req.fd, req.gen), req.stream, ":protocol") ==
+        "websocket"
+  req.httpVersion == 1 and
+  "websocket" in req.header("upgrade").toLowerAscii
+
 proc acceptWebSocket*(req: Request,
                       protocols: openArray[string] = []): WebSocket =
   ## Complete the handshake and switch to WebSocket mode. Loop thread only;
   ## call from the handler after `isWebSocketUpgrade`. Set `onMessage` /
-  ## `onClose` on the returned handle. If the request is not upgradeable or
-  ## already answered, the handle is dead (`ws.isAlive == false`) and the
-  ## caller should send a normal response.
+  ## `onClose` on the returned handle. If the request is not a WebSocket
+  ## handshake (`isWebSocketUpgrade` is false) or has already been answered,
+  ## nothing is written and nothing is upgraded: the handle is dead
+  ## (`ws.isAlive == false`) and the caller still owns the response, which it
+  ## should send itself (a 426 or a 400, as `isWebSocketIntent` describes).
   ##
   ## `protocols` is the server's supported subprotocols in preference
   ## order; the first that the client also offered is negotiated and echoed
@@ -2918,6 +3041,12 @@ proc acceptWebSocket*(req: Request,
   ## the loop thread (it reports "" off-loop, like the other accessors).
   result = WebSocket(core: req.core, fd: req.fd, gen: req.gen,
                      stream: req.stream)
+  # The documented contract, enforced for every transport rather than trusted
+  # to the handler. h1 would otherwise answer `101 Switching Protocols` with a
+  # `Sec-WebSocket-Accept` computed over an empty key off a plain GET, and the
+  # h2/h3 codecs classify an Extended CONNECT on `:protocol` alone, so a
+  # handshake with no `Sec-WebSocket-Version` reached their 200 as well (#400).
+  if not req.isWebSocketUpgrade: return
   if req.fd < 0:
     # HTTP/3 (RFC 9220): reply 200 on the QUIC stream and attach a WsConn.
     when not defined(plainHttp):

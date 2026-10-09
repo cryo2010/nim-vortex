@@ -1,19 +1,21 @@
 ## tlsCipherList and tlsCipherSuites are preference ORDERS, not allow-sets
 ## (#375).
 ##
-## SSL_CTX_set_options was never called with SSL_OP_SERVER_PREFERENCE (the
-## OpenSSL >= 3.5 name for the bit also spelled SSL_OP_CIPHER_SERVER_PREFERENCE),
-## so OpenSSL walked the *client's* list and took the first entry the server also
-## allowed. An operator who wrote "AES256:AES128" to prefer AES-256 got AES-128
-## on every connection from every client whose own list happened to start there:
-## the ordering was accepted, applied, and silently inverted.
+## SSL_CTX_set_options was never called with SSL_OP_SERVER_PREFERENCE (the name
+## OpenSSL 3.6.0 introduced for the bit that 3.5, the project minimum, spells
+## only SSL_OP_CIPHER_SERVER_PREFERENCE), so OpenSSL walked the *client's* list
+## and took the first entry the server also allowed. An operator who wrote
+## "AES256:AES128" to prefer AES-256 got AES-128 on every connection from every
+## client whose own list happened to start there: the ordering was accepted,
+## applied, and silently inverted.
 ##
 ## Two things ride along with that option and are pinned here too.
 ##
-## On OpenSSL >= 3.5 the same bit is documented as "when choosing a cipher,
-## signature, (TLS 1.2) curve or (TLS 1.3) group, use the server's preferences",
-## so group, curve and signature-algorithm selection follow the server's order as
-## well. That is deliberate (the server decides) and free: the group list is
+## OpenSSL 3.5 extended the same bit to server-side TLS 1.3 key exchange group
+## selection, and 3.6 documents it as "when choosing a cipher, signature,
+## (TLS 1.2) curve or (TLS 1.3) group, use the server's preferences", so group,
+## curve and signature-algorithm selection follow the server's order as well.
+## That is deliberate (the server decides) and free: the group list is
 ## OpenSSL's default unless an embedder configures one, and OpenSSL still uses a
 ## group the client sent a key share for, so no extra HelloRetryRequest appears.
 ##

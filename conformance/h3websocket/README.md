@@ -18,15 +18,18 @@ docker network (QUIC is UDP):
 - **server** (`Dockerfile`, `echo_server.nim`) — a vortex HTTP/3 WebSocket
   echo server on `archlinux` (for OpenSSL >= 3.5, which ngtcp2's ossl crypto backend
   needs). It advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL` and echoes each
-  message with its kind.
+  message with its kind. The route is registered with `router.ws`, so the
+  harness covers the router path over h3 and not just a bare handler.
 - **client** (`client.Dockerfile`, `client.py`) — an aioquic client that
   opens an Extended CONNECT WebSocket and checks: the 200 handshake, text and
   binary echo, ping→pong, subprotocol negotiation, a fragmented message, the
   close handshake, a frame coalesced with the handshake (sent before the
-  handler accepts the stream), a half-close in that same burst, and a reply
+  handler accepts the stream), a half-close in that same burst, a reply
   sent from an async continuation (which must reach the wire without waiting
-  for an unrelated event). It exits non-zero (failing the run) on any
-  mismatch.
+  for an unrelated event), and a version-less Extended CONNECT, which must be
+  refused with a 426 carrying `Sec-WebSocket-Version: 13` while leaving the
+  connection usable for a proper handshake. It exits non-zero (failing the
+  run) on any mismatch.
 
 The WebSocket framing in `client.py` is hand-rolled so the test owns exactly
 what goes on the wire; aioquic supplies only the QUIC + HTTP/3 transport.

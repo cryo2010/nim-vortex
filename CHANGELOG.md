@@ -208,6 +208,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async adapters: a `router.ws` route now serves the HTTP/2 and HTTP/3 spelling
+  of the handshake too, and `wsToHandler` is exported for a route an app
+  registers by hand. `ws` registered only `HttpGet`, which is the HTTP/1.1
+  upgrade; over h2 and h3 a WebSocket arrives as `:method CONNECT` with
+  `:protocol websocket` (RFC 8441 / RFC 9220), so an h2 or h3 client reaching an
+  `rt.ws("/ws", h)` route got a 405 and never touched the handler. Registering
+  the CONNECT leg by hand was the workaround, but `wsToHandler` -- the wrapper
+  that closes the socket with 1011 instead of writing an HTTP 500 into an
+  already upgraded stream, exactly what `ws`'s own doc comment warns about --
+  was private, so the only wrapper available was the wrong one (`toHandler`) and
+  the handler had to catch every `CatchableError` itself. `ws` now registers
+  `HttpGet` and `HttpConnect` for the path, both with WebSocket completion
+  semantics, and `wsToHandler` is public for a `streamRoute`-style predicate, a
+  custom method, or any other hand-registered leg. The HEAD-for-GET fallback and
+  the 405/OPTIONS `Allow` builder work off the per-method handler slots, so the
+  path simply also advertises `CONNECT`. Because `ws` registers that leg itself,
+  an app that already added it by hand beside `ws` -- the documented workaround
+  -- must drop that `addRoute`, or `ws` raises `RouteConflictError` at startup
+  like any other duplicate route; the loud failure is deliberate, and a test
+  pins it. The stress target server drops its hand-written CONNECT route for
+  `rt.ws`, and `conformance/h3websocket`'s echo server moves onto `rt.ws` too,
+  so `nimble h3websocket` covers the router path over h3 instead of only a bare
+  handler.
+  Both legs are now screened by one wrapper, and `acceptWebSocket` enforces its
+  own documented contract. Each leg can be matched by a request that is not a
+  handshake -- HTTP/1.1 has a CONNECT of its own (the proxy tunnel of RFC 9110
+  9.3.6), a plain `GET` (or a `HEAD`, which falls back to the GET slot) matches
+  the GET leg, and the h2/h3 codecs classify an Extended CONNECT on `:protocol`
+  alone, so one with a missing or unsupported `Sec-WebSocket-Version` reaches
+  the route as well. None of those reach the handler any more. A request that
+  asked for a WebSocket but cannot be upgraded is answered `426 Upgrade
+  Required` with the `Sec-WebSocket-Version: 13` this server speaks (RFC 6455
+  4.2.2(4), which RFC 8441 5 keeps for h2 and h3), and one that never asked at
+  all gets a 400. `isWebSocketIntent` is exported for a hand-registered leg that
+  wants the same rule. Underneath, `acceptWebSocket` returns a dead handle
+  (`ws.isAlive == false`) for any request `isWebSocketUpgrade` rejects, on every
+  transport, and sends nothing: before, h1 wrote `101 Switching Protocols` with
+  a `Sec-WebSocket-Accept` computed over an empty key and switched the
+  connection into WebSocket mode off a plain GET, while h2 and h3 answered their
+  200 for a version-less Extended CONNECT. The response stays the caller's to
+  send, as the docs say, so a handler on a route it registered itself still owes
+  a non-handshake an answer -- the sync stress server's `/ws` handler does that
+  check explicitly now, so all five of its runtime builds behave alike. (#400)
+- HTTP/3: the ngtcp2 shim compiles against OpenSSL 3.5 again, the version
+  README.md, HARDENING.md and CONTRIBUTING.md all give as the project minimum.
+  `src/vortex/http3/ngtcp2/vq_ngtcp2.cpp` took the server-preference option
+  straight from `<openssl/ssl.h>` as `SSL_OP_SERVER_PREFERENCE`, and that name
+  only arrived in OpenSSL 3.6.0 ("Introduced `SSL_OP_SERVER_PREFERENCE`,
+  superseding misleadingly named `SSL_OP_CIPHER_SERVER_PREFERENCE`"): 3.5
+  defines nothing but the old spelling, so the translation unit did not build
+  on the documented minimum at all. Nobody saw it, because the vortex images are
+  Arch-based and carry a newer OpenSSL, and nim-navi's stress image had papered
+  over it with `--passC:-DSSL_OP_SERVER_PREFERENCE=SSL_OP_CIPHER_SERVER_PREFERENCE`.
+  The shim now carries a fallback define for the older spelling, and since the
+  Nim side was never affected -- `transport/tls.nim` declares the bit itself as
+  `uint64(1) shl 22` instead of reading a header -- that one define covers the
+  whole build; the minimum stays at 3.5 rather than being raised to match the
+  code. The comments and docs that explained the two names had it backwards,
+  saying 3.5 introduced the new name and kept the old one as an alias when it is
+  3.6 that does so, and they overstated the bit's reach: 3.5 extended it to
+  cover server-side TLS 1.3 key exchange group selection while 3.5's own manual
+  still describes it as cipher selection only, and 3.6 is where the full
+  "cipher, signature, (TLS 1.2) curve or (TLS 1.3) group" wording is documented.
+  Both claims are corrected in the shim, `transport/tls.nim`, README.md,
+  HARDENING.md and `tests/test_tls_cipher_order.nim`, and the build is pinned by
+  `tests/test_h3_tls_ossl35.nim`, whose harness rewrites the macros to the
+  single spelling 3.5's header has, compiles the shim against them, and checks
+  the context it builds still carries `SSL_OP_BIT(22)`, so neither a lost define
+  nor a fallback resolving to the wrong bit can pass. It is a separate binary
+  from `tests/test_h3_tls_ctx.nim` because both include the shim's translation
+  unit. (#398)
+- HTTP/2: a streamed response written in chunks larger than `respHighWater`
+  (64 KiB) no longer stalls partway through, with no RST_STREAM and no GOAWAY.
+  `res.write` accepts a chunk whole, so a 1 MiB write parks most of itself in the
+  stream's `pendingBody`; the flush that `write` then runs drains up to
+  `h2MaxRefillRounds` x `respHighWater` (1 MiB) of that straight to the socket,
+  so with a peer whose window is wider than the response -- curl, which returns
+  no WINDOW_UPDATE at all for a 4 MiB download -- the chunk was routinely gone by
+  the time the call returned. The backpressure verdict, though, was taken on the
+  backlog `h2StreamWrite` had reported BEFORE that flush, so the producer was
+  marked backed up with an empty backlog and an empty write buffer: no socket
+  drain, no WINDOW_UPDATE and no scheduler pass was left to come, every path that
+  re-arms a parked producer is driven by one of those three events, and the
+  registered `onDrain` could never fire again. 64 KiB chunks completed because
+  the direct-emit path leaves no backlog, so `write` kept returning true and the
+  producer never parked at all. The verdict now reads the live backlog, the same
+  way it already read the live `pendingOut`, so backpressure is reported only
+  while one of the two caps is genuinely exceeded -- and then the socket or the
+  peer's window still owes the event that resumes it. It reads that backlog
+  under `h2StreamWrite`'s own guards, so a `write` after `finish()` with the
+  final DATA still queued no longer re-marks a finished stream, and a
+  WebSocket-over-h2 stream's frame queue is not mistaken for a response backlog.
+  The re-arm condition is unchanged (a producer is invited back only once its own
+  backlog is under the mark, so a slow peer cannot be fed another megabyte per
+  drain). HTTP/1 and HTTP/3 were never affected.
+
+  `res.sendFile` had the same stall one layer down. Its read-ahead gate ran
+  before the arrived chunk was written and, when the backlog was already at the
+  budget, parked the next disk read on `onDrain` -- relying on the write that
+  followed to report backpressure and arm it. On a wide peer window that write
+  now routinely reports writable with everything already flushed, so the parked
+  read was owed no event at all and the download stopped mid-file. The gate's
+  dispatch half still runs before the write (the disk read overlaps the socket
+  write, #340); the decision to wait moved after it and is taken from the
+  write's own verdict, which also closes the same hole on HTTP/1 (whose drain
+  path needs `c.respBackedUp`) and HTTP/3 (whose `on_stream_writable` only fires
+  on an ack that may already have happened).
+
+  The contract is documented on `res.write` and in the README: a chunk above the
+  mark is accepted whole, so the backlog can overshoot by one chunk, and the
+  verdict is taken on what is LEFT when the call returns -- false only while the
+  stream backlog or the connection write buffer is still at or above the mark, so
+  a fast peer that absorbs a whole 1 MiB chunk inside the call gets true back.
+  `onDrain` then fires once both are under the mark again. Chunk size trades
+  memory for callbacks and can never stall the stream. The debug-only
+  `h2CheckCounters` audit now also covers `backedUpProducers` and asserts that no
+  stream parks a drain callback with nothing queued to fire it. (#399)
+
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
   longer fails its h3 cell at a transfer size it cannot finish.
   `conformance/stress/run.sh` defaulted `VORTEX_STREAM_BYTES` to 1 GiB for every

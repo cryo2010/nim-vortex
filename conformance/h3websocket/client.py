@@ -57,6 +57,7 @@ class WsClient(QuicConnectionProtocol):
         self._http = None
         self._sid = None
         self._status = None
+        self._headers = {}
         self._data = bytearray()
         self._got_headers = asyncio.Event()
         self._got_data = asyncio.Event()
@@ -66,6 +67,7 @@ class WsClient(QuicConnectionProtocol):
             self._http = H3Connection(self._quic)
         for e in self._http.handle_event(event):
             if isinstance(e, HeadersReceived) and e.stream_id == self._sid:
+                self._headers = dict(e.headers)
                 for k, v in e.headers:
                     if k == b":status":
                         self._status = v.decode()
@@ -75,26 +77,34 @@ class WsClient(QuicConnectionProtocol):
                 self._got_data.set()
 
     async def open_ws(self, authority, path="/", subprotocols=None,
-                      pipelined=b"", fin=False):
+                      pipelined=b"", fin=False, version=b"13"):
         """Open an Extended CONNECT WebSocket; return the handshake status.
 
         `pipelined` bytes are sent as DATA before the first transmit, so the
         handshake and those WebSocket frames leave in the same packet burst
         (the server sees them before the handler accepts the stream). `fin`
         half-closes the stream in that same burst (a QUIC-level FIN, no DATA
-        frame), i.e. before the handler can accept.
+        frame), i.e. before the handler can accept. `version` is the offered
+        Sec-WebSocket-Version, left out entirely when empty. Can be called
+        again on the same connection: each call opens a new stream.
         """
         if self._http is None:
             self._http = H3Connection(self._quic)
         self._sid = self._quic.get_next_available_stream_id()
+        self._status = None
+        self._headers = {}
+        self._data.clear()
+        self._got_headers.clear()
+        self._got_data.clear()
         headers = [
             (b":method", b"CONNECT"),
             (b":scheme", b"https"),
             (b":authority", authority.encode()),
             (b":path", path.encode()),
             (b":protocol", b"websocket"),
-            (b"sec-websocket-version", b"13"),
         ]
+        if version:
+            headers.append((b"sec-websocket-version", version))
         if subprotocols:
             headers.append(
                 (b"sec-websocket-protocol", ", ".join(subprotocols).encode()))
@@ -106,6 +116,10 @@ class WsClient(QuicConnectionProtocol):
         self.transmit()
         await asyncio.wait_for(self._got_headers.wait(), timeout=5)
         return self._status
+
+    def resp_header(self, name: bytes) -> bytes:
+        """A field of the last response HEADERS (b"" if the server omitted it)."""
+        return self._headers.get(name, b"")
 
     def send_raw(self, data: bytes):
         self._http.send_data(self._sid, data, end_stream=False)
@@ -190,6 +204,28 @@ async def run_async_send(host, port):
         print(f"deferred (async) send OK in {elapsed:.2f}s")
 
 
+async def run_bad_version(host, port):
+    """A version-less Extended CONNECT is refused, and the connection survives.
+
+    RFC 8441 5 keeps RFC 6455's Sec-WebSocket-Version for h2/h3, and 4.2.2(4)
+    answers a missing or unsupported version with an error such as 426 Upgrade
+    Required naming the version the server speaks. The h3 codec classifies a
+    ws-connect stream on `:protocol` alone, so this is `router.ws`'s screening
+    rather than the codec's -- and it must refuse the stream, not upgrade it.
+    """
+    async with client_ctx(host, port) as client:
+        status = await client.open_ws("server", "/", version=b"")
+        assert status == "426", f"version-less handshake status {status!r}"
+        offered = client.resp_header(b"sec-websocket-version")
+        assert offered == b"13", f"426 must name the version: {offered!r}"
+        status = await client.open_ws("server", "/")
+        assert status == "200", f"handshake after a refusal: {status!r}"
+        client.send_ws(OP_TEXT, b"after-426")
+        fr = (await client.recv_ws())[0]
+        assert fr == (OP_TEXT, b"after-426"), f"echo after a refusal: {fr}"
+        print("version-less Extended CONNECT refused 426, connection OK")
+
+
 async def run(host, port):
     async with client_ctx(host, port) as client:
         status = await client.open_ws("server", "/", ["chat", "json"])
@@ -228,6 +264,7 @@ async def run(host, port):
     await run_coalesced(host, port)
     await run_early_fin(host, port)
     await run_async_send(host, port)
+    await run_bad_version(host, port)
     print("RESULT: all HTTP/3 WebSocket cases passed.")
 
 

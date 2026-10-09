@@ -260,10 +260,29 @@ proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
         bodyReaders.del(k)
       watch(req, fut)
 
-proc wsToHandler(inner: AsyncRequestHandler): RequestHandler =
+proc wsToHandler*(inner: AsyncRequestHandler): RequestHandler =
   ## Like toHandler, but with WebSocket completion semantics: an unhandled
   ## exception closes the socket with 1011 (not an HTTP 500), and there is no
   ## HTTP resume -- the upgraded connection is owned by the WebSocket.
+  ##
+  ## `Router.ws` wraps with this already, for both legs of the handshake. Use it
+  ## directly for a route you register by hand whose handler completes as a
+  ## WebSocket: a custom method, a `streamRoute`-style predicate, or a leg your
+  ## own registration helper adds.
+  ##
+  ##   router.addRoute(HttpConnect, "/ws", wsToHandler(chat))
+  ##
+  ## `toHandler` is the wrong wrapper there for the reason above. This wrapper
+  ## does not screen the request, though: a hand-registered route is matched on
+  ## method and path alone, so the handler must check `req.isWebSocketUpgrade`
+  ## itself and answer a non-handshake with a normal response. An HTTP/1.1
+  ## proxy-style CONNECT (RFC 9110 9.3.6) matches a CONNECT route and carries no
+  ## handshake, a plain GET matches a GET route, and an h2/h3 Extended CONNECT
+  ## is classified on `:protocol` alone, so a missing or unsupported
+  ## `Sec-WebSocket-Version` reaches the route too. `acceptWebSocket` refuses
+  ## all of those (the handle comes back dead), but it answers none of them --
+  ## the caller owns the response. `Router.ws` does that screening for you, on
+  ## both legs; see `isWebSocketIntent` for the status it picks.
   let h = inner
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
@@ -271,19 +290,61 @@ proc wsToHandler(inner: AsyncRequestHandler): RequestHandler =
                          gen: req.gen, stream: req.stream)
       watchWs(ws, h(req, res))
 
+proc wsGuarded(inner: AsyncRequestHandler): RequestHandler =
+  ## Both legs of `Router.ws`: the handler runs only for a request that really
+  ## is a handshake, and everything else is answered here instead of reaching
+  ## it. Each leg can be matched by a request that never asked for a WebSocket
+  ## -- an HTTP/1.1 proxy-style CONNECT (RFC 9110 9.3.6) or a plain GET (and a
+  ## HEAD, which falls back to the GET slot) -- and the h2/h3 codecs classify an
+  ## Extended CONNECT on `:protocol` alone, so one with a missing or unsupported
+  ## `Sec-WebSocket-Version` arrives here too. Running the WebSocket handler on
+  ## any of them would return without answering and park the connection
+  ## (`responseTimeout` is off by default).
+  ##
+  ## The status follows RFC 6455 4.2.2(4), which RFC 8441 5 keeps for h2 and
+  ## h3: a request that shows WebSocket intent but is not a completable
+  ## handshake gets `426 Upgrade Required` plus the `Sec-WebSocket-Version: 13`
+  ## this server speaks, so the client can retry; no intent at all gets a plain
+  ## 400.
+  let h = wsToHandler(inner)
+  proc (req: Request, res: Response) {.gcsafe.} =
+    {.gcsafe.}:
+      if req.isWebSocketUpgrade: h(req, res)
+      elif req.isWebSocketIntent:
+        res.send(Http426, "426 Upgrade Required",
+                 {"Sec-WebSocket-Version": "13"})
+      else: res.send(Http400, "400 Bad Request")
+
 proc ws*(r: Router, path: string, h: AsyncRequestHandler) =
-  ## Register an async WebSocket handler (a WS handshake is a GET). Write a
-  ## plain `{.async.}` proc that accepts the socket and loops -- e.g. with
-  ## `ws.messages` -- and `await` freely; on an unhandled exception the socket
-  ## closes with 1011. Prefer this over `get` for WebSocket routes: `get` would
-  ## answer a failure with an HTTP 500 written into the WebSocket stream.
+  ## Register an async WebSocket handler for both spellings of the handshake: a
+  ## GET with `Upgrade: websocket` over HTTP/1.1 (RFC 6455), and an Extended
+  ## CONNECT with `:protocol = websocket` over HTTP/2 (RFC 8441) or HTTP/3 (RFC
+  ## 9220). Write a plain `{.async.}` proc that accepts the socket and loops --
+  ## e.g. with `ws.messages` -- and `await` freely; on an unhandled exception the
+  ## socket closes with 1011. Prefer this over `get` for WebSocket routes: `get`
+  ## would answer a failure with an HTTP 500 written into the WebSocket stream,
+  ## and would never be reached by an h2/h3 client at all.
   ##
   ##   proc chat(req: Request, res: Response) {.async.} =
   ##     let ws = req.acceptWebSocket()
   ##     ws.messages(msg):
   ##       ws.send(msg)
   ##   router.ws("/chat", chat)
-  r.addRoute(HttpGet, path, wsToHandler(h))
+  ##
+  ## Because the path carries a CONNECT route, CONNECT appears in the `Allow`
+  ## header the router builds for a 405 or an automatic OPTIONS on it. Both legs
+  ## are screened before the handler: a request that is not a handshake never
+  ## reaches it, and is answered with a `426 Upgrade Required` carrying
+  ## `Sec-WebSocket-Version: 13` if it asked for a WebSocket at all (a missing
+  ## or unsupported version, RFC 6455 4.2.2(4)), or a 400 if it did not (an
+  ## HTTP/1.1 proxy-style CONNECT, a plain GET or HEAD).
+  ##
+  ## `ws` registers both methods itself, so an app that used to add the CONNECT
+  ## leg by hand beside it must drop that `addRoute`: registering the same
+  ## method and path twice raises `RouteConflictError` at startup, as it does
+  ## for any duplicate route.
+  r.addRoute(HttpGet, path, wsGuarded(h))
+  r.addRoute(HttpConnect, path, wsGuarded(h))
 
 proc toHandler*(h: AsyncRequestHandler): RequestHandler =
   ## Adapt an async handler to the core handler type (route parameters

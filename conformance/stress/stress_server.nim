@@ -261,6 +261,20 @@ else:
   proc hWhoami(req: Request, res: Response) {.gcsafe.} = whoamiBody(req, res)
 
   proc hWs(req: Request, res: Response) {.gcsafe.} =
+    # Both legs are registered by hand here (`rt.ws` lives on the async
+    # adapters), so this handler owns the handshake screening that `rt.ws` does
+    # for the async build: an h1 proxy-style `CONNECT /ws` (RFC 9110 9.3.6) and
+    # a plain `GET /ws` both match a leg while carrying no handshake, and an
+    # h2/h3 Extended CONNECT is classified on `:protocol` alone, so one with no
+    # supported `Sec-WebSocket-Version` arrives too. Same statuses as `rt.ws`,
+    # so a soak sees one behaviour across all five runtime builds (#400).
+    if not req.isWebSocketUpgrade:
+      if req.isWebSocketIntent:
+        res.send(Http426, "426 Upgrade Required",
+                 {"Sec-WebSocket-Version": "13"})
+      else:
+        res.send(Http400, "400 Bad Request")
+      return
     let ws = req.acceptWebSocket()
     ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
       ws.send(data)                         # echo
@@ -307,11 +321,13 @@ when isMainModule:
   rt.delete("/echo", hEcho)                # every-method coverage (proxy interop);
   rt.patch("/echo", hEcho)                 # HEAD derives from GET, OPTIONS auto-answers
   rt.get("/whoami", hWhoami)               # remote addr (PROXY-protocol assertion)
-  rt.get("/ws", hWs)                       # h1/h2 WebSocket (GET Upgrade)
   when asyncMode:
-    rt.addRoute(HttpConnect, "/ws", toHandler(hWs))   # h2/h3 Extended CONNECT (RFC 9220)
+    rt.ws("/ws", hWs)                      # h1 GET Upgrade + h2/h3 Extended
+                                           # CONNECT, both with WebSocket
+                                           # completion semantics (#400)
   else:
-    rt.addRoute(HttpConnect, "/ws", hWs)
+    rt.get("/ws", hWs)                     # h1/h2 WebSocket (GET Upgrade)
+    rt.addRoute(HttpConnect, "/ws", hWs)   # h2/h3 Extended CONNECT (RFC 9220)
   rt.get("/sse", hSse)
   rt.get("/stats", hStats)
   rt.get("/drops", hDrops)                 # accept-path drop counters (#388)
