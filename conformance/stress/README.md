@@ -18,7 +18,7 @@ nimble stressSse             # SSE subscribe; server drops mid-stream; reconnect
 nimble stressStreamUpload    # stream up; the server verifies the SHA-1 (400 on mismatch)
 nimble stressStreamDownload  # stream down; the client verifies the SHA-1
 nimble stressMixed           # all five of the above at ONE server, concurrently
-nimble stress                # short smoke of all six (20 s); fails on any
+nimble stress                # short smoke of all six (20 s) plus two targeted cells; fails on any
 ```
 
 A green run ends with `== <workload>: all cells passed ==`.
@@ -47,8 +47,8 @@ incompressible store-fallback.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `VORTEX_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3) |
-| `VORTEX_SERVER` | `sync` | `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` - the handler runtime; `chronos` = `vortex/chronos`, `async` = `vortex/asyncdispatch` |
+| `VORTEX_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (`all` = h1 + h2 + h3), or a comma- or space-separated list (`h2,h3`) |
+| `VORTEX_SERVER` | `sync` | `sync` \| `async` \| `async-await` \| `chronos` \| `chronos-await` \| `all` - the handler runtime; `chronos` = `vortex/chronos`, `async` = `vortex/asyncdispatch`. A list works as for `VORTEX_PROTO` (`sync,async`) |
 | `VORTEX_CLIENT` | `python` | `python` \| `navi` \| `all` - which load client drives the cells. `python` = the httpx + websockets + aioquic canary, the default and the interop reference; `navi` = the compiled Nim client; `all` runs every cell **twice**, python then navi. See [Choosing the client](#choosing-the-client) |
 | `VORTEX_NAVI_BACKEND` | `chronos` | `chronos` \| `asyncdispatch` - the navi client backend the binary is **built** against (`-d:useChronos` selects `import navi/chronos`). A docker build arg, so it is fixed per image, not per cell |
 | `VORTEX_NAVI_REF` | the sha pinned in `client/navi/Dockerfile` (nim-navi `62244a8`) | nim-navi ref the navi client image is built from; empty keeps the pin. Pinned so a navi change cannot silently move vortex's numbers - bump it deliberately and re-run the soaks. Pass a **sha**: a branch or tag name is frozen by the docker build cache at its first build on that host |
@@ -59,6 +59,7 @@ incompressible store-fallback.
 | `VORTEX_REQ_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - client encodes the request body; the server decompresses |
 | `VORTEX_RESP_COMPRESSION` | `gzip` | `none` \| `gzip` \| `br` \| `zstd` - the server compresses the response |
 | `VORTEX_STREAM_BYTES` | `1073741824`, or `67108864` under 1200 s; `mixed`: `16777216`, or `2097152` under 1200 s | streaming transfer size: 1 GiB for a real soak and 64 MiB for a short run, and the same rule at 16 MiB / 2 MiB for `mixed` - see [Sizing a short streaming smoke](#sizing-a-short-streaming-smoke) and [Sizing a mixed cell](#sizing-a-mixed-cell). An explicit value always wins; `nimble stress` inlines a per-cell smoke size |
+| `VORTEX_DOWNLOAD_CHUNK` | `0` | bytes per `res.write` on the server's `/download` (the server's `DOWNLOAD_CHUNK`). `0` keeps the historical body: `sendFile` on the sync build, awaited 64 KiB writes on the async ones. `N > 0` switches **every** build to `N`-byte `res.write` calls with `onDrain` re-registration, so a value above `respHighWater` (64 KiB) parks the producer - the path #399 stalled. The async handlers await a future the producer completes when it stops, so they stay suspended for the transfer like the default body. Reaches every cell that downloads (`streamdownload`, `mixed`, the chaos sidecar's `/download` connections, which run in every workload); the bytes are the same generator, so both clients verify it unchanged. Leading zeros are stripped and the ceiling is `1073741824` (1 GiB, exit 2 above it): one chunk is one `res.write`, so near `VORTEX_STREAM_BYTES` it is the whole body already, and the server clamps a chunk above `STREAM_BYTES` to it. When non-zero, every cell's banner gains `, chunk=<size>`. `nimble stress` runs one `streamdownload` h2 cell at `1048576` unless the knob is set - see [The smoke's targeted cells](#the-smokes-targeted-cells) |
 | `VORTEX_MIX` | `requests=40,ws=20,sse=20,streamupload=10,streamdownload=10` | `mixed` only: how the worker budget splits across the five workloads. Weights, normalized by the sum of the weights that compete for the same workers; `0` drops a workload. For `streamupload`/`streamdownload` the weight is **presence-only** (they are fixed at one transfer in flight per client) - see [The mixed soak](#the-mixed-soak) |
 | `VORTEX_RUN_ID` | this run's PID | isolation id for the docker network / container / image names, so runs can go **in parallel** |
 | `VORTEX_CHAOS` | `all` | `none` \| `all` \| CSV of `slowread,slowwrite,idle,abort,vanish` - launches an **unverified misbehaving** sidecar client per cell (see [Chaos sidecar](#chaos-sidecar)); `none` = no sidecar (and no drain pause), the pre-chaos behavior |
@@ -632,6 +633,38 @@ that above 1200 s; pinning one value for the whole smoke, which is what the task
 used to do, applied 64 MiB to the mixed cell too, which cannot finish a transfer
 that size. Hence per cell, inlined on each re-exec.
 
+## The smoke's targeted cells
+
+After the six workload steps, `nimble stress` runs two steps aimed at server
+paths the default knobs never reach (#405):
+
+- **`streamdownload` on h2 at `VORTEX_DOWNLOAD_CHUNK=1048576`**, on the smoke's
+  `VORTEX_SERVER` and `VORTEX_CLIENT` (so both clients under
+  `VORTEX_CLIENT=all`). The default `/download` body never writes above
+  `respHighWater`: the sync build uses `sendFile` and the async ones `await` 64
+  KiB writes, exactly the mark, so no other cell parks a producer on `onDrain`.
+  1 MiB per `res.write` with `onDrain` re-registration is the shape nim-navi's
+  stress origin reported #399 from. It is a `DOWNLOAD_CHUNK` knob on the
+  existing route rather than a `/download-big` route so neither client changes:
+  both request `/download` and verify the same SHA-1, and every output line
+  keeps its form (only the banner gains `, chunk=1MiB`). Skipped when the
+  caller set `VORTEX_DOWNLOAD_CHUNK`: a non-zero value means the six workload
+  steps already ran `streamdownload` (and every other cell) with it, and an
+  explicit `0` opts out. A one-line `##########` notice says which.
+- **`ws` on `VORTEX_SERVER=async` over h2 and h3.** Only the async builds
+  register `/ws` with `rt.ws`, and its Extended CONNECT leg (#400) is the one h2
+  and h3 take; the sync default registers both legs by hand. Skipped when the
+  workload steps already ran it (`async` in `VORTEX_SERVER` and both h2 and h3
+  in `VORTEX_PROTO`).
+
+Each is one more cell per client (`VORTEX_SECONDS` plus the server build, the
+chaos sidecar's warm-up and drain, and teardown), so under the defaults the
+smoke is nine cells instead of six. Measured at the 20 s default with warm build
+caches: 340 s for the six workload steps, 525 s with the two new ones (62 s for
+the download cell, 123 s for the two ws cells, the h3 one's chaos drain being
+the longest). The async server image is built once and shared by the h2 and h3
+cells.
+
 ## Examples
 
 ```sh
@@ -643,6 +676,10 @@ VORTEX_SERVER=chronos nimble stressWs
 
 # Sweep sync/async/chronos for streamed downloads
 VORTEX_SERVER=all VORTEX_STREAM_BYTES=8388608 VORTEX_SECONDS=5 nimble stressStreamDownload
+
+# The above-the-mark producer (1 MiB res.write + onDrain) on sync and async, both clients
+VORTEX_DOWNLOAD_CHUNK=1048576 VORTEX_SERVER=sync,async VORTEX_CLIENT=all \
+  VORTEX_SECONDS=10 nimble stressStreamDownload
 
 # Requests over both protocols with brotli response compression
 VORTEX_PROTO=all VORTEX_RESP_COMPRESSION=br nimble stressRequests

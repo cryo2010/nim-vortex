@@ -26,8 +26,10 @@
 #   VORTEX_MIX       mixed only: the worker split, e.g.
 #                    requests=40,ws=20,sse=20,streamupload=10,streamdownload=10
 #                    (the default); 0 drops a workload from the cell
-#   VORTEX_PROTO     h1 | h2 | h3 | all           (default h2; all = h1 h2 h3)
-#   VORTEX_SERVER    sync | async | async-await | chronos | chronos-await | all
+#   VORTEX_PROTO     h1 | h2 | h3 | all           (default h2; all = h1 h2 h3).
+#                    A list works too, comma- or space-separated: h2,h3
+#   VORTEX_SERVER    sync | async | async-await | chronos | chronos-await | all,
+#                    or a list (sync,async) like VORTEX_PROTO
 #   VORTEX_CLIENT    python | navi | all          (default python; all runs
 #                    every cell twice, python then navi)
 #   VORTEX_NAVI_BACKEND  chronos | asyncdispatch  (default chronos). The
@@ -50,6 +52,21 @@
 #                    client event loop with 30 request/ws/sse workers (see the
 #                    sbytes block below). An explicit value always wins, and
 #                    `nimble stress` inlines a per-cell smoke size.
+#   VORTEX_DOWNLOAD_CHUNK  bytes per `res.write` on the server's /download
+#                    (passed to it as DOWNLOAD_CHUNK). Default 0 = the historical
+#                    body: sendFile on the sync build, awaited 64 KiB writes on
+#                    the async ones. N > 0 switches every build to N-byte
+#                    `res.write` calls with `onDrain` re-registration, so N above
+#                    respHighWater (64 KiB) parks the producer, the path #399
+#                    broke. Reaches every cell that downloads (streamdownload,
+#                    mixed, the chaos sidecar's /download connections); the
+#                    clients and their SHA-1 check are unchanged. Leading zeros
+#                    are stripped and the cap is 1073741824 (1 GiB; one chunk is
+#                    one write, so near STREAM_BYTES it is the whole body, and
+#                    the server clamps a chunk above STREAM_BYTES to it). A
+#                    non-zero value adds ", chunk=<size>" to every cell's
+#                    banner. `nimble stress` adds one streamdownload cell at
+#                    1048576 on h2 unless VORTEX_DOWNLOAD_CHUNK is set (#405).
 #   VORTEX_RUN_ID    isolation id for the docker network/container/image names,
 #                    so runs can go in parallel (default: this run's PID)
 #   VORTEX_CHAOS     none | all | CSV of slowread,slowwrite,idle,abort,vanish
@@ -129,6 +146,20 @@ need_uint() {
   esac
 }
 need_uint VORTEX_SECONDS "$seconds"
+dlchunk="${VORTEX_DOWNLOAD_CHUNK:-0}"
+need_uint VORTEX_DOWNLOAD_CHUNK "$dlchunk"
+# Canonicalize it numerically, so `00` is 0 (the banner, the smoke's skip test
+# and the server then agree on "unset"), and cap it at 1 GiB: a value past
+# int64 crashed the server at startup, which surfaced only as a readiness
+# timeout. One chunk is one `res.write`, so anything near STREAM_BYTES is the
+# whole body already (the server clamps a chunk above STREAM_BYTES to it).
+# The length test runs first so the `-gt` never sees an overflowing number.
+dlchunk=$(printf '%s' "$dlchunk" | sed 's/^0*//')
+[ -n "$dlchunk" ] || dlchunk=0
+if [ "${#dlchunk}" -gt 10 ] || [ "$dlchunk" -gt 1073741824 ]; then
+  echo "VORTEX_DOWNLOAD_CHUNK must be at most 1073741824 (1 GiB) (got '${VORTEX_DOWNLOAD_CHUNK}')"
+  exit 2
+fi
 if [ -n "${VORTEX_STREAM_BYTES:-}" ]; then
   need_uint VORTEX_STREAM_BYTES "$VORTEX_STREAM_BYTES"
 fi
@@ -304,6 +335,46 @@ if [ "${STRESS_SMOKE:-0}" = "1" ]; then
     STRESS_SMOKE=0 VORTEX_WORKLOAD="$w" \
       VORTEX_STREAM_BYTES="${VORTEX_STREAM_BYTES:-$wbytes}" sh "$0" || rc=1
   done
+  # Two targeted steps the loop above cannot reach with the default knobs
+  # (#405). Each cell costs VORTEX_SECONDS plus build, chaos and teardown, per
+  # client:
+  #
+  # 1. streamdownload on h2 with 1 MiB `res.write` calls and `onDrain`
+  #    re-registration (VORTEX_DOWNLOAD_CHUNK). The default /download body
+  #    never writes above respHighWater -- sendFile on sync, awaited writes of
+  #    exactly the mark on async -- so without this no smoke cell parks a
+  #    producer, which is the path #399 stalled. Same server runtime(s) and
+  #    client(s) as the rest of the smoke; h2 because that is where #399 lived.
+  # 2. ws on the async server over h2 and h3. Only the async build registers
+  #    /ws with `rt.ws`, whose Extended CONNECT leg (#400) is what h2 and h3
+  #    take; the sync default never runs it. Skipped when the loop above
+  #    already ran those cells (async in VORTEX_SERVER and both protos in
+  #    VORTEX_PROTO).
+  #    An explicit VORTEX_DOWNLOAD_CHUNK is honoured: non-zero means the loop
+  #    above already ran streamdownload (and every other cell) with it, and an
+  #    explicit 0 opts out, so either way the step is skipped.
+  if [ "$dlchunk" != 0 ]; then
+    echo; echo "########## smoke: streamdownload, 1 MiB res.write: already covered above (VORTEX_DOWNLOAD_CHUNK=$dlchunk) ##########"
+  elif [ -n "${VORTEX_DOWNLOAD_CHUNK:-}" ]; then
+    echo; echo "########## smoke: streamdownload, 1 MiB res.write: skipped (VORTEX_DOWNLOAD_CHUNK=0) ##########"
+  else
+    echo; echo "########## smoke: streamdownload, 1 MiB res.write ##########"
+    STRESS_SMOKE=0 VORTEX_WORKLOAD=streamdownload VORTEX_PROTO=h2 \
+      VORTEX_DOWNLOAD_CHUNK="${VORTEX_DOWNLOAD_CHUNK:-1048576}" \
+      VORTEX_STREAM_BYTES="${VORTEX_STREAM_BYTES:-$stream_short}" sh "$0" || rc=1
+  fi
+  has_word() {
+    case " $(printf '%s' "$1" | tr ',' ' ') " in *" $2 "*) return 0 ;; esac
+    return 1
+  }
+  if { [ "$server" = all ] || has_word "$server" async; } &&
+     { [ "$proto" = all ] || { has_word "$proto" h2 && has_word "$proto" h3; }; }; then
+    echo; echo "########## smoke: ws, async server: already covered above ##########"
+  else
+    echo; echo "########## smoke: ws, async server (router.ws) ##########"
+    STRESS_SMOKE=0 VORTEX_WORKLOAD=ws VORTEX_SERVER=async VORTEX_PROTO="h2 h3" \
+      sh "$0" || rc=1
+  fi
   echo
   [ "$rc" = 0 ] && echo "== stress smoke: all workloads passed ==" \
                 || echo "== stress smoke: FAILURES (see above) =="
@@ -445,6 +516,13 @@ run_cell() {
   case "$workload" in
     streamupload|streamdownload|mixed) sbanner=", stream=$(fmt_stream "$sbytes")" ;;
   esac
+  # The download chunk, only when it is set so a default cell's banner stays
+  # byte-identical, but then on EVERY workload: it changes the server's
+  # /download for the whole cell, and the chaos sidecar's generic behaviours
+  # hit /download whatever the workload.
+  if [ "$dlchunk" != 0 ]; then
+    sbanner="$sbanner, chunk=$(fmt_stream "$dlchunk")"
+  fi
   echo
   echo "=== $workload [proto=$p server=$s$cbanner] : ${seconds}s, ${clients}x${conc}${sbanner} ==="
 
@@ -455,7 +533,8 @@ run_cell() {
   docker rm -f "$srvc" >/dev/null 2>&1 || true
   docker run -d --name "$srvc" --network "$net" --network-alias server \
     -e STRESS_PORT="$port" -e STRESS_TLS="$tls" -e STRESS_HTTP3="$h3" \
-    -e STRESS_COMPRESS="$compress" -e STREAM_BYTES="$sbytes" "$simg" >/dev/null
+    -e STRESS_COMPRESS="$compress" -e STREAM_BYTES="$sbytes" \
+    -e DOWNLOAD_CHUNK="$dlchunk" "$simg" >/dev/null
 
   i=0
   until docker logs "$srvc" 2>&1 | grep -q "listening"; do
@@ -578,8 +657,9 @@ run_cell() {
   return "$crc"
 }
 
-case "$proto"  in all) protos="h1 h2 h3" ;; *) protos="$proto" ;; esac
-case "$server" in all) servers="sync async async-await chronos chronos-await" ;; *) servers="$server" ;; esac
+# A comma-separated list is accepted as well as a space-separated one.
+case "$proto"  in all) protos="h1 h2 h3" ;; *) protos=$(printf '%s' "$proto" | tr ',' ' ') ;; esac
+case "$server" in all) servers="sync async async-await chronos chronos-await" ;; *) servers=$(printf '%s' "$server" | tr ',' ' ') ;; esac
 # VORTEX_CLIENT=all runs every cell twice, python then navi. The client loop is
 # the INNERMOST of the three so the two clients hit the same freshly-built server
 # image back to back: that is the only arrangement in which a python/navi

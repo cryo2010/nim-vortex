@@ -206,6 +206,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging stays off, and the suite skips in the zero-dependency `plainHttp`
   build like its h3 siblings. (#347)
 
+- Stress harness: `VORTEX_DOWNLOAD_CHUNK`, and two targeted cells in
+  `nimble stress` for server paths the smoke never reached. No `/download`
+  body wrote above `respHighWater`: the sync build used `sendFile` and the
+  async ones `await`ed 64 KiB writes, exactly the mark, so no soak could
+  reproduce or confirm the parked-producer stall of #399, which nim-navi's
+  stress origin hit writing 1 MiB per `res.write`. `VORTEX_DOWNLOAD_CHUNK=N`
+  (the server's `DOWNLOAD_CHUNK`, default 0 = the unchanged bodies) switches
+  every server build, sync and async alike, to `N`-byte `res.write` calls that
+  re-register `onDrain` on backpressure, written from a startup-built pattern
+  with no per-chunk allocation; the async handlers await the producer's
+  completion, so they still suspend for the whole transfer. The value is
+  canonicalized (leading zeros stripped), capped at 1 GiB, and clamped to the
+  body size by the server. It is a knob on the existing route rather than
+  a `/download-big` route so neither load client changes: both still request
+  `/download` and verify the same SHA-1, and every output line keeps its form
+  (every cell's banner gains `, chunk=<size>` only when the knob is set). The
+  smoke now runs a `streamdownload` h2 cell at 1 MiB (skipped when the caller
+  set the knob), and a `ws` step on
+  `VORTEX_SERVER=async` over h2 and h3, because only the async builds
+  register `/ws` with `rt.ws` and its Extended CONNECT leg (#400) is what
+  those protocols take; the step is skipped when the workload matrix already
+  covered it. Three more cells per client under the defaults.
+  `VORTEX_PROTO` and `VORTEX_SERVER` also accept a comma-separated list.
+  (#405)
+
 ### Fixed
 
 - Streaming responses: a drain wait registered without a preceding `false` from
