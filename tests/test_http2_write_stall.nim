@@ -24,6 +24,7 @@
 
 import std/[unittest, net, posix, times, httpcore, atomics, os]
 import vortex/[settings, request, server, routing, staticfiles]
+import vortex/asyncdispatch
 import vortex/http2/frames
 from vortex/connection import respHighWater, conn
 from vortex/http2/codec import h2Stream
@@ -87,6 +88,106 @@ proc chunkRoute(chunkLen: int): RequestHandler =
       r.finish()
     pump(res)
 
+# --- a drain wait that no false verdict armed (#403) ------------------------
+
+const drainChunk = 32 * 1024
+  ## Half of respHighWater: a write this size can leave a backlog that is
+  ## non-zero (the socket took part of it) yet under the mark, so `write`
+  ## returns true and nothing marks the stream backed up.
+
+var drainRegs, drainFires: Atomic[int]
+  ## onDrain registrations the sync routes below made, and callbacks fired:
+  ## equal once a response is done (each registration fired exactly once).
+
+proc fillChunk(chunk: var string, sent, n: int) =
+  for i in 0 ..< n: chunk[i] = patternByte(sent + i)
+
+proc drainedEveryWrite(req: Request, res: Response) {.async.} =
+  ## `await res.drained()` after EVERY write, whatever the verdict. The wait is
+  ## registered while the stream may hold a small backlog that no false verdict
+  ## marked, which is the state h2ResumeProducers never visited (#403).
+  res.sendHead(Http200, "application/octet-stream")
+  var chunk = newString(drainChunk)
+  var sent = 0
+  while sent < totalBytes:
+    let n = min(drainChunk, totalBytes - sent)
+    fillChunk(chunk, sent, n)
+    # Low-level bool form on purpose (a string arg resolves to `await res.write`).
+    discard res.write(chunk.toOpenArray(0, n - 1))
+    sent += n
+    await res.drained()
+  res.finish()
+
+proc onDrainEveryWrite(req: Request, res: Response) {.gcsafe.} =
+  ## The sync shape of the same producer: write one chunk, then resume from
+  ## `res.onDrain` unconditionally. Every registration lands on an unmarked
+  ## stream, most of them with nothing queued at all, which no drain path
+  ## visited either (#403).
+  res.sendHead(Http200, "application/octet-stream")
+  var sent = 0
+  proc pump(r: Response) {.gcsafe.} =
+    if sent >= totalBytes:
+      r.finish()
+      return
+    let n = min(drainChunk, totalBytes - sent)
+    var chunk = newString(n)
+    fillChunk(chunk, sent, n)
+    discard r.write(chunk.toOpenArray(0, n - 1))
+    sent += n
+    drainRegs.atomicInc
+    r.onDrain(proc (r2: Response) {.gcsafe.} =
+      drainFires.atomicInc
+      pump(r2))
+  pump(res)
+
+proc endWithPendingDrain(abortIt: bool): RequestHandler =
+  ## Register a drain and end the response in the same breath, with a backlog
+  ## the 16 KiB window keeps queued: `finish` / `abort` drop the pending
+  ## callback, so neither the loop pass the registration queued nor the drain
+  ## that follows may fire it after the response is over.
+  proc (req: Request, res: Response) {.gcsafe.} =
+    res.sendHead(Http200, "application/octet-stream")
+    var chunk = newString(drainChunk)
+    fillChunk(chunk, 0, drainChunk)
+    discard res.write(chunk.toOpenArray(0, drainChunk - 1))
+    drainRegs.atomicInc
+    res.onDrain(proc (r: Response) {.gcsafe.} = drainFires.atomicInc)
+    if abortIt: res.abort() else: res.finish()
+
+var flushSpins: Atomic[int]
+  ## Turns of the flush-before-finish loop below: one per drained() it awaited.
+
+proc flushBeforeFinish(req: Request, res: Response) {.async.} =
+  ## Flush the whole body before finishing, by awaiting drained() until nothing
+  ## is buffered. Against a 16 KiB window that the peer stops crediting, one
+  ## 32 KiB write leaves a 16 KiB backlog under the mark that nothing can move,
+  ## and the loop must park on it, not spin (#403 review).
+  res.sendHead(Http200, "application/octet-stream")
+  var chunk = newString(drainChunk)
+  fillChunk(chunk, 0, drainChunk)
+  discard res.write(chunk.toOpenArray(0, drainChunk - 1))
+  while res.bufferedAmount > 0:
+    flushSpins.atomicInc
+    await res.drained()
+  res.finish()
+
+var kicksQueued: Atomic[int]
+  ## LoopCore.drainKicks length right after a burst of registrations.
+
+proc manyRegistrations(req: Request, res: Response) {.gcsafe.} =
+  ## 1000 onDrain registrations in one handler: each replaces the last, and the
+  ## loop pass they are owed must be queued once, not 1000 times.
+  res.sendHead(Http200, "application/octet-stream")
+  var chunk = newString(1024)
+  fillChunk(chunk, 0, chunk.len)
+  discard res.write(chunk.toOpenArray(0, chunk.high))
+  for i in 0 ..< 1000:
+    drainRegs.atomicInc
+    res.onDrain(proc (r: Response) {.gcsafe.} =
+      drainFires.atomicInc
+      r.finish())
+  kicksQueued.store(res.core.drainKicks.len)
+
 # --- sendFile in the same regime (#399) -------------------------------------
 
 const
@@ -117,6 +218,12 @@ rt.get("/w1m", chunkRoute(bigChunk))        ## 16 x respHighWater per write
 rt.get("/w256k", chunkRoute(256 * 1024))    ## 4 x respHighWater per write
 rt.get("/w64k", chunkRoute(64 * 1024))      ## exactly respHighWater (control)
 rt.get("/file", fileRoute(filePath))
+rt.get("/drained-every", drainedEveryWrite)
+rt.get("/ondrain-every", onDrainEveryWrite)
+rt.get("/ondrain-finish", endWithPendingDrain(abortIt = false))
+rt.get("/ondrain-abort", endWithPendingDrain(abortIt = true))
+rt.get("/flush-finish", flushBeforeFinish)
+rt.get("/many-regs", manyRegistrations)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 
@@ -287,6 +394,123 @@ suite "HTTP/2 streamed writes larger than the high-water mark (#399)":
   test "64 KiB per write completes with a small peer window (the control)":
     checkBody(fetchBody(srv.port, "/w64k", initialWindow = smallWindow,
                         connGrant = wideGrant), totalBytes)
+
+proc resetDrainCounts() =
+  drainRegs.store(0)
+  drainFires.store(0)
+
+template checkFiredOnce() =
+  ## Every registration the route made fired, and none fired twice: the loop
+  ## pass a registration queues and the drain event it may also be owed must
+  ## not both deliver it. A template so the `check` marks the test FAILED.
+  check drainRegs.load() > 0
+  check drainFires.load() == drainRegs.load()
+
+suite "a drain wait registered without a false verdict (#403)":
+  test "await res.drained() after every 32 KiB write completes (#403)":
+    # A GUARD, not a reproduction: the #403 report's shape (a wide window, so
+    # the peer's flow control never binds, and a producer that awaits the drain
+    # after every write instead of only after a false), but a loopback that
+    # takes every 32 KiB chunk inside the write never leaves the small unmarked
+    # backlog the bug needs, and on a Mac it does, so this passes with the fix
+    # reverted. The bursty reader below is the reproduction.
+    checkBody(fetchBody(srv.port, "/drained-every", initialWindow = wideGrant,
+                        connGrant = wideGrant, credit = false), totalBytes)
+
+  test "await res.drained() after every write against a bursty reader":
+    # The same producer against a reader that pauses, so the socket backs up
+    # and the waits land on a non-empty backlog under the mark. With the fix
+    # reverted the response stopped at 800 KiB of the 4 MiB.
+    checkBody(burstyFetch(srv.port, "/drained-every"), totalBytes)
+
+  test "await res.drained() after every write against a small peer window":
+    # Every 32 KiB write returns true and leaves a 16 KiB window-held backlog,
+    # under the mark and with no false verdict. The loop pass the wait is owed
+    # does not fire it (bytes are still buffered); the WINDOW_UPDATE that moves
+    # them runs the resume scan, which the registration marked the stream for.
+    checkBody(fetchBody(srv.port, "/drained-every", initialWindow = smallWindow,
+                        connGrant = wideGrant), totalBytes)
+
+  test "res.onDrain after every 32 KiB write completes (#403)":
+    # The sync shape. Most of these registrations find nothing queued at all,
+    # so there is no drain left to fire them and only a pass the loop owes the
+    # registration itself can.
+    resetDrainCounts()
+    checkBody(fetchBody(srv.port, "/ondrain-every", initialWindow = wideGrant,
+                        connGrant = wideGrant, credit = false), totalBytes)
+    checkFiredOnce()
+
+  test "res.onDrain after every write against a bursty reader":
+    resetDrainCounts()
+    checkBody(burstyFetch(srv.port, "/ondrain-every"), totalBytes)
+    checkFiredOnce()
+
+  test "res.onDrain after every write against a small peer window":
+    # Window-blocked: the registration finds a backlog the peer's window holds
+    # back, and the WINDOW_UPDATE path has to fire it as well.
+    resetDrainCounts()
+    checkBody(fetchBody(srv.port, "/ondrain-every", initialWindow = smallWindow,
+                        connGrant = wideGrant), totalBytes)
+    checkFiredOnce()
+
+  test "finish() drops a drain registered just before it":
+    resetDrainCounts()
+    checkBody(fetchBody(srv.port, "/ondrain-finish", initialWindow = smallWindow,
+                        connGrant = wideGrant), drainChunk)
+    sleep(100)                              # let any stray loop pass run
+    check drainRegs.load() == 1
+    check drainFires.load() == 0
+
+  test "abort() drops a drain registered just before it":
+    resetDrainCounts()
+    let r = fetchBody(srv.port, "/ondrain-abort", initialWindow = smallWindow,
+                      connGrant = wideGrant)
+    check r.gone                            # RST_STREAM, not a clean end
+    check not r.endStream
+    sleep(100)
+    check drainRegs.load() == 1
+    check drainFires.load() == 0
+
+  test "a flush-before-finish loop parks on a stalled peer, then completes":
+    # `while res.bufferedAmount > 0: await res.drained()` against a 16 KiB
+    # window the peer stops crediting. The loop pass a registration is owed
+    # used to fire it whenever the backlog was under the mark, so each wait
+    # resolved on the next zero-timeout pass with the same 16 KiB still
+    # buffered and re-registered: ~30k turns a second, a busy loop. It must
+    # park until the peer credits the window, then finish.
+    flushSpins.store(0)
+    var c = openStream(srv.port, "/flush-finish", smallWindow, wideGrant)
+    var r: DlResult
+    r.collect(c.readFrames(2000, until = proc(f: seq[Frame]): bool =
+      dataBytes(f) >= smallWindow))
+    check r.body.len == smallWindow         # the window's worth, then stalled
+    sleep(100)
+    let s0 = flushSpins.load()
+    sleep(500)
+    let stalledTurns = flushSpins.load() - s0
+    check stalledTurns <= 2                 # parked (0 measured), not spinning
+    var wu = ""
+    wu.addWindowUpdate(1, drainChunk)       # now let the rest through
+    check c.rawSend(wu)
+    r.collect(c.readFrames(quietMs, until = proc(f: seq[Frame]): bool =
+      for x in f:
+        if x.typ == uint8(ftData) and (x.flags and flagEndStream) != 0:
+          return true
+      false))
+    check r.endStream
+    check not r.gone
+    check r.body.len == drainChunk
+    check bodyMismatch(r.body) == -1
+    c.close()
+
+  test "a burst of registrations queues one loop pass":
+    resetDrainCounts()
+    kicksQueued.store(-1)
+    checkBody(fetchBody(srv.port, "/many-regs", initialWindow = wideGrant,
+                        connGrant = wideGrant, credit = false), 1024)
+    check kicksQueued.load() == 1           # was 1000: one kick per call
+    check drainRegs.load() == 1000
+    check drainFires.load() == 1            # the last registration, once
 
 suite "sendFile read-ahead in the #399 regime":
   test "a 16 MiB sendFile completes against a bursty reader (#399)":

@@ -208,6 +208,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Streaming responses: a drain wait registered without a preceding `false` from
+  `res.write` now fires instead of parking forever. `res.drained()` completes at
+  once only when nothing is queued; otherwise it registers `res.onDrain` and
+  waits, and on HTTP/2 the only thing that delivers a drain is the resume scan
+  in `h2ResumeProducers`, which visits a stream only once a false verdict has
+  marked it backed up. So `await res.drained()` after a write that returned
+  `true` but left a small backlog (part of the chunk still in the write buffer
+  or held by the scheduler) registered a callback no socket drain, WINDOW_UPDATE
+  or scheduler pass would ever deliver, and the response stopped mid-body; the
+  same went for a sync `res.onDrain` registered unconditionally, which with
+  nothing queued at all was owed no event whatsoever. HTTP/1.1 had the same
+  hole, since `flushOut` fires a drain only with `c.respBackedUp` set, and the
+  same false verdict was the only thing setting it. HTTP/3 was not affected by
+  the small-backlog case, because its writable callback checks the backlog on
+  every ack instead of a flag, but a sync registration made after the last ack
+  had the same no-event problem. Registration now arms itself: `res.onDrain`
+  marks an open h2 stream (or h1 response, including one registered before
+  `sendHead`, which the head now marks) backed up exactly as a false verdict
+  would, so whichever drain event is still owed delivers it through the existing
+  paths under that path's own rule (both caps under the mark on h2), and queues
+  one loop pass for the registration (`LoopCore.drainKicks`, run by the event
+  loop beside the TLS read-ready pass, at most one entry per response per pass)
+  that fires the callback only if the response is already fully drained (nothing
+  in the stream backlog or the write buffer) and otherwise leaves it to that
+  event. Firing the pass on "under the mark" instead would turn a
+  flush-before-finish loop (`while res.bufferedAmount > 0: await res.drained()`)
+  against a peer that stops crediting its window into a busy loop. The callback
+  still fires exactly once and never from inside the registration (it can fire
+  inside a later `res.write` on the same response, whose flush runs the drain
+  path), so a producer can re-register from its own callback without
+  recursing, and `finish` / `abort` still drop a pending one. With every
+  registration marked, the debug `h2CheckCounters` audit now asserts the strict
+  invariant -- no drain callback on an open h2 response without the mark --
+  where it could only check the empty-backlog case before. Pinned by
+  `tests/test_http2_write_stall.nim` (4 MiB in 32 KiB writes with `await
+  res.drained()` or `res.onDrain` after every write, against a wide window, a
+  bursty reader and a small window; a flush-before-finish loop that must park on
+  a stalled peer; a burst of registrations queuing one pass),
+  `tests/test_streaming_drain.nim` (the same two producers over HTTP/1.1 behind
+  a slow reader, and a registration made before `sendHead`) and
+  `tests/test_http3.nim` (the sync shape over h3). A client that disconnects
+  mid-body now also resumes an HTTP/1.1 producer parked on a drain: `closeConn`
+  fires the parked callback once (as `h2NotifyClosed` already did per h2
+  stream), so an `await res.drained()` coroutine runs to its `finally` instead
+  of leaking its Future and request handles until exit, and a write, `finish`
+  or re-registration from inside the callback is a no-op on the dying
+  connection rather than a send into the dead socket that could re-enter
+  `closeConn` (pinned by two disconnect cases in
+  `tests/test_streaming_drain.nim`). (#403)
 - Async adapters: a `router.ws` route now serves the HTTP/2 and HTTP/3 spelling
   of the handshake too, and `wsToHandler` is exported for a route an app
   registers by hand. `ws` registered only `HttpGet`, which is the HTTP/1.1

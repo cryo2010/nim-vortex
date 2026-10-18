@@ -91,14 +91,24 @@ type
 # --- awaitable outbound backpressure (await res.drained) --------------------
 
 proc drained*(res: Response): Future[void] =
-  ## Await until a streamed response's write backlog empties, so a producer can
-  ## resume after `res.write` reported backpressure (returned false) without the
-  ## onDrain callback trampoline:
+  ## Await until a streamed response's write backlog has drained (by the rule
+  ## `res.onDrain` documents per protocol), so a producer can resume after
+  ## `res.write` reported backpressure (returned false) without the onDrain
+  ## callback trampoline:
   ##
   ##   res.sendHead(Http200, "application/octet-stream")
   ##   for chunk in source:
   ##     if not res.write(chunk): await res.drained()
   ##   res.finish()
+  ##
+  ## Safe to await at any other time too, after a write that returned true or
+  ## from a timer: with nothing queued it completes at once, and with a backlog
+  ## left it completes once that drains (#403: on HTTP/2 a wait registered
+  ## without a preceding false used to park forever). On HTTP/2 "drained" is
+  ## the under-the-mark rule, so it can complete with `bufferedAmount > 0`
+  ## still; a flush-before-finish loop (`while res.bufferedAmount > 0: await
+  ## res.drained()`) then waits for the next WINDOW_UPDATE or socket drain on
+  ## each turn, and parks (without spinning) while the peer reads nothing.
   result = newFuture[void]("res.drained")
   if res.bufferedAmount == 0:
     complete(result)

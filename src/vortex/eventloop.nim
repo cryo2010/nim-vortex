@@ -588,6 +588,27 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     var empty: string
     try: cb(toOpenArray(empty, 0, -1), true)
     except CatchableError: discard
+  if c.h2 == nil and c.rs.onRespDrain != nil:
+    # A streamed HTTP/1.1 response's producer is still parked on a drain (the
+    # client disconnected mid-body). Fire it once so an async adapter suspended
+    # in await res.drained() resumes and its Future / closure / request handles
+    # are released instead of leaking until process exit, and a sync onDrain
+    # producer sees the end of its stream. h2 is handled per stream by
+    # h2NotifyClosed below. Detach first: the producer may write, finish or
+    # re-register from inside the callback, and closeRequested (set above)
+    # makes the flush and kick hooks no-ops, so none of that reaches the
+    # socket, the selector or the pipeline of this dying slot. A queued kick
+    # for this request finds its generation gone and does nothing.
+    let cb = c.rs.onRespDrain
+    c.rs.onRespDrain = nil
+    c.respBackedUp = false
+    try: cb(addr loop.core, c.fd, c.gen, 0)
+    except Exception: discard    # unannotated user producer (raises: [Exception])
+    # Drop a registration the producer made from inside the callback: nothing
+    # will ever fire it, and the slot would hold its closure until reuse.
+    c.rs.onRespDrain = nil
+    c.rs.drainKickQueued = false
+    c.respBackedUp = false
   if c.ws != nil:
     wsClosed(addr loop.core, c)   # deliver onClose (1006 if no peer close)
   if c.h2 != nil:
@@ -1309,7 +1330,10 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
     if fd < 0:
       return                     # h3 responses flush inside h3Respond
     let c = conn(addr loop.core, fd, gen)
-    if c == nil: return
+    # closeRequested: the connection is being torn down (a teardown callback in
+    # closeConn resumed a producer that called finish), or its close is deferred
+    # behind a worker pin. Either way there is no pipeline left to resume.
+    if c == nil or c.closeRequested: return
     if stream == 0 and not (c.awaitingResponse and c.rs.responded):
       return                     # nothing deferred is pending
     loop.resumeAfterRespond(c, stream)
@@ -1332,6 +1356,12 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
       return
     let c = conn(addr loop.core, fd, gen)
     if c == nil or c.pendingOut <= 0: return
+    # A connection being torn down (closeConn's teardown callbacks resume
+    # producers that may write) or whose close is deferred behind a worker pin:
+    # its output is discarded with the slot. Flushing here would send into a
+    # dead socket, re-register it with the selector after closeConn dropped it,
+    # or re-enter closeConn from flushOut's error path (#403).
+    if c.closeRequested: return
     if c.flushHold > 0 and c.pendingOut < respHighWater:
       # A batch is dispatching on this connection (a WebSocket read batch, an
       # outbox drain): the frames this send produced are already in wbuf and the
@@ -2532,6 +2562,11 @@ proc run*(loop: Loop) =
       # this a body that paused and then resumed stalls until some unrelated
       # event happens to wake the loop (#366).
       timeoutMs = 0
+    if loop.core.drainKicks.len > 0:
+      # A res.onDrain registration (from the async pump, a timer, an onDrain
+      # callback) is owed a pass that fires it if the response is already
+      # drained, and there may be no fd event left to bring one (#403).
+      timeoutMs = 0
     when not defined(plainHttp):
       if loop.quicMorePending:
         # The previous pass hit ngReceive's datagram budget with the UDP socket
@@ -2602,6 +2637,10 @@ proc run*(loop: Loop) =
     # same pass (#366). Anything queued after this point (an ack from the async
     # pump, a worker unpinning) rides the next pass, which does not wait.
     loop.driveSslReady()
+    # Fire the res.onDrain registrations that are already drained (#403). Ahead
+    # of h3Drive, so what a resumed h3 producer writes goes out this pass, and of
+    # the pump, so a res.drained() it completes resumes its handler this pass.
+    runDrainKicks(addr loop.core)
     when not defined(plainHttp):
       # Drive QUIC on datagrams, timer expiry, and every wakeup: the stack owns
       # its own retransmission/idle timers.

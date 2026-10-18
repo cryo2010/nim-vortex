@@ -835,9 +835,10 @@ proc h2WsAfterEmit(h2: H2Conn, c: ptr Connection, sid: uint32) =
 
 proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
   ## Resume streamed-response producers parked on the connection write-buffer
-  ## cap (respHighWater), now that a scheduler pass or a socket drain left room.
-  ## A parked producer's frames have already been emitted, so its backlog is
-  ## empty and it is NOT in the ready-queue -- only this scan finds it. Collect
+  ## cap (respHighWater), now that a scheduler pass, a socket drain or a
+  ## WINDOW_UPDATE left room. A parked producer may have no backlog at all, so
+  ## it is NOT in the ready-queue -- only this scan finds it, which is why every
+  ## registration marks (h2ArmDrain, #403). Collect
   ## ids first (an onRespDrain callback may res.write and mutate the table) and
   ## stop early if a resumed producer refills the buffer.
   if h2.resuming: return
@@ -1022,6 +1023,67 @@ proc h2MarkRespBackedUp*(c: ptr Connection, sid: uint32) =
   let h2 = h2Conn(c)
   if h2 != nil and sid in h2.streams:
     setBackedUp(h2, h2.streams[sid])
+
+proc h2ArmDrain*(c: ptr Connection, sid: uint32) =
+  ## A drain callback was just registered on `sid` (`res.onDrain`, which
+  ## `res.drained()` goes through): mark the stream backed up, so the callback
+  ## is fired by h2ResumeProducers, the one place an open h2 response's drain is
+  ## delivered from (#403). Before, only a false verdict from `res.write` marked
+  ## a stream, and a registration made without one -- `await res.drained()`
+  ## after a write that returned true with a small backlog left, or an
+  ## unconditional `res.onDrain` -- sat on a stream the scan never visits, and
+  ## parked forever. The caller also queues a loop pass for the registration
+  ## (LoopCore.drainKicks, h2DrainKick), which fires it when the response is
+  ## already fully drained and so no socket drain or WINDOW_UPDATE is left to
+  ## come; between the two the callback fires exactly once, and never inside
+  ## the registration (it can fire inside a later `res.write` on the stream,
+  ## whose flush runs the scan).
+  ##
+  ## Only an open response is marked (no response yet, or a streamed body still
+  ## open). A registration after finish() or on a WebSocket stream is left to
+  ## teardownStream / h2NotifyClosed, which fire whatever is parked when the
+  ## stream goes, and must not be resumed by the scan: a finished stream's
+  ## producer has nothing left to write.
+  let h2 = h2Conn(c)
+  if h2 == nil: return
+  h2.streams.withValue(sid, st):
+    if st.ws == nil and st.respPhase in {rpNone, rpStreaming}:
+      setBackedUp(h2, st[])
+
+proc h2DrainKick*(c: ptr Connection, sid: uint32): RespDrainCb =
+  ## The loop pass a registration on `sid` is owed (request.runDrainKicks,
+  ## #403). Runs one scheduler pass, so whatever the ready-queue can emit goes
+  ## into the write buffer, but with the resume scan suppressed; then, only if
+  ## the response is FULLY drained (stream backlog 0 and write buffer empty),
+  ## clears the mark and returns the callback for the caller to fire, else nil.
+  ##
+  ## Why not the scan's own rule (both caps under the mark). The kick is not a
+  ## drain event, nothing moved, and firing on "under the mark" here turned a
+  ## producer that flushes before finishing (`while res.bufferedAmount > 0:
+  ## await res.drained()`) against a peer that stops sending WINDOW_UPDATE into
+  ## a busy loop: register, kick fires with bytes still buffered, re-register,
+  ## and so on every zero-timeout pass (~30k wakeups/s). A registration on a
+  ## backlog that still holds bytes needs no kick: h2ArmDrain marked the stream,
+  ## and the WINDOW_UPDATE or socket drain that moves those bytes runs the scan
+  ## and fires it there. Only "nothing queued at all" is owed no event, and
+  ## that is exactly what fires here. The scan is suppressed for the other
+  ## parked streams too, for the same reason: a kick must not resume a stream
+  ## whose bytes have not moved.
+  let h2 = h2Conn(c)
+  if h2 == nil or sid notin h2.streams: return nil
+  if h2.streams[sid].rs.onRespDrain == nil: return nil
+  if not h2.resuming:                  # never nested in the scan; be safe
+    h2.resuming = true
+    h2.h2Schedule(c)
+    h2.resuming = false
+  if sid notin h2.streams: return nil
+  template st: H2Stream = h2.streams[sid]
+  if not st.respBackedUp or st.rs.onRespDrain == nil or
+      st.pendingBody.len > st.pendingPos or pendingOut(c) > 0:
+    return nil
+  clearBackedUp(h2, st)
+  result = st.rs.onRespDrain
+  st.rs.onRespDrain = nil
 
 proc h2DrainResume*(c: ptr Connection, core: ptr LoopCore) =
   ## The connection write buffer drained to the socket: run a scheduler pass to
@@ -2191,28 +2253,27 @@ proc h2CheckCounters*(c: ptr Connection) =
     var awaiting, backlogged, blocked, parked = 0
     var buffered = 0
     var orphaned = -1
-    let emptyOut = pendingOut(c) == 0
     for sid, st in h2.streams.mpairs:   # mpairs: no per-stream value copy
       if not st.endStreamSeen: inc awaiting
       if st.pendingBody.len > st.pendingPos:
         inc backlogged
         if st.sendWindow <= 0: inc blocked
       if st.respBackedUp: inc parked
-      # A drain callback registered on a stream nobody marked backed up, with
-      # NOTHING queued anywhere, is owed no event at all: no socket drain, no
-      # WINDOW_UPDATE and no scheduler pass will ever fire it, since
-      # h2ResumeProducers only looks at marked streams. That is the state #399
-      # hung in, and the state the read-ahead gate's deferred half
-      # (request.pullAfterWrite) exists to keep sendFile out of.
-      #
-      # Deliberately limited to the empty case. A callback registered while the
-      # backlog is non-zero but still under the mark is just as unfireable, but
-      # `res.drained()` registers exactly there on purpose (it short-circuits
-      # only at bufferedAmount == 0), so asserting on it would fail a public API
-      # rather than a bug in this file. A WebSocket stream is exempt: its
-      # pendingBody is a frame queue and its drain is wsDrained's, not this one.
+      # A drain callback on an open response that is not marked backed up is
+      # one h2ResumeProducers will never fire, whatever is or is not queued:
+      # the scan only visits marked streams. This used to be asserted only with
+      # nothing queued anywhere (the park sendFile's read-ahead gate must not
+      # make without a false verdict, #399), because `res.drained()` registered
+      # on an unmarked small backlog by design and parked there (#403). Every
+      # registration now marks (h2ArmDrain), and
+      # the scan, teardownStream and finish/abort clear the mark and the
+      # callback together, so on an open response a callback without the mark
+      # is always a bug in this file. A finished response and a WebSocket
+      # stream are exempt: a callback there is fired by teardownStream /
+      # h2NotifyClosed when the stream goes (a WebSocket's own drain is
+      # wsDrained's), never by the scan.
       if orphaned < 0 and st.rs.onRespDrain != nil and not st.respBackedUp and
-          emptyOut and st.pendingBody.len == st.pendingPos and st.ws == nil:
+          st.ws == nil and st.respPhase in {rpNone, rpStreaming}:
         orphaned = int(sid)
       buffered += st.bufferedCounted
     assert awaiting == h2.awaitingClientStreams,
