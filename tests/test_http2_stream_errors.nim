@@ -96,8 +96,17 @@ suite "HTTP/2 stream-level error scope":
     let frames = c.readFrames(1500,
       until = proc(fs: seq[Frame]): bool = fs.hasResponse(3))
     check frames.goawayError() == -1               # the connection survives
-    check frames.rstError(1) == int(errStreamClosed)
     check frames.hasResponse(3)
+    # Since #404 the early response is followed by RST_STREAM(NO_ERROR), and
+    # RFC 9113 5.1 then has the racing DATA and trailer section ignored: the
+    # reset we sent is the only one stream 1 ever gets, never a second
+    # RST_STREAM(STREAM_CLOSED) per racing frame.
+    let all = early & frames
+    check all.rstError(1) == int(errNoError)
+    var rsts = 0
+    for x in all:
+      if x.typ == uint8(ftRstStream) and x.streamId == 1: inc rsts
+    check rsts == 1
     c.close()
 
 srv.close()

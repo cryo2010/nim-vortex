@@ -111,6 +111,18 @@ type
     # (RFC 9113 5.1, h2spec 5.1). Bounded FIFO so it cannot grow without limit.
     earlyClosed*: HashSet[uint32]
     earlyClosedQ*: Deque[uint32]
+    # Streams the SERVER reset with RST_STREAM(NO_ERROR) after a complete
+    # response while the client was still sending (completeStream, #404), each
+    # mapped to the stream receive window the client still held at that moment.
+    # RFC 9113 5.1 has an endpoint that sent RST_STREAM ignore the frames it
+    # then receives on the stream for a while, so late DATA on these ids is
+    # dropped silently (connection credit returned, no reply, no budget charge)
+    # until it overruns that window. Kept apart from earlyClosed, which also
+    # holds ids the CLIENT reset or the server refused: DATA on those still
+    # draws RST_STREAM(STREAM_CLOSED) (h2spec 5.1). Bounded FIFO, like
+    # earlyClosed: that bound is the RFC's "limited period".
+    serverReset*: Table[uint32, int]
+    serverResetQ*: Deque[uint32]
     goingAway*: bool          ## our own drain: final GOAWAY sent, refuse new streams
     goawayLastId*: uint32     ## last-stream-id the final GOAWAY announced. RFC 9113
                               ## 6.8 forbids RAISING that id in a later GOAWAY (the
@@ -345,6 +357,11 @@ proc h2Goaway*(c: ptr Connection, err = errNoError) =
 
 proc creditConn(h2: H2Conn, c: ptr Connection, n: int) {.gcsafe, raises: [].}
 
+const refuseSilent = high(uint32)
+  ## handleHeaders refusal sentinel: decode the block, dispatch nothing, and
+  ## send no RST_STREAM (a trailer section on a stream we reset after its
+  ## complete response, #404). Not a valid error code on the wire.
+
 const maxEarlyClosed = 256
   ## Cap on remembered server-early-closed stream ids (bounds the racing-frame
   ## tolerance window; a flood of new streams evicts old entries FIFO).
@@ -371,6 +388,38 @@ proc recordEarlyClosed(h2: H2Conn, sid: uint32) {.raises: [].} =
   h2.earlyClosedQ.addLast sid
   if h2.earlyClosedQ.len > maxEarlyClosed:
     h2.earlyClosed.excl h2.earlyClosedQ.popFirst()
+
+proc recordServerReset(h2: H2Conn, sid: uint32, window: int) {.raises: [].} =
+  ## Remember that we reset `sid` with RST_STREAM(NO_ERROR) after its complete
+  ## response, with `window` bytes of stream receive window still granted to the
+  ## client (#404). FIFO-bounded at maxEarlyClosed like recordEarlyClosed; an id
+  ## consumed early (absorbAfterReset, END_STREAM or an overrun) leaves a stale
+  ## queue slot whose eviction is a no-op `del`. Ids are never reused, so an id
+  ## is recorded at most once.
+  if sid in h2.serverReset: return
+  h2.serverReset[sid] = max(window, 0)
+  h2.serverResetQ.addLast sid
+  if h2.serverResetQ.len > maxEarlyClosed:
+    h2.serverReset.del h2.serverResetQ.popFirst()
+
+proc absorbAfterReset(h2: H2Conn, sid: uint32, length: int,
+                      endStream: bool): bool {.raises: [].} =
+  ## Late DATA on a stream we reset after its complete response (#404): true
+  ## means drop the frame silently (RFC 9113 5.1). The frame is charged against
+  ## the stream window the client held at reset, so the drop is bounded by
+  ## exactly what it was allowed to send; one that overruns it is a flow-control
+  ## violation, the entry is forgotten and the frame (with any later one) takes
+  ## the ordinary closed-stream path. END_STREAM ends the tolerance: the client
+  ## has nothing more to send. The caller still returns the frame's connection
+  ## credit, which equals what it consumed from connRecvRemaining.
+  var left = -1
+  h2.serverReset.withValue(sid, w):
+    w[] -= length
+    left = w[]
+  do:
+    return false
+  if left < 0 or endStream: h2.serverReset.del(sid)
+  left >= 0
 
 proc setBackedUp(h2: H2Conn, st: var H2Stream) {.inline.} =
   ## Mark a stream's producer parked and keep h2.backedUpProducers exact.
@@ -495,6 +544,42 @@ proc streamError(h2: H2Conn, c: ptr Connection, sid: uint32, err: uint32) =
   # whatever is present (nothing) without an illegal reset.
   if sid != 0 and sid <= h2.lastStreamId:
     c.wbuf.addRstStream(sid, err)
+  h2.teardownStream(c, sid)
+
+proc completeStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises: [].} =
+  ## The response's final frame (END_STREAM on HEADERS, DATA or the trailer
+  ## section) has just been appended to c.wbuf: drop the stream. Every
+  ## "response complete" site goes through here rather than straight to
+  ## teardownStream, because a response can complete while the request is still
+  ## open -- a refused Extended CONNECT (router.ws's 426/400), or an early
+  ## answer such as a 413 to a streaming route whose body is still arriving.
+  ## The stream would then be half-closed (local) from the client's point of
+  ## view, so it keeps sending into an id we have already forgotten. RFC 9113
+  ## 8.1 lets the server ask it to stop without error: RST_STREAM(NO_ERROR)
+  ## after the complete response (#404). Appended here, i.e. after the
+  ## END_STREAM frame in wbuf order on every path, the scheduler's included.
+  ##
+  ## teardownStream does the rest exactly as for any early close: the id lands
+  ## in earlyClosed (endStreamSeen is still false) so the client's in-flight
+  ## frames are tolerated, connDeferred is returned to the connection window,
+  ## and a pending onBody sink gets last=true so a handler parked in
+  ## `await req.read()` resumes. A request the client already finished gets no
+  ## RST (the common case is unchanged on the wire), and neither does an
+  ## accepted WebSocket, whose stream never ends through this path.
+  ##
+  ## The reset id is also recorded in serverReset with the stream window the
+  ## client still holds, so the DATA it already had in flight is ignored as
+  ## RFC 9113 5.1 requires once we have sent RST_STREAM, rather than answered
+  ## frame by frame with RST_STREAM(STREAM_CLOSED) and charged to the
+  ## control-frame budget.
+  var rst = false
+  var window = 0
+  h2.streams.withValue(sid, st):
+    rst = not st.endStreamSeen and st.ws == nil
+    window = st.recvRemaining
+  if rst:
+    c.wbuf.addRstStream(sid, errNoError)
+    h2.recordServerReset(sid, window)
   h2.teardownStream(c, sid)
 
 const
@@ -701,7 +786,7 @@ proc emitTrailers(h2: H2Conn, c: ptr Connection, sid: uint32) =
   for (name, val) in st.respTrailers:
     encodeTrailerField(hb, name, val)
   emitHeaderBlock(h2, c, sid, hb, flagEndStream)
-  h2.teardownStream(c, sid)
+  h2.completeStream(c, sid)
 
 proc compactPendingBody*(st: var H2Stream) {.inline.} =
   ## Reclaim the already-sent prefix [0, pendingPos) of a stream's response
@@ -765,7 +850,7 @@ proc emitOneFrame(h2: H2Conn, c: ptr Connection, sid: uint32): bool =
         h2.emitTrailers(c, sid)              # trailing HEADERS(END_STREAM) + drop
       else:
         c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
-        h2.teardownStream(c, sid)
+        h2.completeStream(c, sid)
     return false
   var chunk = min(remaining, h2.peerMaxFrame)
   chunk = min(chunk, int(st.sendWindow))
@@ -787,7 +872,7 @@ proc emitOneFrame(h2: H2Conn, c: ptr Connection, sid: uint32): bool =
   compactPendingBody(st)   # reclaim the sent prefix, not only on a full drain (#331)
   h2.syncSendState(st)     # backlog / send window both moved (#339)
   if last:
-    h2.teardownStream(c, sid)
+    h2.completeStream(c, sid)
   true
 
 # --- RFC 8441 WebSockets over HTTP/2 ----------------------------------------
@@ -1126,7 +1211,7 @@ proc h2SendHead*(c: ptr Connection, code: int, sid: uint32,
     encodeExtraHeader(hb, name, val)
   emitHeaderBlock(h2, c, sid, hb, if st.isHead: flagEndStream else: 0'u8)
   if st.isHead:
-    h2.teardownStream(c, sid)
+    h2.completeStream(c, sid)
 
 proc h2StreamWrite*(c: ptr Connection, sid: uint32,
                     data: openArray[char]): int =
@@ -1207,7 +1292,7 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
     # The body already fully drained before finish: the prior DATA frames went
     # out without END_STREAM, so emit a bare END_STREAM DATA frame to close it.
     c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
-    h2.teardownStream(c, sid)
+    h2.completeStream(c, sid)
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
   ## LoopCore.hooks.wsStreamLookup: resolve a stream's WsConn for the public API.
@@ -1332,7 +1417,7 @@ proc h2Respond*(c: ptr Connection, code: int, sid: uint32,
   let noBody = body.len == 0 or skipBody or bodiless
   emitHeaderBlock(h2, c, sid, hb, if noBody: flagEndStream else: 0'u8)
   if noBody:
-    h2.teardownStream(c, sid)
+    h2.completeStream(c, sid)
   else:
     template st: H2Stream = h2.streams[sid]
     st.pendingBody = newString(body.len)
@@ -1623,7 +1708,13 @@ proc handleData(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
   # A streaming body's DATA payload has its connection-window credit deferred
   # to consumption (set below); 0 means credit the whole frame eagerly.
   var streamingConnDefer = 0
-  if sid notin h2.streams or h2.streams[sid].endStreamSeen or
+  if sid notin h2.streams and
+      h2.absorbAfterReset(sid, fh.length, (fh.flags and flagEndStream) != 0):
+    # We reset this stream with NO_ERROR after its complete response, and the
+    # client is still within the window it held: ignore the frame (RFC 9113
+    # 5.1, #404). Its connection credit is returned eagerly below.
+    discard
+  elif sid notin h2.streams or h2.streams[sid].endStreamSeen or
       not h2.streams[sid].headersDone:
     # DATA on a closed / half-closed(remote) / never-headered stream: each
     # small frame elicits a RST_STREAM reply, so budget it as overhead (a
@@ -1812,7 +1903,16 @@ proc handleHeaders(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
       # now gone from the table, so finishHeaders decodes and dispatches nothing.
     # else: trailers (allowed); the deprecated priority flag is ignored
   elif sid <= h2.lastStreamId:
-    if sid in h2.earlyClosed:
+    if sid in h2.serverReset:
+      # We reset this stream with NO_ERROR after its complete response (#404)
+      # and this is the client's racing trailer section: RFC 9113 5.1 has it
+      # ignored. Decode the block (HPACK sync) but neither reply nor charge
+      # the budget, and end the tolerance: a trailer section is the client's
+      # last frame on the stream.
+      h2.serverReset.del sid
+      h2.earlyClosed.excl sid
+      refuseErr = refuseSilent
+    elif sid in h2.earlyClosed:
       # The server closed this stream early (final response before the client
       # finished) and the client's legally in-flight HEADERS raced the
       # deletion. Decode the block (keep HPACK in sync for the client's other
@@ -1871,7 +1971,7 @@ proc handleHeaders(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     # finishHeaders decoded the block; a refused stream is not in the table so
     # it returned without dispatching. Budget the refusal (overhead) then RST
     # it. Skip if decoding or the budget already tore the connection down.
-    if refuseErr != 0 and c.state != csClosing:
+    if refuseErr != 0 and refuseErr != refuseSilent and c.state != csClosing:
       h2.noteControlFrame(c)
       if c.state != csClosing: h2.streamError(c, sid, refuseErr)
   else:
@@ -1903,7 +2003,8 @@ proc handleContinuation(h2: H2Conn, c: ptr Connection, fh: FrameHeader,
     let refuse = h2.contRefuse
     h2.contRefuse = 0
     h2.finishHeaders(c, sid, h2.contEndStream, ready)
-    if refuse != 0 and c.state != csClosing:   # decoded above; now refuse (#233/#239)
+    if refuse != 0 and refuse != refuseSilent and c.state != csClosing:
+      # decoded above; now refuse (#233/#239)
       h2.noteControlFrame(c)
       if c.state != csClosing: h2.streamError(c, sid, refuse)
 
@@ -2090,6 +2191,12 @@ proc handleRstStream(h2: H2Conn, c: ptr Connection, fh: FrameHeader) =
     h2.connError(c, errProtocol); return   # even id = idle push stream (#240.1)
   if fh.streamId > h2.lastStreamId:
     h2.connError(c, errProtocol); return   # RST on idle stream
+  if fh.streamId notin h2.streams and fh.streamId in h2.serverReset:
+    # The client's reset racing (or answering) our RST_STREAM(NO_ERROR) after a
+    # complete response (#404): RFC 9113 5.1 has it ignored, and it is not a
+    # Rapid Reset either (the request was answered in full). One per stream.
+    h2.serverReset.del fh.streamId
+    return
   if fh.streamId in h2.streams:
     # Unified teardown: reclaim deferred connection-window credit (#231),
     # deliver onClose to a WebSocket, and fire onBodyCb(last=true) /

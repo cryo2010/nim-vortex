@@ -374,6 +374,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory for callbacks and can never stall the stream. The debug-only
   `h2CheckCounters` audit now also covers `backedUpProducers` and asserts that no
   stream parks a drain callback with nothing queued to fire it. (#399)
+- HTTP/2 and HTTP/3: a response that completes while the request is still open
+  now tells the client to stop sending, as RFC 9113 8.1 and RFC 9114 4.1 allow.
+  The common shape is a refused Extended CONNECT -- `router.ws` answering a
+  version-less handshake with 426 -- where the client never sends END_STREAM
+  because it expected a WebSocket, but any early answer qualifies, such as a
+  413 from a streaming route whose body is still arriving. On h2 the codec
+  already dropped the stream after END_STREAM, yet said nothing, so the client
+  stayed half-closed (local) and kept writing into an id the server had
+  forgotten, each DATA frame drawing a `RST_STREAM(STREAM_CLOSED)` and a charge
+  to the control-frame budget. Every path that emits a response's final frame
+  (buffered `send`, the scheduler's last DATA, an empty body, a streamed
+  `finish`, trailers, HEAD) now appends `RST_STREAM(NO_ERROR)` after the
+  END_STREAM frame when the request side is still open. The DATA the client
+  already had in flight is then ignored, as RFC 9113 5.1 requires once
+  RST_STREAM is sent: its connection-window credit is returned, but it draws no
+  `RST_STREAM(STREAM_CLOSED)` and no control-frame budget charge (which used to
+  end a client writing small frames with `GOAWAY(ENHANCE_YOUR_CALM)`), up to
+  the stream window the client held at the reset; a racing trailer section or
+  `RST_STREAM` is ignored too, and DATA past that window is answered as before.
+  The teardown is otherwise the usual one, so a `req.onBody` sink or parked
+  `await req.read()` gets its final `last=true`. A request the client already
+  finished, an accepted WebSocket and an already reset stream are untouched, so
+  the common case is byte-identical. On h3 the gap was worse: the stream could
+  not close until the client sent its FIN, so it held a `MAX_STREAMS` credit
+  while vortex kept crediting and buffering its pipelined bytes, and about a
+  hundred refusals starved the connection of streams. The backend now sends
+  `STOP_SENDING(H3_NO_ERROR)` once the response FIN is submitted while the
+  request side is still open (`vq_stream_stop_sending` in the ngtcp2 shim),
+  and the close that follows is not charged to the rapid-reset budget unless
+  the client had already reset the stream itself. (#404)
 
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
   longer fails its h3 cell at a transfer size it cannot finish.

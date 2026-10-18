@@ -1158,7 +1158,11 @@ that is not a handshake never reaches it: one that asked for a WebSocket but
 offered no supported `Sec-WebSocket-Version` gets a `426 Upgrade Required` with
 `Sec-WebSocket-Version: 13` (RFC 6455 4.2.2(4), which RFC 8441 keeps for h2 and
 h3), and one that never asked at all -- an HTTP/1.1 proxy-style `CONNECT`, a
-plain `GET` or `HEAD` -- gets a 400.
+plain `GET` or `HEAD` -- gets a 400. Over h2 and h3 a client normally leaves a
+CONNECT stream open, so when the request side is still open the refusal is
+followed by `RST_STREAM(NO_ERROR)` (h2) or `STOP_SENDING(H3_NO_ERROR)` (h3)
+telling it to stop sending, as for any response that completes before its
+request does; a client that already ended the stream gets the refusal alone.
 
 Because `ws` registers the `CONNECT` leg itself, an app that used to add it by
 hand beside `ws` (the pre-`ws` workaround) must drop that `addRoute`: the

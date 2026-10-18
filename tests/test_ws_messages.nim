@@ -13,6 +13,7 @@
 import std/[unittest, net, httpcore, strutils]
 import vortex/[settings, request, server, routing]
 import vortex/asyncdispatch
+import vortex/http2/frames
 import ./helper
 import ./h2client
 import ./wsclient
@@ -186,6 +187,66 @@ withServer(r.toHandler, initVortexConfig(numThreads = 1), srv):
       defer: c.close()
       check c.extendedConnect(1, "/chat", version = "8") == "426"
       check c.respField(1, "sec-websocket-version") == "13"
+
+    test "a refused Extended CONNECT ends with RST_STREAM(NO_ERROR) (#404)":
+      # The client never sends END_STREAM on a CONNECT: it expects to keep the
+      # stream as a WebSocket, and may pipeline framing behind the handshake. So
+      # the 426 completes the response while the request is still open, and RFC
+      # 9113 8.1 has the server say so with RST_STREAM(NO_ERROR) after it,
+      # instead of leaving the client half-closed (local) writing into an id
+      # the server has dropped.
+      var c = newH2TestConn(port)
+      defer: c.close()
+      var f = ""
+      f.addExtendedConnect(1, [(":method", "CONNECT"), (":protocol", "websocket"),
+        (":scheme", "http"), (":path", "/chat"), (":authority", "x")])
+      f.addData(1, buildFrame(0x1, "pipelined"))   # framing sent before the 426
+      c.sendRaw(f)
+      let fs = c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+        fs.rstError(1) >= 0)
+      var mine: seq[Frame]
+      for x in fs:
+        if x.streamId == 1: mine.add x
+      check mine.len == 3
+      if mine.len == 3:
+        check mine[0].typ == uint8(ftHeaders)
+        check (mine[0].flags and flagEndStream) == 0
+        check decodeHeaders(mine[0].payload).contains((":status", "426"))
+        check mine[1].typ == uint8(ftData)
+        check (mine[1].flags and flagEndStream) != 0
+        check mine[2].typ == uint8(ftRstStream)
+        check get32(mine[2].payload, 0) == errNoError
+      # Framing the client had already queued must not cost the connection: it
+      # is ignored (RFC 9113 5.1, we have sent RST_STREAM), so nothing more
+      # arrives for stream 1, not even RST_STREAM(STREAM_CLOSED), and there is
+      # no GOAWAY. A PING fences the read: its ACK comes after anything the
+      # late DATA provoked.
+      var late = ""
+      late.addData(1, buildFrame(0x1, "late"))
+      late.addPing()
+      c.sendRaw(late)
+      let fenced = c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+        for x in fs:
+          if x.typ == uint8(ftPing) and (x.flags and flagAck) != 0: return true
+        false)
+      check fenced.count(ftPing) == 1
+      check fenced.goawayError() == -1
+      for x in fenced: check x.streamId != 1
+      # The next handshake on the connection upgrades and echoes normally.
+      check c.extendedConnect(3, "/chat") == "200"
+      c.sendData(3, buildFrame(0x1, "after"))
+      let msgs = parseFrames(c.streamData(3, firstWsFrame))[0]
+      check msgs.len >= 1
+      if msgs.len >= 1: check msgs[0].payload == "echo: after"
+      var tail = ""
+      tail.addPing()
+      c.sendRaw(tail)
+      let rest = c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+        for x in fs:
+          if x.typ == uint8(ftPing) and (x.flags and flagAck) != 0: return true
+        false)
+      check rest.goawayError() == -1
+      for x in rest: check x.streamId != 1
 
     test "ws beside a hand-registered CONNECT leg raises RouteConflictError":
       # The pre-#400 workaround was to add the CONNECT leg by hand. `ws` now

@@ -27,9 +27,11 @@ docker network (QUIC is UDP):
   handler accepts the stream), a half-close in that same burst, a reply
   sent from an async continuation (which must reach the wire without waiting
   for an unrelated event), and a version-less Extended CONNECT, which must be
-  refused with a 426 carrying `Sec-WebSocket-Version: 13` while leaving the
-  connection usable for a proper handshake. It exits non-zero (failing the
-  run) on any mismatch.
+  refused with a 426 carrying `Sec-WebSocket-Version: 13` and followed by
+  `STOP_SENDING(H3_NO_ERROR)` on that stream (RFC 9114 4.1, #404), 600 times
+  over on one connection (more than the rapid-reset budget and the stream
+  credit), while leaving the connection usable for a proper handshake. It
+  exits non-zero (failing the run) on any mismatch.
 
 The WebSocket framing in `client.py` is hand-rolled so the test owns exactly
 what goes on the wire; aioquic supplies only the QUIC + HTTP/3 transport.
