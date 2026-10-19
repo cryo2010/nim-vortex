@@ -149,7 +149,63 @@ proc abandonedOnDrain(req: Request, res: Response) {.gcsafe.} =
     r.finish()
   pump(res)
 
+var endFires, endWrote, endEnded, endLateFires: Atomic[int]
+  ## What the drain an h1 finish / abort fires sees (#408): fired, a write
+  ## that reported writable, the response ended, and fires of the registration
+  ## the callback made from inside itself.
+
+proc endWithParkedDrain(abortIt: bool): RequestHandler =
+  ## Back the h1 response up against a reader that has not started, register
+  ## a drain, then end the response. The callback fires exactly once, after
+  ## the teardown, and finds the response dead; neither the flush that drains
+  ## the backlog nor the close that follows may fire anything again.
+  proc (req: Request, res: Response) {.gcsafe.} =
+    res.sendHead(Http200, "application/octet-stream")
+    let chunk = repeat('e', 64 * 1024)
+    for i in 0 ..< 1024:
+      if not res.write(chunk.toOpenArray(0, chunk.high)): break
+    res.onDrain(proc (r: Response) {.gcsafe.} =
+      endFires.atomicInc
+      if r.ended: endEnded.atomicInc
+      if r.write(chunk.toOpenArray(0, 15)): endWrote.atomicInc
+      r.onDrain(proc (r2: Response) {.gcsafe.} = endLateFires.atomicInc))
+    if abortIt: res.abort() else: res.finish()
+
+const answeredBigLen = 16 * 1024 * 1024  ## queued ahead of the answered request
+
+var ansFires, ansEnded, ansWrote, ansLateFires, ansBuffered: Atomic[int]
+  ## What a drain registered before the head sees when a buffered send answers
+  ## the request (#408): fired, the response ended, a write that reported
+  ## writable, fires of a re-registration, and the backlog at registration.
+
+proc answeredBig(req: Request, res: Response) {.gcsafe.} =
+  res.send(Http200, repeat('A', answeredBigLen))
+
+proc answeredWithParkedDrain(fromWorker: bool): RequestHandler =
+  ## Register a drain BEFORE any head while the pipelined /answered-big is
+  ## still queued (HTTP/1.1 counts it in bufferedAmount), then answer with a
+  ## buffered send: inline, or from a blocking worker (the outbox apply path).
+  ## The send must fire the callback once, after the response is over; the
+  ## keep-alive reset used to drop it silently.
+  proc (req: Request, res: Response) {.gcsafe.} =
+    ansBuffered.store(res.bufferedAmount)
+    res.onDrain(proc (r: Response) {.gcsafe.} =
+      ansFires.atomicInc
+      if r.ended: ansEnded.atomicInc
+      if r.write("late".toOpenArray(0, 3)): ansWrote.atomicInc
+      r.onDrain(proc (r2: Response) {.gcsafe.} = ansLateFires.atomicInc))
+    if fromWorker:
+      request.blocking(req):
+        res.send(Http200, "answered")
+    else:
+      res.send(Http200, "answered")
+
 var rt = newRouter()
+rt.get("/answered-big", answeredBig)
+rt.get("/answered", answeredWithParkedDrain(fromWorker = false))
+rt.get("/answered-worker", answeredWithParkedDrain(fromWorker = true))
+rt.get("/end-finish", endWithParkedDrain(abortIt = false))
+rt.get("/end-abort", endWithParkedDrain(abortIt = true))
 rt.get("/abandoned", abandonedStream)
 rt.get("/abandoned-ondrain", abandonedOnDrain)
 rt.get("/big", bigStream)
@@ -295,5 +351,58 @@ withServer(rt.toHandler, initVortexConfig(numThreads = 1), srv):
       check eventually(syncFiredAfterStop.load >= 1)
       os.sleep(200)
       check syncFiredAfterStop.load == 1
+
+    for abortIt in [false, true]:
+      let verb = if abortIt: "abort()" else: "finish()"
+      test "h1 " & verb & " fires a parked res.onDrain once, after the teardown (#408)":
+        for a in [addr endFires, addr endWrote, addr endEnded, addr endLateFires]:
+          a[].store(0)
+        let resp = slowGet(if abortIt: "/end-abort" else: "/end-finish")
+        check resp.startsWith("HTTP/1.1 200")
+        check resp.endsWith("\r\n0\r\n\r\n") == not abortIt
+        os.sleep(200)                    # the close has run by now
+        check endFires.load == 1         # once: closeConn found it detached
+        check endEnded.load == 1
+        check endWrote.load == 0         # write refused, nothing on the wire
+        check endLateFires.load == 0     # re-registration rejected
+
+    for fromWorker in [false, true]:
+      let where = if fromWorker: "from a blocking worker" else: "inline"
+      test "h1 buffered send " & where & " fires a res.onDrain registered before the head (#408)":
+        for a in [addr ansFires, addr ansEnded, addr ansWrote, addr ansLateFires,
+                  addr ansBuffered]:
+          a[].store(0)
+        let s = newSocket(buffered = false)
+        defer: s.close()
+        var rcvbuf: cint = 4096          # keep /answered-big queued in the server
+        discard setsockopt(s.getFd, SOL_SOCKET, SO_RCVBUF, addr rcvbuf,
+                           SockLen(sizeof(rcvbuf)))
+        s.connect("127.0.0.1", port)
+        let path = if fromWorker: "/answered-worker" else: "/answered"
+        s.send("GET /answered-big HTTP/1.1\r\nHost: x\r\n\r\n" &
+               "GET " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        # Fired by the send itself, while the client still reads nothing.
+        check eventually(ansFires.load == 1, 1500)
+        check ansBuffered.load > 0       # registered behind the queued response
+        let resp = s.recvUntilClose(5000)
+        os.sleep(100)                    # the close has run by now
+        check ansFires.load == 1         # once: closeConn found it detached
+        check ansEnded.load == 1
+        check ansWrote.load == 0         # write refused, nothing on the wire
+        check ansLateFires.load == 0     # re-registration rejected
+        let tail = "\r\n\r\nanswered"
+        check resp.endsWith(tail)        # the answer, and nothing after it
+        let first = resp.find("\r\n\r\n")
+        check first > 0
+        if first > 0:
+          let bodyEnd = resp.find("HTTP/1.1 ", first + 4)   # body is all A
+          check bodyEnd - (first + 4) == answeredBigLen
+          var intact = bodyEnd - (first + 4) == answeredBigLen
+          if intact:
+            for i in first + 4 ..< bodyEnd:
+              if resp[i] != 'A':
+                intact = false
+                break
+          check intact                   # not `check body == ...`: no 16 MiB dump
 
 echo "server shut down cleanly"

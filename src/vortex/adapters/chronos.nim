@@ -163,6 +163,16 @@ template onCompleted(fut, body: untyped) =
     except Exception:
       discard
 
+proc completeSoon(fut: Future[void]) =
+  ## Contract shared with the asyncdispatch backend: complete `fut` on a LATER
+  ## turn of the event loop, never inside this call, so a coroutine awaiting it
+  ## suspends and the loop serves I/O before it resumes (adapterimpl's
+  ## `drained()` on an ended response, #408). chronos runs a callback queued
+  ## while it is processing callbacks on its next poll, and the vortex pump
+  ## polls a bounded number of times per loop iteration.
+  callSoon(proc (arg: pointer) {.gcsafe, raises: [].} =
+    if not fut.finished: fut.complete())
+
 template runAsyncBody(body: untyped): untyped =
   ## Immediately-invoked async closure (chronos's `{.async.}` procs are
   ## closures already; no extra pragma needed).

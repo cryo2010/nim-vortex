@@ -61,7 +61,7 @@ proc predicate*(s: StreamRoutes): StreamRouteCb =
   let rules = s.rules
   proc(core: ptr LoopCore, fd: int32, gen: uint32,
        stream: uint32): bool {.gcsafe.} =
-    let req = Request(core: core, fd: fd, gen: gen, stream: stream)
+    let req = requestFor(core, fd, gen, stream)   # live serial (#407)
     for r in rules:
       if r(req): return true
     false

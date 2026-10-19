@@ -11,10 +11,14 @@ type
   PathParams* = seq[(string, string)]
     ## Route parameters captured by the router; exposed as req.params.
 
-  ReqKey* = (int32, uint32, uint32)
-    ## Identifies an in-flight request/stream: (fd, generation, stream id).
-    ## HTTP/1 uses stream 0; h2/h3 use the stream id. Keys the pending
-    ## `res.headers` store below.
+  ReqKey* = (int32, uint32, uint32, uint32)
+    ## Identifies an in-flight request/stream: (fd, generation, stream id,
+    ## request serial). HTTP/1 uses stream 0 and the connection's per-request
+    ## serial (`Connection.reqSerial`), so an entry made through a handle of a
+    ## finished keep-alive request never matches the next request on the same
+    ## connection (#407); h2/h3 use the stream id (never reused inside a
+    ## connection) and serial 0. Build one with `reqKey`. Keys the pending
+    ## `res.headers` / `res.trailers` stores and the drain-kick queue below.
 
   ResponseHeaders* = object
     ## Response headers accumulated via `res.headers` before `send` is called.
@@ -78,6 +82,12 @@ type
     fd*: int32
     gen*: uint32
     stream*: uint32           ## 0 for HTTP/1
+    serial*: uint32           ## HTTP/1: the sending handle's request serial
+                              ## (Connection.reqSerial). A response or file
+                              ## message whose serial no longer matches belongs
+                              ## to a request that already finished and is
+                              ## dropped instead of landing in the next
+                              ## keep-alive request (#407). 0 for h2/h3/ws.
     code*: int32
     data*: string             ## packed response, WS frame, or a file chunk
     # File-streaming (omFileStart/omFileChunk): the loop-pull mechanism carries
@@ -196,6 +206,17 @@ type
   Connection* = object
     fd*: int32
     gen*: uint32              ## bumped on close; part of the Request handle
+    reqSerial*: uint32        ## HTTP/1 per-request serial, bumped by every
+                              ## resetRequestState (keep-alive reuse and slot
+                              ## recycling alike), so it is never 0 for a live
+                              ## request. h1 Request/Response handles carry it
+                              ## (`serial`) and a mismatch resolves to nil, the
+                              ## way a dead h2/h3 stream id does: a handle kept
+                              ## from request N cannot reach request N+1's state
+                              ## on the same connection (#407). `gen` stays the
+                              ## connection identity (it guards worker pins,
+                              ## pending flushes, TLS resume and WebSocket
+                              ## handles, which outlive one request).
     state*: ConnState
     remoteAddr*: string       ## peer IP captured at accept (TCP; "" for HTTP/3)
     rbuf*: string             ## receive buffer (grows, reused)
@@ -387,9 +408,11 @@ type
       ## selector fd and any lingering futures). Without it, a loop thread that
       ## used async leaks the dispatcher on exit (each server restart leaks one).
     kick*: proc (loopPtr: pointer, fd: int32, gen: uint32,
-                 stream: uint32) {.nimcall, gcsafe.}
+                 stream: uint32, serial: uint32) {.nimcall, gcsafe.}
       ## Flush/resume after a deferred same-thread respond (async
       ## completion). Set by the event loop; safe to call redundantly.
+      ## `serial` is the handle's HTTP/1 request serial: a kick from a
+      ## finished request's handle must not resume the next one (#407).
     flushHook*: proc (loopPtr: pointer, fd: int32,
                       gen: uint32) {.nimcall, gcsafe.}
       ## Flush a connection's write buffer now. Used by a loop-thread
@@ -682,6 +705,13 @@ proc onOwnLoopThread(core: ptr LoopCore): bool {.inline.} =
   if pinThreadId == 0: pinThreadId = getThreadId()
   pinThreadId == core.threadId
 
+func reqKey*(fd: int32, gen: uint32, stream: uint32,
+             serial: uint32): ReqKey {.inline.} =
+  ## The ReqKey for a handle's words: the serial counts only for an HTTP/1
+  ## handle (fd >= 0, stream 0); h2/h3 keys carry 0 there, so their entries
+  ## match by stream id alone as before (#407).
+  (fd, gen, stream, (if fd >= 0 and stream == 0: serial else: 0'u32))
+
 proc conn*(core: ptr LoopCore, fd: int32, gen: uint32): ptr Connection =
   ## Resolve a (fd, gen) handle; nil if the connection is gone. Loop-thread
   ## only: the table's block list reallocates on growth (see `ConnTable`), so
@@ -822,6 +852,15 @@ proc releaseFlushHold*(c: ptr Connection): bool {.inline.} =
   if c.flushHold > 0: dec c.flushHold
   c.flushHold == 0
 
+proc closeInProgress*(c: ptr Connection): bool {.inline.} =
+  ## closeConn is delivering this connection's teardown callbacks right now
+  ## (closeRequested with no pin left; a close deferred while pinned has pins
+  ## and has not started). finish/abort then leave drain delivery to that path,
+  ## which fires every callback parked before the close exactly once (#408): a
+  ## producer re-registering and ending its response from inside its own close
+  ## notification must not be called back a second time.
+  c.closeRequested and c.totalPins == 0
+
 proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
   ## Drop any pending `res.headers` for a connection/slot being torn down (a
   ## request that set headers but never sent). No-op when unused; the table is
@@ -836,6 +875,17 @@ proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
     for k in core.respTrailers.keys:
       if k[0] == fd and k[1] == gen: stale.add k
     for k in stale: core.respTrailers.del k
+
+proc dropRequestEntries*(core: ptr LoopCore, c: ptr Connection) =
+  ## Drop the `res.headers` / `res.trailers` the ending HTTP/1 request set but
+  ## never emitted, before resetForNextRequest bumps its serial (#407). Keyed by
+  ## the serial, such an entry can no longer leak into the next request, but it
+  ## would otherwise sit in the table until the connection closes, one per
+  ## request on a long keep-alive connection. Two O(1) len checks when unused.
+  if core.respHeaders.len > 0:
+    core.respHeaders.del reqKey(c.fd, c.gen, 0, c.reqSerial)
+  if core.respTrailers.len > 0:
+    core.respTrailers.del reqKey(c.fd, c.gen, 0, c.reqSerial)
 
 proc resetRequest*(rs: var RequestState) =
   ## Clear every shared per-request field for carrier reuse. cachedUrl and
@@ -878,6 +928,11 @@ proc resetRequestState(c: var Connection) =
   c.respContentLength = -1
   c.respBodyWritten = 0
   c.parser.reset(0)
+  # A new request (or a new occupant): every h1 handle minted for the previous
+  # one now resolves to nil (#407). Skip 0 on wrap so a live request never
+  # shares the default serial of a handle built without one.
+  inc c.reqSerial
+  if c.reqSerial == 0: inc c.reqSerial
 
 proc resetForNextRequest*(c: var Connection) =
   ## Compact consumed bytes and prepare the parser for a pipelined or

@@ -34,12 +34,16 @@ type
     ## `fn` is a trampoline (see request.dispatchBlocking) that rebuilds
     ## the Request/WebSocket from the handle words and runs the user's body.
     fn*: proc (user, core: pointer, fd: int32, gen: uint32, stream: uint32,
-               data: string) {.nimcall, gcsafe.}
+               serial: uint32, data: string) {.nimcall, gcsafe.}
     user*: pointer            ## the user body proc pointer
     core*: pointer            ## ptr LoopCore
     fd*: int32
     gen*: uint32
     stream*: uint32           ## HTTP/2 stream id, 0 for HTTP/1
+    serial*: uint32           ## HTTP/1 request serial of the dispatching handle
+                              ## (Connection.reqSerial; 0 for h2/h3/ws), so the
+                              ## worker's Response stamps it on its outbox
+                              ## messages (#407)
     data*: string             ## moved-in payload (a WebSocket message); "" for HTTP
     snap*: ReqSnapshot        ## request snapshot for an HTTP blocking body
 
@@ -76,7 +80,7 @@ proc workerLoop(pool: ptr WorkerPool) {.thread.} =
     {.gcsafe.}:
       try:
         task.fn(task.user, task.core, task.fd, task.gen, task.stream,
-                move task.data)
+                task.serial, move task.data)
       except Exception:
         # Catch Defect too (where catchable, i.e. not --panics:on): a bug in a
         # user blocking body must not take down the worker thread and the whole

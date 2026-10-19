@@ -55,6 +55,56 @@ proc connectTimeout*(port: Port, ms = 2000): Socket =
   result.connect("127.0.0.1", port)
   result.setRecvTimeout(ms)
 
+type HttpResp* = tuple[ok: bool, head, body, trailers: string]
+
+proc readHttpResponse*(s: Socket, timeoutMs = 3000): HttpResp =
+  ## One HTTP/1.1 response off a keep-alive socket: Content-Length or chunked
+  ## (decoded, with its trailer section). ok = false on timeout/EOF before it
+  ## completed. Bytes past the response are dropped, so use it on sequential
+  ## (not pipelined) exchanges.
+  s.setRecvTimeout(timeoutMs)
+  var buf = ""
+  var tmp = newString(65536)
+  template fill(): bool =
+    let n = recv(s.getFd, addr tmp[0], tmp.len, cint(0))
+    if n > 0: buf.add tmp.substr(0, n - 1)
+    n > 0
+  while "\r\n\r\n" notin buf:
+    if not fill(): return
+  let he = buf.find("\r\n\r\n")
+  result.head = buf[0 ..< he]
+  var pos = he + 4
+  let lower = result.head.toLowerAscii
+  if "transfer-encoding: chunked" in lower:
+    while true:
+      var le = buf.find("\r\n", pos)
+      while le < 0:
+        if not fill(): return
+        le = buf.find("\r\n", pos)
+      let size = parseHexInt(buf[pos ..< le].split(';')[0].strip)
+      pos = le + 2
+      if size == 0:
+        var te = buf.find("\r\n\r\n", pos - 2)
+        while te < 0:
+          if not fill(): return
+          te = buf.find("\r\n\r\n", pos - 2)
+        if te > pos: result.trailers = buf[pos ..< te]
+        result.ok = true
+        return
+      while buf.len < pos + size + 2:
+        if not fill(): return
+      result.body.add buf[pos ..< pos + size]
+      pos += size + 2
+  else:
+    var clen = 0
+    for line in result.head.split("\r\n"):
+      if line.toLowerAscii.startsWith("content-length:"):
+        clen = parseInt(line.split(':', 1)[1].strip)
+    while buf.len < pos + clen:
+      if not fill(): return
+    result.body = buf[pos ..< pos + clen]
+    result.ok = true
+
 # --- curl helpers -------------------------------------------------------------
 
 proc h2curl*(args: string): (string, int) =

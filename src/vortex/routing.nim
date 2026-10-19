@@ -281,7 +281,7 @@ proc streamPredicate*(router: Router): StreamRouteCb =
   proc (core: ptr LoopCore, fd: int32, gen: uint32,
         stream: uint32): bool {.gcsafe.} =
     {.gcsafe.}:
-      let req = Request(core: core, fd: fd, gen: gen, stream: stream)
+      let req = requestFor(core, fd, gen, stream)   # live serial (#407)
       var params: PathParams
       let node = r.matchPath(req, params)   # ptr into the pinned trie
       if node == nil: return false

@@ -233,6 +233,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP/1.1: a `Request` / `Response` kept past its own request no longer
+  reaches the next request on the same keep-alive connection. A handle was
+  fd + generation + stream, and the generation changes only when the
+  connection slot is recycled, not between keep-alive requests, so a handle
+  from request N resolved to request N+1's state once N+1 was in flight: a
+  stale `res.write` spliced bytes into N+1's body, `res.finish` / `res.abort`
+  ended or cut it, `res.onDrain` replaced N+1's drain callback (and, with the
+  #403 arming, had its own closure fired promptly to write into N+1),
+  `res.headers` / `res.trailers` / `res.send` answered N+1 with the stale
+  values, `req.header` / `req.path` read N+1's request, an async body that
+  outlived its request kicked N+1 as "left mid-stream" and closed the
+  connection under it, and a late send from a thread of the app's own landed
+  as N+1's response (or wrote an unsolicited response onto an idle
+  connection). HTTP/1.1 handles now carry a per-request serial, bumped each
+  time the connection resets for a new request (keep-alive reuse and slot
+  recycling alike) and checked on every h1 resolve (`reqState`, the connection
+  lookup, the `res.headers` / `res.trailers` / drain-kick keys, the async
+  adapters' `req.read` table, the loop's resume kick, and the outbox, which now
+  drops a worker or off-loop response or sendFile chunk whose request has
+  finished while still releasing its pin). A stale h1 handle now reads exactly
+  as a dead HTTP/2 stream does: writes return `false`, `isAlive` is `false`,
+  sends, finishes, aborts and drain registrations are no-ops, accessors read
+  empty, and `res.drained()` completes without parking. HTTP/2 and HTTP/3 are
+  unchanged (stream ids are never reused inside a connection). (#407)
+- Async adapters: a coroutine parked in `await res.drained()` (or `await
+  res.write`, which awaits it after a false verdict) now resumes when another
+  task calls `res.finish()` or `res.abort()` on the same response, or (on
+  HTTP/1.1) answers it with a buffered `res.send`, instead of staying parked
+  until the connection died (the 30 s write timeout on a stalled HTTP/1.1 peer;
+  on a long-lived HTTP/2 connection whose peer stopped crediting the window,
+  longer still; for the buffered send, for good). On HTTP/1.1
+  `bufferedAmount` counts an earlier pipelined response still queued, so a wait
+  (or a sync `res.onDrain`) can park before any head; only `sendHead` armed
+  such a registration, and a buffered `send` went straight to the keep-alive
+  reset, which dropped the callback with the rest of the request state.
+  `applyResponse` now detaches and fires it once after marking the request
+  answered, for a send from the loop thread and from a `blocking:` worker
+  (the outbox apply) alike. The only thing that completes that Future is the
+  response's drain callback, and every end of a response dropped it:
+  `h2StreamAbort` and `h2StreamFinish` nil'd `onRespDrain` before tearing the
+  stream down (the `respDeclaredLen` mismatch abort included), HTTP/1.1
+  `finish` / `abort` cleared it with `respBackedUp`, and `h3StreamFinish` /
+  `h3StreamAbort` did the same. Each now detaches the callback, ends the
+  response, then fires it once with exceptions contained (as `h2NotifyClosed`
+  does), so the connection-close path finds nothing left to fire a second
+  time; that covers the Content-Length mismatch abort `finish` turns into on
+  all three protocols (#248, #345) and a finish carrying trailers. The rule is
+  uniform: a pending callback fires on every finish / abort, including a sync
+  producer's own, since which task ended the response is not observable and a
+  producer that stops on a false `write` (the documented pattern) does nothing
+  there; the one exception is a finish / abort from inside a close
+  notification, where `closeConn` / `h2NotifyClosed` keep delivering each
+  callback exactly once and never re-enter the producer. The callback always
+  observes a dead response, which is now a contract on every protocol: a new
+  `res.ended` reports it; `res.write` on a finished, aborted, peer-reset or
+  HTTP/2 or HTTP/3 HEAD response returns false and is a no-op (HTTP/2 and HTTP/3
+  used to report such a stream writable whenever the connection had room);
+  `res.drained()` on an ended response completes, on the next turn of the
+  event loop rather than inside the call (a finished h2 or h3 stream whose
+  last DATA was still queued behind a closed window used to park the wait for
+  good; and since an `await` on an already-completed Future never yields, a
+  producer that ignored the verdict and looped on `await res.write` froze the
+  loop thread once another task ended its response, where it now yields every
+  turn and other connections keep being served, though such a loop still
+  never finishes its source: stop on a false `write` or check `res.ended`);
+  `res.onDrain` on one is rejected rather than stored on dead state, or on the
+  next keep-alive request's; and `res.headers` /
+  `res.trailers` set from inside the callback are dropped instead of leaking
+  onto the next response on an HTTP/1.1 keep-alive connection. A queued
+  `drainKicks` entry for a response finished before its pass runs finds no
+  callback and does nothing. A streamed `sendFile` also stops reading once its
+  response has ended: an HTTP/2 or HTTP/3 peer that reset the stream while
+  keeping the connection up used to have the rest of the file read, hop by
+  hop, into the dropped stream, since each hop's pin was still granted and a
+  gone stream's backlog reads 0, so the read-ahead gate always passed. Pinned
+  by `tests/test_adapter.nim` (asyncdispatch and chronos: a coroutine parked
+  on a stalled HTTP/1.1 peer, a closed 16 KiB h2 window and an h3 stream
+  behind a trickling curl, in `drained()` and `write` shapes, resumed by a
+  second task's abort, finish, short finish and finish with trailers, and
+  checked against what the peer sees; a wait parked behind a queued 16 MiB
+  pipelined response and answered by a second task's buffered send; a
+  producer looping on `await res.write` after an abort, while a `/ping` on
+  another connection is answered mid-loop), the reworked #403 guards in
+  `tests/test_http2_write_stall.nim` (the callback fires once, after teardown,
+  its write refused and its re-registration rejected), four HTTP/1.1 cases in
+  `tests/test_streaming_drain.nim` (finish, abort, and a buffered send inline
+  and from a `blocking:` worker) and a reset sendFile stream in
+  `tests/test_http2_download.nim` that holds no read pin afterwards. (#408)
 - Streaming responses: a drain wait registered without a preceding `false` from
   `res.write` now fires instead of parking forever. `res.drained()` completes at
   once only when nothing is queued; otherwise it registers `res.onDrain` and
@@ -263,14 +351,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still fires exactly once and never from inside the registration (it can fire
   inside a later `res.write` on the same response, whose flush runs the drain
   path), so a producer can re-register from its own callback without
-  recursing, and `finish` / `abort` still drop a pending one. With every
-  registration marked, the debug `h2CheckCounters` audit now asserts the strict
-  invariant -- no drain callback on an open h2 response without the mark --
-  where it could only check the empty-backlog case before. Pinned by
-  `tests/test_http2_write_stall.nim` (4 MiB in 32 KiB writes with `await
-  res.drained()` or `res.onDrain` after every write, against a wide window, a
-  bursty reader and a small window; a flush-before-finish loop that must park on
-  a stalled peer; a burst of registrations queuing one pass),
+  recursing, and `finish` / `abort` still drop a pending one (#408 makes them
+  fire it). With every registration marked, the debug `h2CheckCounters` audit
+  now asserts the strict invariant -- no drain callback on an open h2 response
+  without the mark -- where it could only check the empty-backlog case before.
+  Pinned by `tests/test_http2_write_stall.nim` (4 MiB in 32 KiB writes with
+  `await res.drained()` or `res.onDrain` after every write, against a wide
+  window, a bursty reader and a small window; a flush-before-finish loop that
+  must park on a stalled peer; a burst of registrations queuing one pass),
   `tests/test_streaming_drain.nim` (the same two producers over HTTP/1.1 behind
   a slow reader, and a registration made before `sendHead`) and
   `tests/test_http3.nim` (the sync shape over h3). A client that disconnects

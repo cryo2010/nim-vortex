@@ -16,6 +16,9 @@
 # - `trackParked` / `untrackParked`: a future has parked on / woken from a
 #   wakeup only the vortex loop delivers (chronos counts these so its pump can
 #   stop spinning; asyncdispatch no-ops)
+# - `completeSoon(fut: Future[void])`: complete `fut` on a later turn of the
+#   event loop, never inside the call (chronos: callSoon; asyncdispatch: a zero
+#   timer, since its callback queue drains callbacks queued while it runs)
 # - `template runAsyncBody(body)`: an immediately-invoked async closure
 #   (the backends need different pragma spellings)
 
@@ -34,7 +37,8 @@ proc complete(req: Request, failed: bool) {.gcsafe.} =
   if failed:
     response(req).send(Http500, "500 Internal Server Error")
   if req.core.hooks.kick != nil:
-    req.core.hooks.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
+    req.core.hooks.kick(req.core.loopPtr, req.fd, req.gen, req.stream,
+                        req.serial)
 
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling to a running future: 500 on failure,
@@ -109,7 +113,25 @@ proc drained*(res: Response): Future[void] =
   ## still; a flush-before-finish loop (`while res.bufferedAmount > 0: await
   ## res.drained()`) then waits for the next WINDOW_UPDATE or socket drain on
   ## each turn, and parks (without spinning) while the peer reads nothing.
+  ##
+  ## It also completes when the response ends (#408): a wait parked here while
+  ## another task calls `res.finish()` or `res.abort()`, a buffered `res.send`
+  ## answers the request (HTTP/1.1 can park a wait before any head, behind an
+  ## earlier pipelined response still queued), or the client resets the stream
+  ## or disconnects, resumes then, not when the connection finally dies. A wait
+  ## started on a response that has already ended (`res.ended`) completes too,
+  ## but on the next turn of the event loop rather than inside this call.
+  ## Either way the next `res.write` returns false and is a no-op, so stop on
+  ## it (or check `res.ended` / `req.isAlive`) before writing on. A producer
+  ## that ignores the verdict and loops on `await res.write` never finishes
+  ## its source; the deferred completion only makes each of its turns yield
+  ## to the loop, so the server keeps serving other connections meanwhile
+  ## (an `await` on an already-completed Future does not yield, which froze
+  ## the loop thread in exactly that loop).
   result = newFuture[void]("res.drained")
+  if res.ended:
+    completeSoon(result)
+    return
   if res.bufferedAmount == 0:
     complete(result)
     return
@@ -127,6 +149,10 @@ proc write*(res: Response, data: string) {.async.} =
   ##
   ## (Forgetting `await` compiles -- the async transform discards the Future --
   ## but then skips backpressure; the write still happens.)
+  ##
+  ## On an ended response (`res.ended`) the write is a no-op and the await
+  ## yields one loop turn (drained(), #408), so a loop of `await res.write`
+  ## must check `res.ended` to stop: it cannot tell from this call.
   if not write(res, data.toOpenArray(0, data.len - 1)):
     await res.drained()
 
@@ -224,7 +250,10 @@ proc take[T](r: AwaitableReader[T]): Future[T] =
 
 # --- pull-based request-body reading (await req.read) -----------------------
 
-var bodyReaders {.threadvar.}: Table[(int32, uint32, uint32), AwaitableReader[string]]
+var bodyReaders {.threadvar.}: Table[ReqKey, AwaitableReader[string]]
+  ## Keyed like the core tables (fd, gen, stream, h1 request serial), so a
+  ## handle kept past its request finds no reader instead of the next
+  ## keep-alive request's (#407).
 
 proc toStr(a: openArray[char]): string =
   result = newString(a.len)
@@ -244,7 +273,8 @@ proc read*(req: Request): Future[string] =
   ## Await the next request-body chunk in an async streaming handler; resolves
   ## to "" at end of body. Only meaningful on a route registered with the async
   ## `stream` below (or a `streamRoute` predicate); otherwise resolves to "".
-  let r = bodyReaders.getOrDefault((req.fd, req.gen, req.stream))
+  let r = bodyReaders.getOrDefault(reqKey(req.fd, req.gen, req.stream,
+                                          req.serial))
   if r == nil:
     result = newFuture[string]("request.read")
     result.complete("")
@@ -256,7 +286,7 @@ proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
       let r = newBodyReader(req)
-      let k = (req.fd, req.gen, req.stream)
+      let k = reqKey(req.fd, req.gen, req.stream, req.serial)
       bodyReaders[k] = r
       req.onBody(proc (chunk: openArray[char], last: bool) {.gcsafe.} =
         if chunk.len > 0: r.feed(toStr(chunk))

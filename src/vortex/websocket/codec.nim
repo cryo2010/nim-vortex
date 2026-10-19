@@ -24,8 +24,10 @@ type
     Text, Binary
 
   WebSocket* = object
-    ## Handle to an upgraded connection: the same four words as Request,
-    ## copyable and safe to move across threads. `stream` is 0 for an
+    ## Handle to an upgraded connection: Request's connection words (no h1
+    ## request serial: an upgraded HTTP/1.1 connection serves no further
+    ## requests, so fd + generation already name it), copyable and safe to
+    ## move across threads. `stream` is 0 for an
     ## HTTP/1.1 WebSocket and the HTTP/2 stream id for an RFC 8441 one.
     core*: ptr LoopCore
     fd*: int32

@@ -140,18 +140,33 @@ proc onDrainEveryWrite(req: Request, res: Response) {.gcsafe.} =
       pump(r2))
   pump(res)
 
+var endedInDrain, wroteInDrain, lateFires, firedBeforeEnd: Atomic[int]
+  ## What the callback endWithPendingDrain registers saw when finish / abort
+  ## fired it (#408): the response already ended, a write that reported
+  ## writable, and fires of the registration it made from inside itself.
+
 proc endWithPendingDrain(abortIt: bool): RequestHandler =
   ## Register a drain and end the response in the same breath, with a backlog
-  ## the 16 KiB window keeps queued: `finish` / `abort` drop the pending
-  ## callback, so neither the loop pass the registration queued nor the drain
-  ## that follows may fire it after the response is over.
+  ## the 16 KiB window keeps queued. `finish` / `abort` fire the pending
+  ## callback once, after the response is over (#408), so it must see the
+  ## response ended, a `write` that returns false and puts nothing on the wire,
+  ## and a re-registration that is rejected: neither the loop pass the
+  ## registration queued nor the drain or close that follows may fire anything
+  ## again.
   proc (req: Request, res: Response) {.gcsafe.} =
     res.sendHead(Http200, "application/octet-stream")
     var chunk = newString(drainChunk)
     fillChunk(chunk, 0, drainChunk)
     discard res.write(chunk.toOpenArray(0, drainChunk - 1))
     drainRegs.atomicInc
-    res.onDrain(proc (r: Response) {.gcsafe.} = drainFires.atomicInc)
+    var ending = false
+    res.onDrain(proc (r: Response) {.gcsafe.} =
+      drainFires.atomicInc
+      if not ending: firedBeforeEnd.atomicInc
+      if r.ended: endedInDrain.atomicInc
+      if r.write(chunk.toOpenArray(0, 15)): wroteInDrain.atomicInc
+      r.onDrain(proc (r2: Response) {.gcsafe.} = lateFires.atomicInc))
+    ending = true
     if abortIt: res.abort() else: res.finish()
 
 var flushSpins: Atomic[int]
@@ -453,23 +468,40 @@ suite "a drain wait registered without a false verdict (#403)":
                         connGrant = wideGrant), totalBytes)
     checkFiredOnce()
 
-  test "finish() drops a drain registered just before it":
+  test "finish() fires a drain registered just before it, once, after (#408)":
+    # Was "finish() drops ..." (#403): the drop stranded an async producer
+    # parked in drained() while another task finished the response. The
+    # callback now runs exactly once, after the response is over, and can do
+    # nothing to it: its write is refused (the body is exactly the one chunk,
+    # then END_STREAM), and its re-registration never fires.
     resetDrainCounts()
+    endedInDrain.store(0); wroteInDrain.store(0)
+    lateFires.store(0); firedBeforeEnd.store(0)
     checkBody(fetchBody(srv.port, "/ondrain-finish", initialWindow = smallWindow,
                         connGrant = wideGrant), drainChunk)
     sleep(100)                              # let any stray loop pass run
     check drainRegs.load() == 1
-    check drainFires.load() == 0
+    check drainFires.load() == 1
+    check firedBeforeEnd.load() == 0        # from finish(), not a drain event
+    check endedInDrain.load() == 1
+    check wroteInDrain.load() == 0          # write returned false
+    check lateFires.load() == 0             # re-registration rejected
 
-  test "abort() drops a drain registered just before it":
+  test "abort() fires a drain registered just before it, once, after (#408)":
     resetDrainCounts()
+    endedInDrain.store(0); wroteInDrain.store(0)
+    lateFires.store(0); firedBeforeEnd.store(0)
     let r = fetchBody(srv.port, "/ondrain-abort", initialWindow = smallWindow,
                       connGrant = wideGrant)
     check r.gone                            # RST_STREAM, not a clean end
     check not r.endStream
     sleep(100)
     check drainRegs.load() == 1
-    check drainFires.load() == 0
+    check drainFires.load() == 1
+    check firedBeforeEnd.load() == 0
+    check endedInDrain.load() == 1
+    check wroteInDrain.load() == 0
+    check lateFires.load() == 0
 
   test "a flush-before-finish loop parks on a stalled peer, then completes":
     # `while res.bufferedAmount > 0: await res.drained()` against a 16 KiB

@@ -1,7 +1,9 @@
-## The protocol-independent request handle. A `Request` is four words:
+## The protocol-independent request handle. A `Request` is five words:
 ## a pointer to the owning loop's core state, the connection's fd, a
-## generation counter, and (for HTTP/2) a stream id. Responding through a
-## stale handle (connection closed/recycled meanwhile) is a safe no-op.
+## generation counter, (for HTTP/2 and HTTP/3) a stream id, and (for HTTP/1)
+## a per-request serial. Responding through a stale handle (connection
+## closed/recycled meanwhile, or, on HTTP/1, the request already finished and
+## the keep-alive connection moved on to the next one) is a safe no-op.
 ##
 ## Handlers may respond inside the handler call (fast path) or later;
 ## HTTP/1 pauses request parsing until a response is produced; HTTP/2
@@ -44,19 +46,30 @@ type
     fd*: int32
     gen*: uint32
     stream*: uint32           ## HTTP/2 stream id, 0 for HTTP/1
+    serial*: uint32           ## HTTP/1 request serial (Connection.reqSerial
+                              ## when the handle was minted); 0 and ignored
+                              ## for h2/h3, whose stream ids are never reused
+                              ## inside a connection. fd + gen name the
+                              ## connection, the serial names the request on
+                              ## it: a handle kept past its request resolves
+                              ## to nil once the next keep-alive request
+                              ## starts, so it cannot read or write that
+                              ## request's state (#407).
     snap*: ptr ReqSnapshot    ## non-nil on a blocking: worker: read this
                               ## value snapshot instead of live loop memory
                               ## (IMP2 / C3). nil on the loop thread.
 
   Response* = object
-    ## The write half of a request/response pair: the same four handle
-    ## words as Request, carrying only the capability to send. Copying
-    ## it anywhere (workers, async callbacks) is free; sending through a
-    ## dead connection is a safe no-op.
+    ## The write half of a request/response pair: the same handle words
+    ## as Request, carrying only the capability to send. Copying it
+    ## anywhere (workers, async callbacks) is free; sending through a dead
+    ## connection, a dead stream, or (HTTP/1) a request that already
+    ## finished is a safe no-op (#407: `serial` as on Request).
     core*: ptr LoopCore
     fd*: int32
     gen*: uint32
     stream*: uint32
+    serial*: uint32           ## HTTP/1 request serial; see Request.serial
     relKind*: PinRelease      ## the pin release the first outbox message this
                               ## handle emits from a worker must carry. Set
                               ## once by the owning trampoline (prBlocking for
@@ -91,7 +104,28 @@ type
 proc response*(req: Request): Response =
   ## The Response paired with a Request. Dispatch hands handlers both;
   ## this exists for code that stored only the read half.
-  Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream)
+  Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
+           serial: req.serial)
+
+proc request(res: Response): Request {.inline.} =
+  ## The Request half of a Response handle, same words (serial included), for
+  ## the read-side helpers the response paths call (encoding negotiation, file
+  ## serving, SSE liveness).
+  Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream,
+          serial: res.serial)
+
+proc requestFor*(core: ptr LoopCore, fd: int32, gen: uint32,
+                 stream: uint32): Request =
+  ## A Request for the request currently in flight on (fd, gen, stream), for
+  ## loop callbacks that are handed only the connection words and run for the
+  ## current request by construction (a `StreamRouteCb` streaming predicate,
+  ## called at headers-complete). An HTTP/1 handle takes the connection's live
+  ## request serial; never use this to revive a handle kept from earlier.
+  ## Loop-thread only.
+  result = Request(core: core, fd: fd, gen: gen, stream: stream)
+  if fd >= 0 and stream == 0:
+    let c = conn(core, fd, gen)
+    if c != nil: result.serial = c.reqSerial
 
 var cachedThreadId {.threadvar.}: int
 
@@ -101,6 +135,22 @@ proc currentThreadId(): int {.inline.} =
   if cachedThreadId == 0:
     cachedThreadId = getThreadId()
   cachedThreadId
+
+proc liveConn(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
+              serial: uint32): ptr Connection {.inline.} =
+  ## Resolve a handle's Connection: `conn` (fd + generation) plus, for an
+  ## HTTP/1 handle (stream 0), the request serial -- one extra integer compare.
+  ## nil when the connection is gone, or when the request the handle was minted
+  ## for has finished and the keep-alive connection reset for the next one
+  ## (#407), so every h1 path resolving through it reads a stale handle exactly
+  ## as a dead h2 stream reads. h2 handles (stream != 0) skip the serial: their
+  ## per-stream lookups already return nil for a dead stream. Loop-thread only.
+  result = conn(core, fd, gen)
+  if result != nil and stream == 0 and result.reqSerial != serial:
+    result = nil
+
+template liveConn(h: Request | Response): ptr Connection =
+  liveConn(h.core, h.fd, h.gen, h.stream, h.serial)
 
 proc isAlive*(req: Request): bool =
   ## True while the client is still connected (this request's stream is open).
@@ -118,18 +168,22 @@ proc isAlive*(req: Request): bool =
       return h3c != nil and h3StreamAlive(h3c, uint64(req.stream))
     else:
       return false
-  let c = conn(req.core, req.fd, req.gen)
+  let c = liveConn(req)
   if c == nil: return false
   if req.stream == 0: true
   else: h2StreamAlive(c, req.stream)
 
 proc reqStateOf(core: ptr LoopCore, fd: int32, gen: uint32,
-                stream: uint32): ptr RequestState =
+                stream: uint32, serial: uint32): ptr RequestState =
   ## Resolve a handle's shared per-request state (connection.RequestState) by
   ## discriminating the carrier once: the H3Stream (fd < 0 is an h3 slot), the
   ## H2Stream (stream != 0), or the Connection itself (HTTP/1). nil for a stale
-  ## handle. Loop-thread only; callers on the worker path must consult req.snap
-  ## first (a snapshot request never reads live loop memory).
+  ## handle: a gone connection, a dead h2/h3 stream, or an HTTP/1 handle whose
+  ## `serial` is not the connection's current request serial (the request it
+  ## was minted for finished and the connection moved on, #407; without the
+  ## check `addr c.rs` would be the NEXT request's state). Loop-thread only;
+  ## callers on the worker path must consult req.snap first (a snapshot
+  ## request never reads live loop memory).
   if fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(core, fd, gen)
@@ -137,7 +191,7 @@ proc reqStateOf(core: ptr LoopCore, fd: int32, gen: uint32,
         let st = h3StreamPtr(h3c, uint64(stream))
         if st != nil: return addr st.rs
     return nil
-  let c = conn(core, fd, gen)
+  let c = liveConn(core, fd, gen, stream, serial)
   if c == nil: return nil
   if stream != 0:
     let st = h2Stream(c, stream)
@@ -146,10 +200,10 @@ proc reqStateOf(core: ptr LoopCore, fd: int32, gen: uint32,
   addr c.rs
 
 template reqState(req: Request): ptr RequestState =
-  reqStateOf(req.core, req.fd, req.gen, req.stream)
+  reqStateOf(req.core, req.fd, req.gen, req.stream, req.serial)
 
 template reqState(res: Response): ptr RequestState =
-  reqStateOf(res.core, res.fd, res.gen, res.stream)
+  reqStateOf(res.core, res.fd, res.gen, res.stream, res.serial)
 
 proc responded*(res: Response): bool =
   ## True once a response has been sent (or a streamed response started) for this
@@ -182,7 +236,7 @@ when not defined(plainHttp):
         if n == name: return v
 
 template withConn(req: Request, c, body: untyped) =
-  let c = conn(req.core, req.fd, req.gen)
+  let c = liveConn(req)
   if c != nil:
     body
 
@@ -205,7 +259,7 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
     else:
       discard
   else:
-    let c = conn(req.core, req.fd, req.gen)
+    let c = liveConn(req)
     if c != nil:
       if req.stream != 0:
         onH2
@@ -214,6 +268,17 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
 
 proc lowerA(c: char): char {.inline.} =
   if c in 'A'..'Z': char(uint8(c) or 0x20'u8) else: c
+
+var staleHeaders {.threadvar.}: ResponseHeaders
+  ## Write-only sink `res.headers` / `res.trailers` hand a stale HTTP/1 handle.
+
+proc staleScratch(): var ResponseHeaders =
+  ## The sink for a stale HTTP/1 handle's `res.headers` / `res.trailers`: what
+  ## the caller writes is discarded instead of keyed into the tables, where
+  ## nothing would ever emit or drop it before the connection closes (#407).
+  ## Cleared on every hand-out so nothing one stale call writes is read back.
+  staleHeaders.s.setLen(0)
+  staleHeaders
 
 proc headers*(res: Response): var ResponseHeaders =
   ## Response headers to send with the eventual `res.send`. Set them from
@@ -225,7 +290,10 @@ proc headers*(res: Response): var ResponseHeaders =
   assert currentThreadId() == res.core.threadId,
     "res.headers is loop-thread only; set headers before req.blocking, or " &
     "pass them to send() from the worker"
-  res.core.respHeaders.mgetOrPut((res.fd, res.gen, res.stream), ResponseHeaders())
+  if res.fd >= 0 and res.stream == 0 and liveConn(res) == nil:
+    return staleScratch()             # finished h1 request: a sink (#407)
+  res.core.respHeaders.mgetOrPut(reqKey(res.fd, res.gen, res.stream, res.serial),
+                                 ResponseHeaders())
 
 proc trailers*(res: Response): var ResponseHeaders =
   ## Response trailers to emit after a streamed body: the chunked trailer
@@ -236,7 +304,10 @@ proc trailers*(res: Response): var ResponseHeaders =
   ## (`res.sendHead`/`write`/`finish`); loop-thread only, like `res.headers`.
   assert currentThreadId() == res.core.threadId,
     "res.trailers is loop-thread only; set it before res.finish on the loop"
-  res.core.respTrailers.mgetOrPut((res.fd, res.gen, res.stream), ResponseHeaders())
+  if res.fd >= 0 and res.stream == 0 and liveConn(res) == nil:
+    return staleScratch()             # finished h1 request: a sink (#407)
+  res.core.respTrailers.mgetOrPut(reqKey(res.fd, res.gen, res.stream, res.serial),
+                                  ResponseHeaders())
 
 # --- accessors --------------------------------------------------------------
 
@@ -463,7 +534,7 @@ proc clientCertSubject*(req: Request): string =
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
       if h3c != nil: return tlscodec.peerCertSubject(h3c.ssl)
     else:
-      let c = conn(req.core, req.fd, req.gen)
+      let c = liveConn(req)
       if c != nil and c.ssl != nil: return tlscodec.peerCertSubject(c.ssl)
 
 proc forwardedFor*(req: Request): seq[string] =
@@ -580,7 +651,7 @@ proc isSecure*(req: Request): bool =
   if fp.len > 0: return fp == "https"
   if req.snap != nil: return req.snap.secure
   if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
-  let c = conn(req.core, req.fd, req.gen)
+  let c = liveConn(req)
   c != nil and c.ssl != nil
 
 proc scheme*(req: Request): string =
@@ -950,12 +1021,45 @@ proc headersHaveCt(h: openArray[(string, string)]): bool =
   for (n, _) in h:
     if cmpIgnoreCase(n, "content-type") == 0: return true
 
+proc takeEndedDrain(c: ptr Connection): RespDrainCb {.inline.} =
+  ## Detach the HTTP/1.1 drain callback `finish` / `abort` / a buffered `send`
+  ## is about to end the response under, for fireEndedDrain /
+  ## fireAnsweredDrain (#408). While closeConn is delivering the connection's
+  ## teardown callbacks (closeInProgress) it is left where it is instead:
+  ## closeConn fires one parked before the close itself, and drops one a
+  ## producer re-registered from inside its close notification, so the
+  ## producer is called back once, never re-entered from its own finish.
+  if c.closeInProgress: return nil
+  result = c.rs.onRespDrain
+  c.rs.onRespDrain = nil
+
+proc fireAnsweredDrain(core: ptr LoopCore, c: ptr Connection) {.raises: [].} =
+  ## A buffered response just answered this HTTP/1.1 request (applyResponse set
+  ## `responded`): deliver a drain callback still parked on it, once, now that
+  ## the response is over (#408). On HTTP/1.1 `bufferedAmount` is the whole
+  ## connection's pending output, so `await res.drained()` (or `res.onDrain`)
+  ## can register before any head while an earlier pipelined response is still
+  ## queued; only sendHead arms such a registration, and a buffered `send`
+  ## used to go straight on to the keep-alive reset, which dropped the callback
+  ## with the rest of the request state, so the coroutine stayed parked for
+  ## good. Fired after `responded` is set, so the callback observes
+  ## `res.ended` true, `write` returning false and `drained()` completing; it
+  ## runs before the reset, so its handle still names this request, and
+  ## detaching first leaves nothing for closeConn to fire again.
+  let cb = takeEndedDrain(c)
+  if cb == nil: return
+  c.respBackedUp = false
+  try: cb(core, c.fd, c.gen, 0)
+  except Exception: discard    # unannotated user producer (raises: [Exception])
+
 proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                     code: int, contentType: string,
                     headers: openArray[(string, string)],
                     body: openArray[char]) =
   ## Serialize a response into the connection's write buffer using the
-  ## connection's protocol. Loop thread only.
+  ## connection's protocol. Loop thread only. On HTTP/1.1 a drain callback
+  ## registered before any head and still parked fires once afterwards
+  ## (fireAnsweredDrain, #408); h2 tears the stream down, which fires it.
   # The OWASP baseline (empty unless securityHeaders is on) is injected during
   # serialization, so no merged header seq is allocated per response; the
   # emitter skips any baseline name the handler already set (app wins).
@@ -975,7 +1079,7 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                      altSvc = core.altSvc, secHeaders = core.secHeaders)
       if not c.parser.keepAlive:
         c.closeAfterFlush = true
-  let key = (c.fd, c.gen, stream)
+  let key = reqKey(c.fd, c.gen, stream, c.reqSerial)
   # Skip the tuple hash + table probe unless some response actually set headers
   # (the table is empty and drained otherwise); the common no-custom-header case
   # then pays only an O(1) len check. When there are pending headers, `pop`
@@ -987,6 +1091,9 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
     let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
     emit(ct, merged)
   else: emit(contentType, headers)
+  # emit returned already when an h1 request had its response, so this runs
+  # only for the send that just answered it.
+  if stream == 0: fireAnsweredDrain(core, c)
 
 proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
               code: int, contentType: string,
@@ -996,7 +1103,7 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
   when not defined(plainHttp):
     let h3c = h3ConnOf(core, fd, gen)
     if h3c != nil:
-      let key = (fd, gen, stream)
+      let key = reqKey(fd, gen, stream, 0)
       var pending: ResponseHeaders
       if core.respHeaders.len > 0 and core.respHeaders.pop(key, pending):
         let merged = pending.mergedWith(headers)
@@ -1026,15 +1133,16 @@ proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
     # release per sync task" hold on this path.
     if workerResponded: return
     push(res.core.outbox, OutMsg(
-      fd: res.fd, gen: res.gen, stream: res.stream, code: int32(code),
-      data: packResponse(contentType, headers, body), release: res.relKind))
+      fd: res.fd, gen: res.gen, stream: res.stream, serial: res.serial,
+      code: int32(code), data: packResponse(contentType, headers, body),
+      release: res.relKind))
     workerResponded = true
     return
   if res.fd < 0:
     h3Apply(res.core, res.fd, res.gen, res.stream, int(code), contentType,
             headers, body)
     return
-  let c = conn(res.core, res.fd, res.gen)
+  let c = liveConn(res)
   if c != nil:
     applyResponse(res.core, c, res.stream, int(code), contentType,
                   headers, body)
@@ -1080,8 +1188,7 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if not res.core.config.compress or not compressibleType(contentType) or
         hasContentEncoding(headers):
       return ""
-    chooseEncoding(Request(core: res.core, fd: res.fd, gen: res.gen,
-                           stream: res.stream))
+    chooseEncoding(res.request)
 
   proc makeStreamComp(enc: string): RootRef =
     ## A streaming compressor for `enc` (a CompressStream, stored type-erased as
@@ -1123,8 +1230,7 @@ proc sendBody(res: Response, code: HttpCode, body: openArray[char],
   when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     if res.core.config.compress and body.len >= compressMinSize and
         compressibleType(effCt) and not hasContentEncoding(headers):
-      let enc = chooseEncoding(Request(core: res.core, fd: res.fd,
-                                       gen: res.gen, stream: res.stream))
+      let enc = chooseEncoding(res.request)
       var packed = ""
       when defined(httpBrotli):
         if enc == "br": packed = brotli(body)
@@ -1291,7 +1397,7 @@ proc informational*(res: Response, code: HttpCode,
   if ci < 100 or ci > 199: return
   if currentThreadId() != res.core.threadId: return   # loop-thread only
   if res.fd < 0: return                                # h3: not yet supported
-  let c = conn(res.core, res.fd, res.gen)
+  let c = liveConn(res)
   if c == nil: return
   if res.stream != 0:
     h2SendInformational(c, ci, res.stream, headers)
@@ -1545,7 +1651,7 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
       if h3c != nil:
         h3SetOnBody(h3c, uint64(req.stream), cb, manualAck)
     return
-  let c = conn(req.core, req.fd, req.gen)
+  let c = liveConn(req)
   if c == nil: return
   if req.stream != 0:
     h2SetOnBody(c, req.stream, cb, manualAck)
@@ -1580,7 +1686,7 @@ proc ackBody*(req: Request, n: int) =
         # MAX_(STREAM_)DATA frames vqStreamConsume produces go out on the QUIC
         # engine pump this same loop iteration.
     return
-  let c = conn(req.core, req.fd, req.gen)
+  let c = liveConn(req)
   if c == nil: return
   if req.stream != 0:
     h2AckBody(c, req.stream, n)
@@ -1605,8 +1711,61 @@ proc flushConn(res: Response) {.raises: [].} =
   except Exception: discard
 
 proc kickConn(res: Response) {.raises: [].} =
-  try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0)
+  try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0, res.serial)
   except Exception: discard
+
+proc ended*(res: Response): bool {.raises: [].} =
+  ## True once this response can carry no more body: `finish` or `abort` ran
+  ## (including the internal abort of a body that missed its declared
+  ## Content-Length), a buffered `send` answered it, or its stream or
+  ## connection is gone. False before any response and while a streamed body
+  ## is open. On an ended response `write` returns false and is a no-op,
+  ## `drained()` completes on the next turn of the event loop and `onDrain` is
+  ## a no-op (#408); a drain callback or `drained()` wait still parked when
+  ## any of those events ends the response is fired once. This is the check a
+  ## producer loop must make (or stop on a false `write`): one that ignores
+  ## both never finishes its source. A WebSocket carrier is not "ended" here
+  ## (its drain is its own). Loop-thread only: true from any other thread,
+  ## like `req.isAlive` reporting false there.
+  if currentThreadId() != res.core.threadId: return true
+  try:
+    let rs = reqState(res)
+    if rs == nil: return true
+    if res.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(res.core, res.fd, res.gen)
+        let st = h3StreamPtr(h3c, uint64(res.stream))
+        return st.ws == nil and rs.responded and not rs.respStreaming
+      else:
+        return true
+    let c = conn(res.core, res.fd, res.gen)
+    if res.stream != 0:
+      let st = h2Stream(c, res.stream)
+      # h2 tracks the streamed body in respPhase (rs.respStreaming is h1/h3's).
+      return st.ws == nil and rs.responded and st.respPhase != rpStreaming
+    c.ws == nil and rs.responded and not rs.respStreaming
+  except Exception:
+    true   # the lookups only raise on a table they just checked
+
+proc fireEndedDrain(res: Response, cb: RespDrainCb) {.raises: [].} =
+  ## HTTP/1.1 half of #408 (the h2/h3 codecs carry their own): deliver the drain
+  ## callback `finish` / `abort` detached, once, after the response is torn
+  ## down, so a coroutine parked in `await res.drained()` while another task
+  ## ended the response resumes now instead of when the connection closes
+  ## (closeConn finds the callback already detached). Runs before the kick that
+  ## resumes the pipeline, so the callback's handle still names this request.
+  if cb == nil: return
+  try: cb(res.core, res.fd, res.gen, res.stream)
+  except Exception: discard
+
+proc dropEndedFields(res: Response) {.raises: [].} =
+  ## Forget `res.headers` / `res.trailers` set on a response that has ended
+  ## (from a fired drain callback, say): nothing will emit them, and on an
+  ## HTTP/1.1 keep-alive connection the handle's words would otherwise outlive
+  ## it (#408); the serial keeps the key this request's own (#407).
+  let key = reqKey(res.fd, res.gen, res.stream, res.serial)
+  if res.core.respHeaders.len > 0: res.core.respHeaders.del key
+  if res.core.respTrailers.len > 0: res.core.respTrailers.del key
 
 proc h2Writable(res: Response): bool =
   ## Backpressure verdict for an HTTP/2 streamed write: writable only when both
@@ -1628,22 +1787,24 @@ proc h2Writable(res: Response): bool =
   ## response stopped mid-body. A verdict taken on the live numbers reports
   ## backpressure only while one of the two caps is genuinely exceeded, and then
   ## the socket or the peer's window still owes an event that resumes it.
-  let c = conn(res.core, res.fd, res.gen)     # flush may have closed the conn
+  let c = liveConn(res)     # flush may have closed the conn
   if c == nil: return false
-  var backlog = 0
   let st = h2Stream(c, res.stream)
-  if st != nil and st.respPhase == rpStreaming and not st.isHead and
-      st.ws == nil:
+  # A stream with no open body is not writable at all (#408): gone (a HEAD
+  # closed at its head, an abort, a peer reset), or past rpStreaming (a finish()
+  # whose final DATA is still queued). These used to fall through to the
+  # connection cap and report writable, so a producer resumed on an ended
+  # response kept "writing" into nothing; returning before the mark below also
+  # keeps a finished stream from being re-marked backed up with a producer that
+  # will never be resumed. `write` already refused such a stream before the
+  # call; this catches one the write itself ended.
+  if st == nil or st.respPhase != rpStreaming: return false
+  var backlog = 0
+  if not st.isHead and st.ws == nil:
     backlog = st.pendingBody.len - st.pendingPos
-  # Those are h2StreamWrite's own guards, so the verdict is taken on the backlog
-  # the write it follows could actually have added to, and only on that: a
-  # stream that is gone (a HEAD closed at its head, an abort, a peer reset), one
-  # past rpStreaming (the final DATA of a finish() still queued), a HEAD, or an
-  # Extended CONNECT stream whose pendingBody is a WebSocket frame queue and not
-  # a response backlog at all, all contribute 0 and let the connection cap
-  # decide -- which is what lets `write` on a HEAD response still report
-  # writable, and keeps `write` after finish() from re-marking a finished stream
-  # backed up with a producer that will never be resumed.
+  # The verdict is taken on the backlog the write could actually have added to,
+  # and only on that: an Extended CONNECT stream's pendingBody is a WebSocket
+  # frame queue, not a response backlog, and contributes 0.
   if backlog >= respHighWater or pendingOut(c) >= respHighWater:
     h2MarkRespBackedUp(c, res.stream)
     return false
@@ -1665,10 +1826,10 @@ proc h1ArmHeadDrain(res: Response) {.raises: [].} =
   ## the body backed up. Mark it now that the response streams, AFTER the head's
   ## own flush so it is not fired inside sendHead, and owe it a loop pass in
   ## case the buffer is already empty and no drain event will come.
-  let c = conn(res.core, res.fd, res.gen)
+  let c = liveConn(res)
   if c == nil or c.rs.onRespDrain == nil or not c.rs.respStreaming: return
   c.respBackedUp = true
-  queueDrainKick(res.core, addr c.rs, (res.fd, res.gen, 0'u32))
+  queueDrainKick(res.core, addr c.rs, reqKey(res.fd, res.gen, 0, res.serial))
 
 proc sendHead*(res: Response, code: HttpCode, contentType = "",
                headers: openArray[(string, string)] = [],
@@ -1687,7 +1848,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # applyResponse/h3Apply -- the streaming/file head used to drop them (R14).
     # The send argument wins per name. Consume the entry so the HEAD fallback's
     # applyResponse (which also merges) does not double-apply it.
-    let hkey = (res.fd, res.gen, res.stream)
+    let hkey = reqKey(res.fd, res.gen, res.stream, res.serial)
     var userHeaders: seq[(string, string)]
     if res.core.respHeaders.len > 0 and res.core.respHeaders.hasKey(hkey):
       userHeaders = res.core.respHeaders[hkey].mergedWith(headers)
@@ -1721,7 +1882,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
             if enc.len > 0:
               h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
       return
-    let c = conn(res.core, res.fd, res.gen)
+    let c = liveConn(res)
     if c == nil: return
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
@@ -1788,7 +1949,10 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
   ## callback): a call from a worker or a thread of your own is also a no-op
   ## returning false, so false is not exclusively backpressure. Use
   ## `req.isAlive` to tell a dead connection from a full backlog, and don't
-  ## stream from off the loop thread at all.
+  ## stream from off the loop thread at all. On an ended response (`res.ended`:
+  ## finished, aborted, a peer-reset stream, an HTTP/2 or HTTP/3 HEAD) it is a
+  ## no-op returning false on every protocol (#408; HTTP/2 and HTTP/3 used to
+  ## report such a stream writable).
   ##
   ## A single chunk LARGER than `respHighWater` is accepted whole: `write` never
   ## writes a partial chunk and never refuses one, so the backlog can exceed the
@@ -1810,6 +1974,11 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
+          # No open body (finished, aborted, reset by the peer, a HEAD, or no
+          # head yet): false, not the "writable" a zero backlog would read as,
+          # so a producer resumed on an ended response stops (#408).
+          let st = h3StreamPtr(h3c, uint64(res.stream))
+          if st == nil or not st.rs.respStreaming: return false
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
@@ -1818,9 +1987,14 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
               return h3StreamWrite(h3c, uint64(res.stream), z) < respHighWater
           return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
       return false
-    var c = conn(res.core, res.fd, res.gen)
+    var c = liveConn(res)
     if c == nil: return false
     if res.stream != 0:
+      # Same rule on h2 (#408): a stream that is gone (aborted, reset by the
+      # peer, a HEAD closed at its head) or past rpStreaming used to report
+      # writable whenever the connection buffer had room.
+      let open = h2Stream(c, res.stream)
+      if open == nil or open.respPhase != rpStreaming: return false
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
@@ -1845,7 +2019,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
             c.wbuf.setLen(oldLen + z.len)
             copyMem(addr c.wbuf[oldLen], unsafeAddr z[0], z.len)
         flushConn(res)
-        c = conn(res.core, res.fd, res.gen)
+        c = liveConn(res)
         if c == nil: return false
         if pendingOut(c) >= respHighWater:
           c.respBackedUp = true
@@ -1858,7 +2032,7 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       c.wbuf.setLen(oldLen + data.len)
       copyMem(addr c.wbuf[oldLen], unsafeAddr data[0], data.len)
     flushConn(res)
-    c = conn(res.core, res.fd, res.gen)   # flush may have closed on error
+    c = liveConn(res)   # flush may have closed on error
     if c == nil: return false
     if pendingOut(c) >= respHighWater:
       c.respBackedUp = true
@@ -1873,11 +2047,18 @@ proc finish*(res: Response) {.raises: [].} =
   ## HTTP/3, or a connection close for HTTP/1.0; then flush and resume the
   ## connection for the next request. Set trailers with `res.trailers` first.
   ## `{.raises: [].}` (contained) for async.
+  ##
+  ## A drain callback still pending (`onDrain`, or a coroutine parked in
+  ## `await res.drained()` / `await res.write`) fires once, after the response
+  ## is finished, on every protocol (#408), and sees it ended: `write` returns
+  ## false, `drained()` completes on the next loop turn, `onDrain` is a no-op.
+  ## So does the abort `finish` turns into when a declared Content-Length was
+  ## missed.
   try:
     if currentThreadId() != res.core.threadId: return
     # Pull any pending res.trailers (loop-thread only, so no lock needed).
     var trailers: seq[(string, string)]
-    let tkey = (res.fd, res.gen, res.stream)
+    let tkey = reqKey(res.fd, res.gen, res.stream, res.serial)
     var pendingTrailers: ResponseHeaders     # fetch + remove in one probe
     if res.core.respTrailers.len > 0 and res.core.respTrailers.pop(tkey, pendingTrailers):
       for pair in pendingTrailers.pairs: trailers.add pair
@@ -1892,8 +2073,9 @@ proc finish*(res: Response) {.raises: [].} =
               if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
           h3StreamFinish(h3c, uint64(res.stream), trailers)
+          if ended(res): dropEndedFields(res)
       return
-    let c = conn(res.core, res.fd, res.gen)
+    let c = liveConn(res)
     if c == nil: return
     if res.stream != 0:
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
@@ -1910,13 +2092,14 @@ proc finish*(res: Response) {.raises: [].} =
           if st != nil:
             st.rs.respComp = nil
             st.rs.respEnc = ""
-      h2StreamFinish(c, res.stream, trailers)
+      h2StreamFinish(c, res.stream, trailers)   # fires a parked drain (#408)
+      if ended(res): dropEndedFields(res)
       flushConn(res)
       return
     if not c.rs.respStreaming: return
     c.rs.respStreaming = false
     c.respBackedUp = false
-    c.rs.onRespDrain = nil
+    let drainCb = takeEndedDrain(c)   # fired once, below (#408)
     let framing = c.respFraming
     c.respFraming = rfNone
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
@@ -1945,6 +2128,8 @@ proc finish*(res: Response) {.raises: [].} =
     if not c.parser.keepAlive or c.peerHalfClosed or
         framing == rfCloseDelimited:
       c.closeAfterFlush = true
+    fireEndedDrain(res, drainCb)
+    dropEndedFields(res)
     # kick resumes the paused pipeline when finish runs after the handler
     # returned (deferred); inline finish is a no-op here and the dispatch
     # return path resets and flushes.
@@ -1967,11 +2152,30 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## LATER `res.write` on the same response, whose flush runs the drain path. A
   ## producer that re-registers from its callback without writing is fired
   ## again on every loop pass while drained (effectively a setImmediate). A
-  ## later registration replaces an unfired one, `finish` / `abort` drop one
-  ## still pending, and on an HTTP/2 HEAD response a registration after
-  ## `sendHead` is dropped (the head closed the stream). Loop-thread only to
-  ## register, too: an off-thread registration is dropped silently, and a
-  ## producer that then waits for the callback waits for good.
+  ## later registration replaces an unfired one.
+  ##
+  ## Ending the response fires one still pending, on every protocol (#408):
+  ## `finish`, `abort`, the abort `finish` becomes on a body that missed its
+  ## declared Content-Length, and a buffered `res.send` that answers a request
+  ## whose callback was registered before any head (from another task, or the
+  ## same handler; on HTTP/1.1 `bufferedAmount` counts an earlier pipelined
+  ## response still queued, so a wait can park there) each detach the
+  ## callback, end the response, then invoke it once, so the callback always
+  ## runs AFTER the response is over. It sees `res.ended` true, `write`
+  ## returning false (a no-op), `drained()` completing on the next loop turn,
+  ## and a registration from inside it (or any later one) dropped as a no-op;
+  ## the connection-close path later finds nothing to fire again. This is
+  ## what resumes a coroutine parked in `await res.drained()` (or `await
+  ## res.write`) when ANOTHER task ends the response; before, the callback
+  ## was dropped and the coroutine stayed parked until the connection died.
+  ## The rule is uniform, so a sync producer that registers and then ends the
+  ## response itself is called back once more: a producer that stops on a
+  ## false `write` (the documented pattern) or checks `res.ended` does nothing
+  ## there. The same holds when the client
+  ## goes away (connection close, or a peer reset of the stream).
+  ##
+  ## Loop-thread only to register, too: an off-thread registration is dropped
+  ## silently, and a producer that then waits for the callback waits for good.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
   # The h3 reflush path cannot pass the handle words, so the callback closes
@@ -1980,6 +2184,9 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   let held = res
   let rs = reqState(res)
   if rs == nil: return
+  # An ended response has no drain left to report, and its state may already
+  # be the next request's (h1 keep-alive): never store a callback on it (#408).
+  if ended(res): return
   rs.onRespDrain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
                         stream: uint32) {.gcsafe.} =
     captured(held)
@@ -1995,11 +2202,11 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   # writable callback checks the backlog, not a flag), only the loop pass. An
   # h1 registration made before the head is marked by sendHead (h1ArmHeadDrain).
   if res.fd >= 0:
-    let c = conn(res.core, res.fd, res.gen)
+    let c = liveConn(res)
     if c != nil:
       if res.stream != 0: h2ArmDrain(c, res.stream)
       elif c.rs.respStreaming: c.respBackedUp = true
-  queueDrainKick(res.core, rs, (res.fd, res.gen, res.stream))
+  queueDrainKick(res.core, rs, reqKey(res.fd, res.gen, res.stream, res.serial))
 
 proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
   ## The loop pass each `res.onDrain` registration is owed (LoopCore.drainKicks,
@@ -2008,16 +2215,18 @@ proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
   ## registration marked the response for it). Called once per loop iteration
   ## by the event loop, outside any codec callback, so a fired producer may
   ## write freely. Exactly once: every firing site (this one, the h2 resume
-  ## scan, h1's flushOut, h3's writable callback, every teardown) clears the
-  ## callback before invoking it, and a kick that finds it already gone --
-  ## fired, replaced, dropped by finish/abort, or its connection closed and
-  ## recycled -- does nothing.
+  ## scan, h1's flushOut, h3's writable callback, finish/abort (#408), every
+  ## teardown) clears the callback before invoking it, and a kick that finds it
+  ## already gone -- fired, replaced, fired by finish/abort, or its stream or
+  ## connection closed and recycled -- does nothing.
   if core.drainKicks.len == 0: return
   var kicks: seq[ReqKey]
   swap(kicks, core.drainKicks)        # a re-registration lands on the next pass
-  for (fd, gen, stream) in kicks:
+  for (fd, gen, stream, serial) in kicks:
     try:
-      let rs = reqStateOf(core, fd, gen, stream)
+      # The serial makes a kick queued by a finished h1 request resolve to nil
+      # here rather than to the next request's state (#407).
+      let rs = reqStateOf(core, fd, gen, stream, serial)
       if rs == nil: continue
       rs.drainKickQueued = false      # consumed: the next registration re-queues
       if rs.onRespDrain == nil: continue
@@ -2080,7 +2289,7 @@ proc bufferedAmount*(res: Response): int =
       if h3c != nil:
         return h3StreamBacklog(h3c, uint64(res.stream))
     return 0
-  let c = conn(res.core, res.fd, res.gen)
+  let c = liveConn(res)
   if c == nil: return 0
   if res.stream != 0:
     let st = h2Stream(c, res.stream)
@@ -2102,7 +2311,7 @@ proc setPriority*(res: Response, urgency: range[0..7], incremental = false)
   ## Loop-thread only; call before or while streaming the response.
   if currentThreadId() != res.core.threadId: return
   if res.fd < 0: return                       # h3: handled by the ngtcp2 backend
-  let c = conn(res.core, res.fd, res.gen)
+  let c = liveConn(res)
   if c != nil and res.stream != 0:
     h2SetPriority(c, res.stream, uint8(urgency), incremental)
 
@@ -2113,28 +2322,36 @@ proc abort*(res: Response) {.raises: [].} =
   ## stream with an internal error. Use this instead of `finish` when the body
   ## cannot be completed (an error partway through). No-op if not streaming.
   ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
+  ##
+  ## As with `finish`, a drain callback still pending fires once after the
+  ## response is torn down (#408), so a coroutine another task left parked in
+  ## `await res.drained()` resumes and finds `write` returning false.
   try:
     if currentThreadId() != res.core.threadId: return
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
-          h3StreamAbort(h3c, uint64(res.stream))
+          h3StreamAbort(h3c, uint64(res.stream))   # fires a parked drain
+          if ended(res): dropEndedFields(res)
       return
-    let c = conn(res.core, res.fd, res.gen)
+    let c = liveConn(res)
     if c == nil: return
     if res.stream != 0:
-      h2StreamAbort(c, res.stream)
+      h2StreamAbort(c, res.stream)                 # fires a parked drain
+      if ended(res): dropEndedFields(res)
       flushConn(res)
       return
     if not c.rs.respStreaming: return
     c.rs.respStreaming = false
     c.respBackedUp = false
-    c.rs.onRespDrain = nil
+    let drainCb = takeEndedDrain(c)   # fired once, below (#408)
     # No terminating chunk: closing mid-stream is the truncation signal. (For a
     # close-delimited HTTP/1.0 body there is no in-band signal; close is all we
     # have.)
     c.closeAfterFlush = true
+    fireEndedDrain(res, drainCb)
+    dropEndedFields(res)
     kickConn(res)
   except Exception:
     discard
@@ -2351,8 +2568,7 @@ proc alive*(s: SseStream): bool =
   ## False once the client disconnects; the producer loop should stop. Use this
   ## rather than `send` returning false, which is ambiguous (backpressure *or*
   ## a dead connection). Loop-thread only: false from any other thread.
-  Request(core: s.res.core, fd: s.res.fd, gen: s.res.gen,
-          stream: s.res.stream).isAlive
+  s.res.request.isAlive
 
 proc close*(s: SseStream) {.raises: [].} = s.res.finish()
   ## End the SSE stream cleanly and resume the connection.
@@ -2462,19 +2678,19 @@ type PoolSaturatedError* = object of CatchableError
   ## queuing without bound. The synchronous `blocking:` template answers 503
   ## directly rather than raising.
 
-proc emitPoolSaturated(core: ptr LoopCore, fd: int32, gen: uint32,
-                       stream: uint32) =
+proc emitPoolSaturated(req: Request) =
   ## Load shedding: answer 503 on the loop thread for a `blocking:` dispatch the
   ## saturated pool refused, without pinning or running any body.
   const body = "503 Service Unavailable"
   const hdrs = [("Retry-After", "1")]
-  if fd < 0:
+  if req.fd < 0:
     when not defined(plainHttp):
-      h3Apply(core, fd, gen, stream, 503, "text/plain", hdrs, body)
+      h3Apply(req.core, req.fd, req.gen, req.stream, 503, "text/plain", hdrs,
+              body)
   else:
-    let c = conn(core, fd, gen)
+    let c = liveConn(req)
     if c != nil:
-      applyResponse(core, c, stream, 503, "text/plain", hdrs, body)
+      applyResponse(req.core, c, req.stream, 503, "text/plain", hdrs, body)
 
 proc undoPin(req: Request, k: PinKind) =
   ## Release a pin taken on this loop thread for a dispatch the pool then refused
@@ -2486,6 +2702,8 @@ proc undoPin(req: Request, k: PinKind) =
         req.core.h3slots[idx].gen == req.gen:
       releasePin(addr req.core.h3slots[idx], k)
   else:
+    # Raw fd + gen, not liveConn: pins are per connection, and the one taken
+    # moments ago must be released whatever the request serial says.
     let c = conn(req.core, req.fd, req.gen)
     if c != nil: releasePin(c, k)
 
@@ -2493,21 +2711,25 @@ proc undoPinAnd503(req: Request, k: PinKind) =
   ## The pool refused a `blocking:` dispatch after we pinned: release the pin and
   ## answer 503 (load shedding for the synchronous paths).
   undoPin(req, k)
-  emitPoolSaturated(req.core, req.fd, req.gen, req.stream)
+  emitPoolSaturated(req)
 
-proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32): Request =
+proc workerReq(lc: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
+               serial: uint32): Request =
   ## Build the worker's Request, pointing it at the task snapshot when present
   ## (pool path); nil snapshot on the inline loop-thread path (live reads).
+  ## `serial` is the dispatching handle's (WorkerTask.serial), so the worker's
+  ## outbox messages name the request they answer (#407).
   var snap: ptr ReqSnapshot = nil
   if workerSnapshot != nil and workerSnapshot.present: snap = workerSnapshot
-  Request(core: lc, fd: fd, gen: gen, stream: stream, snap: snap)
+  Request(core: lc, fd: fd, gen: gen, stream: stream, serial: serial,
+          snap: snap)
 
 proc workerResponse(req: Request, rel: PinRelease): Response =
   ## The Response for a worker task, carrying the pin release its first outbox
   ## message must stamp (Response.relKind). Each trampoline constructs a fresh
   ## Response, so worker-thread reuse cannot leak a previous task's kind.
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
-           relKind: rel)
+           serial: req.serial, relKind: rel)
 
 template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
   ## The shared invariant of the synchronous worker trampolines: on the pool path
@@ -2529,11 +2751,12 @@ template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
     res.send(Http500, "500 Internal Server Error")
 
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                        stream: uint32, data: string) {.nimcall, gcsafe.} =
+                        stream: uint32, serial: uint32,
+                        data: string) {.nimcall, gcsafe.} =
   discard data                 # HTTP bodies read the request via `req`
   let fn = cast[BlockingProc](user)
   let lc = cast[ptr LoopCore](core)
-  let req = workerReq(lc, fd, gen, stream)
+  let req = workerReq(lc, fd, gen, stream, serial)
   let res = workerResponse(req, prBlocking)   # sync task: first send releases
   runWorkerBody(lc, res):
     fn(req, res)
@@ -2551,7 +2774,7 @@ proc acquireDispatchPin(req: Request, kind: PinKind): bool =
       return false
     acquirePin(req.core, addr req.core.h3slots[idx], kind)
   else:
-    let c = conn(req.core, req.fd, req.gen)
+    let c = liveConn(req)
     if c == nil: return false
     if c.closeRequested:
       # The connection is being torn down (closeConn set this before firing its
@@ -2576,13 +2799,14 @@ proc dispatchBlocking*(req: Request, fn: BlockingProc) {.raises: [].} =
   try:
     if req.core.pool == nil:
       blockingTrampoline(cast[pointer](fn), cast[pointer](req.core),
-                         req.fd, req.gen, req.stream, "")  # no pool: inline
+                         req.fd, req.gen, req.stream, req.serial,
+                         "")  # no pool: inline
       return
     if not acquireDispatchPin(req, pkBlocking): return
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingTrampoline, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
-                       gen: req.gen, stream: req.stream,
+                       gen: req.gen, stream: req.stream, serial: req.serial,
                        snap: snapshotRequest(req))):
       undoPinAnd503(req, pkBlocking) # pool saturated: shed load with 503
   except Exception:
@@ -2596,27 +2820,30 @@ type
     ## file serving to carry the resolved path + options to the worker.
 
 proc blockingDataImpl(user, core: pointer, fd: int32, gen: uint32,
-                      stream: uint32, data: string, rel: PinRelease) {.gcsafe.} =
+                      stream: uint32, serial: uint32, data: string,
+                      rel: PinRelease) {.gcsafe.} =
   let fn = cast[BlockingDataProc](user)
   let lc = cast[ptr LoopCore](core)
-  let req = workerReq(lc, fd, gen, stream)
+  let req = workerReq(lc, fd, gen, stream, serial)
   let res = workerResponse(req, rel)
   runWorkerBody(lc, res):
     fn(req, res, data)
 
 proc blockingDataTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                            stream: uint32, data: string) {.nimcall, gcsafe.} =
+                            stream: uint32, serial: uint32,
+                            data: string) {.nimcall, gcsafe.} =
   ## Sync data body (incl. the sendFile initial read): holds pkBlocking, so
   ## the one message it emits releases prBlocking.
-  blockingDataImpl(user, core, fd, gen, stream, data, prBlocking)
+  blockingDataImpl(user, core, fd, gen, stream, serial, data, prBlocking)
 
 proc fileChunkTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                         stream: uint32, data: string) {.nimcall, gcsafe.} =
+                         stream: uint32, serial: uint32,
+                         data: string) {.nimcall, gcsafe.} =
   ## sendFile chunk read (dispatchNextRead): holds pkFileChunk. Its normal
   ## omFileChunk stamps prFileChunk itself (emitFileChunk); relKind matters
   ## for the error fallback (a reader that raises answers 500 via omHttp,
   ## which must then release the pkFileChunk pin this task holds).
-  blockingDataImpl(user, core, fd, gen, stream, data, prFileChunk)
+  blockingDataImpl(user, core, fd, gen, stream, serial, data, prFileChunk)
 
 proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
                              data: sink string,
@@ -2641,13 +2868,14 @@ proc dispatchBlockingDataPin(req: Request, fn: BlockingDataProc,
   try:
     if req.core.pool == nil:
       tramp(cast[pointer](fn), cast[pointer](req.core),
-            req.fd, req.gen, req.stream, data)  # no pool: inline
+            req.fd, req.gen, req.stream, req.serial, data)  # no pool: inline
       return true
     if not acquireDispatchPin(req, pin): return false
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: tramp, user: cast[pointer](fn),
                        core: cast[pointer](req.core), fd: req.fd,
-                       gen: req.gen, stream: req.stream, data: data,
+                       gen: req.gen, stream: req.stream, serial: req.serial,
+                       data: data,
                        snap: snapshotRequest(req))):
       # Pool saturated: release the pin we just took. Shed load with a 503 for
       # the synchronous path; the file-chunk continuation only releases the pin
@@ -2675,10 +2903,11 @@ type
     data: T
 
 proc blockingArgsTrampoline[T](user, core: pointer, fd: int32, gen: uint32,
-                               stream: uint32, ignored: string) {.nimcall, gcsafe.} =
+                               stream: uint32, serial: uint32,
+                               ignored: string) {.nimcall, gcsafe.} =
   let box = cast[BlockingArgsBox[T]](user)
   let lc = cast[ptr LoopCore](core)
-  let req = workerReq(lc, fd, gen, stream)
+  let req = workerReq(lc, fd, gen, stream, serial)
   let res = workerResponse(req, prBlocking)   # sync task: first send releases
   runWorkerBody(lc, res):
     box.body(req, res, box.data)
@@ -2698,7 +2927,8 @@ proc dispatchBlockingArgs[T](req: Request,
       # on the loop thread, so there is no cross-thread refcount access.
       GC_ref(box)
       blockingArgsTrampoline[T](cast[pointer](box), cast[pointer](req.core),
-                                req.fd, req.gen, req.stream, "")   # inline; unrefs
+                                req.fd, req.gen, req.stream, req.serial,
+                                "")   # inline; unrefs
       return
     # Pool path: hand the box's sole reference to the worker. ORC refcounts are
     # non-atomic, so the box's header must be touched on exactly one thread. The
@@ -2714,7 +2944,7 @@ proc dispatchBlockingArgs[T](req: Request,
     if not tryEnqueue(cast[ptr WorkerPool](req.core.pool),
             WorkerTask(fn: blockingArgsTrampoline[T], user: raw,
                        core: cast[pointer](req.core), fd: req.fd,
-                       gen: req.gen, stream: req.stream,
+                       gen: req.gen, stream: req.stream, serial: req.serial,
                        snap: snapshotRequest(req))):
       # Pool saturated: no worker took the box, so reclaim its sole reference and
       # free it here (loop thread), release the pin, and shed load with 503.
@@ -2743,7 +2973,8 @@ type
     err*: ref CatchableError
 
 proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
-                                    stream: uint32, ignored: string) {.nimcall, gcsafe.} =
+                                    stream: uint32, serial: uint32,
+                                    ignored: string) {.nimcall, gcsafe.} =
   # Access the box through a raw `ptr` to its object payload, never a counted
   # ref-bind. `box` outlives the hop via the single GC_ref in
   # dispatchBlockingResult (released by the drain's GC_unref on the loop). ORC
@@ -2756,7 +2987,7 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
   # RootObj m_type offset correct.
   let box = cast[ptr typeof(BlockingResultBox[A, R]()[])](user)
   let lc = cast[ptr LoopCore](core)
-  let req = workerReq(lc, fd, gen, stream)
+  let req = workerReq(lc, fd, gen, stream, serial)
   # This task owns a pkAwait pin and releases it via the omBlockingDone pushed
   # below (release: prAwait). Any response the body emits itself must carry
   # prNone (res.relKind) so its apply path leaves the pin alone -- releasing
@@ -2791,7 +3022,8 @@ proc dispatchBlockingResult*[A, R](req: Request,
     inc req.core.pendingBlockingResults
     if req.core.pool == nil:
       blockingResultTrampoline[A, R](cast[pointer](box), cast[pointer](req.core),
-                                     req.fd, req.gen, req.stream, "")   # inline
+                                     req.fd, req.gen, req.stream, req.serial,
+                                     "")   # inline
       return
     if not acquireDispatchPin(req, pkAwait):
       # Dead connection: balance the GC_ref and the pending count taken above.
@@ -2800,7 +3032,7 @@ proc dispatchBlockingResult*[A, R](req: Request,
             WorkerTask(fn: blockingResultTrampoline[A, R],
                        user: cast[pointer](box), core: cast[pointer](req.core),
                        fd: req.fd, gen: req.gen, stream: req.stream,
-                       snap: snapshotRequest(req))):
+                       serial: req.serial, snap: snapshotRequest(req))):
       # Pool saturated: fail the awaited future with PoolSaturatedError (the
       # caller can catch it and answer 503, or let it surface as a 500). Balance
       # the pin, the GC_ref and the pending count taken above.
@@ -2828,6 +3060,7 @@ proc emitFileStart*(res: Response, status: int, contentType: string,
   ## (serveResolved), whose pin this message ends.
   push(res.core.outbox, OutMsg(
     kind: omFileStart, fd: res.fd, gen: res.gen, stream: res.stream,
+    serial: res.serial,
     code: int32(status), data: packResponse(contentType, headers, firstChunk),
     aux: nextRead, user: reader, n64: totalLen, last: last,
     release: res.relKind))
@@ -2851,6 +3084,7 @@ proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   ## each emits exactly one omFileChunk (readChunkTramp).
   push(res.core.outbox, OutMsg(
     kind: omFileChunk, fd: res.fd, gen: res.gen, stream: res.stream,
+    serial: res.serial,
     buf: buf, code: int32(n), aux: nextRead, user: reader, last: last,
     release: prFileChunk))
   workerResponded = true
@@ -2868,10 +3102,20 @@ proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
   ## pkFileChunk, so the counters stay balanced by construction. A refused or
   ## dead-connection dispatch returns false; we then reclaim the borrowed buffer
   ## and abort the stream (issue #272) instead of leaking it and stalling.
+  ##
+  ## Nothing is dispatched for a response that has ended (#408): an HTTP/2
+  ## stream the peer reset (RST_STREAM) while the connection stays up, an
+  ## HTTP/3 stream reset the same way, or a response aborted under the chain.
+  ## The connection is alive, so the pin would be granted, and a gone stream's
+  ## `bufferedAmount` is 0, so the read-ahead gate always passed: the rest of
+  ## the file used to be read, hop by hop, into a stream that drops it. This
+  ## also covers the drain callback teardownStream fires for a parked read
+  ## (parkNextRead). The reader is stateless (each hop opens, preads and
+  ## closes), so stopping the chain leaks nothing.
+  if res.ended: return
   let buf = res.core.chunkPool.chunkTake()
   if not dispatchBlockingDataPin(
-      Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
-      cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf),
+      res.request, cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf),
       pkFileChunk):
     # No worker took the read (saturated pool, or a dead connection). The buffer
     # whose pointer we embedded in the task will never come back via an
@@ -2991,6 +3235,13 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   if n == fileChunkFailed:
     res.abort()
     return
+  # The stream was reset by the peer (or the response aborted) while this read
+  # was in flight: drop the chunk and end the chain here, dispatching nothing
+  # (#408; dispatchNextRead refuses too, this also skips the dead write). `buf`
+  # still goes back to the pool with the batch, as for any other chunk, and on
+  # HTTP/1.1 the outbox's final-chunk resume runs as before (a reset h1
+  # response is closing anyway).
+  if res.ended: return
   # `deferred` = the gate held the read back; pullAfterWrite then decides how to
   # wait, from the write's own verdict.
   var deferred = not last and not pullNext(res, nextRead, reader)
@@ -3113,7 +3364,7 @@ proc isWebSocketUpgrade*(req: Request): bool =
   if req.httpVersion == 2:
     # HTTP/2: :method CONNECT + :protocol websocket (validated by the codec).
     return req.method == HttpConnect and
-      h2Field(conn(req.core, req.fd, req.gen), req.stream, ":protocol") ==
+      h2Field(liveConn(req), req.stream, ":protocol") ==
         "websocket" and
       req.header("sec-websocket-version") == "13"
   req.httpVersion == 1 and req.method == HttpGet and
@@ -3144,7 +3395,7 @@ proc isWebSocketIntent*(req: Request): bool =
       return false
   if req.httpVersion == 2:
     return req.method == HttpConnect and
-      h2Field(conn(req.core, req.fd, req.gen), req.stream, ":protocol") ==
+      h2Field(liveConn(req), req.stream, ":protocol") ==
         "websocket"
   req.httpVersion == 1 and
   "websocket" in req.header("upgrade").toLowerAscii
@@ -3181,7 +3432,7 @@ proc acceptWebSocket*(req: Request,
                            req.header("sec-websocket-extensions"),
                            req.header("sec-websocket-protocol"), protocols)
     return
-  let c = conn(req.core, req.fd, req.gen)
+  let c = liveConn(req)
   if c == nil: return
   if req.stream != 0:
     # HTTP/2 (RFC 8441): reply 200 on the stream and attach a WsConn.
@@ -3211,7 +3462,8 @@ proc wsRunBody(lc: ptr LoopCore, fn: WsBlockingProc, fd: int32, gen: uint32,
                                # so the worker survives and still unpins below
 
 proc wsBlockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
-                          stream: uint32, data: string) {.nimcall, gcsafe.} =
+                          stream: uint32, serial: uint32,
+                          data: string) {.nimcall, gcsafe.} =
   ## Worker-pool entry point: run the body, then signal completion so the
   ## loop unpins the connection and dispatches the next buffered message.
   let lc = cast[ptr LoopCore](core)

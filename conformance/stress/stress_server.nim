@@ -294,10 +294,11 @@ template dlPumpBody(req, res: untyped, onStop: untyped) =
   proc pump(r: Response) {.gcsafe.} =
     try:
       while true:
-        # Checked every iteration, not only on a false verdict: after a peer
-        # RST_STREAM (h2) or stream reset (h3) with the connection still up,
-        # `write` on the gone stream returns true, and the loop would "write"
-        # the rest of the body synchronously on the loop thread.
+        # Checked every iteration, not only on a false verdict: before #408 a
+        # `write` on a stream gone to a peer RST_STREAM (h2) or stream reset
+        # (h3) with the connection still up returned true, and the loop would
+        # "write" the rest of the body synchronously on the loop thread. It
+        # returns false now; the check stays as the cheap explicit stop.
         if not req.isAlive:
           stopPump()
           return
