@@ -41,6 +41,13 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.sendHead(Http200, "text/plain")
     res.write("body")
     res.finish()
+  of "/pendingct":
+    # A pending Content-Type wins over sendHead's argument, exactly as for a
+    # buffered res.send: the streamed head carries one Content-Type, not both.
+    res.headers["Content-Type"] = "application/json"
+    res.sendHead(Http200, "text/plain")
+    res.write("{}")
+    res.finish()
   of "/boom":
     # The body raises after committing a 200 and some data: the stream must be
     # aborted (no chunked terminator / RST_STREAM), not finished cleanly.
@@ -118,6 +125,13 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1), srv):
       check "X-Pending: yes" in head          # set before sendHead, not dropped
       check dechunk(body) == "body"
 
+    test "a pending Content-Type yields exactly one Content-Type header":
+      let resp = rawGet("/pendingct")
+      let (head, body) = splitHeadBody(resp)
+      check head.toLowerAscii.count("content-type:") == 1
+      check "Content-Type: application/json" in head
+      check dechunk(body) == "{}"
+
     test "a large body streams intact under backpressure":
       let resp = rawGet("/big")
       let (head, body) = splitHeadBody(resp)
@@ -190,9 +204,18 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1), srv):
       check output == $(512 * 4096)
 
     test "HEAD over a streamed h2 route has no body":
-      let (output, rc) = h2curl("-I -w '%{size_download}' " & base & "/stream")
+      # /stream calls sendHead with no contentLength, then write and finish:
+      # the h2 leg of #410 (h1 is covered in test_http1_server).
+      let (output, rc) = h2curl("-I -m 5 -w '%{size_download}' " & base & "/stream")
       check rc == 0
+      check "HTTP/2 200" in output
       check output.endsWith("0")
+
+    test "a pending Content-Type yields exactly one content-type over h2":
+      let (output, rc) = h2curl("-D - -o /dev/null " & base & "/pendingct")
+      check rc == 0
+      check output.toLowerAscii.count("content-type:") == 1
+      check "content-type: application/json" in output.toLowerAscii
 
     test "a mid-stream exception resets the h2 stream (client sees an error)":
       # RST_STREAM after HEADERS+DATA: curl fails rather than reporting success.

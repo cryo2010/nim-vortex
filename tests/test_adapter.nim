@@ -89,6 +89,21 @@ proc hStreamEmit(req: Request, res: Response) {.async.} =
   res.stream(Http200, "text/plain"):
     for i in 0 ..< 50: await res.write("chunk")
 
+
+proc hHeadLate(req: Request, res: Response) {.async.} =
+  # sendHead with no length after the first await, then an SSE-style loop that
+  # keeps the handler future pending. A HEAD must get its head at once, not
+  # when the loop ends (#410); a GET streams the ticks as usual.
+  let n = parseInt(req.param("n"))
+  await sleepMs(20)
+  res.sendHead(Http200, "text/plain")
+  var i = 0
+  while req.isAlive and i < n:
+    await sleepMs(100)
+    discard res.write("tick")
+    inc i
+  res.finish()
+
 proc hUpload(req: Request, res: Response) {.async.} =
   # Consume the whole body; no explicit response -> auto-200 on block exit.
   req.stream(chunk):
@@ -356,6 +371,7 @@ appRouter.get("/worker-value/:name", hBlockingValue)
 appRouter.get("/stream", hStream)
 appRouter.get("/streamraw", hStreamRaw)
 appRouter.get("/streamemit", hStreamEmit)
+appRouter.get("/headlate/:n", hHeadLate)
 appRouter.post("/upload", hUpload, streaming = true)
 appRouter.post("/upload-reject", hUploadReject, streaming = true)
 appRouter.post("/upload-boom", hUploadBoom, streaming = true)
@@ -434,6 +450,36 @@ withServer(appRouter.toHandler,
 
     test "res.stream(emit) block form streams an outbound body":
       check fetch("/streamemit") == "chunk".repeat(50)
+
+    test "a no-length sendHead after an await answers a HEAD at once (#410)":
+      # The head used to sit in the write buffer until the handler's future
+      # completed (~3 s here, never for an endless loop).
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      let t0 = epochTime()
+      s.send("HEAD /headlate/30 HTTP/1.1\r\nHost: x\r\n\r\n")
+      let head = s.recvAvailable(3000)
+      let elapsed = epochTime() - t0
+      check head.startsWith("HTTP/1.1 200")
+      check head.endsWith("\r\n\r\n")       # head only, no body
+      check "Transfer-Encoding: chunked" in head
+      check "Content-Length" notin head
+      check elapsed < 0.2
+      # The connection moved on to the next request while the handler is
+      # still looping; its writes on the stale handle reach nothing (#407).
+      s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      let next = s.readHttpResponse()
+      check next.ok and next.body == "sync-in-async"
+      check "tick" notin next.body
+
+    test "the same route streams normally on a GET (#410)":
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      s.send("GET /headlate/3 HTTP/1.1\r\nHost: x\r\n\r\n")
+      let r = s.readHttpResponse()
+      check r.ok
+      check "Transfer-Encoding: chunked" in r.head
+      check r.body == "tick".repeat(3)
 
     test "await req.read() streams a request body":
       let body = "z".repeat(200 * 1024)

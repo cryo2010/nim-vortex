@@ -233,6 +233,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP/1.1: a `HEAD` request routed to a streamed handler that calls
+  `res.sendHead(code, contentType)` without a `contentLength` now gets its
+  head. `sendHead` marked the request answered before falling back to a
+  headers-only buffered answer for HEAD, and that answer is a no-op on an
+  already-answered request, so nothing reached the wire and the client waited
+  out its own timeout. Such a HEAD now gets the head a GET to the same route
+  gets, with no body: `Transfer-Encoding: chunked` (close-delimited with
+  `Connection: close` on HTTP/1.0), `Content-Encoding` and `Vary` when
+  compression is negotiated, and no `Content-Length` (RFC 9110 section 8.6
+  forbids one that differs from the GET's, and `Content-Length: 0` made size
+  probes read the resource as empty). It is flushed at once, also when an
+  async handler calls `sendHead` after an `await` and keeps running (it used
+  to wait for the handler's future, forever for an SSE-style loop), and the
+  connection then moves on to the next request; the handler's following
+  `res.write` is a no-op and `res.finish` is harmless. On compression builds a
+  HEAD with a declared length (static files) and a matching
+  `Accept-Encoding` takes the same path, since negotiation drops the length,
+  so it was affected too. HTTP/2 and HTTP/3 were already correct. Separately,
+  on every protocol a streamed head no longer carries two `Content-Type`
+  fields when the handler set `res.headers["Content-Type"]` before
+  `sendHead`: the pending one wins, as for a buffered `res.send`, and
+  compression is negotiated on it. (#410)
+- A thread the application owns can now answer several kept `Response`
+  handles in turn. The off-loop branch of `send` drops a duplicate response
+  with a first-send latch, and that latch was a thread-wide `{.threadvar.}`
+  bool that only the worker trampolines reset at task start. On an app-owned
+  thread nothing ever reset it, so the thread's first `res.send` pushed its
+  response and set the latch, and every later `send` from that thread, for any
+  other request, returned without pushing anything: those requests hung until
+  the response timeout, even though the `Response` doc invites copying handles
+  to any thread (the #407 off-loop test passed only because it spawned a fresh
+  thread per send). The latch now covers only a worker task's own handle: a
+  `blocking:` body's `res` is answered at most once from its task (a repeat
+  `send`, or the 500 for a body that raises after answering, is dropped), since
+  its first answer releases the task's pin. Sends on any other handle, a kept
+  `Response` a body answers or anything sent from an app-owned thread, always
+  push; they release no pin, and the loop drops a second response for a
+  request already answered. So a body that answers its own request and then a
+  kept handle is not mistaken for one that answered nothing (that would push a
+  second, pin-releasing 500 and lose the rest of the outbox batch). A
+  `blocking:` body's own `res` must not be kept past the body. The exported
+  `workerResponded` threadvar is gone (nothing outside `request.nim` used it)
+  (#409).
 - HTTP/1.1: a `Request` / `Response` kept past its own request no longer
   reaches the next request on the same keep-alive connection. A handle was
   fd + generation + stream, and the generation changes only when the

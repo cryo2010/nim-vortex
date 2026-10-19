@@ -62,9 +62,18 @@ type
   Response* = object
     ## The write half of a request/response pair: the same handle words
     ## as Request, carrying only the capability to send. Copying it
-    ## anywhere (workers, async callbacks) is free; sending through a dead
-    ## connection, a dead stream, or (HTTP/1) a request that already
-    ## finished is a safe no-op (#407: `serial` as on Request).
+    ## anywhere (workers, async callbacks, threads the app owns) is free, and
+    ## one thread may answer many kept handles in turn (#409). Sending through
+    ## a dead connection, a dead stream, or (HTTP/1) a request that already
+    ## finished is a safe no-op (#407: `serial` as on Request), and a second
+    ## response for a request already answered is dropped by the loop. Inside
+    ## a `blocking:` body the body's own `res` is answered at most once (a
+    ## repeat send, or the 500 for a body that raises after answering, is
+    ## dropped before it leaves the worker), because its first answer carries
+    ## the release of the task's pin. For the same reason that `res` must not
+    ## be kept past the body: once the body returns the trampoline has
+    ## answered it (with a 500 if the body did not), and a later send of it
+    ## would release the pin a second time.
     core*: ptr LoopCore
     fd*: int32
     gen*: uint32
@@ -1114,29 +1123,76 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
         h3Respond(core, h3c, uint64(stream), code, contentType, headers, body,
                   core.secHeaders)
 
-var workerResponded* {.threadvar.}: bool
-  ## On a worker thread, set by the worker-path `send` so blockingTrampoline can
-  ## tell whether the `blocking:` body produced a response. A body that finishes
-  ## without one (a bug, or a misuse of the loop-thread-only streaming API from a
-  ## worker) must still get a default response emitted, otherwise the outbox push
-  ## that releases the connection's pin never happens and it hangs forever.
+var workerTaskKey {.threadvar.}: ReqKey
+var workerTaskSet {.threadvar.}: bool
+var workerTaskAnswered {.threadvar.}: bool
+  ## The off-loop first-send latch, scoped to the worker task's OWN handle
+  ## (#409): the ReqKey of the request the task running on this thread
+  ## answers, whether a task is running at all, and whether that handle has
+  ## been answered yet. A worker trampoline opens it at task start
+  ## (`beginWorkerTask`), reads it at the end to tell whether the `blocking:`
+  ## body produced a response, and closes it (`endWorkerTask`). A body that
+  ## finishes without one (a bug, or a misuse of the loop-thread-only
+  ## streaming API from a worker) must still get a default response emitted,
+  ## otherwise the outbox push that releases the connection's pin never
+  ## happens and it hangs forever; a body that answered must not get a second
+  ## push, which would release that pin twice.
+  ##
+  ## Only the task's own handle is latched. Its Response carries the task's
+  ## pin release (relKind), so it must reach the outbox at most once from the
+  ## task: that is the pin-release invariant. Any OTHER handle (a kept
+  ## Response a worker body answers, or any send from a thread the
+  ## application owns, where no task is running) always pushes: such handles
+  ## carry prNone, so a duplicate never touches a pin, and the loop drops a
+  ## duplicate response (the responded guard, the HTTP/1 request serial, h2/h3
+  ## closed-stream handling). Before #409 this was one thread-wide bool, so an
+  ## app-owned thread (which no trampoline resets) answered only its first
+  ## kept handle and every later send from it was dropped. Latching only the
+  ## task's own handle (rather than whichever handle was answered last) is
+  ## also what keeps a body that answers its own request and then a kept one
+  ## from looking unanswered and getting a second, pin-releasing 500.
+
+proc beginWorkerTask(res: Response) {.inline.} =
+  ## Worker task start: latch `res` (the task's own handle) as unanswered.
+  workerTaskKey = reqKey(res.fd, res.gen, res.stream, res.serial)
+  workerTaskSet = true
+  workerTaskAnswered = false
+
+proc endWorkerTask() {.inline.} =
+  ## Worker task end: later sends from this thread latch nothing.
+  workerTaskSet = false
+
+proc isWorkerTaskHandle(res: Response): bool {.inline.} =
+  ## Whether `res` is the own handle of the worker task running on this thread.
+  workerTaskSet and
+    workerTaskKey == reqKey(res.fd, res.gen, res.stream, res.serial)
+
+proc markWorkerAnswered(res: Response) {.inline.} =
+  ## Record an outbox answer for `res`; only the task's own handle latches.
+  if res.isWorkerTaskHandle: workerTaskAnswered = true
 
 proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
              contentType: string, headers: openArray[(string, string)]) =
   if currentThreadId() != res.core.threadId:
-    # Worker thread: pack protocol-neutrally; the loop serializes.
-    # Idempotent (R3): a blocking: body that calls send twice must not push a
-    # second response. Each push is one OutMsg carrying res.relKind as its pin
-    # release, so a duplicate would both corrupt the pipeline (a spurious
-    # extra response) and double-release the task's pin. First send wins;
-    # later ones are dropped -- which is what makes "exactly one non-prNone
-    # release per sync task" hold on this path.
-    if workerResponded: return
+    # Off-loop (a worker or an app-owned thread): pack protocol-neutrally; the
+    # loop serializes. Each push is one OutMsg carrying res.relKind as its pin
+    # release. A worker task's OWN handle carries the task's pin release, so
+    # it is answered at most once from that task (R3): a blocking: body that
+    # calls send twice, or raises after answering, must not push a second
+    # response, which would release the pin twice (an AssertionDefect that
+    # aborts the rest of the outbox batch, or on h3 a theft of another
+    # stream's pin). First send of the own handle wins, later ones are dropped
+    # -- which is what makes "exactly one non-prNone release per sync task"
+    # hold on this path. Any OTHER handle (a kept Response a body answers, or
+    # every send from a thread the application owns) always pushes: it carries
+    # prNone, so a duplicate touches no pin and the loop drops it as a second
+    # response for an answered request (#409).
+    if res.isWorkerTaskHandle and workerTaskAnswered: return
     push(res.core.outbox, OutMsg(
       fd: res.fd, gen: res.gen, stream: res.stream, serial: res.serial,
       code: int32(code), data: packResponse(contentType, headers, body),
       release: res.relKind))
-    workerResponded = true
+    res.markWorkerAnswered()
     return
   if res.fd < 0:
     h3Apply(res.core, res.fd, res.gen, res.stream, int(code), contentType,
@@ -1858,11 +1914,20 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # Inject the security-headers baseline here too (a streaming response's head;
     # merged once, not per chunk).
     var hdrs = withSecHeaders(res.core, userHeaders)
+    # A Content-Type among the merged headers (a pending res.headers entry or
+    # the send argument) wins over the sendHead argument, exactly as in
+    # applyResponse's buffered path: every emitter below gets `ct`, so the head
+    # never carries two Content-Type fields. Compression negotiates on the type
+    # that actually goes on the wire, as sendBody does for a buffered send.
+    let ct = if contentType.len > 0 and headersHaveCt(userHeaders): ""
+             else: contentType
     # Negotiate streaming compression up front: it drops Content-Length (the
     # compressed size is unknown -> chunked) and adds Content-Encoding + Vary.
     var enc = ""
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-      enc = negotiateStreamEnc(res, contentType, userHeaders)
+      let wireCt = if headersHaveCt(userHeaders): contentTypeOf(userHeaders)
+                   else: contentType
+      enc = negotiateStreamEnc(res, wireCt, userHeaders)
       if enc.len > 0:
         hdrs.add ("content-encoding", enc)
         hdrs.add ("vary", "accept-encoding")
@@ -1877,7 +1942,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
           h3SendHead(res.core, h3c, uint64(res.stream), int(code),
-                     contentType, hdrs, int64(effLen))
+                     ct, hdrs, int64(effLen))
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             if enc.len > 0:
               h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
@@ -1886,7 +1951,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     if c == nil: return
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
-                 res.core.serverHeader, contentType, hdrs, res.core.altSvc,
+                 res.core.serverHeader, ct, hdrs, res.core.altSvc,
                  int64(effLen))
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         if enc.len > 0:
@@ -1898,24 +1963,58 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
       return
     if c.rs.responded: return
     c.rs.responded = true
+    if c.parser.httpMethod == HttpHead and effLen < 0:
+      # HEAD with no declared length (#410): send exactly the head a GET to the
+      # same route would get, with no body: chunked on HTTP/1.1, close-delimited
+      # on HTTP/1.0, the security baseline, and Content-Encoding + Vary when a
+      # compressor was negotiated, but never a Content-Length, which RFC 9110
+      # 8.6 forbids unless it equals the GET's (RFC 9112 6.3: a HEAD response
+      # ends at its header block whatever its framing fields say). No
+      # compressor is installed (nothing is written). respStreaming stays
+      # false, so a following write() is a no-op and finish()/abort() return
+      # early; nothing streams, so no drain is armed (h1ArmHeadDrain).
+      let ka = c.parser.keepAlive
+      let chunked = c.parser.minor >= 1
+      appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                       ct, hdrs, chunked, keepAlive = ka,
+                       announceKeepAlive = ka and c.parser.minor == 0,
+                       altSvc = res.core.altSvc, contentLength = -1)
+      if not ka or not chunked:
+        c.closeAfterFlush = true      # the head said Connection: close
+      # The response is over: as applyResponse does, deliver a drain parked
+      # before any head (#408) once `responded` and the head are in place.
+      fireAnsweredDrain(res.core, c)
+      dropEndedFields(res)
+      # Answer now rather than when the handler returns: a sendHead after the
+      # handler's first await would otherwise sit in the write buffer until the
+      # handler's future completes (never, for an SSE-style loop). Deferred,
+      # the kick runs resumeAfterRespond, which flushes, then closes on
+      # closeAfterFlush or resets for the next request and serves a pipelined
+      # one, exactly as the adapter's completion kick does for a deferred
+      # buffered send; the handler's later calls then hold a stale serial and
+      # are no-ops (#407), its own completion kick included. Inline the kick is
+      # a no-op (awaitingResponse is false) and the dispatch return resets or
+      # closes, as for a buffered send. The flush is skipped on a closing
+      # connection: inline it would start the linger close under the dispatch
+      # return, and deferred the kick flushes it anyway.
+      let lc = liveConn(res)       # re-resolved: the drain callback ran user code
+      if lc != nil and not lc.closeAfterFlush: flushConn(res)
+      kickConn(res)
+      return
     if c.parser.httpMethod == HttpHead:
-      # HEAD carries no body. When the caller declared a length (file serving),
+      # HEAD carries no body. The caller declared a length (file serving):
       # report it as the Content-Length a GET would return -- length-delimited
       # and keep-alive, but with no body -- rather than forcing Content-Length:
-      # 0. finish() completes it (write() is a no-op on HEAD). With no declared
-      # length, fall back to a plain empty response.
-      if effLen >= 0:
-        c.rs.respStreaming = true
-        c.respFraming = rfContentLength
-        let ka = c.parser.keepAlive
-        appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
-                         contentType, hdrs, chunked = false, keepAlive = ka,
-                         announceKeepAlive = ka and c.parser.minor == 0,
-                         altSvc = res.core.altSvc, contentLength = effLen)
-        flushConn(res)
-        h1ArmHeadDrain(res)
-      else:
-        applyResponse(res.core, c, 0, int(code), contentType, userHeaders, "")
+      # 0. finish() completes it (write() is a no-op on HEAD).
+      c.rs.respStreaming = true
+      c.respFraming = rfContentLength
+      let ka = c.parser.keepAlive
+      appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                       ct, hdrs, chunked = false, keepAlive = ka,
+                       announceKeepAlive = ka and c.parser.minor == 0,
+                       altSvc = res.core.altSvc, contentLength = effLen)
+      flushConn(res)
+      h1ArmHeadDrain(res)
       return
     c.rs.respStreaming = true
     let ka = c.parser.keepAlive
@@ -1932,7 +2031,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
         c.rs.respComp = makeStreamComp(enc)
         c.rs.respEnc = enc
     appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
-                     contentType, hdrs, chunked, keepAlive = ka,
+                     ct, hdrs, chunked, keepAlive = ka,
                      announceKeepAlive = ka and c.parser.minor == 0,
                      altSvc = res.core.altSvc, contentLength = effLen)
     flushConn(res)
@@ -2733,7 +2832,7 @@ proc workerResponse(req: Request, rel: PinRelease): Response =
 
 template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
   ## The shared invariant of the synchronous worker trampolines: on the pool path
-  ## (a worker thread holding the connection pin) reset the first-send-wins latch,
+  ## (a worker thread holding the connection pin) latch the task's own handle,
   ## run `body`, turn any exception into a 500 rather than let the worker abort,
   ## and -- if the body answered nothing -- emit a default 500 so the task's
   ## outbox message always fires and releases the pin (otherwise the connection
@@ -2741,14 +2840,19 @@ template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
   ## no pin, so it skips the latch and the fallback. The "always respond / release
   ## the pin" contract thus lives in one place. Does NOT cover the awaitable
   ## (err-box) or WebSocket (no-500) trampolines, whose completion differs.
+  ## The 500 of a body that raises after answering its own handle is dropped by
+  ## the latch, and answering OTHER handles (kept ones) does not count as
+  ## answering this one (#409).
   let onWorker = currentThreadId() != lc.threadId
-  if onWorker: workerResponded = false
+  if onWorker: beginWorkerTask(res)
   try:
     body
   except Exception:
     res.send(Http500, "500 Internal Server Error")
-  if onWorker and not workerResponded:
-    res.send(Http500, "500 Internal Server Error")
+  if onWorker:
+    if not workerTaskAnswered:
+      res.send(Http500, "500 Internal Server Error")
+    endWorkerTask()
 
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, serial: uint32,
@@ -2994,10 +3098,10 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
   # there too would dec the pin twice and could free/reuse the slot under this
   # still-running worker (use-after-free).
   let res = workerResponse(req, prNone)
-  # Reset the first-send-wins latch like the sync trampolines do: without it, a
-  # worker thread whose previous task left workerResponded=true would silently
-  # drop a response this body emits (sendRaw's duplicate guard).
-  if currentThreadId() != lc.threadId: workerResponded = false
+  # Latch the task's own handle like the sync trampolines do, so a body that
+  # answers it twice pushes one response (sendRaw's duplicate guard).
+  let onWorker = currentThreadId() != lc.threadId
+  if onWorker: beginWorkerTask(res)
   try:
     when R is void:
       box.body(req, res, box.args)
@@ -3005,6 +3109,7 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
       box.value = box.body(req, res, box.args)
   except CatchableError as e:
     box.err = e
+  if onWorker: endWorkerTask()
   push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
                          stream: stream, user: user, release: prAwait))
 
@@ -3064,7 +3169,7 @@ proc emitFileStart*(res: Response, status: int, contentType: string,
     code: int32(status), data: packResponse(contentType, headers, firstChunk),
     aux: nextRead, user: reader, n64: totalLen, last: last,
     release: res.relKind))
-  workerResponded = true
+  res.markWorkerAnswered()
 
 const fileChunkFailed* = -1
   ## `n` sentinel for emitFileChunk: this hop could not read the bytes the
@@ -3087,7 +3192,7 @@ proc emitFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
     serial: res.serial,
     buf: buf, code: int32(n), aux: nextRead, user: reader, last: last,
     release: prFileChunk))
-  workerResponded = true
+  res.markWorkerAnswered()
 
 proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
   ## Loop-side: borrow a pool buffer and enqueue the next chunk read INTO it
