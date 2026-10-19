@@ -6,7 +6,7 @@
 # src/vortex/adapters/adapterimpl.nim, but the backend primitives
 # (onCompleted, pump, pendingOps) differ, so the full scenario matrix runs
 # against each backend.
-import std/[unittest, net, httpcore, strutils, os, osproc, posix]
+import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics]
 import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
@@ -116,6 +116,34 @@ proc hUploadRead(req: Request, res: Response) {.async.} =
     total += chunk.len
   res.send(Http200, "got " & $total)
 
+var staleAsyncBuffered: Atomic[int]     # bufferedAmount through the kept handle
+var staleAsyncDrained: Atomic[int]      # its `await res.drained()` completed
+var staleAsyncWrite: Atomic[int]        # 1 = its write reported success
+
+proc hStaleKeep(req: Request, res: Response) {.async.} =
+  ## Request N of a keep-alive pair (#407): answer at once, then keep running
+  ## past the request boundary holding `res`, while N+1 streams on the same
+  ## connection. Every call through the kept handle must miss N+1: before the
+  ## h1 request serial `drained` read N+1's backlog (and could replace its drain
+  ## callback), the write spliced into N+1's chunked body, the finish ended it,
+  ## and this future's completion kick resumed N+1 as "left mid-stream" and
+  ## closed the connection under it.
+  res.send(Http200, "kept")
+  await sleepMs(100)                     # the connection moves on to N+1
+  staleAsyncBuffered.store(res.bufferedAmount)
+  await res.drained()                    # must complete, not park or hijack
+  staleAsyncDrained.store(1)
+  if res.write("STALE".toOpenArray(0, 4)): staleAsyncWrite.store(1)
+  res.finish()
+
+proc hStaleVictim(req: Request, res: Response) {.async.} =
+  ## Request N+1: a streamed body that stays open across the kept handle's use.
+  res.sendHead(Http200, "text/plain")
+  discard res.write("part1|".toOpenArray(0, 5))
+  await sleepMs(300)
+  discard res.write("part2".toOpenArray(0, 4))
+  res.finish()
+
 proc hWs(req: Request, res: Response) {.gcsafe.} =
   let ws = req.acceptWebSocket()
   ws.onMessage = proc(ws: WebSocket, data: string, kind: WsKind) {.gcsafe.} =
@@ -145,6 +173,8 @@ appRouter.get("/", hRoot)
 appRouter.get("/delay", hDelay)
 appRouter.get("/hello/:name", hCapture)
 appRouter.get("/fan", hFanIn)
+appRouter.get("/stale-keep", hStaleKeep)
+appRouter.get("/stale-victim", hStaleVictim)
 appRouter.get("/boom", hBoom)
 appRouter.get("/boomsync", hBoomSync)
 appRouter.get("/worker", hBlockingInside)
@@ -322,6 +352,26 @@ withServer(appRouter.toHandler,
       check epochTime() - t0 < 0.5       # woken by the socket, not by a timeout
       s.sendText("again")
       check s.recvFrame().payload == "slept: again"
+
+    test "a coroutine holding res across the keep-alive boundary misses the next request (#407)":
+      staleAsyncBuffered.store(-1)
+      staleAsyncDrained.store(0)
+      staleAsyncWrite.store(0)
+      let s = connectTimeout(srv.port)
+      defer: s.close()
+      s.send("GET /stale-keep HTTP/1.1\r\nHost: x\r\n\r\n")
+      let a = s.readHttpResponse()
+      check a.ok and a.body == "kept"
+      s.send("GET /stale-victim HTTP/1.1\r\nHost: x\r\n\r\n")
+      let b = s.readHttpResponse()
+      check b.ok
+      check b.body == "part1|part2"
+      check staleAsyncDrained.load == 1  # drained() resolved on the dead handle
+      check staleAsyncBuffered.load == 0
+      check staleAsyncWrite.load == 0
+      s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")   # still in sync, not closed
+      let c = s.readHttpResponse()
+      check c.ok and c.body == "sync-in-async"
 
     test "newVortex overload accepts a bare async handler (no toHandler)":
       proc bare(req: Request, res: Response) {.async.} =

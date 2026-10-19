@@ -233,6 +233,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- HTTP/1.1: a `Request` / `Response` kept past its own request no longer
+  reaches the next request on the same keep-alive connection. A handle was
+  fd + generation + stream, and the generation changes only when the
+  connection slot is recycled, not between keep-alive requests, so a handle
+  from request N resolved to request N+1's state once N+1 was in flight: a
+  stale `res.write` spliced bytes into N+1's body, `res.finish` / `res.abort`
+  ended or cut it, `res.onDrain` replaced N+1's drain callback (and, with the
+  #403 arming, had its own closure fired promptly to write into N+1),
+  `res.headers` / `res.trailers` / `res.send` answered N+1 with the stale
+  values, `req.header` / `req.path` read N+1's request, an async body that
+  outlived its request kicked N+1 as "left mid-stream" and closed the
+  connection under it, and a late send from a thread of the app's own landed
+  as N+1's response (or wrote an unsolicited response onto an idle
+  connection). HTTP/1.1 handles now carry a per-request serial, bumped each
+  time the connection resets for a new request (keep-alive reuse and slot
+  recycling alike) and checked on every h1 resolve (`reqState`, the connection
+  lookup, the `res.headers` / `res.trailers` / drain-kick keys, the async
+  adapters' `req.read` table, the loop's resume kick, and the outbox, which now
+  drops a worker or off-loop response or sendFile chunk whose request has
+  finished while still releasing its pin). A stale h1 handle now reads exactly
+  as a dead HTTP/2 stream does: writes return `false`, `isAlive` is `false`,
+  sends, finishes, aborts and drain registrations are no-ops, accessors read
+  empty, and `res.drained()` completes at once. HTTP/2 and HTTP/3 are
+  unchanged (stream ids are never reused inside a connection). (#407)
+
 - Streaming responses: a drain wait registered without a preceding `false` from
   `res.write` now fires instead of parking forever. `res.drained()` completes at
   once only when nothing is queued; otherwise it registers `res.onDrain` and

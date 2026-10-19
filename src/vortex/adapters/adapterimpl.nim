@@ -34,7 +34,8 @@ proc complete(req: Request, failed: bool) {.gcsafe.} =
   if failed:
     response(req).send(Http500, "500 Internal Server Error")
   if req.core.hooks.kick != nil:
-    req.core.hooks.kick(req.core.loopPtr, req.fd, req.gen, req.stream)
+    req.core.hooks.kick(req.core.loopPtr, req.fd, req.gen, req.stream,
+                        req.serial)
 
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling to a running future: 500 on failure,
@@ -224,7 +225,10 @@ proc take[T](r: AwaitableReader[T]): Future[T] =
 
 # --- pull-based request-body reading (await req.read) -----------------------
 
-var bodyReaders {.threadvar.}: Table[(int32, uint32, uint32), AwaitableReader[string]]
+var bodyReaders {.threadvar.}: Table[ReqKey, AwaitableReader[string]]
+  ## Keyed like the core tables (fd, gen, stream, h1 request serial), so a
+  ## handle kept past its request finds no reader instead of the next
+  ## keep-alive request's (#407).
 
 proc toStr(a: openArray[char]): string =
   result = newString(a.len)
@@ -244,7 +248,8 @@ proc read*(req: Request): Future[string] =
   ## Await the next request-body chunk in an async streaming handler; resolves
   ## to "" at end of body. Only meaningful on a route registered with the async
   ## `stream` below (or a `streamRoute` predicate); otherwise resolves to "".
-  let r = bodyReaders.getOrDefault((req.fd, req.gen, req.stream))
+  let r = bodyReaders.getOrDefault(reqKey(req.fd, req.gen, req.stream,
+                                          req.serial))
   if r == nil:
     result = newFuture[string]("request.read")
     result.complete("")
@@ -256,7 +261,7 @@ proc streamToHandler(inner: AsyncRequestHandler): RequestHandler =
   proc (req: Request, res: Response) {.gcsafe.} =
     {.gcsafe.}:
       let r = newBodyReader(req)
-      let k = (req.fd, req.gen, req.stream)
+      let k = reqKey(req.fd, req.gen, req.stream, req.serial)
       bodyReaders[k] = r
       req.onBody(proc (chunk: openArray[char], last: bool) {.gcsafe.} =
         if chunk.len > 0: r.feed(toStr(chunk))

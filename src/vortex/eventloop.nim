@@ -1081,7 +1081,8 @@ proc startStreamingDispatch(loop: Loop, c: ptr Connection) =
   c.bodyFed = 0
   c.bodyUnacked = 0
   loop.clearBodyPause(c)   # fresh body: no read-ahead debt, so no pause to hold
-  let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
+  let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen,
+                    serial: c.reqSerial)
   try:
     {.gcsafe.}:
       loop.callHandler(req, response(req))
@@ -1200,7 +1201,8 @@ proc processInput(loop: Loop, c: ptr Connection) =
         # Streaming handler already ran (early or just now): deliver the tail.
         loop.feedBody(c, last = true)
       else:
-        let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen)
+        let req = Request(core: addr loop.core, fd: c.fd, gen: c.gen,
+                          serial: c.reqSerial)
         try:
           {.gcsafe.}:
             loop.callHandler(req, response(req))
@@ -1239,6 +1241,7 @@ proc processInput(loop: Loop, c: ptr Connection) =
       # The reset scrubs bodyReadPaused along with the rest of the per-request
       # state, so hand the paused-conns slot back with it (#344).
       loop.clearBodyPause(c)
+      dropRequestEntries(addr loop.core, c)   # before the serial bump (#407)
       c[].resetForNextRequest()
       if c.rlen == 0:
         c.setDeadline(loop, dkIdle)
@@ -1273,6 +1276,7 @@ proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
     # consumer that answered without draining its read-ahead debt. The reset
     # clears bodyReadPaused, so release the counter slot with it (#344).
     loop.clearBodyPause(c)
+    dropRequestEntries(addr loop.core, c)     # before the serial bump (#407)
     c[].resetForNextRequest()
     loop.flushOut(c)
     if c.state == csFree: return
@@ -1322,9 +1326,13 @@ proc releasePin(loop: Loop, slot: ptr H3SlotEntry, k: PinKind) =
     releasePin(slot, k)
 
 proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
-              stream: uint32) {.nimcall, gcsafe.} =
+              stream: uint32, serial: uint32) {.nimcall, gcsafe.} =
   ## LoopCore.hooks.kick: adapters call this on the loop thread after a
-  ## deferred respond. Redundant calls are harmless.
+  ## deferred respond. Redundant calls are harmless. An HTTP/1 kick whose
+  ## `serial` is not the connection's current request serial comes from a
+  ## handle of a request that already finished (an async body that outlived
+  ## it, a stale `res.finish`): it must not resume the NEXT request, which
+  ## would reset it under its handler or close it as "left mid-stream" (#407).
   {.gcsafe.}:
     let loop = cast[Loop](loopPtr)
     if fd < 0:
@@ -1334,6 +1342,7 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
     # closeConn resumed a producer that called finish), or its close is deferred
     # behind a worker pin. Either way there is no pipeline left to resume.
     if c == nil or c.closeRequested: return
+    if stream == 0 and c.reqSerial != serial: return   # stale h1 handle (#407)
     if stream == 0 and not (c.awaitingResponse and c.rs.responded):
       return                     # nothing deferred is pending
     loop.resumeAfterRespond(c, stream)
@@ -1953,7 +1962,8 @@ proc applyFileMessage(loop: Loop, m: OutMsg) =
   ## Emit an omFileStart (head + first chunk) or omFileChunk (a later chunk) into
   ## its response. The apply is identical for h1/h2 and h3 (the pin release and
   ## post-apply resume differ and stay with each caller).
-  let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen, stream: m.stream)
+  let res = Response(core: addr loop.core, fd: m.fd, gen: m.gen,
+                     stream: m.stream, serial: m.serial)
   if m.kind == omFileStart:
     let bodyStart = unpackResponseInto(m.data, loop.unpackCt, loop.unpackHeaders)
     applyFileStart(res, int(m.code), loop.unpackCt, loop.unpackHeaders, m.n64,
@@ -2086,6 +2096,14 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
       if w != nil:
         wsResume(addr loop.core, c, w)
     return
+  # An HTTP/1 response or file message names the request it answers by serial.
+  # One whose request has already finished (a late send through a kept handle,
+  # from a worker or a thread of the app's own) must not land in the next
+  # keep-alive request on this connection (#407). Its pin is still this
+  # connection's (gen matched), so the release below runs regardless; only the
+  # apply and the pipeline resume are skipped. Taken BEFORE the release, whose
+  # input resume may itself advance the connection to a further request.
+  let staleReq = m.stream == 0 and c.reqSerial != m.serial
   if m.kind in {omFileStart, omFileChunk}:
     # Only chunk reads (dispatchNextRead -> omFileChunk) release prFileChunk. The
     # initial read (omFileStart -> serveResolved) reads req headers, so it releases
@@ -2100,7 +2118,7 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
     elif c.closeRequested:
       loop.closeConn(c)          # re-defers while other pins remain
       return
-    if c.state != csActive: return
+    if staleReq or c.state != csActive: return
     # Several chunks of the same download can land in one outbox batch (the
     # read-ahead keeps one read in flight per stream, and a batch can carry the
     # replies of several streams on this connection). Hold the flush so they cost
@@ -2111,7 +2129,11 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
     # The final chunk finished the response: reset and resume the pipeline (the
     # blocking-dispatch path doesn't set awaitingResponse, so finish()'s kick is a
     # no-op here -- mirror the buffered omHttp path explicitly).
-    if m.last and not staleConn(c, m.gen):
+    # Only while the connection is still on this message's request: the
+    # finish() inside the apply may already have kicked the pipeline on to the
+    # next one, and resuming again would reset that request under its handler.
+    if m.last and not staleConn(c, m.gen) and
+        (m.stream != 0 or c.reqSerial == m.serial):
       loop.resumeAfterRespond(c, m.stream)
     # Otherwise the batch tail flushes: the write scheduler fills c.wbuf up to
     # respHighWater and stops, and on a fast socket flushOut never hits EAGAIN, so
@@ -2128,6 +2150,7 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
   elif c.closeRequested:
     loop.closeConn(c)          # connection died while the task ran
     return
+  if staleReq: return
   let bodyStart = unpackResponseInto(m.data, loop.unpackCt, loop.unpackHeaders)
   applyResponse(addr loop.core, c, m.stream, int(m.code), loop.unpackCt,
                 loop.unpackHeaders,

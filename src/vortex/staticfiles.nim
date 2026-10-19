@@ -342,7 +342,8 @@ proc sendFile*(res: Response, path: string, opts = staticOptions()) =
   ## (router-free): `res.sendFile("public/index.html")`. Request and Response
   ## are the same handle; the worker rebuilds both from it.
   dispatchBlockingData(
-    Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream),
+    Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream,
+            serial: res.serial),
     serveResolved, pack(path, "", opts))
 
 proc staticHandler*(rootDir: string, opts = staticOptions()): RequestHandler =
