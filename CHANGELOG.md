@@ -206,8 +206,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging stays off, and the suite skips in the zero-dependency `plainHttp`
   build like its h3 siblings. (#347)
 
+- Stress harness: `VORTEX_DOWNLOAD_CHUNK`, and two targeted cells in
+  `nimble stress` for server paths the smoke never reached. No `/download`
+  body wrote above `respHighWater`: the sync build used `sendFile` and the
+  async ones `await`ed 64 KiB writes, exactly the mark, so no soak could
+  reproduce or confirm the parked-producer stall of #399, which nim-navi's
+  stress origin hit writing 1 MiB per `res.write`. `VORTEX_DOWNLOAD_CHUNK=N`
+  (the server's `DOWNLOAD_CHUNK`, default 0 = the unchanged bodies) switches
+  every server build, sync and async alike, to `N`-byte `res.write` calls that
+  re-register `onDrain` on backpressure, written from a startup-built pattern
+  with no per-chunk allocation; the async handlers await the producer's
+  completion, so they still suspend for the whole transfer. The value is
+  canonicalized (leading zeros stripped), capped at 1 GiB, and clamped to the
+  body size by the server. It is a knob on the existing route rather than
+  a `/download-big` route so neither load client changes: both still request
+  `/download` and verify the same SHA-1, and every output line keeps its form
+  (every cell's banner gains `, chunk=<size>` only when the knob is set). The
+  smoke now runs a `streamdownload` h2 cell at 1 MiB (skipped when the caller
+  set the knob), and a `ws` step on
+  `VORTEX_SERVER=async` over h2 and h3, because only the async builds
+  register `/ws` with `rt.ws` and its Extended CONNECT leg (#400) is what
+  those protocols take; the step is skipped when the workload matrix already
+  covered it. Three more cells per client under the defaults.
+  `VORTEX_PROTO` and `VORTEX_SERVER` also accept a comma-separated list.
+  (#405)
+
 ### Fixed
 
+- Streaming responses: a drain wait registered without a preceding `false` from
+  `res.write` now fires instead of parking forever. `res.drained()` completes at
+  once only when nothing is queued; otherwise it registers `res.onDrain` and
+  waits, and on HTTP/2 the only thing that delivers a drain is the resume scan
+  in `h2ResumeProducers`, which visits a stream only once a false verdict has
+  marked it backed up. So `await res.drained()` after a write that returned
+  `true` but left a small backlog (part of the chunk still in the write buffer
+  or held by the scheduler) registered a callback no socket drain, WINDOW_UPDATE
+  or scheduler pass would ever deliver, and the response stopped mid-body; the
+  same went for a sync `res.onDrain` registered unconditionally, which with
+  nothing queued at all was owed no event whatsoever. HTTP/1.1 had the same
+  hole, since `flushOut` fires a drain only with `c.respBackedUp` set, and the
+  same false verdict was the only thing setting it. HTTP/3 was not affected by
+  the small-backlog case, because its writable callback checks the backlog on
+  every ack instead of a flag, but a sync registration made after the last ack
+  had the same no-event problem. Registration now arms itself: `res.onDrain`
+  marks an open h2 stream (or h1 response, including one registered before
+  `sendHead`, which the head now marks) backed up exactly as a false verdict
+  would, so whichever drain event is still owed delivers it through the existing
+  paths under that path's own rule (both caps under the mark on h2), and queues
+  one loop pass for the registration (`LoopCore.drainKicks`, run by the event
+  loop beside the TLS read-ready pass, at most one entry per response per pass)
+  that fires the callback only if the response is already fully drained (nothing
+  in the stream backlog or the write buffer) and otherwise leaves it to that
+  event. Firing the pass on "under the mark" instead would turn a
+  flush-before-finish loop (`while res.bufferedAmount > 0: await res.drained()`)
+  against a peer that stops crediting its window into a busy loop. The callback
+  still fires exactly once and never from inside the registration (it can fire
+  inside a later `res.write` on the same response, whose flush runs the drain
+  path), so a producer can re-register from its own callback without
+  recursing, and `finish` / `abort` still drop a pending one. With every
+  registration marked, the debug `h2CheckCounters` audit now asserts the strict
+  invariant -- no drain callback on an open h2 response without the mark --
+  where it could only check the empty-backlog case before. Pinned by
+  `tests/test_http2_write_stall.nim` (4 MiB in 32 KiB writes with `await
+  res.drained()` or `res.onDrain` after every write, against a wide window, a
+  bursty reader and a small window; a flush-before-finish loop that must park on
+  a stalled peer; a burst of registrations queuing one pass),
+  `tests/test_streaming_drain.nim` (the same two producers over HTTP/1.1 behind
+  a slow reader, and a registration made before `sendHead`) and
+  `tests/test_http3.nim` (the sync shape over h3). A client that disconnects
+  mid-body now also resumes an HTTP/1.1 producer parked on a drain: `closeConn`
+  fires the parked callback once (as `h2NotifyClosed` already did per h2
+  stream), so an `await res.drained()` coroutine runs to its `finally` instead
+  of leaking its Future and request handles until exit, and a write, `finish`
+  or re-registration from inside the callback is a no-op on the dying
+  connection rather than a send into the dead socket that could re-enter
+  `closeConn` (pinned by two disconnect cases in
+  `tests/test_streaming_drain.nim`). (#403)
 - Async adapters: a `router.ws` route now serves the HTTP/2 and HTTP/3 spelling
   of the handshake too, and `wsToHandler` is exported for a route an app
   registers by hand. `ws` registered only `HttpGet`, which is the HTTP/1.1
@@ -325,6 +399,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory for callbacks and can never stall the stream. The debug-only
   `h2CheckCounters` audit now also covers `backedUpProducers` and asserts that no
   stream parks a drain callback with nothing queued to fire it. (#399)
+- HTTP/2 and HTTP/3: a response that completes while the request is still open
+  now tells the client to stop sending, as RFC 9113 8.1 and RFC 9114 4.1 allow.
+  The common shape is a refused Extended CONNECT -- `router.ws` answering a
+  version-less handshake with 426 -- where the client never sends END_STREAM
+  because it expected a WebSocket, but any early answer qualifies, such as a
+  413 from a streaming route whose body is still arriving. On h2 the codec
+  already dropped the stream after END_STREAM, yet said nothing, so the client
+  stayed half-closed (local) and kept writing into an id the server had
+  forgotten, each DATA frame drawing a `RST_STREAM(STREAM_CLOSED)` and a charge
+  to the control-frame budget. Every path that emits a response's final frame
+  (buffered `send`, the scheduler's last DATA, an empty body, a streamed
+  `finish`, trailers, HEAD) now appends `RST_STREAM(NO_ERROR)` after the
+  END_STREAM frame when the request side is still open. The DATA the client
+  already had in flight is then ignored, as RFC 9113 5.1 requires once
+  RST_STREAM is sent: its connection-window credit is returned, but it draws no
+  `RST_STREAM(STREAM_CLOSED)` and no control-frame budget charge (which used to
+  end a client writing small frames with `GOAWAY(ENHANCE_YOUR_CALM)`), up to
+  the stream window the client held at the reset; a racing trailer section or
+  `RST_STREAM` is ignored too, and DATA past that window is answered as before.
+  The teardown is otherwise the usual one, so a `req.onBody` sink or parked
+  `await req.read()` gets its final `last=true`. A request the client already
+  finished, an accepted WebSocket and an already reset stream are untouched, so
+  the common case is byte-identical. On h3 the gap was worse: the stream could
+  not close until the client sent its FIN, so it held a `MAX_STREAMS` credit
+  while vortex kept crediting and buffering its pipelined bytes, and about a
+  hundred refusals starved the connection of streams. The backend now sends
+  `STOP_SENDING(H3_NO_ERROR)` once the response FIN is submitted while the
+  request side is still open (`vq_stream_stop_sending` in the ngtcp2 shim),
+  and the close that follows is not charged to the rapid-reset budget unless
+  the client had already reset the stream itself. (#404)
 
 - Stress harness: a short `stressStreamUpload` / `stressStreamDownload` smoke no
   longer fails its h3 cell at a transfer size it cannot finish.

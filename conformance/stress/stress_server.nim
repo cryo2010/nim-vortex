@@ -21,7 +21,12 @@
 ##   /upload  (streaming POST) hash the streamed body (constant memory); 200 if it
 ##                            matches the client's x-sha1 header, else 400
 ##   /download                stream STREAM_BYTES of a deterministic generator
-##                            (byte i = i mod 256); the client re-hashes and checks
+##                            (byte i = i mod 256); the client re-hashes and checks.
+##                            Default body: sendFile (sync) or awaited 64 KiB
+##                            `res.write` (async). DOWNLOAD_CHUNK=N (bytes, > 0)
+##                            switches EVERY build to N-byte `res.write` calls
+##                            with `onDrain` re-registration (see dlPumpBody):
+##                            the above-respHighWater producer of #399 (#405)
 ##   /stats                   "<rss> <heap> <fds>", exactly three fields (the
 ##                            client and the chaos sidecar both parse it)
 ##   /drops                   vortex's accept-path drop counters, so a soak can
@@ -61,6 +66,27 @@ const
 
 let streamBytes = parseInt(getEnv("STREAM_BYTES", "1073741824"))   # /download size
 
+let requestedDownloadChunk = parseInt(getEnv("DOWNLOAD_CHUNK", "0"))
+  ## 0 (the default): /download keeps its historical body, sendFile on the sync
+  ## build and awaited `dlChunk` writes on the async ones -- what the proxy job
+  ## and the benchmarks measure. N > 0: every build streams /download as N-byte
+  ## `res.write` calls that re-register `onDrain` whenever write reports
+  ## backpressure (dlPumpBody below). That is nim-navi's stress origin shape,
+  ## the one #399 was reported from: a 1 MiB chunk is 16x respHighWater, so the
+  ## producer actually parks, which `dlChunk` (exactly the mark) never did and
+  ## sendFile / `await res.write` never exercised (#405).
+if requestedDownloadChunk < 0:
+  quit("DOWNLOAD_CHUNK must be >= 0 (got " & $requestedDownloadChunk & ")", 2)
+
+let downloadChunk =
+  if streamBytes > 0 and requestedDownloadChunk > streamBytes: streamBytes
+  else: requestedDownloadChunk
+  ## The effective chunk: DOWNLOAD_CHUNK clamped to STREAM_BYTES, since no
+  ## write can carry more than the whole body and bigPattern is sized from this
+  ## (an unclamped 1 TiB value allocated and filled 1 TiB before listening).
+  ## Read once at startup; a plain int global, so the gcsafe handlers may read
+  ## it.
+
 proc buildDlPattern(): string =
   ## `dlChunk + 256` bytes of the deterministic generator (byte j = j mod 256).
   ## The generator has period 256 and `dlChunk` is a whole number of periods, so
@@ -88,6 +114,23 @@ proc genChunk(start, n: int): string =
   doAssert n <= dlChunk, "genChunk: n exceeds the precomputed pattern span"
   let s = start and 0xff
   result = dlPattern[s ..< s + n]
+
+var bigPattern: ptr UncheckedArray[char]
+  ## `downloadChunk + 256` bytes of the same generator, for dlPumpBody, built
+  ## once at startup and only when DOWNLOAD_CHUNK is set. The same period
+  ## argument as dlPattern, without its whole-periods requirement on the chunk:
+  ## any run of up to `downloadChunk` bytes from any global offset is the
+  ## contiguous slice starting at `offset mod 256`, and 256 bytes of tail cover
+  ## the largest such start. A raw shared allocation rather than a string
+  ## because the size is a runtime knob (so it cannot be a const like
+  ## dlPattern) and a gcsafe handler may not read a GC'd global; a pointer to
+  ## memory that is never written after startup and never freed is safe to read
+  ## from every loop thread. `res.write` copies what it is given, so each chunk
+  ## is written straight from this slice with no per-chunk allocation.
+
+proc buildBigPattern(n: int) =
+  bigPattern = cast[ptr UncheckedArray[char]](allocShared0(n + 256))
+  for j in 0 ..< n + 256: bigPattern[j] = char(j and 0xff)
 
 # --- typed GET bodies (cross-language contract with the Python client) --------
 # Precomputed once so the hot path does no per-request string building, like
@@ -219,6 +262,70 @@ template whoamiBody(req, res: untyped) =
   ## interop suite asserts this to confirm PROXY-header parsing.
   vortex.send(res, Http200, req.remoteAddress)
 
+template dlPumpBody(req, res: untyped, onStop: untyped) =
+  ## /download as `downloadChunk`-byte `res.write` calls with sync `onDrain`
+  ## re-registration, the shape #399 was reported from (nim-navi's stress
+  ## origin, 1 MiB per write): write until `write` returns false, park on
+  ## `onDrain`, resume from the callback, `finish` at the end. The producer
+  ## itself is identical in the sync and async builds -- it uses only the
+  ## loop-thread callback API -- which puts the parked producer under every
+  ## runtime, not just sync (#405).
+  ##
+  ## `onStop` runs exactly once, when the pump stops for good: after `finish`,
+  ## when the request died, or when the pump raised (then `dlErr`, injected, is
+  ## set). The async handler completes a future there and awaits it, so it
+  ## genuinely suspends for the length of the transfer the way the default
+  ## `await res.write` body does. Returning with the response open instead
+  ## left the handler future finished at return, so the adapter never started
+  ## its pump: the chaos sidecar's fd baseline relies on suspending /download
+  ## handlers to create each loop thread's dispatcher before it is sampled.
+  ##
+  ## The bytes and their order are the same generator as the default bodies, so
+  ## both load clients verify it with the SHA-1 they already compute: no client
+  ## change, no new route.
+  res.sendHead(Http200, "application/octet-stream")
+  var sent = 0
+  var stopped = false
+  var dlErr {.inject.}: ref CatchableError = nil
+  proc stopPump() {.gcsafe.} =
+    if stopped: return
+    stopped = true
+    onStop
+  proc pump(r: Response) {.gcsafe.} =
+    try:
+      while true:
+        # Checked every iteration, not only on a false verdict: after a peer
+        # RST_STREAM (h2) or stream reset (h3) with the connection still up,
+        # `write` on the gone stream returns true, and the loop would "write"
+        # the rest of the body synchronously on the loop thread.
+        if not req.isAlive:
+          stopPump()
+          return
+        if sent >= streamBytes:
+          r.finish()
+          stopPump()
+          return
+        let n = min(downloadChunk, streamBytes - sent)
+        let s = sent and 0xff
+        # Advance BEFORE the verdict: write accepts the whole chunk even when it
+        # reports backpressure (it never writes a partial chunk), so false means
+        # "sent, now wait", not "retry this one".
+        let ok = r.write(bigPattern.toOpenArray(s, s + n - 1))
+        sent += n
+        if not ok:
+          # false also covers a dead connection; there is then nothing to wait
+          # for and no drain will fire, so stop instead of parking forever.
+          if req.isAlive: r.onDrain(pump)
+          else: stopPump()
+          return
+    except Exception as e:
+      # Every call above is raises: [], so only a Defect gets here; still never
+      # leave the async handler's future pending on it.
+      dlErr = newException(ValueError, "download pump failed: " & e.msg)
+      r.abort()
+      stopPump()
+  pump(res)
+
 # --- runtime-specific handlers -----------------------------------------------
 
 when asyncMode:
@@ -245,6 +352,16 @@ when asyncMode:
     else: res.send(Http400, "mismatch")
 
   proc hDownload(req: Request, res: Response) {.async.} =
+    if downloadChunk > 0:
+      # Above-the-mark producer (#405). The pump completes `done` once, when it
+      # stops; awaiting it keeps this handler suspended for the transfer.
+      let done = newFuture[void]("stress.download")
+      dlPumpBody(req, res):
+        if not done.finished:
+          if dlErr != nil: done.fail(dlErr)
+          else: done.complete()
+      await done
+      return
     res.sendHead(Http200, "application/octet-stream")
     var off = 0
     while off < streamBytes:
@@ -292,12 +409,26 @@ else:
         else: res.send(Http400, "mismatch")
 
   proc hDownload(req: Request, res: Response) {.gcsafe.} =
-    res.sendFile(downloadFile)              # backpressure-safe large-body path
+    if downloadChunk > 0:
+      dlPumpBody(req, res):                 # above-the-mark producer (#405)
+        discard
+    else:
+      res.sendFile(downloadFile)            # backpressure-safe large-body path
 
 when isMainModule:
+  if downloadChunk > 0:
+    buildBigPattern(downloadChunk)
+    echo "stress_server: /download streams ", downloadChunk,
+         "-byte res.write calls with onDrain re-registration",
+         (if downloadChunk != requestedDownloadChunk:
+            " (DOWNLOAD_CHUNK=" & $requestedDownloadChunk &
+            " clamped to STREAM_BYTES)"
+          else: "")
   when not asyncMode:
-    # Pre-generate the deterministic download file once (sync uses sendFile).
-    if not fileExists(downloadFile) or getFileSize(downloadFile) != streamBytes:
+    # Pre-generate the deterministic download file once (sync uses sendFile;
+    # not needed when DOWNLOAD_CHUNK replaces it with dlPumpBody).
+    if downloadChunk == 0 and (not fileExists(downloadFile) or
+        getFileSize(downloadFile) != streamBytes):
       let f = open(downloadFile, fmWrite)
       var off = 0
       while off < streamBytes:

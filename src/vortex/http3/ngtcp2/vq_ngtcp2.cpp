@@ -128,6 +128,10 @@ struct Stream {
   bool headSubmitted = false; // submit_response/submit_head issued
   bool hasTrailers = false;   // trailers submitted: keep the stream open past body EOF
   bool everBlocked = false;   // nghttp3 stream currently blocked in ngtcp2
+  bool stopSent = false;      // we sent STOP_SENDING(H3_NO_ERROR) after a
+                              // complete response (#404): not a reset-class close
+  bool peerReset = false;     // the client sent RESET_STREAM before any stop of
+                              // ours: its close stays a reset for the budget
   // request header accumulation (owned copies; borrowed to on_headers)
   std::vector<std::string> hdrStore;
   std::vector<VqHeader> hdrs;
@@ -288,6 +292,9 @@ int cbAckedStreamDataOffset(ngtcp2_conn *, int64_t stream_id, uint64_t offset,
                             uint64_t datalen, void *user_data,
                             void *stream_user_data);
 int cbStreamOpen(ngtcp2_conn *, int64_t stream_id, void *user_data);
+int cbStreamReset(ngtcp2_conn *, int64_t stream_id, uint64_t final_size,
+                  uint64_t app_error_code, void *user_data,
+                  void *stream_user_data);
 
 // --- nghttp3 callbacks ------------------------------------------------------
 
@@ -520,6 +527,9 @@ int cbRecvStreamData(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
 int cbStreamClose(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                   uint64_t app_error_code, void *user_data, void *) {
   auto *c = static_cast<Conn *>(user_data);
+  // Read before nghttp3_conn_close_stream: its stream_close callback erases it.
+  const Stream *cs = c->stream(stream_id);
+  const bool stopSent = cs && cs->stopSent;
   if (c->h3) nghttp3_conn_close_stream(c->h3, stream_id, app_error_code);
   // Grant the client one more bidi stream to replace the finished request one,
   // via a MAX_STREAMS frame. Without this the peer is capped forever at the
@@ -532,8 +542,10 @@ int cbStreamClose(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
   // line rate. Count reset-class closes -- an app error code was set, i.e. the
   // stream did not complete cleanly -- on client bidi streams, and tear the
   // connection down with H3_EXCESSIVE_LOAD (0x0107) once they exceed the budget.
+  // A stream we stopped ourselves after answering it in full (#404) carries an
+  // app error code too, but it is a completed request, not a reset.
   if (c->engine->cfg.max_reset_streams > 0 && (stream_id & 0x03) == 0 &&
-      (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET)) {
+      (flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET) && !stopSent) {
     if (++c->reset_count > c->engine->cfg.max_reset_streams &&
         !c->wantClose && !c->closed) {
       ngtcp2_ccerr_set_application_error(&c->ccerr, 0x0107 /*H3_EXCESSIVE_LOAD*/,
@@ -541,6 +553,21 @@ int cbStreamClose(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
       c->wantClose = true;
     }
   }
+  return 0;
+}
+
+int cbStreamReset(ngtcp2_conn *, int64_t stream_id, uint64_t, uint64_t,
+                  void *user_data, void *) {
+  // RESET_STREAM from the client. Only recorded: ngtcp2 already stops
+  // forwarding the stream's data, and cbStreamClose finalizes it. The flag is
+  // what tells vq_stream_stop_sending that the client abandoned the request on
+  // its own, so a response that completes afterwards (a route that answers at
+  // once) does not earn the #404 rapid-reset exemption: the close is the
+  // client's reset, not a reply to our STOP_SENDING. A reset that arrives after
+  // our stop is that reply (RFC 9000 3.5) and is not recorded.
+  auto *c = static_cast<Conn *>(user_data);
+  Stream *s = c->stream(stream_id);
+  if (s && !s->stopSent) s->peerReset = true;
   return 0;
 }
 
@@ -837,6 +864,7 @@ Conn *acceptConn(Engine *e, const uint8_t *pkt, size_t pktlen,
   cbs.extend_max_stream_data = cbExtendMaxStreamData;
   cbs.stream_open = cbStreamOpen;
   cbs.stream_close = cbStreamClose;
+  cbs.stream_reset = cbStreamReset;
   cbs.rand = cbRand;
   cbs.get_new_connection_id = cbGetNewCid;
   cbs.remove_connection_id = cbRemoveCid;
@@ -2065,6 +2093,38 @@ size_t vq_stream_backlog(VqConn *conn, int64_t stream_id) {
 void vq_stream_reset(VqConn *conn, int64_t stream_id, uint64_t app_error) {
   auto *c = reinterpret_cast<Conn *>(conn);
   if (c->conn) ngtcp2_conn_shutdown_stream(c->conn, 0, stream_id, app_error);
+}
+
+int vq_stream_stop_sending(VqConn *conn, int64_t stream_id) {
+  auto *c = reinterpret_cast<Conn *>(conn);
+  Stream *s = c->stream(stream_id);
+  if (!s || s->stopSent || s->peerReset || !c->conn) return 0;
+  // nghttp3 marks the read side shut (and cancels the stream on the QPACK
+  // decoder stream, RFC 9204 4.4.2); ngtcp2 queues STOP_SENDING and from now
+  // on discards the stream's DATA, crediting MAX_DATA for it on receipt. Both
+  // return 0 for a stream they no longer know, so a non-zero return is a real
+  // failure (NOMEM, or nghttp3's QPACK_FATAL decoder-stream overflow) and is
+  // surfaced the way the receive path surfaces one: failConn for nghttp3 (its
+  // connection is undefined after an error, #362), a CONNECTION_CLOSE carrying
+  // the mapped transport error for ngtcp2.
+  if (c->h3) {
+    int rv = nghttp3_conn_shutdown_stream_read(c->h3, stream_id);
+    if (rv != 0) {
+      failConn(c, rv);
+      return rv;
+    }
+  }
+  int rv = ngtcp2_conn_shutdown_stream_read(c->conn, 0, stream_id,
+                                            NGHTTP3_H3_NO_ERROR);
+  if (rv != 0) {
+    if (!c->wantClose && !c->closed) {
+      ngtcp2_ccerr_set_liberr(&c->ccerr, rv, nullptr, 0);
+      c->wantClose = true;
+    }
+    return rv;
+  }
+  s->stopSent = true;
+  return 1;
 }
 
 void vq_stream_consume(VqConn *conn, int64_t stream_id, size_t n) {

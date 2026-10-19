@@ -220,7 +220,11 @@ task loadtest, "Configurable k6 load test with live Grafana/Prometheus charts (D
 # VORTEX_STREAM_BYTES (1 GiB, 64 MiB for a run under 1200 s; mixed has its own
 # measured pair, 16 MiB and 2 MiB under 1200 s), VORTEX_MIX (stressMixed's
 # worker split), VORTEX_CHAOS[,_CONC,_SEED] (misbehaving-client sidecar; default
-# all, VORTEX_CHAOS=none for a chaos-free run). Local-only.
+# all, VORTEX_CHAOS=none for a chaos-free run), VORTEX_DOWNLOAD_CHUNK (bytes per
+# res.write on /download; default 0 = sendFile on sync / awaited 64 KiB writes on
+# async, N > 0 = N-byte writes with onDrain re-registration in every build, the
+# above-respHighWater producer of #399; at most 1 GiB). VORTEX_PROTO /
+# VORTEX_SERVER take a comma-separated list as well as `all`. Local-only.
 # The load client is an axis too: VORTEX_CLIENT (python|navi|all, default
 # python -- the httpx/websockets/aioquic canary; navi is the compiled Nim client
 # for the cells where the Python loop, not vortex, is the ceiling), with
@@ -261,7 +265,13 @@ task stressMixed, "Stress soak: all five workloads at one server at once (Docker
 
 task stress, "Short smoke of all six stress workloads (Docker)":
   # Runs every workload short (20s), mixed included, and hard-fails on any
-  # mismatch.
+  # mismatch. Then two targeted steps (#405): streamdownload on h2 with
+  # VORTEX_DOWNLOAD_CHUNK=1048576 (1 MiB res.write + onDrain, the parked
+  # producer no default cell reaches) and ws on VORTEX_SERVER=async over h2 and
+  # h3 (rt.ws's Extended CONNECT leg, which the sync default never registers).
+  # Three more cells per client under the defaults; see run.sh. An explicit
+  # VORTEX_DOWNLOAD_CHUNK skips the download step (non-zero already reached
+  # every step, 0 opts out).
   # Default to 20s but honor an explicit VORTEX_SECONDS from the caller -- an
   # inline `VORTEX_SECONDS=20 sh ...` would otherwise shadow the inherited env
   # (VORTEX_REPORT_SECONDS already passes through, so the two were

@@ -1649,6 +1649,27 @@ proc h2Writable(res: Response): bool =
     return false
   true
 
+proc queueDrainKick(core: ptr LoopCore, rs: ptr RequestState,
+                    key: ReqKey) {.inline.} =
+  ## Owe a carrier's pending drain registration one loop pass (runDrainKicks,
+  ## #403), at most once per pass: a burst of registrations, or a producer that
+  ## re-registers in a tight loop, queues one entry and costs one pass.
+  if rs.drainKickQueued: return
+  rs.drainKickQueued = true
+  core.drainKicks.add key
+
+proc h1ArmHeadDrain(res: Response) {.raises: [].} =
+  ## HTTP/1.1 half of onDrain's arming for a registration made BEFORE the head
+  ## (#403): onDrain marks c.respBackedUp only on a streaming response, so a
+  ## callback registered first sat unmarked, and flushOut never fired it once
+  ## the body backed up. Mark it now that the response streams, AFTER the head's
+  ## own flush so it is not fired inside sendHead, and owe it a loop pass in
+  ## case the buffer is already empty and no drain event will come.
+  let c = conn(res.core, res.fd, res.gen)
+  if c == nil or c.rs.onRespDrain == nil or not c.rs.respStreaming: return
+  c.respBackedUp = true
+  queueDrainKick(res.core, addr c.rs, (res.fd, res.gen, 0'u32))
+
 proc sendHead*(res: Response, code: HttpCode, contentType = "",
                headers: openArray[(string, string)] = [],
                contentLength = -1) {.raises: [].} =
@@ -1731,6 +1752,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
                          announceKeepAlive = ka and c.parser.minor == 0,
                          altSvc = res.core.altSvc, contentLength = effLen)
         flushConn(res)
+        h1ArmHeadDrain(res)
       else:
         applyResponse(res.core, c, 0, int(code), contentType, userHeaders, "")
       return
@@ -1753,6 +1775,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
                      announceKeepAlive = ka and c.parser.minor == 0,
                      altSvc = res.core.altSvc, contentLength = effLen)
     flushConn(res)
+    h1ArmHeadDrain(res)
   except Exception:
     discard
 
@@ -1930,10 +1953,25 @@ proc finish*(res: Response) {.raises: [].} =
     discard
 
 proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
-  ## Register a callback fired (loop thread) when a backed-up streaming
-  ## response's write backlog empties, so the producer can resume writing.
-  ## Loop-thread only to register, too: an off-thread registration is dropped
-  ## silently, and a producer that then waits for the callback waits for good.
+  ## Register a one-shot callback fired (loop thread) once the streaming
+  ## response's write backlog has drained, so the producer can resume writing.
+  ## The rule per protocol: on HTTP/2, once both the stream backlog and the
+  ## connection write buffer are under the mark (a socket drain or WINDOW_UPDATE
+  ## moved bytes), or, with nothing queued at all, on the next loop pass; on
+  ## HTTP/1.1 once the write buffer is empty; on HTTP/3 once the stream's unsent
+  ## backlog is empty. Register after a `write` that returned false (the usual
+  ## pattern), or at any other time, before or after `sendHead` (#403).
+  ##
+  ## It never fires from inside this call, so a producer may re-register from
+  ## its own callback without recursing; but it can fire synchronously inside a
+  ## LATER `res.write` on the same response, whose flush runs the drain path. A
+  ## producer that re-registers from its callback without writing is fired
+  ## again on every loop pass while drained (effectively a setImmediate). A
+  ## later registration replaces an unfired one, `finish` / `abort` drop one
+  ## still pending, and on an HTTP/2 HEAD response a registration after
+  ## `sendHead` is dropped (the head closed the stream). Loop-thread only to
+  ## register, too: an off-thread registration is dropped silently, and a
+  ## producer that then waits for the callback waits for good.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
   # The h3 reflush path cannot pass the handle words, so the callback closes
@@ -1945,6 +1983,90 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   rs.onRespDrain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
                         stream: uint32) {.gcsafe.} =
     captured(held)
+  # Arm it (#403). The drain paths deliver a callback only to a response they
+  # know is waiting: h2ResumeProducers visits marked streams and h1's flushOut
+  # fires only with c.respBackedUp set, and until now only a false verdict from
+  # `write` set either. A registration without one -- `await res.drained()`
+  # after a write that returned true with a small backlog left, or an
+  # unconditional `res.onDrain` -- was never fired. Mark the response the way a
+  # false verdict would, so whichever drain event is still owed delivers it, and
+  # queue one loop pass (runDrainKicks) that fires it if the response is already
+  # fully drained, for when no event is owed at all. h3 needs no mark (its
+  # writable callback checks the backlog, not a flag), only the loop pass. An
+  # h1 registration made before the head is marked by sendHead (h1ArmHeadDrain).
+  if res.fd >= 0:
+    let c = conn(res.core, res.fd, res.gen)
+    if c != nil:
+      if res.stream != 0: h2ArmDrain(c, res.stream)
+      elif c.rs.respStreaming: c.respBackedUp = true
+  queueDrainKick(res.core, rs, (res.fd, res.gen, res.stream))
+
+proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
+  ## The loop pass each `res.onDrain` registration is owed (LoopCore.drainKicks,
+  ## #403): fire the callback if the response is ALREADY fully drained, and
+  ## otherwise leave it to the drain event that is still coming (the
+  ## registration marked the response for it). Called once per loop iteration
+  ## by the event loop, outside any codec callback, so a fired producer may
+  ## write freely. Exactly once: every firing site (this one, the h2 resume
+  ## scan, h1's flushOut, h3's writable callback, every teardown) clears the
+  ## callback before invoking it, and a kick that finds it already gone --
+  ## fired, replaced, dropped by finish/abort, or its connection closed and
+  ## recycled -- does nothing.
+  if core.drainKicks.len == 0: return
+  var kicks: seq[ReqKey]
+  swap(kicks, core.drainKicks)        # a re-registration lands on the next pass
+  for (fd, gen, stream) in kicks:
+    try:
+      let rs = reqStateOf(core, fd, gen, stream)
+      if rs == nil: continue
+      rs.drainKickQueued = false      # consumed: the next registration re-queues
+      if rs.onRespDrain == nil: continue
+      if fd < 0:
+        when not defined(plainHttp):
+          let h3c = h3ConnOf(core, fd, gen)
+          if h3c == nil: continue
+          let st = h3StreamPtr(h3c, uint64(stream))
+          if st == nil or st.rs.onRespDrain == nil: continue
+          # Bytes not yet handed to nghttp3 will be sent and acked, and that ack
+          # fires the callback (backend.cbStreamWritable); none means drained.
+          if h3StreamBacklog(h3c, uint64(stream)) > 0: continue
+          let cb = st.rs.onRespDrain
+          st.rs.onRespDrain = nil
+          cb(core, fd, gen, stream)
+        continue
+      let c = conn(core, fd, gen)
+      if c == nil: continue
+      if stream != 0:
+        # h2: fire only when fully drained (h2DrainKick); a backlog that still
+        # holds bytes is the marked stream's next WINDOW_UPDATE or socket drain
+        # to deliver, under the scan's own rule. Firing here on "under the mark"
+        # busy-looped a flush-before-finish producer against a stalled peer.
+        # The kick's scheduler pass runs under a flush hold, and its bytes are
+        # flushed once; the flush is skipped when the pass emitted nothing, so
+        # a stalled socket's EAGAIN drain path (which runs the scan) is not
+        # re-entered by every kick.
+        if c.h2 == nil: continue
+        let before = pendingOut(c)
+        holdFlush(c)
+        let cb = h2DrainKick(c, stream)
+        if releaseFlushHold(c) and pendingOut(c) > before:
+          core.hooks.flushHook(core.loopPtr, fd, gen)
+        if cb != nil: cb(core, fd, gen, stream)
+        continue
+      # h1: drained means the write buffer is empty. With bytes still queued,
+      # mark the response (a registration made before sendHead, or one the
+      # flag missed) so the write interest flushOut armed delivers it. Before
+      # the head, sendHead marks it (h1ArmHeadDrain).
+      if not c.rs.respStreaming: continue
+      if pendingOut(c) > 0:
+        c.respBackedUp = true
+        continue
+      c.respBackedUp = false
+      let cb = c.rs.onRespDrain
+      c.rs.onRespDrain = nil
+      cb(core, fd, gen, 0)
+    except Exception:
+      discard                         # a raising producer must not stop the rest
 
 proc bufferedAmount*(res: Response): int =
   ## Bytes queued for the streaming response but not yet written to the
@@ -2791,9 +2913,11 @@ const fileReadAhead = fileChunkCap
   ## pullAfterWrite can dispatch on it without overshooting the budget.
 
 proc parkNextRead(res: Response, nextRead: string, reader: pointer) =
-  ## Hang the next disk read off the response's drain callback. Only correct
-  ## when the write that just ran reported backpressure, which is what arms the
-  ## callback: see pullAfterWrite.
+  ## Hang the next disk read off the response's drain callback. Taken only when
+  ## the write that just ran reported backpressure (see pullAfterWrite): a
+  ## registration now arms itself (onDrain, #403), so parking after a true
+  ## verdict would no longer stall, but it would cost a loop pass to learn what
+  ## the verdict already said.
   let held = nextRead
   let r = reader
   res.onDrain(proc(res2: Response) {.gcsafe.} =

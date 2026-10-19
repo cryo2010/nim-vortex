@@ -46,6 +46,20 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     for i in 0 ..< 64:
       discard res.write(chunk)
     res.finish()
+  of "/ondrain-every":
+    # res.onDrain after EVERY write, whatever the verdict (#403): h3's writable
+    # callback needs no mark, but a registration that finds nothing left to send
+    # is owed no ack, so only the loop's pass for the registration can fire it.
+    res.sendHead(Http200, "application/octet-stream")
+    let n = new(int)
+    proc pump(r: Response) {.gcsafe.} =
+      if n[] >= 64:
+        r.finish()
+        return
+      inc n[]
+      discard r.write(repeat('e', 32 * 1024))
+      r.onDrain(pump)
+    pump(res)
   of "/exactlen":
     # A streamed body that delivers exactly the Content-Length it declared: the
     # normal case (every sendFile response), which must still end cleanly.
@@ -194,6 +208,12 @@ withServer(RequestHandler(handler),
         "-o /dev/null -w '%{size_download}' " & base & "/streambig")
       check rc == 0
       check output == $(64 * 4096)
+
+    test "res.onDrain after every write completes over h3 (#403)":
+      let (output, rc) = h3curl(
+        "-o /dev/null -w '%{size_download}' " & base & "/ondrain-every")
+      check rc == 0
+      check output == $(64 * 32 * 1024)
 
     test "response trailers are emitted over h3 (trailing HEADERS)":
       # curl surfaces h3 trailers by dumping them with the response headers (-D).

@@ -121,6 +121,7 @@ proc vqStreamFinish(conn: ptr VqConn, sid: int64) {.importc: "vq_stream_finish".
 proc vqStreamBacklog(conn: ptr VqConn, sid: int64): csize_t {.importc: "vq_stream_backlog".}
 proc vqStreamReset(conn: ptr VqConn, sid: int64, appErr: uint64) {.importc: "vq_stream_reset".}
 proc vqStreamConsume(conn: ptr VqConn, sid: int64, n: csize_t) {.importc: "vq_stream_consume".}
+proc vqStreamStopSending(conn: ptr VqConn, sid: int64): cint {.importc: "vq_stream_stop_sending".}
 template vqConnConsume(conn: ptr VqConn, n: csize_t) =
   ## Connection-level (MAX_DATA) credit only; sid < 0 skips the per-stream window
   ## (see vq_stream_consume). For received body bytes with no stream to replenish.
@@ -904,6 +905,23 @@ proc buildRespHeaders(core: ptr LoopCore, code: int, contentType: string,
     if isForbiddenResponseField(ln): continue
     if ln.len == 0 or ln[0] != ':': result.add (ln, val)
 
+proc stopIfRequestOpen(conn: H3Conn, sid: uint64) =
+  ## The response on `sid` is complete (FIN submitted) while the client has not
+  ## finished the request -- a refused Extended CONNECT, or an early answer to a
+  ## body still arriving. RFC 9114 4.1: stop reading it with H3_NO_ERROR rather
+  ## than keep crediting and buffering bytes nobody will read; the h3 twin of
+  ## h2's RST_STREAM(NO_ERROR) (#404). An accepted WebSocket never gets here
+  ## (responded at accept), and a finished or already-reset request is skipped.
+  ## cbStreamClose still finalizes the sink and credit once the client resets.
+  if conn.vq == nil or sid notin conn.streams: return
+  template st: H3Stream = conn.streams[sid]
+  if st.finSeen or st.ws != nil or st.rejected: return
+  # 1: stopped. 0: nothing to do (the client already reset the stream, so its
+  # close is still charged as a reset). < 0: nghttp3/ngtcp2 failed, and the
+  # shim has already set the connection to close (CONNECTION_CLOSE on the
+  # next pump), so there is nothing more to do from here either.
+  discard vqStreamStopSending(conn.vq, int64(sid))
+
 proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                 contentType: string, extraHeaders: openArray[(string, string)],
                 body: openArray[char],
@@ -919,6 +937,7 @@ proc h3Respond*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
   vqSubmitResponse(conn.vq, int64(sid), cint(code), addr nv[0], csize_t(nv.len),
     (if sendBody: cast[ptr uint8](unsafeAddr body[0]) else: nil),
     (if sendBody: csize_t(body.len) else: 0), 1)
+  stopIfRequestOpen(conn, sid)
 
 proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                  contentType: string, extraHeaders: openArray[(string, string)],
@@ -937,7 +956,9 @@ proc h3SendHead*(core: ptr LoopCore, conn: H3Conn, sid: uint64, code: int,
                               bodyLen = -1, st.isHead, bodiless = false)
   var nv = toVq(hdrs)
   vqSubmitHead(conn.vq, int64(sid), cint(code), addr nv[0], csize_t(nv.len))
-  if st.isHead: vqStreamFinish(conn.vq, int64(sid))
+  if st.isHead:
+    vqStreamFinish(conn.vq, int64(sid))
+    stopIfRequestOpen(conn, sid)
 
 proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
   if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return 0
@@ -993,6 +1014,7 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
                          value: lower[i][1].cstring, value_len: csize_t(lower[i][1].len))
       vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
   vqStreamFinish(conn.vq, int64(sid))
+  stopIfRequestOpen(conn, sid)
 
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
   if conn.vq == nil or sid notin conn.streams: return 0

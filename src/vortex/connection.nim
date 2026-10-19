@@ -180,6 +180,10 @@ type
                               ## state when the carrier is reset/deleted.
     respEnc*: string          ## "gzip"/"br" for respComp (empty = none)
     onRespDrain*: RespDrainCb ## streamed-response drain callback
+    drainKickQueued*: bool    ## this carrier's key is already on
+                              ## LoopCore.drainKicks, so a burst of onDrain
+                              ## registrations queues one kick, not one each
+                              ## (cleared when runDrainKicks consumes it, #403)
     reqStreaming*: bool       ## dispatched early; body flows to onBody
     onBodyCb*: BodyCb         ## inbound streaming sink (req.onBody)
     bodyManualAck*: bool      ## defer flow-control credit to req.ackBody (the
@@ -435,6 +439,16 @@ type
       ## Pending `res.trailers` per in-flight streamed response, emitted by
       ## `res.finish` after the body (loop-thread only). Empty for the common
       ## case, so a response that sets no trailers pays only one failed lookup.
+    drainKicks*: seq[ReqKey]
+      ## Streamed responses that just registered `res.onDrain` (directly or via
+      ## `res.drained()`), each owed one loop pass that fires the callback if the
+      ## response is already fully drained (request.runDrainKicks, #403). A
+      ## drain is otherwise delivered only by an event -- a socket drain, a
+      ## WINDOW_UPDATE, an h3 ack -- and a registration made while nothing is
+      ## queued has no such event left to come. Loop-thread only; while
+      ## non-empty the selector does not wait. fd+generation, so a recycled slot
+      ## is skipped. At most one entry per carrier per pass
+      ## (RequestState.drainKickQueued).
     # Async-adapter integration (see adapters/). All loop-thread only.
     loopPtr*: pointer         ## the owning Loop, for kick
     hooks*: AdapterHooks      ## adapter/event-loop proc-pointer vtable (below)
@@ -839,6 +853,8 @@ proc resetRequest*(rs: var RequestState) =
   rs.respComp = nil           # frees the streaming codec state (=destroy)
   rs.respEnc = ""
   rs.onRespDrain = nil
+  rs.drainKickQueued = false  # a kick still queued for the old request finds
+                              # no callback; a new registration queues afresh
   rs.reqStreaming = false
   rs.onBodyCb = nil
   rs.bodyManualAck = false

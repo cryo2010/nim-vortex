@@ -52,9 +52,32 @@ proc hBuffered(req: Request, res: Response) {.gcsafe.} =
   for (n, v) in req.trailers: tr.add "|" & n & "=" & v
   res.send(Http200, "buffered:" & $req.body.len & tr)
 
+var earlyEof: Atomic[int]   ## onBody(last=true) deliveries on the /early* routes
+
+proc hEarly(req: Request, res: Response) {.gcsafe.} =
+  ## Streaming route that answers before the body arrives (a 413 for a body it
+  ## will not take), with a body sink still registered: the response completes
+  ## while the request is open, so the codec must reset the stream with
+  ## NO_ERROR and terminate the sink (#404). The three spellings below reach
+  ## the three ways a response's final frame is emitted: DATA(END_STREAM) from
+  ## the scheduler, HEADERS(END_STREAM) for an empty body, and the bare
+  ## END_STREAM DATA a streamed response's finish writes.
+  req.onBody proc(chunk: openArray[char], last: bool) {.gcsafe.} =
+    if last: discard earlyEof.fetchAdd(1)
+  case req.path
+  of "/early": res.send(Http413, "too large")
+  of "/early0": res.send(Http413)
+  else:
+    res.sendHead(Http413, "text/plain")
+    discard res.write("too large, streamed")
+    res.finish()
+
 var rt = newRouter()
 rt.post("/stream", hStream, streaming = true)
 rt.post("/buffered", hBuffered)
+rt.post("/early", hEarly, streaming = true)
+rt.post("/early0", hEarly, streaming = true)
+rt.post("/earlystream", hEarly, streaming = true)
 
 var srv = newVortex(rt.toHandler,
                     initVortexConfig(numThreads = 1,
@@ -275,6 +298,126 @@ suite "HTTP/2 streaming-route content-length reconciliation (#237)":
     let fs = c.settle(1)
     check fs.rstError(1) == -1
     check fs.bodyOf(1) == "buffered:4"
+    c.close()
+
+proc firstIndex(fs: seq[Frame], sid: uint32, typ: FrameType,
+                flag = 0'u8): int =
+  ## Index of the first `typ` frame on `sid` (carrying `flag` if non-zero), or
+  ## -1: frame ORDER is the point of the #404 assertions.
+  for i, f in fs:
+    if f.streamId == sid and f.typ == uint8(typ) and
+        (flag == 0 or (f.flags and flag) != 0):
+      return i
+  -1
+
+template checkEarlyAnswer(path: string) =
+  ## A streaming POST declaring a body far larger than what is sent, answered
+  ## by the handler at once: the frames on stream 1 must be the complete
+  ## response, END_STREAM, then RST_STREAM(NO_ERROR) (RFC 9113 8.1), the sink
+  ## must see last=true, DATA the client already had in flight must not cost the
+  ## connection, and the connection must keep serving.
+  var c = newH2TestConn(srv.port)
+  c.drainHello()
+  let eofs = earlyEof.load()
+  var f = ""
+  f.addRequest(1, head(path, [("content-length", "1000000")]),
+               endStream = false)
+  f.addData(1, 'x'.repeat(16384), endStream = false)
+  c.sendAll(f)
+  let fs = c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+    fs.rstError(1) >= 0)
+  check fs.hasResponse(1)
+  check fs.rstError(1) == int(errNoError)
+  let endAt = max(fs.firstIndex(1, ftHeaders, flagEndStream),
+                  fs.firstIndex(1, ftData, flagEndStream))
+  check endAt >= 0
+  check fs.firstIndex(1, ftRstStream) > endAt   # RST strictly after END_STREAM
+  check waitFor(proc(): bool = earlyEof.load() > eofs)
+  # The client keeps sending what it had queued before it read the reset: the
+  # stream is gone, but these must be tolerated per stream, never a GOAWAY.
+  var late = ""
+  for _ in 0 ..< 8: late.addData(1, 'y'.repeat(16384), endStream = false)
+  late.addRequest(3, head("/buffered", [("content-length", "4")]),
+                  endStream = false)
+  late.addData(3, "body", endStream = true)
+  c.sendAll(late)
+  let after = c.settle(3)
+  check after.goawayError() == -1
+  check after.bodyOf(3) == "buffered:4"
+  check after.rstError(3) == -1
+  c.close()
+
+suite "HTTP/2 early answer on an open request (#404)":
+  test "a sent body: DATA(END_STREAM) then RST_STREAM(NO_ERROR)":
+    checkEarlyAnswer("/early")
+
+  test "an empty body: HEADERS(END_STREAM) then RST_STREAM(NO_ERROR)":
+    checkEarlyAnswer("/early0")
+
+  test "a streamed response: finish's END_STREAM then RST_STREAM(NO_ERROR)":
+    checkEarlyAnswer("/earlystream")
+
+  test "late DATA after RST_STREAM(NO_ERROR) is ignored, not answered":
+    # RFC 9113 5.1: an endpoint that has sent RST_STREAM MUST ignore the
+    # frames it then receives on the stream. The reviewer's shape: the client
+    # keeps writing its body in small frames after our 413 and reset, well
+    # past maxControlFrames (1000) frames. Answering each with
+    # RST_STREAM(STREAM_CLOSED) and a budget charge tore the connection down
+    # with GOAWAY(ENHANCE_YOUR_CALM) and stream 3 was never answered. The late
+    # bytes stay inside the stream window the client held at the reset, so
+    # they are dropped silently; a racing trailer section and a racing
+    # RST_STREAM(CANCEL) are ignored too.
+    var c = newH2TestConn(srv.port)
+    c.drainHello()
+    var f = ""
+    f.addRequest(1, head("/early", [("content-length", "1000000")]),
+                 endStream = false)
+    f.addData(1, 'x'.repeat(100), endStream = false)
+    c.sendAll(f)
+    let fs = c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+      fs.rstError(1) >= 0)
+    check fs.rstError(1) == int(errNoError)
+    var late = ""
+    for _ in 0 ..< 1500: late.addData(1, 'y'.repeat(100), endStream = false)
+    late.addRequest(1, [("x-late", "1")], endStream = true)   # trailers
+    late.addRstStream(1, errCancel)
+    late.addRequest(3, head("/buffered", [("content-length", "4")]),
+                    endStream = false)
+    late.addData(3, "body", endStream = true)
+    c.sendAll(late)
+    let after = c.settle(3)
+    check after.goawayError() == -1
+    check after.rstError(1) == -1          # no RST(STREAM_CLOSED) for stream 1
+    check after.bodyOf(3) == "buffered:4"
+    check after.rstError(3) == -1
+    c.close()
+
+  test "late DATA past the stream window it held is answered as before":
+    # The tolerance is bounded by the stream receive window the client still
+    # held when we reset (1 MiB here): DATA beyond it is a flow-control
+    # violation, not in-flight data, and takes the ordinary closed-stream
+    # path, RST_STREAM(STREAM_CLOSED) per frame.
+    var c = newH2TestConn(srv.port)
+    c.drainHello()
+    var f = ""
+    f.addRequest(1, head("/early", [("content-length", "1000000")]),
+                 endStream = false)
+    c.sendAll(f)
+    let fs = c.readFrames(1500, until = proc(fs: seq[Frame]): bool =
+      fs.rstError(1) >= 0)
+    check fs.rstError(1) == int(errNoError)
+    var late = ""
+    for _ in 0 ..< 72: late.addData(1, 'y'.repeat(16384), endStream = false)
+    c.sendAndDrain(late)
+    var more = ""
+    more.addRequest(3, head("/buffered", [("content-length", "4")]),
+                    endStream = false)
+    more.addData(3, "body", endStream = true)
+    c.sendAll(more)
+    let after = c.settle(3)
+    check after.rstError(1) == int(errStreamClosed)
+    check after.goawayError() == -1
+    check after.bodyOf(3) == "buffered:4"
     c.close()
 
 proc sendTrailers(c: var H2TestConn, sid: uint32,

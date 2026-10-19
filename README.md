@@ -588,9 +588,9 @@ through a dead connection is a safe no-op.
 | `res.trailers[name] = v` | `void` | set a response *trailer* emitted after the streamed body: the chunked trailer section on h1, a trailing `HEADERS` frame on h2 and h3. Same shape as `res.headers`; set before `res.finish` |
 | `res.abort()` | `void` | truncate a streamed response (error mid-body) |
 | `res.stream(code = Http200, contentType, headers = []): body` | `template` | block form of a streamed response |
-| `res.onDrain(cb)` | `void` | fire `cb` when the streamed-response write backlog empties |
+| `res.onDrain(cb)` | `void` | fire `cb` once (one-shot) when the streamed-response write backlog has drained (rule per protocol under [Download](#download)). Register after a `false` write or at any other time, before or after `sendHead`; it never fires inside the registration call, but can fire inside a later `res.write` on the same response. Re-registering from `cb` without writing fires it again on every loop pass while drained (a setImmediate). On an HTTP/2 `HEAD` response a registration after `sendHead` is dropped |
 | `res.bufferedAmount` | `int` | bytes queued but not yet written to the socket; loop-thread only (0 from another thread) |
-| `res.drained()` | `Future[void]` | awaitable drain (async adapter) |
+| `res.drained()` | `Future[void]` | awaitable drain (async adapter); safe after any write, not only one that returned `false`. Completes at once when nothing is queued; on HTTP/2 it can complete with `bufferedAmount > 0` (under the mark) |
 | `res.setPriority(urgency, incremental = false)` | `void` | RFC 9218 scheduling override for this response over HTTP/2: lower `urgency` (0..7, default 3) is served first; `incremental = true` interleaves with same-urgency streams, `false` delivers it sequentially. Beats the client's `Priority` header / `PRIORITY_UPDATE`. No-op over h1 and h3; loop-thread only |
 | `res.sse(headers = [], retry = 0)` | `SseStream` | begin a Server-Sent Events stream (see [SSE](#server-sent-events)) |
 | `res.withSse(s, headers = [], retry = 0): body` | `macro` | block form of an SSE stream; `headers`/`retry` forward to `res.sse` (pass them by name) |
@@ -962,7 +962,16 @@ stream's backlog or the connection's write buffer is *still* at or above the
 mark at that point. A fast peer can absorb a whole 1 MiB chunk inside the call
 and get `true` back, which is the common case on HTTP/2 with a wide peer
 window. When it does return `false`, `onDrain` fires once both the stream
-backlog and the connection write buffer are under the mark again. Chunk size is
+backlog and the connection write buffer are under the mark again. A drain wait
+registered without a preceding `false` -- `await res.drained()` after every
+write, or a `res.onDrain` from a timer -- is fine too. On HTTP/2 it fires when
+a socket drain or `WINDOW_UPDATE` leaves both caps under the mark, as after a
+`false`, or on the next loop pass if nothing is queued at all; on HTTP/1.1 once
+the write buffer is empty, and on HTTP/3 once the stream's unsent backlog is
+empty. `drained()` completes at once when nothing is queued. So a
+flush-before-finish loop (`while res.bufferedAmount > 0: await res.drained()`)
+can take several turns on HTTP/2, one per drain event, and simply parks while
+the peer reads nothing. Chunk size is
 purely a memory / callback trade-off -- a 1 MiB chunk retains more per stream
 and earns fewer drain callbacks than a 64 KiB one -- and no chunk size can
 stall the stream.
@@ -1149,7 +1158,11 @@ that is not a handshake never reaches it: one that asked for a WebSocket but
 offered no supported `Sec-WebSocket-Version` gets a `426 Upgrade Required` with
 `Sec-WebSocket-Version: 13` (RFC 6455 4.2.2(4), which RFC 8441 keeps for h2 and
 h3), and one that never asked at all -- an HTTP/1.1 proxy-style `CONNECT`, a
-plain `GET` or `HEAD` -- gets a 400.
+plain `GET` or `HEAD` -- gets a 400. Over h2 and h3 a client normally leaves a
+CONNECT stream open, so when the request side is still open the refusal is
+followed by `RST_STREAM(NO_ERROR)` (h2) or `STOP_SENDING(H3_NO_ERROR)` (h3)
+telling it to stop sending, as for any response that completes before its
+request does; a client that already ended the stream gets the refusal alone.
 
 Because `ws` registers the `CONNECT` leg itself, an app that used to add it by
 hand beside `ws` (the pre-`ws` workaround) must drop that `addRoute`: the

@@ -253,6 +253,15 @@ size_t vq_stream_backlog(VqConn *conn, int64_t stream_id);
 /* Abort a single stream with an HTTP/3 application error (RESET_STREAM). */
 void vq_stream_reset(VqConn *conn, int64_t stream_id, uint64_t app_error);
 
+/* The response is complete but the request is not: stop reading it and send
+ * STOP_SENDING(H3_NO_ERROR) (RFC 9114 4.1), leaving the response side alone.
+ * The close that follows is not charged to the rapid-reset budget (#404).
+ * Returns 1 when the stop was sent; 0 when nothing was done (unknown stream,
+ * already stopped, or the client had already reset it, whose close then
+ * stays a reset for the budget); a negative nghttp3/ngtcp2 error code when the
+ * library failed, in which case the connection is already set to close. */
+int vq_stream_stop_sending(VqConn *conn, int64_t stream_id);
+
 /* Ack n consumed request-body bytes: extend the peer's flow-control window
  * (mirrors req.ackBody backpressure). stream_id < 0 extends the CONNECTION-level
  * window (MAX_DATA) only, leaving the per-stream window untouched -- used for

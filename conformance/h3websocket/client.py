@@ -16,8 +16,10 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h3.connection import H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import StopSendingReceived
 
 OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x1, 0x2, 0x8, 0x9, 0xA
+H3_NO_ERROR = 0x100
 MASK = b"\x21\x43\x65\x87"
 
 
@@ -61,10 +63,15 @@ class WsClient(QuicConnectionProtocol):
         self._data = bytearray()
         self._got_headers = asyncio.Event()
         self._got_data = asyncio.Event()
+        self._stops = {}                    # stream id -> STOP_SENDING code
+        self._got_stop = asyncio.Event()
 
     def quic_event_received(self, event):
         if self._http is None:
             self._http = H3Connection(self._quic)
+        if isinstance(event, StopSendingReceived):
+            self._stops[event.stream_id] = event.error_code
+            self._got_stop.set()
         for e in self._http.handle_event(event):
             if isinstance(e, HeadersReceived) and e.stream_id == self._sid:
                 self._headers = dict(e.headers)
@@ -116,6 +123,18 @@ class WsClient(QuicConnectionProtocol):
         self.transmit()
         await asyncio.wait_for(self._got_headers.wait(), timeout=5)
         return self._status
+
+    async def stop_sending(self, sid, timeout=5):
+        """The STOP_SENDING error code the server sent for stream `sid`."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while sid not in self._stops:
+            self._got_stop.clear()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(f"no STOP_SENDING on stream {sid}")
+            await asyncio.wait_for(self._got_stop.wait(), timeout=remaining)
+        return self._stops[sid]
 
     def resp_header(self, name: bytes) -> bytes:
         """A field of the last response HEADERS (b"" if the server omitted it)."""
@@ -212,18 +231,34 @@ async def run_bad_version(host, port):
     Required naming the version the server speaks. The h3 codec classifies a
     ws-connect stream on `:protocol` alone, so this is `router.ws`'s screening
     rather than the codec's -- and it must refuse the stream, not upgrade it.
+
+    The client never ends a CONNECT stream itself, so the 426 completes the
+    response while the request is still open: RFC 9114 4.1 has the server stop
+    reading it with STOP_SENDING(H3_NO_ERROR) (#404). Without that the stream
+    never closes, never returns its MAX_STREAMS credit, and enough refusals
+    starve the connection of streams; with it, the close must not be charged to
+    the rapid-reset budget either (maxResetStreams, 512 by default), which the
+    loop runs past.
     """
     async with client_ctx(host, port) as client:
-        status = await client.open_ws("server", "/", version=b"")
+        status = await client.open_ws(
+            "server", "/", version=b"", pipelined=ws_frame(OP_TEXT, b"early"))
         assert status == "426", f"version-less handshake status {status!r}"
         offered = client.resp_header(b"sec-websocket-version")
         assert offered == b"13", f"426 must name the version: {offered!r}"
+        code = await client.stop_sending(client._sid)
+        assert code == H3_NO_ERROR, f"STOP_SENDING code {code:#x} after a 426"
+        for i in range(600):
+            status = await client.open_ws("server", "/", version=b"")
+            assert status == "426", f"refusal {i}: status {status!r}"
+            await client.stop_sending(client._sid)
         status = await client.open_ws("server", "/")
         assert status == "200", f"handshake after a refusal: {status!r}"
         client.send_ws(OP_TEXT, b"after-426")
         fr = (await client.recv_ws())[0]
         assert fr == (OP_TEXT, b"after-426"), f"echo after a refusal: {fr}"
-        print("version-less Extended CONNECT refused 426, connection OK")
+        print("version-less Extended CONNECT refused 426 + STOP_SENDING"
+              "(H3_NO_ERROR), 600 more refusals, connection OK")
 
 
 async def run(host, port):
