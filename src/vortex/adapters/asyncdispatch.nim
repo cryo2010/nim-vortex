@@ -100,6 +100,19 @@ template onCompleted(fut, body: untyped) =
   fut.addCallback proc () {.gcsafe.} =
     body
 
+proc completeSoon(fut: Future[void]) =
+  ## Contract shared with the chronos backend: complete `fut` on a LATER turn of
+  ## the event loop, never inside this call, so a coroutine awaiting it suspends
+  ## and the loop serves I/O before it resumes (adapterimpl's `drained()` on an
+  ## ended response, #408). Not `callSoon`: asyncdispatch drains its callback
+  ## queue until it is empty, including callbacks queued while it runs, so a
+  ## producer loop re-arming through callSoon would spin inside one poll()
+  ## forever. A zero timer fires on the next poll() (processTimers only pops
+  ## timers due when it started), and the vortex pump polls a bounded number of
+  ## times per loop iteration.
+  sleepAsync(0).addCallback proc () {.gcsafe.} =
+    if not fut.finished: complete(fut)
+
 template runAsyncBody(body: untyped): untyped =
   ## Immediately-invoked async closure; asyncdispatch needs the explicit
   ## `closure` calling convention alongside `{.async.}`.

@@ -9,7 +9,7 @@ import std/[unittest, net, httpcore, strutils, atomics, posix, times, os]
 import vortex/[settings, request, server, routing, staticfiles]
 import vortex/asyncdispatch
 import vortex/http2/frames
-from vortex/connection import conn, fileChunkCap
+from vortex/connection import conn, fileChunkCap, totalPins
 from vortex/http2/codec import h2Stream
 import ./h2client
 
@@ -161,6 +161,29 @@ block:
   writeFile(shrinkPath, body)
 
 rt.get("/shrink", fileRoute(shrinkPath))
+
+# --- a sendFile stream the peer resets while the connection stays up ----------
+
+const hugeBytes = 8'i64 * 1024 * 1024 * 1024
+  ## A sparse file (no disk blocks): ~32K read hops, seconds of reading if the
+  ## chain kept going after the reset, which is what the test must rule out.
+
+let hugePath = getTempDir() / ("vortex_h2_reset_" & $getCurrentProcessId())
+block:
+  var f = open(hugePath, fmWrite)
+  f.setFilePos(hugeBytes - 1)
+  f.write('\0')
+  f.close()
+
+proc pinsRoute(req: Request, res: Response) {.gcsafe.} =
+  ## Worker tasks this connection holds right now. A streamed sendFile holds a
+  ## pkFileChunk pin for every read in flight, so a chain that is still reading
+  ## shows one nearly all the time. Runs on the loop thread (a plain handler).
+  let c = conn(res.core, res.fd, res.gen)
+  res.send(Http200, if c == nil: "-1" else: $c.totalPins)
+
+rt.get("/huge", fileRoute(hugePath))
+rt.get("/pins", pinsRoute)
 
 var srv = newVortex(rt.toHandler, initVortexConfig(numThreads = 1)).start(0)
 
@@ -563,8 +586,58 @@ suite "HTTP/2 streaming download":
         break
     check mismatch == -1                      # what did arrive is still exact
 
+  test "sendFile stops reading once the peer resets the stream (#408)":
+    # The connection stays up, so each read hop's pin is granted, and a reset
+    # stream's bufferedAmount is 0, so the read-ahead gate always passed: the
+    # rest of the file used to be read, hop by hop, into a stream that drops
+    # it. The chain must stop at the reset (applyFileChunk / dispatchNextRead
+    # check res.ended).
+    var c = newH2TestConn(srv.port)
+    var req = ""
+    req.addWindowUpdate(0, wideGrant)         # the stream window throttles, so
+                                              # the probes below still get bytes
+    req.addRequest(1, {":method": "GET", ":scheme": "http",
+                       ":path": "/huge", ":authority": "localhost"},
+                   endStream = true)
+    c.sendRaw(req)
+    var got = 0
+    let frames = c.readFrames(3000, until = proc(f: seq[Frame]): bool =
+      var n = 0
+      for x in f:
+        if x.typ == uint8(ftData) and x.streamId == 1: n += x.payload.len
+      n >= 32 * 1024)
+    for f in frames:
+      if f.typ == uint8(ftData) and f.streamId == 1: got += f.payload.len
+    check got >= 32 * 1024                    # the download really started
+    c.sendRst(1, errCancel)                   # the connection stays open
+    sleep(300)                                # the in-flight hop lands, then stop
+    var samples: seq[string]
+    var sid = 3'u32
+    for i in 0 ..< 10:
+      var probe = ""
+      probe.addRequest(sid, {":method": "GET", ":scheme": "http",
+                             ":path": "/pins", ":authority": "localhost"},
+                       endStream = true)
+      c.sendRaw(probe)
+      let want = sid
+      let fr = c.readFrames(2000, until = proc(f: seq[Frame]): bool =
+        for x in f:
+          if x.streamId == want and (x.flags and flagEndStream) != 0: return true
+        false)
+      var body = ""
+      for f in fr:
+        if f.typ == uint8(ftData) and f.streamId == sid: body.add f.payload
+      samples.add body
+      sid += 2
+      sleep(30)
+    check samples.len == 10
+    for s in samples:
+      check s == "0"                          # no read in flight, ever again
+    c.close()
+
 budgetSrv.close()
 srv.close()
 removeFile(filePath)
 removeFile(shrinkPath)
+removeFile(hugePath)
 echo "server shut down cleanly"

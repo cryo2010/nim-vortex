@@ -968,11 +968,29 @@ proc h3StreamWrite*(conn: H3Conn, sid: uint64, data: openArray[char]): int =
                              cast[ptr uint8](unsafeAddr data[0]), csize_t(data.len)))
   int(vqStreamBacklog(conn.vq, int64(sid)))
 
+proc fireEndedDrain(conn: H3Conn, sid: uint64, cb: RespDrainCb) =
+  ## Deliver a drain callback h3StreamAbort / h3StreamFinish detached before
+  ## ending the response (#408), once, after the reset or FIN was submitted: a
+  ## coroutine parked in `await res.drained()` while another task ended the
+  ## response resumes now, not on stream or connection close (cbStreamClose /
+  ## h3Free find it already detached). The callback observes a dead response:
+  ## `res.write` returns false, `res.drained()` completes (next loop turn) and a
+  ## re-registration is rejected. Contain Exception: an unannotated user
+  ## producer must not unwind into the engine (matches cbStreamClose).
+  if cb == nil: return
+  try: cb(conn.core, h3SlotFd(conn.slot), conn.core.h3slots[conn.slot].gen,
+          uint32(sid))
+  except Exception: discard
+
 proc h3StreamAbort*(conn: H3Conn, sid: uint64) =
+  ## Reset a streamed response mid-body (H3_INTERNAL_ERROR). A parked drain
+  ## callback is detached first and fired after the reset (#408).
   if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
   conn.streams[sid].rs.respStreaming = false
+  let drainCb = conn.streams[sid].rs.onRespDrain
   conn.streams[sid].rs.onRespDrain = nil
   vqStreamReset(conn.vq, int64(sid), 0x0102)   # H3_INTERNAL_ERROR
+  conn.fireEndedDrain(sid, drainCb)
 
 proc h3StreamFinish*(conn: H3Conn, sid: uint64,
                      trailers: openArray[(string, string)] = []) =
@@ -982,12 +1000,16 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
   ## well-formed lie the peer can only report as a protocol error, so the reset
   ## makes the truncation visible on our side too, as HTTP/1 forces the
   ## connection closed on the same mismatch (#248, #345).
+  ##
+  ## A parked drain callback is detached first and fired once after the FIN
+  ## (or by h3StreamAbort on the mismatch), #408.
   if conn.vq == nil or sid notin conn.streams or not conn.streams[sid].rs.respStreaming: return
   if conn.streams[sid].respDeclaredLen >= 0 and
       conn.streams[sid].respBodyWritten != conn.streams[sid].respDeclaredLen:
-    h3StreamAbort(conn, sid)
+    h3StreamAbort(conn, sid)   # resets the stream, fires a parked drain
     return
   conn.streams[sid].rs.respStreaming = false
+  let drainCb = conn.streams[sid].rs.onRespDrain
   conn.streams[sid].rs.onRespDrain = nil
   # Submit any trailer fields before the FIN so nghttp3 keeps the stream open for
   # the trailing HEADERS (RFC 9114 4.1). Names must be lowercase on the wire.
@@ -1015,6 +1037,7 @@ proc h3StreamFinish*(conn: H3Conn, sid: uint64,
       vqSubmitTrailers(conn.vq, int64(sid), addr tv[0], csize_t(tv.len))
   vqStreamFinish(conn.vq, int64(sid))
   stopIfRequestOpen(conn, sid)
+  conn.fireEndedDrain(sid, drainCb)
 
 proc h3StreamBacklog*(conn: H3Conn, sid: uint64): int =
   if conn.vq == nil or sid notin conn.streams: return 0

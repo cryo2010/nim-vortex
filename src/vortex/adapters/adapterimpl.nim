@@ -16,6 +16,9 @@
 # - `trackParked` / `untrackParked`: a future has parked on / woken from a
 #   wakeup only the vortex loop delivers (chronos counts these so its pump can
 #   stop spinning; asyncdispatch no-ops)
+# - `completeSoon(fut: Future[void])`: complete `fut` on a later turn of the
+#   event loop, never inside the call (chronos: callSoon; asyncdispatch: a zero
+#   timer, since its callback queue drains callbacks queued while it runs)
 # - `template runAsyncBody(body)`: an immediately-invoked async closure
 #   (the backends need different pragma spellings)
 
@@ -110,7 +113,25 @@ proc drained*(res: Response): Future[void] =
   ## still; a flush-before-finish loop (`while res.bufferedAmount > 0: await
   ## res.drained()`) then waits for the next WINDOW_UPDATE or socket drain on
   ## each turn, and parks (without spinning) while the peer reads nothing.
+  ##
+  ## It also completes when the response ends (#408): a wait parked here while
+  ## another task calls `res.finish()` or `res.abort()`, a buffered `res.send`
+  ## answers the request (HTTP/1.1 can park a wait before any head, behind an
+  ## earlier pipelined response still queued), or the client resets the stream
+  ## or disconnects, resumes then, not when the connection finally dies. A wait
+  ## started on a response that has already ended (`res.ended`) completes too,
+  ## but on the next turn of the event loop rather than inside this call.
+  ## Either way the next `res.write` returns false and is a no-op, so stop on
+  ## it (or check `res.ended` / `req.isAlive`) before writing on. A producer
+  ## that ignores the verdict and loops on `await res.write` never finishes
+  ## its source; the deferred completion only makes each of its turns yield
+  ## to the loop, so the server keeps serving other connections meanwhile
+  ## (an `await` on an already-completed Future does not yield, which froze
+  ## the loop thread in exactly that loop).
   result = newFuture[void]("res.drained")
+  if res.ended:
+    completeSoon(result)
+    return
   if res.bufferedAmount == 0:
     complete(result)
     return
@@ -128,6 +149,10 @@ proc write*(res: Response, data: string) {.async.} =
   ##
   ## (Forgetting `await` compiles -- the async transform discards the Future --
   ## but then skips backpressure; the write still happens.)
+  ##
+  ## On an ended response (`res.ended`) the write is a no-op and the await
+  ## yields one loop turn (drained(), #408), so a loop of `await res.write`
+  ## must check `res.ended` to stop: it cannot tell from this call.
   if not write(res, data.toOpenArray(0, data.len - 1)):
     await res.drained()
 

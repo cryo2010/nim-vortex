@@ -1021,12 +1021,45 @@ proc headersHaveCt(h: openArray[(string, string)]): bool =
   for (n, _) in h:
     if cmpIgnoreCase(n, "content-type") == 0: return true
 
+proc takeEndedDrain(c: ptr Connection): RespDrainCb {.inline.} =
+  ## Detach the HTTP/1.1 drain callback `finish` / `abort` / a buffered `send`
+  ## is about to end the response under, for fireEndedDrain /
+  ## fireAnsweredDrain (#408). While closeConn is delivering the connection's
+  ## teardown callbacks (closeInProgress) it is left where it is instead:
+  ## closeConn fires one parked before the close itself, and drops one a
+  ## producer re-registered from inside its close notification, so the
+  ## producer is called back once, never re-entered from its own finish.
+  if c.closeInProgress: return nil
+  result = c.rs.onRespDrain
+  c.rs.onRespDrain = nil
+
+proc fireAnsweredDrain(core: ptr LoopCore, c: ptr Connection) {.raises: [].} =
+  ## A buffered response just answered this HTTP/1.1 request (applyResponse set
+  ## `responded`): deliver a drain callback still parked on it, once, now that
+  ## the response is over (#408). On HTTP/1.1 `bufferedAmount` is the whole
+  ## connection's pending output, so `await res.drained()` (or `res.onDrain`)
+  ## can register before any head while an earlier pipelined response is still
+  ## queued; only sendHead arms such a registration, and a buffered `send`
+  ## used to go straight on to the keep-alive reset, which dropped the callback
+  ## with the rest of the request state, so the coroutine stayed parked for
+  ## good. Fired after `responded` is set, so the callback observes
+  ## `res.ended` true, `write` returning false and `drained()` completing; it
+  ## runs before the reset, so its handle still names this request, and
+  ## detaching first leaves nothing for closeConn to fire again.
+  let cb = takeEndedDrain(c)
+  if cb == nil: return
+  c.respBackedUp = false
+  try: cb(core, c.fd, c.gen, 0)
+  except Exception: discard    # unannotated user producer (raises: [Exception])
+
 proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
                     code: int, contentType: string,
                     headers: openArray[(string, string)],
                     body: openArray[char]) =
   ## Serialize a response into the connection's write buffer using the
-  ## connection's protocol. Loop thread only.
+  ## connection's protocol. Loop thread only. On HTTP/1.1 a drain callback
+  ## registered before any head and still parked fires once afterwards
+  ## (fireAnsweredDrain, #408); h2 tears the stream down, which fires it.
   # The OWASP baseline (empty unless securityHeaders is on) is injected during
   # serialization, so no merged header seq is allocated per response; the
   # emitter skips any baseline name the handler already set (app wins).
@@ -1058,6 +1091,9 @@ proc applyResponse*(core: ptr LoopCore, c: ptr Connection, stream: uint32,
     let ct = if contentType.len > 0 and headersHaveCt(merged): "" else: contentType
     emit(ct, merged)
   else: emit(contentType, headers)
+  # emit returned already when an h1 request had its response, so this runs
+  # only for the send that just answered it.
+  if stream == 0: fireAnsweredDrain(core, c)
 
 proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
               code: int, contentType: string,
@@ -1678,6 +1714,59 @@ proc kickConn(res: Response) {.raises: [].} =
   try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0, res.serial)
   except Exception: discard
 
+proc ended*(res: Response): bool {.raises: [].} =
+  ## True once this response can carry no more body: `finish` or `abort` ran
+  ## (including the internal abort of a body that missed its declared
+  ## Content-Length), a buffered `send` answered it, or its stream or
+  ## connection is gone. False before any response and while a streamed body
+  ## is open. On an ended response `write` returns false and is a no-op,
+  ## `drained()` completes on the next turn of the event loop and `onDrain` is
+  ## a no-op (#408); a drain callback or `drained()` wait still parked when
+  ## any of those events ends the response is fired once. This is the check a
+  ## producer loop must make (or stop on a false `write`): one that ignores
+  ## both never finishes its source. A WebSocket carrier is not "ended" here
+  ## (its drain is its own). Loop-thread only: true from any other thread,
+  ## like `req.isAlive` reporting false there.
+  if currentThreadId() != res.core.threadId: return true
+  try:
+    let rs = reqState(res)
+    if rs == nil: return true
+    if res.fd < 0:
+      when not defined(plainHttp):
+        let h3c = h3ConnOf(res.core, res.fd, res.gen)
+        let st = h3StreamPtr(h3c, uint64(res.stream))
+        return st.ws == nil and rs.responded and not rs.respStreaming
+      else:
+        return true
+    let c = conn(res.core, res.fd, res.gen)
+    if res.stream != 0:
+      let st = h2Stream(c, res.stream)
+      # h2 tracks the streamed body in respPhase (rs.respStreaming is h1/h3's).
+      return st.ws == nil and rs.responded and st.respPhase != rpStreaming
+    c.ws == nil and rs.responded and not rs.respStreaming
+  except Exception:
+    true   # the lookups only raise on a table they just checked
+
+proc fireEndedDrain(res: Response, cb: RespDrainCb) {.raises: [].} =
+  ## HTTP/1.1 half of #408 (the h2/h3 codecs carry their own): deliver the drain
+  ## callback `finish` / `abort` detached, once, after the response is torn
+  ## down, so a coroutine parked in `await res.drained()` while another task
+  ## ended the response resumes now instead of when the connection closes
+  ## (closeConn finds the callback already detached). Runs before the kick that
+  ## resumes the pipeline, so the callback's handle still names this request.
+  if cb == nil: return
+  try: cb(res.core, res.fd, res.gen, res.stream)
+  except Exception: discard
+
+proc dropEndedFields(res: Response) {.raises: [].} =
+  ## Forget `res.headers` / `res.trailers` set on a response that has ended
+  ## (from a fired drain callback, say): nothing will emit them, and on an
+  ## HTTP/1.1 keep-alive connection the handle's words would otherwise outlive
+  ## it (#408); the serial keeps the key this request's own (#407).
+  let key = reqKey(res.fd, res.gen, res.stream, res.serial)
+  if res.core.respHeaders.len > 0: res.core.respHeaders.del key
+  if res.core.respTrailers.len > 0: res.core.respTrailers.del key
+
 proc h2Writable(res: Response): bool =
   ## Backpressure verdict for an HTTP/2 streamed write: writable only when both
   ## the stream's unsent backlog and the connection write buffer (`pendingOut`)
@@ -1700,20 +1789,22 @@ proc h2Writable(res: Response): bool =
   ## the socket or the peer's window still owes an event that resumes it.
   let c = liveConn(res)     # flush may have closed the conn
   if c == nil: return false
-  var backlog = 0
   let st = h2Stream(c, res.stream)
-  if st != nil and st.respPhase == rpStreaming and not st.isHead and
-      st.ws == nil:
+  # A stream with no open body is not writable at all (#408): gone (a HEAD
+  # closed at its head, an abort, a peer reset), or past rpStreaming (a finish()
+  # whose final DATA is still queued). These used to fall through to the
+  # connection cap and report writable, so a producer resumed on an ended
+  # response kept "writing" into nothing; returning before the mark below also
+  # keeps a finished stream from being re-marked backed up with a producer that
+  # will never be resumed. `write` already refused such a stream before the
+  # call; this catches one the write itself ended.
+  if st == nil or st.respPhase != rpStreaming: return false
+  var backlog = 0
+  if not st.isHead and st.ws == nil:
     backlog = st.pendingBody.len - st.pendingPos
-  # Those are h2StreamWrite's own guards, so the verdict is taken on the backlog
-  # the write it follows could actually have added to, and only on that: a
-  # stream that is gone (a HEAD closed at its head, an abort, a peer reset), one
-  # past rpStreaming (the final DATA of a finish() still queued), a HEAD, or an
-  # Extended CONNECT stream whose pendingBody is a WebSocket frame queue and not
-  # a response backlog at all, all contribute 0 and let the connection cap
-  # decide -- which is what lets `write` on a HEAD response still report
-  # writable, and keeps `write` after finish() from re-marking a finished stream
-  # backed up with a producer that will never be resumed.
+  # The verdict is taken on the backlog the write could actually have added to,
+  # and only on that: an Extended CONNECT stream's pendingBody is a WebSocket
+  # frame queue, not a response backlog, and contributes 0.
   if backlog >= respHighWater or pendingOut(c) >= respHighWater:
     h2MarkRespBackedUp(c, res.stream)
     return false
@@ -1858,7 +1949,10 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
   ## callback): a call from a worker or a thread of your own is also a no-op
   ## returning false, so false is not exclusively backpressure. Use
   ## `req.isAlive` to tell a dead connection from a full backlog, and don't
-  ## stream from off the loop thread at all.
+  ## stream from off the loop thread at all. On an ended response (`res.ended`:
+  ## finished, aborted, a peer-reset stream, an HTTP/2 or HTTP/3 HEAD) it is a
+  ## no-op returning false on every protocol (#408; HTTP/2 and HTTP/3 used to
+  ## report such a stream writable).
   ##
   ## A single chunk LARGER than `respHighWater` is accepted whole: `write` never
   ## writes a partial chunk and never refuses one, so the backlog can exceed the
@@ -1880,6 +1974,11 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
+          # No open body (finished, aborted, reset by the peer, a HEAD, or no
+          # head yet): false, not the "writable" a zero backlog would read as,
+          # so a producer resumed on an ended response stops (#408).
+          let st = h3StreamPtr(h3c, uint64(res.stream))
+          if st == nil or not st.rs.respStreaming: return false
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             let comp = h3RespComp(h3c, uint64(res.stream))
             if comp != nil:
@@ -1891,6 +1990,11 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
     var c = liveConn(res)
     if c == nil: return false
     if res.stream != 0:
+      # Same rule on h2 (#408): a stream that is gone (aborted, reset by the
+      # peer, a HEAD closed at its head) or past rpStreaming used to report
+      # writable whenever the connection buffer had room.
+      let open = h2Stream(c, res.stream)
+      if open == nil or open.respPhase != rpStreaming: return false
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         let st = h2Stream(c, res.stream)
         if st != nil and st.rs.respComp != nil:
@@ -1943,6 +2047,13 @@ proc finish*(res: Response) {.raises: [].} =
   ## HTTP/3, or a connection close for HTTP/1.0; then flush and resume the
   ## connection for the next request. Set trailers with `res.trailers` first.
   ## `{.raises: [].}` (contained) for async.
+  ##
+  ## A drain callback still pending (`onDrain`, or a coroutine parked in
+  ## `await res.drained()` / `await res.write`) fires once, after the response
+  ## is finished, on every protocol (#408), and sees it ended: `write` returns
+  ## false, `drained()` completes on the next loop turn, `onDrain` is a no-op.
+  ## So does the abort `finish` turns into when a declared Content-Length was
+  ## missed.
   try:
     if currentThreadId() != res.core.threadId: return
     # Pull any pending res.trailers (loop-thread only, so no lock needed).
@@ -1962,6 +2073,7 @@ proc finish*(res: Response) {.raises: [].} =
               if z.len > 0: discard h3StreamWrite(h3c, uint64(res.stream), z)
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
           h3StreamFinish(h3c, uint64(res.stream), trailers)
+          if ended(res): dropEndedFields(res)
       return
     let c = liveConn(res)
     if c == nil: return
@@ -1980,13 +2092,14 @@ proc finish*(res: Response) {.raises: [].} =
           if st != nil:
             st.rs.respComp = nil
             st.rs.respEnc = ""
-      h2StreamFinish(c, res.stream, trailers)
+      h2StreamFinish(c, res.stream, trailers)   # fires a parked drain (#408)
+      if ended(res): dropEndedFields(res)
       flushConn(res)
       return
     if not c.rs.respStreaming: return
     c.rs.respStreaming = false
     c.respBackedUp = false
-    c.rs.onRespDrain = nil
+    let drainCb = takeEndedDrain(c)   # fired once, below (#408)
     let framing = c.respFraming
     c.respFraming = rfNone
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
@@ -2015,6 +2128,8 @@ proc finish*(res: Response) {.raises: [].} =
     if not c.parser.keepAlive or c.peerHalfClosed or
         framing == rfCloseDelimited:
       c.closeAfterFlush = true
+    fireEndedDrain(res, drainCb)
+    dropEndedFields(res)
     # kick resumes the paused pipeline when finish runs after the handler
     # returned (deferred); inline finish is a no-op here and the dispatch
     # return path resets and flushes.
@@ -2037,11 +2152,30 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   ## LATER `res.write` on the same response, whose flush runs the drain path. A
   ## producer that re-registers from its callback without writing is fired
   ## again on every loop pass while drained (effectively a setImmediate). A
-  ## later registration replaces an unfired one, `finish` / `abort` drop one
-  ## still pending, and on an HTTP/2 HEAD response a registration after
-  ## `sendHead` is dropped (the head closed the stream). Loop-thread only to
-  ## register, too: an off-thread registration is dropped silently, and a
-  ## producer that then waits for the callback waits for good.
+  ## later registration replaces an unfired one.
+  ##
+  ## Ending the response fires one still pending, on every protocol (#408):
+  ## `finish`, `abort`, the abort `finish` becomes on a body that missed its
+  ## declared Content-Length, and a buffered `res.send` that answers a request
+  ## whose callback was registered before any head (from another task, or the
+  ## same handler; on HTTP/1.1 `bufferedAmount` counts an earlier pipelined
+  ## response still queued, so a wait can park there) each detach the
+  ## callback, end the response, then invoke it once, so the callback always
+  ## runs AFTER the response is over. It sees `res.ended` true, `write`
+  ## returning false (a no-op), `drained()` completing on the next loop turn,
+  ## and a registration from inside it (or any later one) dropped as a no-op;
+  ## the connection-close path later finds nothing to fire again. This is
+  ## what resumes a coroutine parked in `await res.drained()` (or `await
+  ## res.write`) when ANOTHER task ends the response; before, the callback
+  ## was dropped and the coroutine stayed parked until the connection died.
+  ## The rule is uniform, so a sync producer that registers and then ends the
+  ## response itself is called back once more: a producer that stops on a
+  ## false `write` (the documented pattern) or checks `res.ended` does nothing
+  ## there. The same holds when the client
+  ## goes away (connection close, or a peer reset of the stream).
+  ##
+  ## Loop-thread only to register, too: an off-thread registration is dropped
+  ## silently, and a producer that then waits for the callback waits for good.
   if currentThreadId() != res.core.threadId: return
   let captured = cb
   # The h3 reflush path cannot pass the handle words, so the callback closes
@@ -2050,6 +2184,9 @@ proc onDrain*(res: Response, cb: proc(res: Response) {.gcsafe.}) =
   let held = res
   let rs = reqState(res)
   if rs == nil: return
+  # An ended response has no drain left to report, and its state may already
+  # be the next request's (h1 keep-alive): never store a callback on it (#408).
+  if ended(res): return
   rs.onRespDrain = proc(core: ptr LoopCore, fd: int32, gen: uint32,
                         stream: uint32) {.gcsafe.} =
     captured(held)
@@ -2078,10 +2215,10 @@ proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
   ## registration marked the response for it). Called once per loop iteration
   ## by the event loop, outside any codec callback, so a fired producer may
   ## write freely. Exactly once: every firing site (this one, the h2 resume
-  ## scan, h1's flushOut, h3's writable callback, every teardown) clears the
-  ## callback before invoking it, and a kick that finds it already gone --
-  ## fired, replaced, dropped by finish/abort, or its connection closed and
-  ## recycled -- does nothing.
+  ## scan, h1's flushOut, h3's writable callback, finish/abort (#408), every
+  ## teardown) clears the callback before invoking it, and a kick that finds it
+  ## already gone -- fired, replaced, fired by finish/abort, or its stream or
+  ## connection closed and recycled -- does nothing.
   if core.drainKicks.len == 0: return
   var kicks: seq[ReqKey]
   swap(kicks, core.drainKicks)        # a re-registration lands on the next pass
@@ -2185,28 +2322,36 @@ proc abort*(res: Response) {.raises: [].} =
   ## stream with an internal error. Use this instead of `finish` when the body
   ## cannot be completed (an error partway through). No-op if not streaming.
   ## `{.raises: [].}` (contained) so it composes in strict-effect async bodies.
+  ##
+  ## As with `finish`, a drain callback still pending fires once after the
+  ## response is torn down (#408), so a coroutine another task left parked in
+  ## `await res.drained()` resumes and finds `write` returning false.
   try:
     if currentThreadId() != res.core.threadId: return
     if res.fd < 0:
       when not defined(plainHttp):
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
-          h3StreamAbort(h3c, uint64(res.stream))
+          h3StreamAbort(h3c, uint64(res.stream))   # fires a parked drain
+          if ended(res): dropEndedFields(res)
       return
     let c = liveConn(res)
     if c == nil: return
     if res.stream != 0:
-      h2StreamAbort(c, res.stream)
+      h2StreamAbort(c, res.stream)                 # fires a parked drain
+      if ended(res): dropEndedFields(res)
       flushConn(res)
       return
     if not c.rs.respStreaming: return
     c.rs.respStreaming = false
     c.respBackedUp = false
-    c.rs.onRespDrain = nil
+    let drainCb = takeEndedDrain(c)   # fired once, below (#408)
     # No terminating chunk: closing mid-stream is the truncation signal. (For a
     # close-delimited HTTP/1.0 body there is no in-band signal; close is all we
     # have.)
     c.closeAfterFlush = true
+    fireEndedDrain(res, drainCb)
+    dropEndedFields(res)
     kickConn(res)
   except Exception:
     discard
@@ -2957,6 +3102,17 @@ proc dispatchNextRead(res: Response, nextRead: string, reader: pointer) =
   ## pkFileChunk, so the counters stay balanced by construction. A refused or
   ## dead-connection dispatch returns false; we then reclaim the borrowed buffer
   ## and abort the stream (issue #272) instead of leaking it and stalling.
+  ##
+  ## Nothing is dispatched for a response that has ended (#408): an HTTP/2
+  ## stream the peer reset (RST_STREAM) while the connection stays up, an
+  ## HTTP/3 stream reset the same way, or a response aborted under the chain.
+  ## The connection is alive, so the pin would be granted, and a gone stream's
+  ## `bufferedAmount` is 0, so the read-ahead gate always passed: the rest of
+  ## the file used to be read, hop by hop, into a stream that drops it. This
+  ## also covers the drain callback teardownStream fires for a parked read
+  ## (parkNextRead). The reader is stateless (each hop opens, preads and
+  ## closes), so stopping the chain leaks nothing.
+  if res.ended: return
   let buf = res.core.chunkPool.chunkTake()
   if not dispatchBlockingDataPin(
       res.request, cast[BlockingDataProc](reader), nextRead & '\0' & $cast[uint](buf),
@@ -3079,6 +3235,13 @@ proc applyFileChunk*(res: Response, buf: pointer, n: int, nextRead: string,
   if n == fileChunkFailed:
     res.abort()
     return
+  # The stream was reset by the peer (or the response aborted) while this read
+  # was in flight: drop the chunk and end the chain here, dispatching nothing
+  # (#408; dispatchNextRead refuses too, this also skips the dead write). `buf`
+  # still goes back to the pool with the batch, as for any other chunk, and on
+  # HTTP/1.1 the outbox's final-chunk resume runs as before (a reset h1
+  # response is closing anyway).
+  if res.ended: return
   # `deferred` = the gate held the read back; pullAfterWrite then decides how to
   # wait, from the write's own verdict.
   var deferred = not last and not pullNext(res, nextRead, reader)

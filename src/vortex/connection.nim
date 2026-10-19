@@ -852,6 +852,15 @@ proc releaseFlushHold*(c: ptr Connection): bool {.inline.} =
   if c.flushHold > 0: dec c.flushHold
   c.flushHold == 0
 
+proc closeInProgress*(c: ptr Connection): bool {.inline.} =
+  ## closeConn is delivering this connection's teardown callbacks right now
+  ## (closeRequested with no pin left; a close deferred while pinned has pins
+  ## and has not started). finish/abort then leave drain delivery to that path,
+  ## which fires every callback parked before the close exactly once (#408): a
+  ## producer re-registering and ending its response from inside its own close
+  ## notification must not be called back a second time.
+  c.closeRequested and c.totalPins == 0
+
 proc clearRespHeaders*(core: ptr LoopCore, fd: int32, gen: uint32) =
   ## Drop any pending `res.headers` for a connection/slot being torn down (a
   ## request that set headers but never sent). No-op when unused; the table is

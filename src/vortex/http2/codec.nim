@@ -1125,10 +1125,10 @@ proc h2ArmDrain*(c: ptr Connection, sid: uint32) =
   ## whose flush runs the scan).
   ##
   ## Only an open response is marked (no response yet, or a streamed body still
-  ## open). A registration after finish() or on a WebSocket stream is left to
-  ## teardownStream / h2NotifyClosed, which fire whatever is parked when the
-  ## stream goes, and must not be resumed by the scan: a finished stream's
-  ## producer has nothing left to write.
+  ## open). A registration after finish() never gets here (request.onDrain
+  ## rejects one on an ended response, #408); one on a WebSocket stream is left
+  ## to teardownStream / h2NotifyClosed, which fire whatever is parked when the
+  ## stream goes, and must not be resumed by the scan.
   let h2 = h2Conn(c)
   if h2 == nil: return
   h2.streams.withValue(sid, st):
@@ -1240,17 +1240,44 @@ proc h2StreamWrite*(c: ptr Connection, sid: uint32,
   if sid notin h2.streams: return 0
   h2.streams[sid].pendingBody.len - h2.streams[sid].pendingPos
 
+proc fireEndedDrain(h2: H2Conn, c: ptr Connection, sid: uint32,
+                    cb: RespDrainCb) {.raises: [].} =
+  ## Deliver a drain callback that h2StreamAbort / h2StreamFinish detached
+  ## before ending the response (#408). Fired once, AFTER the teardown, so the
+  ## callback observes a dead response: `res.write` returns false and is a
+  ## no-op, `res.drained()` completes (next loop turn) and a re-registration is
+  ## rejected. An async producer suspended in `await res.drained()` while
+  ## another task ended the response resumes now instead of on connection
+  ## close (h2NotifyClosed, which this mirrors, finds the callback already
+  ## detached and cannot fire it a second time). The callback wraps an
+  ## unannotated user producer (raises: [Exception]), contained here.
+  ##
+  ## Dropped instead while closeConn is delivering the connection's teardown
+  ## (closeInProgress): h2NotifyClosed detached every callback parked before
+  ## the close up front and fires each once, so one present now was registered
+  ## from inside a close notification, and firing it would re-enter a producer
+  ## from its own finish/abort.
+  if cb == nil or c.closeInProgress: return
+  try: cb(h2.core, c.fd, c.gen, sid)
+  except Exception: discard
+
 proc h2StreamAbort*(c: ptr Connection, sid: uint32) =
   ## Abort a streamed response mid-body: RST_STREAM(INTERNAL_ERROR) so the peer
   ## sees the transfer was cut short, not cleanly completed. No-op unless the
   ## stream is an open streamed response.
+  ##
+  ## A parked drain callback is detached first and fired once after the stream
+  ## is torn down (fireEndedDrain, #408), so a coroutine parked in
+  ## `await res.drained()` resumes on a response whose `write` returns false.
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or
       h2.streams[sid].respPhase != rpStreaming:
     return
   h2.streams[sid].respPhase = rpAborted
-  h2.streams[sid].rs.onRespDrain = nil
+  let drainCb = h2.streams[sid].rs.onRespDrain
+  h2.streams[sid].rs.onRespDrain = nil  # teardownStream must not fire it too
   h2.streamError(c, sid, errInternal)
+  h2.fireEndedDrain(c, sid, drainCb)
 
 proc h2StreamFinish*(c: ptr Connection, sid: uint32,
                      trailers: openArray[(string, string)] = []) =
@@ -1263,6 +1290,13 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   ## lie the peer can only report as a protocol error, so RST_STREAM makes the
   ## truncation visible on our side too, as HTTP/1 forces the connection closed
   ## on the same mismatch (#248, #345).
+  ##
+  ## A parked drain callback is detached before the stream is finished (or, on
+  ## the mismatch, by h2StreamAbort) and fired once afterwards (fireEndedDrain,
+  ## #408): the final DATA may still be queued behind a closed peer window, but
+  ## the response is over, so the callback sees `write` return false and a
+  ## `drained()` that completes on the next loop turn, and the scheduler's
+  ## resume scan and teardownStream / h2NotifyClosed find nothing left to fire.
   let h2 = h2Conn(c)
   if h2 == nil or sid notin h2.streams or
       h2.streams[sid].respPhase != rpStreaming:
@@ -1270,29 +1304,31 @@ proc h2StreamFinish*(c: ptr Connection, sid: uint32,
   template st: H2Stream = h2.streams[sid]
   if not st.isHead and st.respDeclaredLen >= 0 and
       st.respBodyWritten != st.respDeclaredLen:
-    h2StreamAbort(c, sid)      # tears the stream down: clears every counter
+    h2StreamAbort(c, sid)      # tears the stream down, fires a parked drain
     return
   st.respPhase = rpFinished
+  let drainCb = st.rs.onRespDrain
   st.rs.onRespDrain = nil
   clearBackedUp(h2, st)            # finished: never let a drain path resume it
-  if st.isHead:
-    return                               # HEAD stream already closed at head
-  st.pendingIsLast = true
-  if trailers.len > 0: st.respTrailers = @trailers
-  if st.pendingBody.len - st.pendingPos > 0:
-    # A final real DATA chunk remains; the scheduler tags it END_STREAM (or, with
-    # trailers pending, emits the trailing HEADERS once the body drains; a closed
-    # window re-enters via the stream WINDOW_UPDATE path).
-    h2.h2Enqueue(sid)
-    h2.h2Schedule(c)
-  elif st.respTrailers.len > 0:
-    # The body already drained; close with the trailer section.
-    h2.emitTrailers(c, sid)
-  else:
-    # The body already fully drained before finish: the prior DATA frames went
-    # out without END_STREAM, so emit a bare END_STREAM DATA frame to close it.
-    c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
-    h2.completeStream(c, sid)
+  if not st.isHead:                # HEAD: the stream already closed at its head
+    st.pendingIsLast = true
+    if trailers.len > 0: st.respTrailers = @trailers
+    if st.pendingBody.len - st.pendingPos > 0:
+      # A final real DATA chunk remains; the scheduler tags it END_STREAM (or,
+      # with trailers pending, emits the trailing HEADERS once the body drains;
+      # a closed window re-enters via the stream WINDOW_UPDATE path).
+      h2.h2Enqueue(sid)
+      h2.h2Schedule(c)
+    elif st.respTrailers.len > 0:
+      # The body already drained; close with the trailer section.
+      h2.emitTrailers(c, sid)
+    else:
+      # The body already fully drained before finish: the prior DATA frames
+      # went out without END_STREAM, so emit a bare END_STREAM DATA frame.
+      c.wbuf.addFrameHeader(0, ftData, flagEndStream, sid)
+      h2.completeStream(c, sid)
+  # `st` may be gone by now (completeStream, or the scheduler finishing it).
+  h2.fireEndedDrain(c, sid, drainCb)
 
 proc h2WsLookup(cp: pointer, stream: uint32): RootRef {.nimcall, gcsafe.} =
   ## LoopCore.hooks.wsStreamLookup: resolve a stream's WsConn for the public API.
