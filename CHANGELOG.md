@@ -255,6 +255,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fields when the handler set `res.headers["Content-Type"]` before
   `sendHead`: the pending one wins, as for a buffered `res.send`, and
   compression is negotiated on it. (#410)
+- A thread the application owns can now answer several kept `Response`
+  handles in turn. The off-loop branch of `send` drops a duplicate response
+  with a first-send latch, and that latch was a thread-wide `{.threadvar.}`
+  bool that only the worker trampolines reset at task start. On an app-owned
+  thread nothing ever reset it, so the thread's first `res.send` pushed its
+  response and set the latch, and every later `send` from that thread, for any
+  other request, returned without pushing anything: those requests hung until
+  the response timeout, even though the `Response` doc invites copying handles
+  to any thread (the #407 off-loop test passed only because it spawned a fresh
+  thread per send). The latch now covers only a worker task's own handle: a
+  `blocking:` body's `res` is answered at most once from its task (a repeat
+  `send`, or the 500 for a body that raises after answering, is dropped), since
+  its first answer releases the task's pin. Sends on any other handle, a kept
+  `Response` a body answers or anything sent from an app-owned thread, always
+  push; they release no pin, and the loop drops a second response for a
+  request already answered. So a body that answers its own request and then a
+  kept handle is not mistaken for one that answered nothing (that would push a
+  second, pin-releasing 500 and lose the rest of the outbox batch). A
+  `blocking:` body's own `res` must not be kept past the body. The exported
+  `workerResponded` threadvar is gone (nothing outside `request.nim` used it)
+  (#409).
 - HTTP/1.1: a `Request` / `Response` kept past its own request no longer
   reaches the next request on the same keep-alive connection. A handle was
   fd + generation + stream, and the generation changes only when the
