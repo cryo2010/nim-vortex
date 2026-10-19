@@ -40,6 +40,11 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     res.write("streamed ")
     res.write("h3!")
     res.finish()
+  of "/pendingct":
+    res.headers["Content-Type"] = "application/json"   # wins over sendHead's
+    res.sendHead(Http200, "text/plain")
+    res.write("{}")
+    res.finish()
   of "/streambig":
     res.sendHead(Http200, "application/octet-stream")
     let chunk = repeat('y', 4096)
@@ -180,6 +185,18 @@ withServer(RequestHandler(handler),
 
     test "HEAD has no body":
       let (output, rc) = h3curl("-I -w '%{size_download}' " & base & "/")
+      check rc == 0
+      check "HTTP/3 200" in output
+      check output.endsWith("0")
+
+    test "a pending Content-Type yields exactly one content-type on a streamed head":
+      let (output, rc) = h3curl("-D - -o /dev/null " & base & "/pendingct")
+      check rc == 0
+      check output.toLowerAscii.count("content-type:") == 1
+      check "content-type: application/json" in output.toLowerAscii
+
+    test "HEAD over a streamed h3 route without contentLength (#410)":
+      let (output, rc) = h3curl("-I -m 5 -w '%{size_download}' " & base & "/stream")
       check rc == 0
       check "HTTP/3 200" in output
       check output.endsWith("0")

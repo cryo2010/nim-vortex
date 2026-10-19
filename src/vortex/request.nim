@@ -1858,11 +1858,20 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     # Inject the security-headers baseline here too (a streaming response's head;
     # merged once, not per chunk).
     var hdrs = withSecHeaders(res.core, userHeaders)
+    # A Content-Type among the merged headers (a pending res.headers entry or
+    # the send argument) wins over the sendHead argument, exactly as in
+    # applyResponse's buffered path: every emitter below gets `ct`, so the head
+    # never carries two Content-Type fields. Compression negotiates on the type
+    # that actually goes on the wire, as sendBody does for a buffered send.
+    let ct = if contentType.len > 0 and headersHaveCt(userHeaders): ""
+             else: contentType
     # Negotiate streaming compression up front: it drops Content-Length (the
     # compressed size is unknown -> chunked) and adds Content-Encoding + Vary.
     var enc = ""
     when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
-      enc = negotiateStreamEnc(res, contentType, userHeaders)
+      let wireCt = if headersHaveCt(userHeaders): contentTypeOf(userHeaders)
+                   else: contentType
+      enc = negotiateStreamEnc(res, wireCt, userHeaders)
       if enc.len > 0:
         hdrs.add ("content-encoding", enc)
         hdrs.add ("vary", "accept-encoding")
@@ -1877,7 +1886,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
         let h3c = h3ConnOf(res.core, res.fd, res.gen)
         if h3c != nil:
           h3SendHead(res.core, h3c, uint64(res.stream), int(code),
-                     contentType, hdrs, int64(effLen))
+                     ct, hdrs, int64(effLen))
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             if enc.len > 0:
               h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
@@ -1886,7 +1895,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
     if c == nil: return
     if res.stream != 0:
       h2SendHead(c, int(code), res.stream, res.core.dateStr,
-                 res.core.serverHeader, contentType, hdrs, res.core.altSvc,
+                 res.core.serverHeader, ct, hdrs, res.core.altSvc,
                  int64(effLen))
       when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
         if enc.len > 0:
@@ -1898,24 +1907,58 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
       return
     if c.rs.responded: return
     c.rs.responded = true
+    if c.parser.httpMethod == HttpHead and effLen < 0:
+      # HEAD with no declared length (#410): send exactly the head a GET to the
+      # same route would get, with no body: chunked on HTTP/1.1, close-delimited
+      # on HTTP/1.0, the security baseline, and Content-Encoding + Vary when a
+      # compressor was negotiated, but never a Content-Length, which RFC 9110
+      # 8.6 forbids unless it equals the GET's (RFC 9112 6.3: a HEAD response
+      # ends at its header block whatever its framing fields say). No
+      # compressor is installed (nothing is written). respStreaming stays
+      # false, so a following write() is a no-op and finish()/abort() return
+      # early; nothing streams, so no drain is armed (h1ArmHeadDrain).
+      let ka = c.parser.keepAlive
+      let chunked = c.parser.minor >= 1
+      appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                       ct, hdrs, chunked, keepAlive = ka,
+                       announceKeepAlive = ka and c.parser.minor == 0,
+                       altSvc = res.core.altSvc, contentLength = -1)
+      if not ka or not chunked:
+        c.closeAfterFlush = true      # the head said Connection: close
+      # The response is over: as applyResponse does, deliver a drain parked
+      # before any head (#408) once `responded` and the head are in place.
+      fireAnsweredDrain(res.core, c)
+      dropEndedFields(res)
+      # Answer now rather than when the handler returns: a sendHead after the
+      # handler's first await would otherwise sit in the write buffer until the
+      # handler's future completes (never, for an SSE-style loop). Deferred,
+      # the kick runs resumeAfterRespond, which flushes, then closes on
+      # closeAfterFlush or resets for the next request and serves a pipelined
+      # one, exactly as the adapter's completion kick does for a deferred
+      # buffered send; the handler's later calls then hold a stale serial and
+      # are no-ops (#407), its own completion kick included. Inline the kick is
+      # a no-op (awaitingResponse is false) and the dispatch return resets or
+      # closes, as for a buffered send. The flush is skipped on a closing
+      # connection: inline it would start the linger close under the dispatch
+      # return, and deferred the kick flushes it anyway.
+      let lc = liveConn(res)       # re-resolved: the drain callback ran user code
+      if lc != nil and not lc.closeAfterFlush: flushConn(res)
+      kickConn(res)
+      return
     if c.parser.httpMethod == HttpHead:
-      # HEAD carries no body. When the caller declared a length (file serving),
+      # HEAD carries no body. The caller declared a length (file serving):
       # report it as the Content-Length a GET would return -- length-delimited
       # and keep-alive, but with no body -- rather than forcing Content-Length:
-      # 0. finish() completes it (write() is a no-op on HEAD). With no declared
-      # length, fall back to a plain empty response.
-      if effLen >= 0:
-        c.rs.respStreaming = true
-        c.respFraming = rfContentLength
-        let ka = c.parser.keepAlive
-        appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
-                         contentType, hdrs, chunked = false, keepAlive = ka,
-                         announceKeepAlive = ka and c.parser.minor == 0,
-                         altSvc = res.core.altSvc, contentLength = effLen)
-        flushConn(res)
-        h1ArmHeadDrain(res)
-      else:
-        applyResponse(res.core, c, 0, int(code), contentType, userHeaders, "")
+      # 0. finish() completes it (write() is a no-op on HEAD).
+      c.rs.respStreaming = true
+      c.respFraming = rfContentLength
+      let ka = c.parser.keepAlive
+      appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
+                       ct, hdrs, chunked = false, keepAlive = ka,
+                       announceKeepAlive = ka and c.parser.minor == 0,
+                       altSvc = res.core.altSvc, contentLength = effLen)
+      flushConn(res)
+      h1ArmHeadDrain(res)
       return
     c.rs.respStreaming = true
     let ka = c.parser.keepAlive
@@ -1932,7 +1975,7 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
         c.rs.respComp = makeStreamComp(enc)
         c.rs.respEnc = enc
     appendStreamHead(c.wbuf, code, res.core.dateStr, res.core.serverHeader,
-                     contentType, hdrs, chunked, keepAlive = ka,
+                     ct, hdrs, chunked, keepAlive = ka,
                      announceKeepAlive = ka and c.parser.minor == 0,
                      altSvc = res.core.altSvc, contentLength = effLen)
     flushConn(res)

@@ -36,6 +36,12 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
       res.send(Http200, "second")
   of "/boom":
     raise newException(ValueError, "handler exploded")
+  of "/streamhead":
+    # Streamed route with no declared length (chunked on a GET). A HEAD to it
+    # must still get its head (#410); write is a no-op and finish harmless.
+    res.sendHead(Http200, "text/plain")
+    res.write("streamed body")
+    res.finish()
   else:
     res.send(Http404, "not found")
 
@@ -99,6 +105,39 @@ suite "http/1.1 integration":
     check "200" in resp
     check "Content-Length: 13" in resp
     check not resp.endsWith("Hello, World!")
+
+  test "HEAD on a streamed route without contentLength gets its head (#410)":
+    # sendHead with no length used to mark the request answered before its
+    # HEAD fallback ran, so the fallback was a no-op and nothing reached the
+    # wire. A GET on the same keep-alive connection checks framing stays sane.
+    let s = newSocket(buffered = false)
+    defer: s.close()
+    s.connect("127.0.0.1", port)
+    s.send("HEAD /streamhead HTTP/1.1\r\nHost: x\r\n\r\n")
+    let head = s.recvAvailable(1000)
+    check head.startsWith("HTTP/1.1 200")
+    check "Content-Type: text/plain" in head
+    # The head a GET gets: chunked, and no Content-Length (RFC 9110 8.6 forbids
+    # one that differs from the GET's; it used to say 0).
+    check "Transfer-Encoding: chunked" in head
+    check "Content-Length" notin head
+    check "streamed body" notin head
+    check head.endsWith("\r\n\r\n")         # headers only, no body
+    s.send("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    let next = s.recvUntilClose(1000)
+    check next.startsWith("HTTP/1.1 200")
+    check next.endsWith("Hello, World!")
+    check "streamed body" notin next
+
+  test "HTTP/1.0 HEAD on a streamed route without contentLength (#410)":
+    let resp = rawExchange(port, "HEAD /streamhead HTTP/1.0\r\nHost: x\r\n\r\n",
+                           timeoutMs = 1000)
+    check resp.startsWith("HTTP/1.1 200")
+    check "Connection: close" in resp
+    check "Content-Length" notin resp          # close-delimited, like the GET
+    check "Transfer-Encoding" notin resp
+    check "streamed body" notin resp
+    check resp.endsWith("\r\n\r\n")
 
   test "pipelined requests answered in order":
     let resp = rawExchange(port,

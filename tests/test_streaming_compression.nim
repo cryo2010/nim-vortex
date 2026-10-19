@@ -30,6 +30,14 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     for _ in 0 ..< nChunks:
       discard res.write(chunkText)
     res.finish()
+  of "/fixed":
+    # A declared length (file-serving shape): negotiated compression drops it,
+    # so a GET is chunked and a HEAD takes the no-length path (#410).
+    res.sendHead(Http200, "text/plain",
+                 contentLength = chunkText.len * nChunks)
+    for _ in 0 ..< nChunks:
+      discard res.write(chunkText)
+    res.finish()
   else:
     res.send(Http404)
 
@@ -75,6 +83,29 @@ suite "streaming response compression":
       let (hdrs, body) = fetch(true, enc)
       check ("content-encoding: " & enc) in hdrs
       check body == expected
+
+when defined(httpGzip):
+  suite "HEAD on a compressed streamed route (#410)":
+    for path in ["/stream", "/fixed"]:
+      test "HTTP/1.1 HEAD " & path & " carries the GET's gzip head, no body":
+        # The head a GET gets: chunked, content-encoding + vary, and no
+        # Content-Length (it used to be Content-Length: 0 and identity).
+        let s = connectTimeout(srv.port, 3000)
+        defer: s.close()
+        s.send("HEAD " & path & " HTTP/1.1\r\nHost: x\r\n" &
+               "Accept-Encoding: gzip\r\n\r\n")
+        let head = s.recvAvailable(3000)
+        let lower = head.toLowerAscii
+        check head.startsWith("HTTP/1.1 200")
+        check head.endsWith("\r\n\r\n")              # no body
+        check "content-encoding: gzip" in lower
+        check "vary: accept-encoding" in lower
+        check "transfer-encoding: chunked" in lower
+        check "content-length" notin lower
+        # Keep-alive survives: the next request is answered in full.
+        s.send("GET " & path & " HTTP/1.1\r\nHost: x\r\n\r\n")
+        let r = s.readHttpResponse()
+        check r.ok and r.body == expected
 
 srv.close()
 removeDir(tmp)
