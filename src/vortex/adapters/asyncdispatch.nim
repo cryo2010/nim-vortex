@@ -42,7 +42,9 @@
 ## a task waiting on the dispatcher's I/O alone runs as soon as that I/O
 ## is ready, and an idle server sleeps the loop's full wait. When the
 ## future finishes, the deferred respond is flushed via
-## LoopCore.hooks.kick. An uncaught exception in the body responds 500.
+## LoopCore.hooks.kick. An uncaught exception in the body responds 500;
+## a detached (`asyncCheck`ed) task that fails is logged and the loop carries
+## on (#423).
 
 import std/[asyncdispatch, httpcore, tables, deques, macros, selectors,
           heapqueue, monotimes, times]
@@ -51,6 +53,7 @@ import ../request
 import ../routing
 import ../server
 import ../settings
+import ./detachedfailure
 
 export asyncdispatch
 
@@ -117,6 +120,19 @@ proc onIoReady() {.nimcall, gcsafe.} =
   ## LoopCore.hooks.ioReadyHook.
   {.gcsafe.}: ioReady = true
 
+proc pollContained() =
+  ## One non-blocking dispatcher pass that a detached task's failure cannot
+  ## escape (#423). asyncCheck re-raises a failed future's error from the
+  ## dispatcher's callback, inside this poll; uncaught it left the pump and
+  ## ended the loop thread. A raise leaves the rest of the dispatcher's queue
+  ## in place for the next poll. Exception, not CatchableError: a Defect a
+  ## task raises surfaces here the same way (under --panics:on a Defect aborts
+  ## the process before any handler runs).
+  try:
+    poll(0)
+  except Exception as e:
+    noteDetachedFailure(e)
+
 proc pump(): int {.nimcall, gcsafe.} =
   ## Drive the dispatcher's ready work, then cap the loop's wait at its next
   ## timer (-1, the loop's full wait, with none).
@@ -160,7 +176,7 @@ proc pump(): int {.nimcall, gcsafe.} =
     let pollIo = io and not getIoHandler(d).isEmpty
     var spins = 0
     while spins < 8 and (readyNow(d) or (pollIo and spins == 0)):
-      poll(0)
+      pollContained()
       inc spins
     if readyNow(d): return 1     # more ready work: come straight back
     result = nextTimerCap(d)
@@ -178,9 +194,14 @@ proc teardown() {.nimcall, gcsafe.} =
   ## and must not create one just to close it.
   {.gcsafe.}:
     if not dispatcherLive: return
+    proc pending(): bool =
+      # hasPendingOperations goes through getGlobalDispatcher: contained like
+      # the poll, so a teardown raise never cuts the release below short.
+      try: hasPendingOperations()
+      except CatchableError, Defect: false
     var spins = 0
-    while hasPendingOperations() and spins < 64:
-      poll(0)
+    while pending() and spins < 64:
+      pollContained()                    # a failing task must not end the drain
       inc spins
     try:
       let d = getGlobalDispatcher()

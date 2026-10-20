@@ -237,6 +237,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async adapters: a detached task that fails no longer ends its loop thread.
+  A task a handler started with `asyncCheck` (asyncdispatch) or `asyncSpawn`
+  (chronos) and never awaited has its error raised by the dispatcher's own
+  callback when it fails: asyncCheck re-raises the error, asyncSpawn raises a
+  `FutureDefect`. That raise surfaced inside the adapter pump's poll, and
+  nothing between the pump and the loop thread's entry caught it, so the loop
+  thread exited (`vortex: event-loop thread exited on error: ...`), its
+  listener closed, and the next connection to that loop was refused: a
+  one-thread server was dead after one failing detached task. The pump (and
+  the adapter's shutdown drain) now catch each poll's raise, log it once per
+  loop thread at most every 5 s with a running count (`vortex: async adapter:
+  a detached task failed (the loop carries on): ...`), and carry on, the way a
+  failing handler costs only its own connection. A Defect is caught too,
+  except under `--panics:on`, where it aborts the process as anywhere else; on
+  chronos every detached failure arrives as a `FutureDefect`, so under
+  `--panics:on` none of this applies there and a failing detached task still
+  aborts the process. The runtimes still leak the failed task itself on that
+  path (about 4 KB per failure on asyncdispatch, whose callback loop in Nim
+  2.2.10 skips the raising callback's destructor, and about 200 bytes on
+  chronos), so a detached task should still catch its own errors. chronos's
+  async transform also lets a Defect out of any async body that raises it
+  after an `await` (it re-raises Defects instead of failing the future, even
+  under `-d:chronosHandleException` or `{.async: (handleException: true).}`),
+  and the future never completes. The pump now tells that apart from a
+  detached task's `FutureDefect` and logs it as what it is (`vortex: async
+  adapter: an async body raised a Defect past an await ...`). In a `doAsync:`
+  body, which is the adapter's own closure, the Defect now fails the body's
+  future, so the request is answered 500 (a WebSocket closed with 1011) as on
+  asyncdispatch; before, it got no response until its timeout. A
+  router-registered `{.async.}` handler is the application's own proc, which
+  the adapter cannot wrap: on chronos its request still gets no response until
+  the timeout, and a graceful shutdown waits out the 3 s async drain for it,
+  so catch the Defects you can expect in the handler or move that code into a
+  `doAsync:` block. The event loop also releases its adapter state when it
+  does leave on an exception: that exit skipped the adapter fd unregister, the
+  selector close and the adapter's teardown, so the dispatcher and reader
+  tables #422 frees on a clean exit leaked there. That exit now also closes the
+  loop's live connections, whose clients hung on sockets nothing served, and no
+  longer closes a listener a shutdown drain had already closed (a descriptor
+  number another thread may have been handed since). (#423)
 - Async adapters: a loop thread's exit now frees the adapter's dispatcher and
   thread-local tables instead of leaking them. On chronos every loop thread
   that ever used the adapter leaked its whole dispatcher (about 15 KB with its

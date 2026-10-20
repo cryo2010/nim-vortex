@@ -49,7 +49,21 @@
 ## inbound WebSocket message, a request-body chunk), the pump stops
 ## spinning: chronos has nothing to poll for then. When the future
 ## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
-## uncaught exception in the body responds 500.
+## uncaught exception in the body responds 500; a detached (`asyncSpawn`ed)
+## task that fails is logged and the loop carries on (#423).
+##
+## Defects: chronos's async transform does not turn a Defect into a failed
+## future, not even under `-d:chronosHandleException` or
+## `{.async: (handleException: true).}` (both cover `Exception`, and chronos
+## re-raises a Defect ahead of that). A Defect raised after an `await` leaves
+## the continuation inside the pump's poll, and that future never completes. In
+## a `doAsync:` body the adapter catches it and answers 500 (1011 on a
+## WebSocket). In a router-registered `{.async.}` handler, which is the app's
+## own proc, it cannot: the loop logs it (`vortex: async adapter: an async body
+## raised a Defect past an await ...`) and carries on, but that request gets no
+## response until its timeout, and a graceful shutdown waits out its 3 s async
+## drain for it. Catch a Defect you can expect (an IndexDefect from a bounds
+## check) in the handler, or run that code in a `doAsync:` block.
 
 import pkg/chronos
 import pkg/chronos/selectors2 as chronosSelectors   # close(Selector) for teardown
@@ -60,6 +74,7 @@ import ../request
 import ../routing
 import ../server
 import ../settings
+import ./detachedfailure
 
 export chronos
 
@@ -149,9 +164,30 @@ proc pollOnce() =
   ## from the next timer, so queue a callback first: a pending callback forces
   ## a zero-timeout poll that runs ready work and checks ready I/O without ever
   ## blocking the loop.
+  ##
+  ## A detached task's failure cannot escape it (#423): chronos raises a
+  ## FutureDefect from the callback asyncSpawn registered when the task fails,
+  ## inside this poll, and uncaught it left the pump and ended the loop
+  ## thread. A raise leaves the rest of chronos's queue in place, and the next
+  ## poll runs it (its leading pass drains to the sentinel). Exception, since
+  ## asyncSpawn's is a Defect. Under --panics:on no Defect is catchable, so a
+  ## failing detached task still aborts the process there.
+  ##
+  ## Any other raise is a Defect an `{.async.}` body raised after an await:
+  ## chronos's async transform re-raises a Defect instead of failing the
+  ## future (with or without `handleException`), so it leaves the
+  ## continuation's callback here and that future never completes. It is
+  ## logged as what it is (noteAsyncDefect); a router-registered `{.async.}`
+  ## handler is the app's own proc, so the adapter cannot turn it into a 500
+  ## as it does for a doAsync: body (runAsyncBody).
   ioReady = false
   callSoon(noop)
-  poll()
+  try:
+    poll()
+  except FutureDefect as e:
+    noteDetachedFailure(e)
+  except Exception as e:
+    noteAsyncDefect(e)
 
 proc ioRegistered(): bool =
   ## Without a pollable selector fd (not nestedSelector): the dispatcher watches
@@ -346,9 +382,31 @@ proc completeSoon(fut: Future[void]) =
   callSoon(proc (arg: pointer) {.gcsafe, raises: [].} =
     if not fut.finished: fut.complete())
 
+type AsyncBodyDefect* = object of CatchableError
+  ## A Defect a doAsync: body raised, as the failure of that body's future
+  ## (`parent` holds the Defect). See runAsyncBody.
+
+proc asyncBodyDefect(e: ref Defect): ref AsyncBodyDefect =
+  (ref AsyncBodyDefect)(msg: $e.name & ": " & e.msg, parent: e)
+
 template runAsyncBody(body: untyped): untyped =
   ## Immediately-invoked async closure (chronos's `{.async.}` procs are
   ## closures already; no extra pragma needed).
-  (proc () {.async.} = body)()
+  ##
+  ## chronos's async transform does not catch a Defect: it re-raises it from
+  ## the continuation, in the pump's poll, and the future never completes, so a
+  ## doAsync: body that raised one after an await left its request unanswered
+  ## until the request timeout (#423). `handleException` does not change that
+  ## on any chronos release (checked on 4.0.4, 4.2.2 and 4.4.0: its Defect
+  ## branch re-raises ahead of the Exception one). Catching it inside the body
+  ## does, on all of them: the body's future fails with an AsyncBodyDefect, and
+  ## the uncaught-exception path answers 500 (closes a WebSocket with 1011), as
+  ## the asyncdispatch adapter, whose transform does catch Defects, already
+  ## did. Under --panics:on a Defect is not catchable and aborts the process.
+  (proc () {.async.} =
+    try:
+      body
+    except Defect as vortexBodyDefect:
+      raise asyncBodyDefect(vortexBodyDefect))()
 
 include ./adapterimpl

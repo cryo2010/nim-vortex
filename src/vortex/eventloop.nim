@@ -2690,8 +2690,46 @@ proc registerAdapterFd(loop: Loop) =
     # The pump then polls the dispatcher's I/O on every pass and run caps the
     # loop's wait at 5 ms (see run), so that I/O is served within 5 ms, as the
     # pumps' own I/O cap did before #419, rather than on the loop's next
-    # unrelated wakeup.
+    # unrelated wakeup. The cost is permanent for this loop thread (it never
+    # asks again), but it is paid only on this failure path: an idle loop
+    # wakes every 5 ms instead of sleeping its full wait.
     loop.adapterFd = -2
+
+proc releaseOnAbort(loop: Loop) =
+  ## run's exception exit (#423): release what its normal tail and the drain
+  ## would have, each step contained so the exception in flight is the one
+  ## runLoopThread reports.
+  ##
+  ## The adapter's teardown runs first, while the selector is still open: its
+  ## drain can resume continuations that write a response or re-arm a
+  ## connection through it. Then every live connection's fd is closed, so its
+  ## client sees a FIN (or a reset) instead of hanging on a socket no thread
+  ## serves; the Connection memory is left alone, since a blocking: worker may
+  ## still hold a pin on it and post to the outbox, which the server frees only
+  ## after it joins the workers. The listeners close here too, and are set to -1
+  ## like beginDrain does, so runLoopThread closes only the ones a loop never
+  ## took over (newLoop failed) and never a number this loop already closed and
+  ## another thread may have reused.
+  if loop.adapterFd >= 0:
+    try: loop.selector.unregister(loop.adapterFd)
+    except CatchableError, Defect: discard
+    loop.adapterFd = -1
+  if loop.core.hooks.teardownHook != nil:      # release the async adapter's dispatcher
+    try: loop.core.hooks.teardownHook()
+    except CatchableError, Defect: discard
+  try:
+    for c in loop.core.conns.slots:
+      if c.state != csFree and c.fd >= 0:
+        discard posix.close(cint(c.fd))
+  except CatchableError, Defect: discard
+  try: loop.selector.close()
+  except CatchableError, Defect: discard
+  if loop.listenFd >= 0:
+    discard posix.close(cint(loop.listenFd))
+    loop.listenFd = -1
+  if loop.udpFd >= 0:
+    discard posix.close(cint(loop.udpFd))
+    loop.udpFd = -1
 
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
@@ -2704,6 +2742,15 @@ proc run*(loop: Loop) =
     installH3WsHooks(addr loop.core)   # h3 WebSocket (RFC 9220) stream lookup
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
+  var tailRan = false
+  defer:
+    if not tailRan:
+      # run is leaving on an exception (runLoopThread logs it): still release
+      # what the tail and the drain release, or the dispatcher and its tables
+      # leak as on any exit before #422, the adapter fd stays registered with a
+      # selector nothing closes, and every client of this loop hangs on a
+      # socket nothing serves (#423).
+      loop.releaseOnAbort()
   while true:
     if loop.stopFlag[].load(moAcquire) and not loop.draining:
       loop.tick()                     # refresh nowSec before arming the deadline
@@ -2910,6 +2957,7 @@ proc run*(loop: Loop) =
             " connection(s) held by a still-running blocking: handler; the " &
             "loop cannot exit until they return (a handler that never returns " &
             "will block shutdown -- blocking: bodies must finish)")
+  tailRan = true
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
@@ -2956,11 +3004,13 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   # and run() is defended per-connection but not absolutely; contain both so one
   # loop failing degrades the server instead of killing it. Close this loop's
   # listeners so its share of connections isn't blackholed by a dead listener.
+  var loopOwnsFds = false     # the Loop took over the listeners (see except)
   try:
     block:
       let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
                          arg.pool, arg.outbox, arg.tls, arg.udpFd,
                          arg.streamRoute, arg.quicReload)
+      loopOwnsFds = true
       loop.run()
     # The Loop (and any async-dispatcher state) is now out of scope. Under ORC,
     # a cyclic object decref'd here is only queued in this thread's cycle-root
@@ -2971,10 +3021,15 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
     when defined(gcOrc): GC_fullCollect()
   except CatchableError, Defect:
     opLog("event-loop thread exited on error: " & getCurrentExceptionMsg())
-    if arg.listenFd != osInvalidSocket:
-      discard posix.close(cint(arg.listenFd))
-    if arg.udpFd != osInvalidSocket:
-      discard posix.close(cint(arg.udpFd))
+    # Once the Loop exists it owns the listeners: run's exit (releaseOnAbort,
+    # or beginDrain before it) closes whichever it still holds, and closing
+    # arg's numbers again here could close a descriptor another thread has
+    # since been handed under the same number (#423).
+    if not loopOwnsFds:
+      if arg.listenFd != osInvalidSocket:
+        discard posix.close(cint(arg.listenFd))
+      if arg.udpFd != osInvalidSocket:
+        discard posix.close(cint(arg.udpFd))
   # The WebSocket pump's reused frame buffer is a thread-local; free it here on
   # both paths, since nothing destroys a thread-local when the thread exits.
   wsReleasePumpBuffer()

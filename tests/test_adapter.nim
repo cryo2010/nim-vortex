@@ -17,6 +17,7 @@ import ./h2client
 import ./wsclient
 import vortex/http2/frames
 from vortex/connection import conn, totalPins
+from vortex/adapters/detachedfailure import failureSummary   # #423 log line
 when defined(vortexChronos):
   import vortex/chronos as nhsasync          # adapter's; Request/Response via facade
   import pkg/chronos/config as chronosCfg    # chronosEventEngine (#419 CPU check)
@@ -882,6 +883,214 @@ block:
       check took < 0.3
       let r = slow.readHttpResponse(3000)
       check r.ok and r.body == "slow"
+
+# --- the dispatcher cannot be created (#422) ----------------------------------
+#
+# The accept takes the process's last descriptor, so the handler's first use of
+# the dispatcher, which opens its kqueue/epoll fd, fails with EMFILE. The
+# asyncdispatch adapter marked the dispatcher live anyway, its pump then asked
+# for it outside any guard, and the OSError ended the loop thread ("Too many
+# open files"): every later connection to that loop was refused. asyncdispatch
+# only: chronos raises an OSDefect from newDispatcher there, which its adapter
+# already survived, but that Defect object stays referenced and its
+# newDispatcher allocation stack would trip tests/leakcheck.sh.
+
+proc hFirstAwait(req: Request, res: Response) {.async.} =
+  await sleepMs(1)
+  res.send(Http200, "ok")
+
+when not defined(vortexChronos):
+  block:
+    let emRouter = newRouter()
+    emRouter.get("/", hFirstAwait)
+    var emSrv = newVortex(emRouter.toHandler,
+                          initVortexConfig(numThreads = 1, workerThreads = 1)).start(0)
+    defer: emSrv.close()
+
+    proc emGet(): HttpResp =
+      try:
+        let s = connectTimeout(emSrv.port, 1000)
+        defer: s.close()
+        s.send("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        s.readHttpResponse(2000)
+      except CatchableError: (false, "", "", "")
+
+    suite suiteName & " (no descriptor for the dispatcher, #422)":
+      test "a loop thread survives a dispatcher it cannot create (#422)":
+        sleep(50)                          # the loop is up and idle
+        var openFds: seq[int]
+        for fd in 0 ..< 4096:
+          if fcntl(cint(fd), F_GETFD) != -1: openFds.add fd
+        var lim, saved: RLimit
+        doAssert getrlimit(RLIMIT_NOFILE, lim) == 0
+        saved = lim
+        # The smallest limit with two free descriptor numbers under it: one for
+        # this client's socket, one for the connection the server accepts.
+        var limit = 0
+        var free = 0
+        while free < 2:
+          if limit notin openFds: inc free
+          inc limit
+        lim.rlim_cur = limit
+        doAssert setrlimit(RLIMIT_NOFILE, lim) == 0
+        var first: HttpResp
+        try:
+          first = emGet()
+        finally:
+          doAssert setrlimit(RLIMIT_NOFILE, saved) == 0
+        # The handler's own sleepAsync met the EMFILE and failed its request.
+        check first.ok and first.head.startsWith("HTTP/1.1 500")
+        sleep(50)
+        let second = emGet()
+        check second.ok and second.body == "ok"
+
+# --- a detached task that fails (#423) ----------------------------------------
+#
+# A task the handler detached (asyncCheck / asyncSpawn) whose future fails has
+# its error raised by the dispatcher's own callback, inside the pump's poll:
+# asyncCheck re-raises the error, and chronos's asyncSpawn raises a
+# FutureDefect. Nothing between the pump and the loop thread's entry caught it,
+# so the loop thread exited ("event-loop thread exited on error"), its listener
+# closed, and a one-thread server refused every connection after one failing
+# detached task. Its own one-thread server, so a dead loop takes nothing else
+# down.
+
+proc failingTask() {.async.} =
+  await sleepMs(10)
+  raise newException(ValueError, "detached boom (#423)")
+
+proc hDetachFail(req: Request, res: Response) {.async.} =
+  detach failingTask()
+  res.send(Http200, "detached")
+
+proc hAlive(req: Request, res: Response) {.async.} =
+  await sleepMs(1)                       # through the pump, after the failure
+  res.send(Http200, "alive")
+
+block:
+  let failRouter = newRouter()
+  failRouter.get("/fail", hDetachFail)
+  failRouter.get("/alive", hAlive)
+  var failSrv = newVortex(failRouter.toHandler,
+                          initVortexConfig(numThreads = 1)).start(0)
+  var closed = false
+  defer:
+    if not closed: failSrv.close()
+
+  proc failGet(path: string): string =
+    ## The body, or "" when the request was refused or went unanswered.
+    try:
+      let s = connectTimeout(failSrv.port, 1000)
+      defer: s.close()
+      s.send("GET " & path &
+             " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      let r = s.readHttpResponse(2000)
+      if r.ok: r.body else: ""
+    except CatchableError: ""
+
+  suite suiteName & " (failing detached task, #423)":
+    test "a detached task that fails does not end the loop thread (#423)":
+      for i in 0 ..< 3:
+        check failGet("/fail") == "detached"
+        sleep(50)                        # the task fails 10 ms in
+        check failGet("/alive") == "alive"
+
+    test "close() after a failed detached task is prompt (#423)":
+      check failGet("/fail") == "detached"
+      sleep(50)
+      let t0 = epochTime()
+      failSrv.close()
+      closed = true
+      let took = epochTime() - t0
+      echo "    close() after a failed detached task took ", int(took * 1000),
+        " ms"
+      check took < 0.2
+
+# --- a Defect past an await (#423) -------------------------------------------
+#
+# chronos's async transform does not catch a Defect (not even under
+# handleException): one raised after an await leaves the continuation inside
+# the pump's poll and the body's future never completes. The pump catches it
+# like a detached task's failure, but must say what it is, since the request it
+# was answering gets nothing until its timeout. A doAsync: body is the
+# adapter's own closure, which turns the Defect into a failed future and so a
+# 500, as the asyncdispatch transform does for any async body.
+
+proc hDefectAfterAwait(req: Request, res: Response) {.async.} =
+  await sleepMs(1)
+  raise newException(IndexDefect, "handler defect (#423)")
+
+proc hDoAsyncDefect(req: Request, res: Response) {.gcsafe.} =
+  req.doAsync:
+    await sleepMs(1)
+    raise newException(IndexDefect, "doAsync defect (#423)")
+
+template captureStderr(body: untyped): string =
+  ## What the process wrote to fd 2 while `body` ran (opLog's sink).
+  let capPath = getTempDir() / ("vortex_adapter_stderr_" &
+                                $getCurrentProcessId() & ".log")
+  let capFd = posix.open(capPath.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o600)
+  let savedFd = dup(2)
+  discard dup2(capFd, 2)
+  try:
+    body
+  finally:
+    discard dup2(savedFd, 2)
+    discard posix.close(savedFd)
+    discard posix.close(capFd)
+  let captured = readFile(capPath)
+  removeFile(capPath)
+  captured
+
+block:
+  let defRouter = newRouter()
+  defRouter.get("/defect", hDefectAfterAwait)
+  defRouter.get("/doasync", hDoAsyncDefect)
+  defRouter.get("/alive", hAlive)
+  var defSrv = newVortex(defRouter.toHandler,
+                         initVortexConfig(numThreads = 1)).start(0)
+  defer: defSrv.close()   # chronos: waits out the 3 s drain for the lost future
+
+  proc defGet(path: string, ms = 2000): HttpResp =
+    try:
+      let s = connectTimeout(defSrv.port, 1000)
+      defer: s.close()
+      s.send("GET " & path &
+             " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      s.readHttpResponse(ms)
+    except CatchableError: (false, "", "", "")
+
+  suite suiteName & " (Defect past an await, #423)":
+    test "a doAsync: body's Defect after an await answers 500 (#423)":
+      let r = defGet("/doasync")
+      check r.ok and r.head.startsWith("HTTP/1.1 500")
+      check defGet("/alive").body == "alive"
+
+    test "a handler's Defect after an await is reported and the loop serves on (#423)":
+      var r: HttpResp
+      let log = captureStderr:
+        r = defGet("/defect", 300)
+        sleep(50)
+      when defined(vortexChronos):
+        # The handler's future never completes: no response, but the loop says
+        # why, under its own line rather than as a detached task's failure.
+        check not r.ok
+        check "async adapter: an async body raised a Defect past an await" in log
+        check "IndexDefect: handler defect (#423)" in log
+        check "a detached task failed" notin log
+      else:
+        check r.ok and r.head.startsWith("HTTP/1.1 500")
+      check defGet("/alive").body == "alive"
+
+suite suiteName & " (failure summary, #423)":
+  test "the log line stops at the runtime's traceback and is capped":
+    check failureSummary(newException(ValueError,
+      "boom\nStack trace:\nfoo.nim(1) bar\nbaz.nim(2) qux")) == "boom"
+    check failureSummary(newException(ValueError,
+      "two\nlines\nAsync traceback:\n  frame")) == "two lines"
+    check failureSummary(newException(ValueError, "")) == "ValueError"
+    let long = failureSummary(newException(ValueError, repeat('x', 5000)))
+    check long.len <= 503 and long.endsWith("...")
 
 # --- a Future completed by the pump's held-flush release (#421) ---------------
 #
