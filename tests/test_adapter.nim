@@ -687,6 +687,61 @@ block:
       # bound leaves headroom for a loaded host.
       check (getMonoTime() - t0).inMilliseconds < 2500
 
+# --- an idle loop thread with live long timers (#417) -------------------------
+#
+# A timer nobody waits on (a detached heartbeat, the leftover timer of a
+# `withTimeout` whose operation finished early) must cost the loop thread one
+# wakeup when it is due, not one every few ms for as long as it lives. The
+# asyncdispatch pump answered any such timer with a 5 ms wake cap.
+
+proc loopThreadCpuNs(): int64 =
+  var ts: Timespec
+  discard clock_gettime(CLOCK_THREAD_CPUTIME_ID, ts)
+  int64(ts.tv_sec) * 1_000_000_000 + int64(ts.tv_nsec)
+
+proc hArmTimers(req: Request, res: Response) {.async.} =
+  detach heartbeat()                     # a 10 s timer, re-armed for good
+  # Finishes after 5 ms; its 30 s timeout timer stays in the dispatcher's heap.
+  when defined(vortexChronos):
+    discard await withTimeout(sleepMs(5), 30_000.milliseconds)
+  else:
+    discard await withTimeout(sleepMs(5), 30_000)
+  res.send(Http200, "armed")
+
+proc hLoopCpu(req: Request, res: Response) {.async.} =
+  res.send(Http200, $loopThreadCpuNs())  # runs on the (only) loop thread
+
+block:
+  let idleRouter = newRouter()
+  idleRouter.get("/arm", hArmTimers)
+  idleRouter.get("/cpu", hLoopCpu)
+  var idle = newVortex(idleRouter.toHandler,
+                       initVortexConfig(numThreads = 1)).start(0)
+  defer: idle.close()
+
+  proc idleGet(path: string): string =
+    let s = connectTimeout(idle.port, 3000)
+    defer: s.close()
+    s.send("GET " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    let r = s.readHttpResponse(3000)
+    doAssert r.ok, path
+    r.body
+
+  suite suiteName & " (idle loop)":
+    test "live long timers do not wake an idle loop thread (#417)":
+      check idleGet("/arm") == "armed"
+      sleep(50)
+      let c0 = parseBiggestInt(idleGet("/cpu"))
+      sleep(2000)                        # idle: only the two long timers live
+      let c1 = parseBiggestInt(idleGet("/cpu"))
+      let cpu = float(c1 - c0) / 1e9
+      # A 5 ms wake cap costs 0.019 to 0.036 s of loop CPU over this window,
+      # depending on the host (0.094 s per 5 s measured); one wakeup per second
+      # of idle wait costs under a millisecond (0.0008 s measured).
+      echo "    loop thread CPU over 2 s idle: ", formatFloat(cpu, ffDecimal, 4),
+        " s"
+      check cpu < 0.003
+
 withServer(appRouter.toHandler,
            initVortexConfig(numThreads = 1, workerThreads = 2),
            appRouter.streamPredicate, srv):

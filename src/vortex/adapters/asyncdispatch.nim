@@ -33,13 +33,16 @@
 ## still works inside an async body for synchronous libraries.
 ##
 ## Mechanics: the loop calls the registered pump once per iteration to
-## run ready callbacks, capping its selector timeout at a few ms while
-## async operations are pending (asyncdispatch's own fds cannot wake our
-## selector; this bounds completion latency instead). When the future
-## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
-## uncaught exception in the body responds 500.
+## run ready callbacks and expired timers, capping its selector timeout at
+## the dispatcher's next timer (so a long timer nobody waits on, such as a
+## detached heartbeat, costs one wakeup when it is due), and at a few ms
+## while the dispatcher has fds registered (asyncdispatch's own fds cannot
+## wake our selector; this bounds completion latency instead). When the
+## future finishes, the deferred respond is flushed via
+## LoopCore.hooks.kick. An uncaught exception in the body responds 500.
 
-import std/[asyncdispatch, httpcore, tables, deques, macros, selectors]
+import std/[asyncdispatch, httpcore, tables, deques, macros, selectors,
+          heapqueue, monotimes, times]
 import ../connection
 import ../request
 import ../routing
@@ -48,17 +51,54 @@ import ../settings
 
 export asyncdispatch
 
+proc readyNow(d: PDispatcher): bool =
+  ## The dispatcher holds work that is runnable now: a queued callback or a
+  ## timer that has expired.
+  d.callbacks.len > 0 or
+    (d.timers.len > 0 and d.timers[0].finishAt <= getMonoTime())
+
+proc nextTimerCap(d: PDispatcher): int =
+  ## Milliseconds until the dispatcher's earliest timer is due (rounded up, as
+  ## asyncdispatch's own processTimers does, so the loop does not wake a hair
+  ## early and pay a second pass for it), clamped to the loop's 1 s idle wait;
+  ## -1 with no timer.
+  if d.timers.len == 0: return -1
+  let left = (d.timers[0].finishAt - getMonoTime()).inMilliseconds + 1
+  int(clamp(left, 1'i64, 1000'i64))
+
 proc pump(): int {.nimcall, gcsafe.} =
+  ## Drive the dispatcher's ready work, then cap the loop's wait at its next
+  ## timer (-1, the loop's full wait, with none).
+  ##
+  ## Not on hasPendingOperations (#417): that predicate counts every timer the
+  ## dispatcher holds, including ones no request waits on -- a detached
+  ## heartbeat sleeping 10 s, or the timer of a `withTimeout` whose operation
+  ## finished early, which sits in the heap until it expires -- and the pump
+  ## used to answer it with a 5 ms cap, so any such timer woke the loop thread
+  ## every 5 ms for as long as it lived (0.094 s of loop CPU per 5 s idle after
+  ## a `withTimeout(30 s)` that finished early, against 0.0009 s on chronos).
+  ## A timer needs a wakeup when it is due, no sooner; the chronos pump's idle
+  ## exit already worked that way.
+  ##
+  ## Registered I/O is the exception: the dispatcher's selector fd is invisible
+  ## to the loop's selector, so while any fd is registered the pump polls it on
+  ## every pass and keeps the bounded 5 ms cap that has always bounded an I/O
+  ## completion's latency.
   {.gcsafe.}:
-    # Bounded spin: completing one future can resume work that
-    # immediately suspends again (pipelined requests, chained awaits);
-    # each such link needs another poll pass. Real IO waits are not
-    # completed by poll(0) and fall through to the timeout cap below.
+    let d = getGlobalDispatcher()
+    let io = not getIoHandler(d).isEmpty
+    # Bounded spin: completing one future can resume work that immediately
+    # suspends again (pipelined requests, chained awaits, a fired timer whose
+    # continuation runs as a callback); each such link needs another poll pass.
+    # A poll(0) never blocks.
     var spins = 0
-    while hasPendingOperations() and spins < 8:
-      poll(0)                    # run completed futures; never block
+    while spins < 8 and (readyNow(d) or (io and spins == 0)):
+      poll(0)
       inc spins
-    if hasPendingOperations(): 5 else: -1
+    if readyNow(d): return 1     # more ready work: come straight back
+    result = nextTimerCap(d)
+    if not getIoHandler(d).isEmpty:
+      result = if result < 0: 5 else: min(result, 5)
 
 proc teardown() {.nimcall, gcsafe.} =
   ## Release this loop thread's asyncdispatch dispatcher on exit. Without it the

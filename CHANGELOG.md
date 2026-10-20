@@ -237,6 +237,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- asyncdispatch adapter: a live timer that no request waits on no longer wakes
+  its loop thread every 5 ms. The adapter's pump capped the loop's selector
+  wait at 5 ms whenever the dispatcher's `hasPendingOperations()` was true, and
+  that predicate counts every timer the dispatcher holds: a detached heartbeat
+  (an `asyncCheck`ed loop around `sleepAsync(10_000)`), or the timer of a
+  `withTimeout` whose operation finished early, which stays in the heap until
+  it expires. Any such timer kept the loop thread spinning through a poll pass
+  every 5 ms for as long as it lived, on every loop thread that held one. The
+  pump now runs the dispatcher's ready callbacks and expired timers and caps
+  the wait at its next timer, the way the chronos pump's idle exit already did,
+  so a 30 s timer costs a wakeup when it is due and an idle server otherwise
+  sleeps its full 1 s wait. While the dispatcher has an fd registered the pump
+  still polls it on every pass under the 5 ms cap, since the dispatcher's
+  selector is invisible to the loop's own (dropped again by #419). Measured
+  with a 10 s heartbeat and a finished `withTimeout(30 s)` live on a
+  one-thread server: 0.036 s of loop thread CPU over 2 s of idle before,
+  0.0008 s after (0.0007 s on chronos).
+  (#417)
 - An awaitable `req.blocking(...)` whose body raises a `Defect` (a failed
   `doAssert`, an `IndexDefect`; catchable under the default `--panics:off`) now
   fails the awaited call, so the handler answers `500`, instead of leaving the
