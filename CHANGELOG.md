@@ -237,6 +237,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A Future completed by a write-buffer drain that the loop's held flushes
+  fire no longer waits up to a second to resume. Since #412 the loop holds the
+  flushes the async pump makes and sends them once the pump returns, but the
+  pump computed the loop's next wait before that. When one of those flushes
+  emptied a backed-up connection it fired the drain callback there: a sync
+  `ws.onDrain` the app turns into a Future, an HTTP/1 `res.onDrain`, an HTTP/2
+  producer's drain resume. The adapter only queues the continuation of a
+  Future completed that way, and with the pump having reported nothing pending
+  the selector slept its full 1 s idle wait before running it, on both
+  adapters. Before #412 the completion happened inside the pump, whose bounded
+  poll ran the continuation in the same pass. The release now reports whether
+  a flush ran such a callback (every drain and teardown callback site bumps a
+  per-loop counter the release compares), and the loop then polls again at
+  once instead of sleeping. A plain response flushed into a socket with room,
+  or a flush that only meets a full socket again under a client that is not
+  reading, keeps the normal wait, and `res.drained()` was never affected (its
+  drain kick already forces a zero wait). The outbox batch's release needs no
+  such flag: it runs ahead of the same iteration's pump. Measured with a
+  WebSocket producer parked on such a Future under a slow reader: 1000 ms from
+  the drain to the next frame before, under 1 ms after. The same wait followed
+  a connection the loop's timeout sweeps closed (they also run after the pump):
+  a handler in `ws.messages` on a WebSocket closed for an unanswered keepalive
+  ping resumed 1000 ms after the close on both adapters, and now at once. The
+  HTTP/3 backend's drain, body and teardown callbacks are counted too, for the
+  extra HTTP/3 pass the loop makes after the pump. (#421)
 - Reading a kept `Request` or `Response` from a thread that holds no snapshot
   of its request (a worker task it does not belong to, or a thread the
   application owns) no longer reaches the loop's connection table through

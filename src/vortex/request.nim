@@ -1152,6 +1152,7 @@ proc fireAnsweredDrain(core: ptr LoopCore, c: ptr Connection) {.raises: [].} =
   let cb = takeEndedDrain(c)
   if cb == nil: return
   c.respBackedUp = false
+  noteDrainFire(core)          # #421
   try: cb(core, c.fd, c.gen, 0)
   except Exception: discard    # unannotated user producer (raises: [Exception])
 
@@ -1947,6 +1948,7 @@ proc fireEndedDrain(res: Response, cb: RespDrainCb) {.raises: [].} =
   ## (closeConn finds the callback already detached). Runs before the kick that
   ## resumes the pipeline, so the callback's handle still names this request.
   if cb == nil: return
+  noteDrainFire(res.core)      # #421
   try: cb(res.core, res.fd, res.gen, res.stream)
   except Exception: discard
 
@@ -2488,6 +2490,7 @@ proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
           if h3StreamBacklog(h3c, uint64(stream)) > 0: continue
           let cb = st.rs.onRespDrain
           st.rs.onRespDrain = nil
+          noteDrainFire(core)         # #421
           cb(core, fd, gen, stream)
         continue
       let c = conn(core, fd, gen)
@@ -2507,7 +2510,9 @@ proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
         let cb = h2DrainKick(c, stream)
         if releaseFlushHold(c) and pendingOut(c) > before:
           core.hooks.flushHook(core.loopPtr, fd, gen)
-        if cb != nil: cb(core, fd, gen, stream)
+        if cb != nil:
+          noteDrainFire(core)         # #421
+          cb(core, fd, gen, stream)
         continue
       # h1: drained means the write buffer is empty. With bytes still queued,
       # mark the response (a registration made before sendHead, or one the
@@ -2520,6 +2525,7 @@ proc runDrainKicks*(core: ptr LoopCore) {.raises: [].} =
       c.respBackedUp = false
       let cb = c.rs.onRespDrain
       c.rs.onRespDrain = nil
+      noteDrainFire(core)             # #421
       cb(core, fd, gen, 0)
     except Exception:
       discard                         # a raising producer must not stop the rest

@@ -499,6 +499,19 @@ type
       ## non-empty the selector does not wait. fd+generation, so a recycled slot
       ## is skipped. At most one entry per carrier per pass
       ## (RequestState.drainKickQueued).
+    drainFires*: uint
+      ## Bumped (wrapping) each time the loop thread is about to run a user
+      ## drain or teardown callback that a socket flush can fire: an HTTP/1
+      ## `res.onDrain`, a WebSocket `onDrain` / `onClose`, an h2 producer's
+      ## drain resume, a final onBody(last=true), and finish/abort's detached
+      ## drain (`noteDrainFire`). Any of them can complete a Future whose
+      ## continuation the adapter only queues, so the loop compares it across
+      ## everything that runs after the pump computed its wake cap (the
+      ## held-flush release, tick()'s timeout sweeps, the tail h3Drive) and,
+      ## when it moved, does not sleep on that cap (#421). The HTTP/3
+      ## backend's fire sites (stream close, connection free, stream-writable
+      ## drain, ended-response drain, h3 WebSocket onDrain, request-body
+      ## delivery) count too, for the tail h3Drive. Loop-thread only.
     # Async-adapter integration (see adapters/). All loop-thread only.
     loopPtr*: pointer         ## the owning Loop, for kick
     hooks*: AdapterHooks      ## adapter/event-loop proc-pointer vtable (below)
@@ -603,6 +616,11 @@ proc callStreamRoute*(core: ptr LoopCore, fd: int32, gen: uint32,
   cast[proc (core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
              env: pointer): bool {.nimcall, gcsafe.}](
     core.streamRouteRaw.prc)(core, fd, gen, stream, core.streamRouteRaw.env)
+
+template noteDrainFire*(core: ptr LoopCore) =
+  ## A user drain or teardown callback is about to run (LoopCore.drainFires,
+  ## #421). Unsigned, so it wraps rather than overflows.
+  inc core.drainFires
 
 # The outbox's wakeup descriptor is vortex's own (#418): an eventfd on Linux, a
 # non-blocking pipe elsewhere. It used to be a std/selectors SelectEvent, but

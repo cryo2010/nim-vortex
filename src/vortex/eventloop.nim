@@ -164,6 +164,10 @@ type
                                  # -1 = not yet, -2 = registration failed
     inPump: bool                 # the adapter's pump is running: loop-thread
                                  # flushes are held to its end (pumpHold)
+    pumpOwed: bool               # the pump's held-flush release ran code that
+                                 # may have queued async work after pumpCap was
+                                 # computed: do not sleep before the next pump
+                                 # (#421)
     wakeFd: int                  # the outbox's wakeup read end, registered
                                  # for Read (#418); -1 = no outbox
     outboxScratch: seq[OutMsg]   # reused drain buffer
@@ -601,6 +605,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     let cb = c.rs.onBodyCb
     c.rs.onBodyCb = nil
     var empty: string
+    noteDrainFire(addr loop.core)     # a teardown callback runs (#421)
     try: cb(toOpenArray(empty, 0, -1), true)
     except CatchableError: discard
   if c.h2 == nil and c.rs.onRespDrain != nil:
@@ -617,6 +622,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     let cb = c.rs.onRespDrain
     c.rs.onRespDrain = nil
     c.respBackedUp = false
+    noteDrainFire(addr loop.core)
     try: cb(addr loop.core, c.fd, c.gen, 0)
     except Exception: discard    # unannotated user producer (raises: [Exception])
     # Drop a registration the producer made from inside the callback: nothing
@@ -878,6 +884,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
         # re-fire spuriously on the next full drain (issue #273).
         let cb = c.rs.onRespDrain
         c.rs.onRespDrain = nil
+        noteDrainFire(addr loop.core)       # #421
         cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
       return
     else:
@@ -2218,7 +2225,7 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
                 m.data.toOpenArray(bodyStart, m.data.len - 1))
   loop.resumeAfterRespond(c, m.stream)
 
-proc releaseBatchFlushes(loop: Loop) =
+proc releaseBatchFlushes(loop: Loop): bool {.discardable.} =
   ## One socket write per connection for the whole outbox batch (#333). Each entry
   ## is the one hold deferBatchFlush took for that connection, so dropping it
   ## flushes everything the batch produced there. A connection that died while the
@@ -2238,6 +2245,20 @@ proc releaseBatchFlushes(loop: Loop) =
   ## per-connection guard: a callback that raises closes its own connection,
   ## as a dispatch error does, rather than ending the loop thread. The list is
   ## cleared even then, so no later connection inherits a stale entry.
+  ##
+  ## Returns true when a flush ran such user code, which can complete a Future
+  ## (a sync onDrain the app turns into one, a resumed h2 producer, a teardown
+  ## callback) whose continuation the adapter only queues. The pump's caller
+  ## must then not sleep on the wake cap it read before this ran (#421). Exact,
+  ## not inferred from the connection's stall state: every site that runs a
+  ## drain or teardown callback bumps LoopCore.drainFires (noteDrainFire), and
+  ## this compares it across the release. A plain response flushed into a
+  ## socket with room, or a flush that only meets EAGAIN again under a client
+  ## that is not reading, fires nothing, so the pass keeps its wait. A flush
+  ## that raised counts too: the user code it ran may have completed a Future
+  ## before the raise.
+  let fires = loop.core.drainFires
+  var raised = false
   try:
     for (fd, gen) in loop.pendingFlush:
       let c = conn(addr loop.core, fd, gen)
@@ -2248,10 +2269,12 @@ proc releaseBatchFlushes(loop: Loop) =
           loop.flushOut(c)
       except Exception:
         # A per-connection bug must never take down the loop thread.
+        raised = true
         if c.state != csFree:
           loop.closeConn(c)
   finally:
     loop.pendingFlush.setLen(0)
+  raised or loop.core.drainFires != fires
 
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing. Each
@@ -2273,6 +2296,9 @@ proc processOutbox(loop: Loop) =
       else:
         loop.applyOutboxConn(m)
   finally:
+    # A flush here that completes a Future needs no pumpOwed: processOutbox runs
+    # from the selector's event branch, ahead of this iteration's pump, which
+    # runs the continuation and computes a fresh wake cap (#421).
     loop.releaseBatchFlushes()
   # Recycle every sendFile read buffer from this batch back to the pool -- once,
   # here, so a buffer is returned exactly once whether its stream was alive (the
@@ -2714,6 +2740,13 @@ proc run*(loop: Loop) =
       # this a body that paused and then resumed stalls until some unrelated
       # event happens to wake the loop (#366).
       timeoutMs = 0
+    if loop.pumpOwed:
+      # The last pump's held flushes ran after it computed pumpCap, and one of
+      # them may have completed a Future (a WebSocket onDrain turned into one, an
+      # h2 producer's drain resume): its continuation is queued with nothing to
+      # wake the selector for it, so pump again at once instead of waiting out
+      # a cap that predates it, up to the 1 s idle wait (#421).
+      timeoutMs = 0
     if loop.core.drainKicks.len > 0:
       # A res.onDrain registration (from the async pump, a timer, an onDrain
       # callback) is owed a pass that fires it if the response is already
@@ -2821,11 +2854,22 @@ proc run*(loop: Loop) =
       # are held for the pump and released once it returns, one send() per
       # connection for everything it produced (pumpHold).
       loop.inPump = true
+      loop.pumpOwed = false
       try:
         loop.pumpCap = loop.core.hooks.pumpHook()
       finally:
         loop.inPump = false
-        loop.releaseBatchFlushes()
+        if loop.releaseBatchFlushes():
+          loop.pumpOwed = true         # pumpCap predates what it ran (#421)
+    # Everything below runs after the pump computed pumpCap too: tick()'s
+    # timeout sweeps close connections (closeConn fires onClose, a final
+    # onBody, a parked onRespDrain) and the tail h3Drive runs the HTTP/3
+    # backend's fire sites. A Future one of them completes has its continuation
+    # only queued, so compare the drain-fire count across them the way the
+    # release does, or the handler waits out the cap (up to the 1 s idle wait)
+    # before it resumes. The sweeps run at most once a second, so this adds no
+    # spin.
+    let firesAfterPump = loop.core.drainFires
     if loop.adapterFd == -1 and loop.core.hooks.ioFdHook != nil:
       loop.registerAdapterFd()
     loop.tick()
@@ -2839,6 +2883,9 @@ proc run*(loop: Loop) =
       if loop.h3FlushPending and loop.udpFd >= 0:
         try: loop.h3Drive()
         except Exception: discard
+    if loop.core.drainFires != firesAfterPump and
+        loop.core.hooks.pumpHook != nil:
+      loop.pumpOwed = true             # see firesAfterPump (#421)
     if loop.draining:
       loop.drainSweep()               # close connections that just finished
       if loop.drainComplete():

@@ -872,6 +872,166 @@ block:
       let r = slow.readHttpResponse(3000)
       check r.ok and r.body == "slow"
 
+# --- a Future completed by the pump's held-flush release (#421) ---------------
+#
+# Since #412 the loop holds the flushes the async pump makes and releases them
+# after the pump returns, but the pump computed the loop's wake cap before that.
+# A release flush that empties a backed-up WebSocket fires its onDrain; an app
+# that turns that sync callback into a Future completes it there, and the
+# adapter only queues the continuation. With the pump's cap saying "nothing
+# pending" (-1) the selector then slept its full 1 s idle wait before the
+# producer resumed.
+#
+# The window needs a connection that is backed up (it hit EAGAIN and has not
+# drained to zero since) with less than respHighWater buffered (a bigger buffer
+# is flushed at send time, inside the pump, where the continuation runs in the
+# same pass), a pump write to it, and room in the socket by the time the pump
+# returns although the pass saw no writability. The client builds it, one step
+# per message, without depending on how the kernel sizes its socket buffers:
+#  * "s" (client not reading): the server sends three 16 KiB frames from the
+#    pump, held and released together; "q", read on a later pass, publishes
+#    ws.bufferedAmount. The client repeats both until the release hit EAGAIN:
+#    the socket is full and up to 48 KiB stay buffered, backed up.
+#  * "w": a waiter parks on a drain Future made from the sync ws.onDrain.
+#  * "x", then the client starts reading 5 ms later: the reply spins 30 ms in
+#    the pump (the pass that read "x" saw a full socket) and sends "e" behind
+#    the backlog; by the time the pump returns the client has emptied the
+#    kernel buffers, so the release writes everything and fires onDrain.
+# Nothing else wakes the loop then (no timer, the client sends nothing), so
+# before the fix the waiter's "r" arrived ~1 s after "e".
+
+const drainFrame = 16 * 1024
+var drainQ, drainQSeq, drainSent: Atomic[int]
+
+proc wsDrainedFut(ws: WebSocket): Future[void] =
+  ## A sync `ws.onDrain` turned into a Future, the way an app awaits a drain.
+  let f = newFuture[void]("wsDrainedFut")
+  proc cb(ws: WebSocket) {.gcsafe.} =
+    if not f.finished: f.complete()
+  try: ws.onDrain = cb
+  except Exception: discard
+  f
+
+proc wsSafeSend(ws: WebSocket, data: string) {.raises: [], gcsafe.} =
+  try: ws.send(data, WsKind.Binary)
+  except Exception: discard
+
+proc wsPublishBuffered(ws: WebSocket) {.raises: [], gcsafe.} =
+  try: drainQ.store(ws.bufferedAmount)
+  except Exception: drainQ.store(-1)
+  drainQSeq.atomicInc
+
+proc wsDrainWaiter(ws: WebSocket) {.async.} =
+  await wsDrainedFut(ws)
+  wsSafeSend(ws, "r")
+
+proc hWsDrain(req: Request, res: Response) {.async.} =
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):
+    case msg
+    of "s":
+      for i in 0 ..< 3: wsSafeSend(ws, repeat('x', drainFrame))
+      drainSent.atomicInc
+    of "q":
+      wsPublishBuffered(ws)
+    of "w":
+      detach wsDrainWaiter(ws)
+    of "x":
+      let t0 = epochTime()
+      while epochTime() - t0 < 0.03: discard   # hold the pump: see above
+      wsSafeSend(ws, "e")
+
+block:
+  let drainRouter = newRouter()
+  drainRouter.ws("/wsdrain", hWsDrain)
+  var dsrv = newVortex(drainRouter.toHandler,
+    initVortexConfig(numThreads = 1, workerThreads = 1)).start(0)
+  defer: dsrv.close()
+
+  suite suiteName & " (held-flush release)":
+    test "a WebSocket onDrain Future completed by a held flush resumes at once (#421)":
+      let s = openWs(dsrv.port, "/wsdrain", timeoutMs = 5000).sock
+      defer: s.close()
+      var gaps: seq[int]
+      for cycle in 0 ..< 3:
+        # Fill the socket without reading until a release hits EAGAIN.
+        var buffered = 0
+        var rounds = 0
+        while buffered == 0 and rounds < 2000:
+          inc rounds
+          let sent = drainSent.load
+          s.sendBin("s")
+          var deadline = epochTime() + 3.0
+          while drainSent.load == sent and epochTime() < deadline: sleep(0)
+          # "q" must be read on a later pass than "s", after the release:
+          # in the same batch it would see the frames still held.
+          sleep(2)
+          let before = drainQSeq.load
+          s.sendBin("q")
+          deadline = epochTime() + 3.0
+          while drainQSeq.load == before and epochTime() < deadline: sleep(0)
+          buffered = drainQ.load
+        check buffered > 0 and buffered < 64 * 1024
+        s.sendBin("w")
+        sleep(20)                    # the waiter parks
+        s.sendBin("x")
+        sleep(5)                     # read only once the pump is spinning
+        var tE = 0.0
+        while true:
+          let f = s.recvFrame()
+          if f.payload == "e": tE = epochTime()
+          elif f.payload == "r": break
+        gaps.add int((epochTime() - tE) * 1000)
+      echo "    drain-to-resume gap per cycle (ms): ", gaps
+      check max(gaps) < 300
+
+# The same window, opened by the loop's timeout sweeps instead of a held flush:
+# tick() runs after the pump, and a WebSocket whose client never answers the
+# keepalive ping is closed there (an h1 WebSocket rides the deadline sweep:
+# sweepTimeouts -> closeConn -> onClose), which
+# completes the handler's `ws.messages` Future. Its continuation was queued
+# under the pump's stale cap, so the handler resumed ~1 s after the close.
+
+var sweepDoneNs: Atomic[int64]
+
+proc hWsSweep(req: Request, res: Response) {.async.} =
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):
+    discard msg
+  sweepDoneNs.store(getMonoTime().ticks)
+
+block:
+  let sweepRouter = newRouter()
+  sweepRouter.ws("/wssweep", hWsSweep)
+  var sweepCfg = initVortexConfig(numThreads = 1, workerThreads = 1)
+  sweepCfg.wsPingInterval = 1          # ping after 1 s idle,
+  sweepCfg.wsPongTimeout = 1           # close 1 s later without a reply
+  var ssrv = newVortex(sweepRouter.toHandler, sweepCfg).start(0)
+  defer: ssrv.close()
+
+  suite suiteName & " (timeout sweep close)":
+    test "a handler resumes at once when a timeout sweep closes its WebSocket (#421)":
+      sweepDoneNs.store(0)
+      let s = openWs(ssrv.port, "/wssweep", timeoutMs = 8000).sock
+      defer: s.close()
+      # Never answer the ping: read (and drop) until the server closes.
+      var buf = newString(256)
+      var eofNs = 0'i64
+      while eofNs == 0:
+        var n = -1
+        try: n = s.recv(addr buf[0], buf.len)
+        except CatchableError: n = -1
+        if n <= 0: eofNs = getMonoTime().ticks
+      var waited = 0
+      while sweepDoneNs.load == 0 and waited < 3000:
+        sleep(1)
+        inc waited
+      let done = sweepDoneNs.load
+      check done != 0
+      let gapMs = (done - eofNs) div 1_000_000
+      echo "    sweep close to handler resume: ", gapMs, " ms"
+      check gapMs < 300
+
 withServer(appRouter.toHandler,
            initVortexConfig(numThreads = 1, workerThreads = 2),
            appRouter.streamPredicate, srv):
