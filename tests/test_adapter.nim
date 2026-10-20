@@ -6,7 +6,8 @@
 # src/vortex/adapters/adapterimpl.nim, but the backend primitives
 # (onCompleted, pump, pendingOps) differ, so the full scenario matrix runs
 # against each backend.
-import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics]
+import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics,
+            monotimes]
 import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
@@ -15,6 +16,7 @@ import ./helper                              # macro would clash with the async
 import ./h2client
 import ./wsclient
 import vortex/http2/frames
+from vortex/connection import conn, totalPins
 when defined(vortexChronos):
   import vortex/chronos as nhsasync          # adapter's; Request/Response via facade
   const suiteName = "chronos adapter"
@@ -595,6 +597,95 @@ block:
       fresh.close()
       closed = true
       check epochTime() - t0 < 1.5        # a stuck drain takes 2 s or more
+
+# --- an awaitable blocking body that raises a Defect (#416) ----------------
+#
+# Its own server, so the last test can time its shutdown. The awaitable
+# trampoline caught only CatchableError: a Defect escaped it, skipping the
+# omBlockingDone push, so the awaiting future never completed (no response
+# at all), the task's pkAwait pin stayed held, and close() waited out the
+# async drain deadline (3 s) for the outstanding result.
+
+proc hDefectValue(req: Request, res: Response) {.async.} =
+  let n = 7
+  let v = req.blocking(n):
+    doAssert n < 0, "defect in a blocking body"
+    n
+  res.send(Http200, $v)                   # never reached: the await raises
+
+proc hDefectVoid(req: Request, res: Response) {.async.} =
+  let n = 1
+  req.blocking(n):
+    # Raised outright: an out-of-range `s[n]` is undefined under -d:danger
+    # (no bounds checks), so it would not raise there.
+    if n > 0: raise newException(IndexDefect, "index " & $n & " out of bounds")
+    res.send(Http200, "unreachable")
+
+proc hCatchDefect(req: Request, res: Response) {.async.} =
+  let n = 7
+  try:
+    let v = req.blocking(n):
+      doAssert n < 0, "caught by the handler"
+      n
+    res.send(Http200, "no error " & $v)
+  except BlockingDefectError as e:
+    res.send(Http200, e.msg)
+
+proc hOwnPins(req: Request, res: Response) {.async.} =
+  # Loop thread: this connection's pin count once the defect request is done.
+  let c = conn(req.core, req.fd, req.gen)
+  res.send(Http200, if c == nil: "gone" else: $c.totalPins)
+
+block:
+  let defRouter = newRouter()
+  defRouter.get("/defect-value", hDefectValue)
+  defRouter.get("/defect-void", hDefectVoid)
+  defRouter.get("/defect-caught", hCatchDefect)
+  defRouter.get("/pins", hOwnPins)
+  var dsrv = newVortex(defRouter.toHandler, initVortexConfig(
+    numThreads = 1, workerThreads = 1)).start(0)
+  var closed = false
+  defer:
+    if not closed: dsrv.close()
+
+  suite suiteName & " (blocking body Defect, #416)":
+    for path in ["/defect-value", "/defect-void"]:
+      test "a Defect in an awaitable blocking body answers 500 and unpins (" &
+          path & ")":
+        let s = connectTimeout(dsrv.port, 3000)
+        defer: s.close()
+        s.send("GET " & path & " HTTP/1.1\r\nHost: x\r\n\r\n")
+        let r = s.readHttpResponse(2000)
+        check r.ok
+        check r.head.startsWith("HTTP/1.1 500")
+        # Same connection: it moved on, and the task's pin is released.
+        s.send("GET /pins HTTP/1.1\r\nHost: x\r\n\r\n")
+        let p = s.readHttpResponse(2000)
+        check p.ok and p.body == "0"
+
+    test "the Defect reaches the handler as a BlockingDefectError":
+      let s = connectTimeout(dsrv.port, 3000)
+      defer: s.close()
+      s.send("GET /defect-caught HTTP/1.1\r\nHost: x\r\n\r\n")
+      let r = s.readHttpResponse(2000)
+      check r.ok
+      check r.body.startsWith("AssertionDefect: ")
+      check "caught by the handler" in r.body
+      # The trace sits under a "Stack trace:" header, so a one-line log
+      # summary (#423) stops before it instead of flattening it.
+      check "\nStack trace:\n" in r.body
+
+    test "close() after a Defect in a blocking body does not wait out the drain":
+      let s = connectTimeout(dsrv.port, 3000)
+      s.send("GET /defect-value HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      discard s.recvUntilClose(2000)
+      s.close()
+      let t0 = getMonoTime()
+      dsrv.close()
+      closed = true
+      # The drain deadline is 3 s and the unfixed case took about 18 s; the
+      # bound leaves headroom for a loaded host.
+      check (getMonoTime() - t0).inMilliseconds < 2500
 
 withServer(appRouter.toHandler,
            initVortexConfig(numThreads = 1, workerThreads = 2),

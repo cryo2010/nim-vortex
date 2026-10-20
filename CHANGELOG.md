@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockingDefectError` is new public API: the exported `CatchableError` an
+  awaitable `req.blocking(...)` future fails with when its body raised a
+  `Defect`; its message is `<DefectName>: <msg>` followed by the stack trace.
+  (#416)
 - Stress harness: `VORTEX_CLIENT=python|navi|all`, which makes the **load
   client** an axis of the soak matrix beside `VORTEX_PROTO` and `VORTEX_SERVER`.
   The Python canary (httpx + websockets + aioquic) stays the default and the
@@ -233,6 +237,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An awaitable `req.blocking(...)` whose body raises a `Defect` (a failed
+  `doAssert`, an `IndexDefect`; catchable under the default `--panics:off`) now
+  fails the awaited call, so the handler answers `500`, instead of leaving the
+  request hanging. The worker side of the awaitable form caught only
+  `CatchableError`; a Defect escaped it past the completion it posts back to
+  the loop, so the awaiting future never completed and the client got no
+  response at all, the task's connection pin was never released (on HTTP/1.1
+  that connection served nothing more), and a graceful shutdown waited for the
+  outstanding result until its deadlines ran out (about 18 s in the test). The
+  worker thread itself survived, but kept a stale record of the finished task.
+  The completion now always runs, and a Defect reaches the handler as a
+  `BlockingDefectError` (a new exported `CatchableError` type) carrying the
+  Defect's name, message and, after a `Stack trace:` line, its trace (a full
+  trace on a debug build, the raise site only with stack traces off), which
+  the handler can catch or leave to the usual `500`. The synchronous `blocking:`
+  form already answered `500` for a Defect; it now also clears its task record
+  if that fallback answer itself raises. (#416)
 - Compression: a buffered `res.send` from a worker thread no longer answers
   `500` when its body is eligible for compression. On a compression build with
   `compress = true`, a `blocking:` body sending at least 1400 bytes of a

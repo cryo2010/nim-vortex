@@ -505,6 +505,14 @@ proc report(req: Request, res: Response) {.async.} =
 Returning a value is async-only: a pure sync handler can't suspend, so there
 `req.blocking` is terminal (the block sends the response itself).
 
+An exception the block raises fails the awaited call, so it re-raises in the
+handler at the `req.blocking` line; left uncaught it answers `500` like any
+other handler exception. A `Defect` (a failed `doAssert`, an `IndexDefect`;
+catchable under the default `--panics:off`) cannot fail a future, so it arrives
+as a `BlockingDefectError` whose message names the Defect
+(`"AssertionDefect: ..."`), followed by a `Stack trace:` line and the trace (a
+full trace on a debug build, the raise site only with stack traces off).
+
 An async handler does not have to answer before its future completes. It can
 hand `res` to a task it does not await (an `asyncCheck`ed or `asyncSpawn`ed
 producer, a timer) and return; that task's `res.send` answers the request

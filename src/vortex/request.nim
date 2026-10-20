@@ -2883,6 +2883,16 @@ type PoolSaturatedError* = object of CatchableError
   ## queuing without bound. The synchronous `blocking:` template answers 503
   ## directly rather than raising.
 
+type BlockingDefectError* = object of CatchableError
+  ## Fails an awaitable `req.blocking(...)` whose body raised a `Defect` (an
+  ## assertion, an `IndexDefect`; catchable under the default `--panics:off`).
+  ## The awaiting future can only fail with a `CatchableError`, so the Defect
+  ## is carried by name and message (`"AssertionDefect: ..."`), then a
+  ## `Stack trace:` line and the trace (a full trace on a debug build, the
+  ## raise site only with stack traces off), so it can be located. Left
+  ## uncaught in the handler, it surfaces as a 500 like any other handler
+  ## exception (#416).
+
 proc emitPoolSaturated(req: Request) =
   ## Load shedding: answer 503 on the loop thread for a `blocking:` dispatch the
   ## saturated pool refused, without pinning or running any body.
@@ -2949,13 +2959,16 @@ template runWorkerBody(lc: ptr LoopCore, res: Response, body: untyped) =
   let onWorker = currentThreadId() != lc.threadId
   if onWorker: beginWorkerTask(res)
   try:
-    body
-  except Exception:
-    res.send(Http500, "500 Internal Server Error")
-  if onWorker:
-    if not workerTaskAnswered:
+    try:
+      body
+    except Exception:
       res.send(Http500, "500 Internal Server Error")
-    endWorkerTask()
+    if onWorker and not workerTaskAnswered:
+      res.send(Http500, "500 Internal Server Error")
+  finally:
+    # Close the latch even if a fallback send raised (#416): a stale latch
+    # would make this thread's next off-task send look like this task's.
+    if onWorker: endWorkerTask()
 
 proc blockingTrampoline(user, core: pointer, fd: int32, gen: uint32,
                         stream: uint32, serial: uint32,
@@ -3203,18 +3216,38 @@ proc blockingResultTrampoline[A, R](user, core: pointer, fd: int32, gen: uint32,
   let res = workerResponse(req, prNone)
   # Latch the task's own handle like the sync trampolines do, so a body that
   # answers it twice pushes one response (sendRaw's duplicate guard).
+  #
+  # Catch Exception, not just CatchableError (#416): a Defect from the body (an
+  # assertion, an IndexDefect) used to propagate past this point, skipping both
+  # endWorkerTask (leaving a stale latch on the worker thread) and the
+  # omBlockingDone push, so the awaiting future never completed, the pkAwait
+  # pin and pendingBlockingResults were never released, and a graceful
+  # shutdown waited out its drain deadline. The future can only fail with a
+  # CatchableError, so a Defect travels as a BlockingDefectError; the
+  # `finally` keeps the latch close and the push unconditional.
   let onWorker = currentThreadId() != lc.threadId
   if onWorker: beginWorkerTask(res)
   try:
-    when R is void:
-      box.body(req, res, box.args)
-    else:
-      box.value = box.body(req, res, box.args)
-  except CatchableError as e:
-    box.err = e
-  if onWorker: endWorkerTask()
-  push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
-                         stream: stream, user: user, release: prAwait))
+    try:
+      when R is void:
+        box.body(req, res, box.args)
+      else:
+        box.value = box.body(req, res, box.args)
+    except CatchableError as e:
+      box.err = e
+    except Exception as e:
+      # The stack trace is a plain string (a full trace on a debug build, the
+      # raise site only with stack traces off), safe to carry across threads,
+      # so an IndexDefect can still be located. The "Stack trace:" header is
+      # the chronos convention a one-line log summary stops at (#423).
+      let trace = e.getStackTrace()
+      box.err = newException(BlockingDefectError, $e.name & ": " & e.msg &
+                             (if trace.len > 0: "\nStack trace:\n" & trace
+                              else: ""))
+  finally:
+    if onWorker: endWorkerTask()
+    push(lc.outbox, OutMsg(kind: omBlockingDone, fd: fd, gen: gen,
+                           stream: stream, user: user, release: prAwait))
 
 proc dispatchBlockingResult*[A, R](req: Request,
                                    box: BlockingResultBox[A, R]) {.raises: [].} =
