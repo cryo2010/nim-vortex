@@ -10,6 +10,9 @@
 # - the runtime import/export itself (Future[T], newFuture, complete,
 #   fail, addCallback, the `{.async.}` macro, `await`)
 # - `pump` / `teardown` procs (the loop hooks wired by `ensurePump`)
+# - `ioFd` / `onIoReady` procs: the dispatcher's selector fd (-1 while there is
+#   none) and its readiness callback, which the loop registers and calls so the
+#   dispatcher's I/O wakes it (#419)
 # - `template onCompleted(fut, body)`: run `body` when `fut` completes,
 #   absorbing the backend's addCallback callback signature (and, for
 #   chronos, the pendingOps bookkeeping that drives its pump)
@@ -41,6 +44,8 @@ proc ensurePump*(core: ptr LoopCore) {.inline.} =
     core.hooks.pumpHook = pump
     core.hooks.teardownHook = teardown
     core.hooks.pendingHook = watchedPending
+    core.hooks.ioFdHook = ioFd          # the loop watches the dispatcher (#419)
+    core.hooks.ioReadyHook = onIoReady
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op

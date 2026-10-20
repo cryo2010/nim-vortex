@@ -237,6 +237,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async adapters: a task waiting only on the adapter's own I/O now resumes as
+  soon as that I/O is ready, instead of when the loop next wakes for some other
+  reason. A detached task (`asyncSpawn`/`asyncCheck` from a handler that has
+  already completed) that waits on nothing but its own socket (a chronos
+  `StreamTransport`, an asyncdispatch `AsyncSocket`; no timer, no callback)
+  owned nothing the adapter's pump could see, and the dispatcher's fds are
+  invisible to the loop's selector, so on chronos it ran only when a request
+  arrived or the loop's 1 s idle wait expired. A handler's own awaits on such
+  I/O were covered only by a 5 ms wake cap on both adapters, which kept the
+  loop thread spinning for as long as the wait lasted. The loop now registers
+  the adapter dispatcher's selector fd (its kqueue or epoll fd, which reads
+  ready while it holds pending events; nested kqueue checked on macOS) with its
+  own selector once the dispatcher exists, and that fd's readiness has the pump
+  poll the dispatcher in the same pass, so the dispatcher's I/O wakes the loop
+  like any connection. Both pumps drop their I/O wake caps: the wait is capped
+  only at the dispatcher's next timer, so a loop thread with an idle async
+  connection open sleeps its full wait. The fd is unregistered before the
+  adapter's teardown closes the dispatcher. Measured from the peer's write to
+  the response, on a one-thread server idle in its selector wait: under 1 ms on
+  both adapters, against 0.8 s on chronos before. On asyncdispatch the old 5 ms
+  cap answered within 7 ms but kept the loop thread polling through the whole
+  wait: 0.013 s of loop thread CPU over 2 s with a task parked on its socket
+  before, 0.0007 s after. If the fd cannot be registered the loop polls the
+  dispatcher on every pass and caps its wait at 5 ms. On chronos's poll engine,
+  which has no pollable selector fd, the pump polls on every pass while chronos
+  watches any fd, under the same 5 ms cap, so a detached task waiting only on
+  I/O is driven there too. (#419)
 - `close()` (and `serve()` after SIGINT/SIGTERM) on an idle server no longer
   waits out the event loops' idle wait. A stop request only set the server's
   stop flag, and a loop thread asleep in its selector wait read it when it next

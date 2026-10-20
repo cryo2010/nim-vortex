@@ -35,9 +35,12 @@
 ## Mechanics: the loop calls the registered pump once per iteration to
 ## run ready callbacks and expired timers, capping its selector timeout at
 ## the dispatcher's next timer (so a long timer nobody waits on, such as a
-## detached heartbeat, costs one wakeup when it is due), and at a few ms
-## while the dispatcher has fds registered (asyncdispatch's own fds cannot
-## wake our selector; this bounds completion latency instead). When the
+## detached heartbeat, costs one wakeup when it is due). The dispatcher's
+## own selector fd (its kqueue or epoll fd) is registered with the loop's
+## selector, so I/O completing on any socket the dispatcher watches wakes
+## the loop like one of its own connections and the pump polls it then:
+## a task waiting on the dispatcher's I/O alone runs as soon as that I/O
+## is ready, and an idle server sleeps the loop's full wait. When the
 ## future finishes, the deferred respond is flushed via
 ## LoopCore.hooks.kick. An uncaught exception in the body responds 500.
 
@@ -66,6 +69,25 @@ proc nextTimerCap(d: PDispatcher): int =
   let left = (d.timers[0].finishAt - getMonoTime()).inMilliseconds + 1
   int(clamp(left, 1'i64, 1000'i64))
 
+# The dispatcher's selector is a kqueue (BSD, macOS) or epoll (Linux) fd, which
+# reads ready while it holds pending events, so the loop can watch it (#419).
+# Elsewhere std/selectors falls back to select/poll, whose state is no fd.
+const nestedSelector = ioselSupportedPlatform and not defined(nuttx)
+
+# The loop's selector found the dispatcher's fd readable this iteration (set by
+# ioReadyHook): the pump polls its I/O even with no timer or callback due.
+var ioReady {.threadvar.}: bool
+
+proc ioFd(): int {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.ioFdHook: this thread's dispatcher selector fd.
+  when nestedSelector:
+    {.gcsafe.}: getIoHandler(getGlobalDispatcher()).getFd
+  else: -1
+
+proc onIoReady() {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.ioReadyHook.
+  {.gcsafe.}: ioReady = true
+
 proc pump(): int {.nimcall, gcsafe.} =
   ## Drive the dispatcher's ready work, then cap the loop's wait at its next
   ## timer (-1, the loop's full wait, with none).
@@ -80,25 +102,37 @@ proc pump(): int {.nimcall, gcsafe.} =
   ## A timer needs a wakeup when it is due, no sooner; the chronos pump's idle
   ## exit already worked that way.
   ##
-  ## Registered I/O is the exception: the dispatcher's selector fd is invisible
-  ## to the loop's selector, so while any fd is registered the pump polls it on
-  ## every pass and keeps the bounded 5 ms cap that has always bounded an I/O
-  ## completion's latency.
+  ## Registered I/O needs no cap either (#419): the loop watches the
+  ## dispatcher's selector fd (ioFdHook), so I/O completing on it wakes the
+  ## loop, and ioReady has this pump poll it. A task parked on the dispatcher's
+  ## I/O alone, with no timer (a detached task reading its own socket), used to
+  ## run only on the 5 ms cap. Without a pollable selector fd
+  ## (not nestedSelector) the pump polls registered I/O on every pass under that
+  ## 5 ms cap, as before.
   {.gcsafe.}:
     let d = getGlobalDispatcher()
-    let io = not getIoHandler(d).isEmpty
+    when nestedSelector:
+      let io = ioReady
+    else:
+      let io = not getIoHandler(d).isEmpty
+    ioReady = false
     # Bounded spin: completing one future can resume work that immediately
     # suspends again (pipelined requests, chained awaits, a fired timer whose
     # continuation runs as a callback); each such link needs another poll pass.
-    # A poll(0) never blocks.
+    # A poll(0) never blocks, and drains up to 64 ready fds per call; more
+    # stay ready on the dispatcher's fd and wake the loop's next pass.
+    # The I/O readiness may be stale by now (a handler closed the socket it was
+    # for), and poll() raises on a dispatcher with nothing registered.
+    let pollIo = io and not getIoHandler(d).isEmpty
     var spins = 0
-    while spins < 8 and (readyNow(d) or (io and spins == 0)):
+    while spins < 8 and (readyNow(d) or (pollIo and spins == 0)):
       poll(0)
       inc spins
     if readyNow(d): return 1     # more ready work: come straight back
     result = nextTimerCap(d)
-    if not getIoHandler(d).isEmpty:
-      result = if result < 0: 5 else: min(result, 5)
+    when not nestedSelector:
+      if not getIoHandler(d).isEmpty:
+        result = if result < 0: 5 else: min(result, 5)
 
 proc teardown() {.nimcall, gcsafe.} =
   ## Release this loop thread's asyncdispatch dispatcher on exit. Without it the
@@ -122,11 +156,11 @@ proc teardown() {.nimcall, gcsafe.} =
 
 # Futures the adapter watches (handlers, doAsync bodies) that are still
 # outstanding, and how many of those are parked on a wakeup only the vortex loop
-# delivers, per loop thread. The pump does not need them (the dispatcher's
-# hasPendingOperations tells it when to run); a graceful shutdown does: it waits
-# for watched work through LoopCore.hooks.pendingHook (adapterimpl's
-# watchedPending), not for every timer the dispatcher holds, so an app's
-# detached heartbeat timer does not hold a drained loop open.
+# delivers, per loop thread. The pump does not need them (it reads the
+# dispatcher's own callbacks, timers and fd readiness); a graceful shutdown
+# does: it waits for watched work through LoopCore.hooks.pendingHook
+# (adapterimpl's watchedPending), not for every timer the dispatcher holds, so
+# an app's detached heartbeat timer does not hold a drained loop open.
 var pendingOps {.threadvar.}: int
 var parkedOps {.threadvar.}: int
 
@@ -134,17 +168,17 @@ proc trackParked() {.inline.} = inc parkedOps
   ## Contract shared with the chronos backend: one outstanding future has parked
   ## on a wakeup that only the vortex loop delivers. The pump needs no tally --
   ## a bare parked Future registers no fd, timer or callback with the
-  ## dispatcher, so hasPendingOperations already reads false and the pump below
-  ## already returns -1 (loop may sleep) on its own -- but the shutdown's
-  ## watchedPending must not wait on such a future either.
+  ## dispatcher, so the pump has nothing to poll for it and the loop may sleep
+  ## -- but the shutdown's watchedPending must not wait on such a future
+  ## either.
 proc untrackParked() {.inline.} = dec parkedOps
   ## The unpark half of trackParked.
 
 template onCompleted(fut, body: untyped) =
   ## Contract shared with the chronos backend: run `body` when `fut` completes
   ## (asyncdispatch callback signature: a plain nullary closure), counting the
-  ## future as watched until then (see pendingOps). The pump itself still runs
-  ## on the dispatcher's hasPendingOperations; see chronos.nim's onCompleted.
+  ## future as watched until then (see pendingOps). The pump itself runs on the
+  ## dispatcher's own state; see chronos.nim's onCompleted.
   inc pendingOps
   fut.addCallback proc () {.gcsafe.} =
     dec pendingOps

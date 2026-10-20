@@ -7,7 +7,7 @@
 # (onCompleted, pump, pendingOps) differ, so the full scenario matrix runs
 # against each backend.
 import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics,
-            monotimes]
+            monotimes, selectors]
 import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
@@ -19,11 +19,13 @@ import vortex/http2/frames
 from vortex/connection import conn, totalPins
 when defined(vortexChronos):
   import vortex/chronos as nhsasync          # adapter's; Request/Response via facade
+  import pkg/chronos/config as chronosCfg    # chronosEventEngine (#419 CPU check)
   const suiteName = "chronos adapter"
   # chronos's sleepAsync takes a Duration; asyncdispatch's takes plain ms.
   template sleepMs(n: int): untyped = sleepAsync(n.milliseconds)
 else:
   import vortex/asyncdispatch as nhsasync    # adapter's; Request/Response via facade
+  import std/asyncnet                        # AsyncSocket (#419 I/O wait)
   const suiteName = "asyncdispatch adapter"
   template sleepMs(n: int): untyped = sleepAsync(n)
 
@@ -718,10 +720,62 @@ proc hArmTimers(req: Request, res: Response) {.async.} =
 proc hLoopCpu(req: Request, res: Response) {.async.} =
   res.send(Http200, $loopThreadCpuNs())  # runs on the (only) loop thread
 
+# The idle loop-CPU ceiling of the #417 and #419 checks below. A loop that
+# sleeps its full wait costs under a millisecond over their 2 s windows (0.0008
+# s measured), but a sanitizer build slows each wakeup: macOS ASan measured
+# 0.0019-0.0021 s on chronos, about 1.4x headroom under 0.003, and CI's Linux
+# sanitize job runs this suite under ASan+LSan (tests/leakcheck.sh; -d:useMalloc
+# is what NIM_SANITIZE=1 implies). The fallbacks the checks must still catch, a
+# 5 ms wake cap on a timer or on the dispatcher's I/O, cost 0.013 s and more, so
+# three times the limit still fails them.
+const idleCpuLimit = when defined(useMalloc): 0.009 else: 0.003
+
+# --- a detached task parked on the adapter's own I/O (#419) -------------------
+#
+# The task waits only on a socket of the adapter's dispatcher: no timer, no
+# callback, nothing the pump can see, and the loop's selector could not see the
+# dispatcher's fds, so the task ran only when the loop woke for some other
+# reason (the 1 s idle wait, or a timer cap).
+
+var ioPeerPort: Atomic[int]              # the test's plain listener
+
+# Whether the loop can watch the dispatcher's selector fd. chronos's poll
+# engine has none, so its pump keeps a 5 ms wake cap for registered I/O by
+# design, and the loop-CPU check below does not apply there.
+const pollableDispatcher =
+  when defined(vortexChronos):
+    chronosCfg.chronosEventEngine in ["epoll", "kqueue"]
+  else: true
+
+proc ioWaiter(res: Response, port: int) {.async.} =
+  try:
+    when defined(vortexChronos):
+      let t = await connect(initTAddress("127.0.0.1", Port(port)))
+      var buf = newString(5)
+      await t.readExactly(addr buf[0], 5)
+      await t.closeWait()
+    else:
+      let t = newAsyncSocket(buffered = false)
+      await t.connect("127.0.0.1", Port(port))
+      let buf = await t.recv(5)
+      t.close()
+    res.send(Http200, buf)
+  except CatchableError as e:
+    res.send(Http500, e.msg)
+
+proc hIoWait(req: Request, res: Response) {.async.} =
+  detach ioWaiter(res, ioPeerPort.load)  # the handler answers nothing itself
+
+proc hSlowPending(req: Request, res: Response) {.async.} =
+  await sleepMs(1500)                    # a watched future on a far timer
+  res.send(Http200, "slow")
+
 block:
   let idleRouter = newRouter()
   idleRouter.get("/arm", hArmTimers)
   idleRouter.get("/cpu", hLoopCpu)
+  idleRouter.get("/iowait", hIoWait)
+  idleRouter.get("/slow", hSlowPending)
   var idle = newVortex(idleRouter.toHandler,
                        initVortexConfig(numThreads = 1)).start(0)
   defer: idle.close()
@@ -747,7 +801,76 @@ block:
       # of idle wait costs under a millisecond (0.0008 s measured).
       echo "    loop thread CPU over 2 s idle: ", formatFloat(cpu, ffDecimal, 4),
         " s"
-      check cpu < 0.003
+      check cpu < idleCpuLimit
+
+    # Accept the detached task's connection, let the loop settle into its idle
+    # wait, then write: the response must follow the write, not the loop's
+    # next unrelated wakeup (up to ~1 s later). With `cpuWindowMs` > 0 it also
+    # measures the loop thread's CPU over that long an idle window while the
+    # task is parked, before the write: a pump that keeps a wake cap for the
+    # dispatcher's I/O (the 5 ms cap asyncdispatch had before #419, which also
+    # answered the write in time) spins the loop through it.
+    proc ioWaitRoundTrip(lis: Socket, client: Socket,
+                         cpuWindowMs = 0): tuple[took, cpu: float] =
+      var sel = newSelector[int]()
+      defer: sel.close()
+      sel.registerHandle(lis.getFd, {Event.Read}, 0)
+      doAssert sel.select(3000).len > 0, "the detached task never connected"
+      var peer: Socket
+      lis.accept(peer)
+      defer: peer.close()
+      if cpuWindowMs > 0:
+        sleep(20)                        # the task reaches its read
+        let c0 = parseBiggestInt(idleGet("/cpu"))
+        sleep(cpuWindowMs)
+        let c1 = parseBiggestInt(idleGet("/cpu"))
+        result.cpu = float(c1 - c0) / 1e9
+      sleep(200)                         # the loop is asleep on its selector
+      let t0 = epochTime()
+      peer.send("hello")
+      let r = client.readHttpResponse(3000)
+      result.took = epochTime() - t0
+      check r.ok and r.body == "hello"
+
+    proc ioListener(): Socket =
+      result = newSocket()
+      result.setSockOpt(OptReuseAddr, true)
+      result.bindAddr(Port(0), "127.0.0.1")
+      result.listen()
+      ioPeerPort.store(int(result.getLocalAddr()[1]))
+
+    test "a detached task parked on adapter I/O alone resumes on that I/O (#419)":
+      let lis = ioListener()
+      defer: lis.close()
+      let c = connectTimeout(idle.port, 3000)
+      defer: c.close()
+      c.send("GET /iowait HTTP/1.1\r\nHost: x\r\n\r\n")
+      let (took, cpu) = ioWaitRoundTrip(lis, c, cpuWindowMs = 2000)
+      checkpoint "write to response: " & $took & " s"
+      echo "    loop thread CPU over 2 s parked on I/O: ",
+        formatFloat(cpu, ffDecimal, 4), " s"
+      check took < 0.3
+      # The 5 ms I/O wake cap asyncdispatch kept until #419 costs 0.013 s over
+      # this window (and answers the write within 7 ms, so `took` alone cannot
+      # tell); sleeping on the dispatcher's fd costs 0.0007 s.
+      when pollableDispatcher:
+        check cpu < idleCpuLimit
+
+    test "a detached task resumes on adapter I/O while another request is in flight (#419)":
+      let lis = ioListener()
+      defer: lis.close()
+      let slow = connectTimeout(idle.port, 3000)
+      defer: slow.close()
+      slow.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+      sleep(20)                          # its handler is parked on the timer
+      let c = connectTimeout(idle.port, 3000)
+      defer: c.close()
+      c.send("GET /iowait HTTP/1.1\r\nHost: x\r\n\r\n")
+      let took = ioWaitRoundTrip(lis, c).took
+      checkpoint "write to response: " & $took & " s"
+      check took < 0.3
+      let r = slow.readHttpResponse(3000)
+      check r.ok and r.body == "slow"
 
 withServer(appRouter.toHandler,
            initVortexConfig(numThreads = 1, workerThreads = 2),

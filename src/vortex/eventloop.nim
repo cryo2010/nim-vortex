@@ -107,7 +107,7 @@ else:
   const sendFlags = cint(0)
 
 type
-  FdKind = enum fkListen, fkClient, fkWakeup, fkQuic
+  FdKind = enum fkListen, fkClient, fkWakeup, fkQuic, fkAdapter
 
   AcceptDropCause* = enum
     ## Why the accept path gave up on a connection. The first three are
@@ -159,6 +159,9 @@ type
     stopFlag: ptr Atomic[bool]
     lastWallSec: int64
     pumpCap: int                 # adapter-suggested selector timeout cap
+    adapterFd: int               # the async adapter's dispatcher selector fd,
+                                 # registered for Read once it exists (#419);
+                                 # -1 = not yet, -2 = registration failed
     inPump: bool                 # the adapter's pump is running: loop-thread
                                  # flushes are held to its end (pumpHold)
     wakeFd: int                  # the outbox's wakeup read end, registered
@@ -404,7 +407,8 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
     handlerRaw: cast[RawClosure](handler),   # raw pair: no cross-thread refcount
     stopFlag: stopFlag,
     tls: tls,
-    udpFd: -1)
+    udpFd: -1,
+    adapterFd: -1)
   result.core.streamRouteRaw = cast[RawClosure](streamRoute)
   result.core.serverHeader = settings.serverHeader
   if settings.securityHeaders:
@@ -2630,6 +2634,39 @@ proc drainComplete(loop: Loop): bool =
     return false
   loop.core.nowSec >= loop.asyncDrainDeadline
 
+proc registerAdapterFd(loop: Loop) =
+  ## Register the async adapter's dispatcher selector fd (a kqueue or epoll fd)
+  ## with the loop's selector for Read, once the dispatcher exists (#419). The
+  ## dispatcher's own fds are invisible to this selector, so without it a task
+  ## parked on the adapter's I/O alone (a detached task reading its own socket,
+  ## no timer) ran only when the loop woke for some other reason, up to the 1 s
+  ## idle wait later. A kqueue or epoll fd reads ready, level-triggered, while it
+  ## holds pending events (nested kqueue checked on macOS), so its readiness
+  ## wakes the selector and ioReadyHook has the pump poll it. Polled after each
+  ## pump: the dispatcher is created lazily, possibly by this iteration's
+  ## handlers, and the hook returns -1 until then.
+  var fd = -1
+  try:
+    # Inside the try: the hook may create the dispatcher, and creating one
+    # opens its selector, which raises OSError under fd exhaustion. Ask again
+    # next pass then; a loop thread must not end on it. That retry costs one
+    # hook call per loop pass, and only while it keeps failing (the adapters'
+    # hooks return -1 without creating anything until the dispatcher exists).
+    fd = loop.core.hooks.ioFdHook()
+  except CatchableError, Defect:
+    return
+  if fd < 0: return
+  try:
+    loop.selector.registerHandle(fd, {Event.Read}, fkAdapter)
+    loop.adapterFd = fd
+  except CatchableError, Defect:
+    # Stop asking (-2): an unregistrable fd will not register next pass either.
+    # The pump then polls the dispatcher's I/O on every pass and run caps the
+    # loop's wait at 5 ms (see run), so that I/O is served within 5 ms, as the
+    # pumps' own I/O cap did before #419, rather than on the loop's next
+    # unrelated wakeup.
+    loop.adapterFd = -2
+
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.hooks.kick = kickImpl
@@ -2654,6 +2691,10 @@ proc run*(loop: Loop) =
       # An adapter has pending async operations: bound the wait so
       # timer/IO completions from its dispatcher aren't starved.
       timeoutMs = min(timeoutMs, max(1, loop.pumpCap))
+    if loop.adapterFd == -2:
+      # The dispatcher's fd could not be watched (registerAdapterFd): nothing
+      # wakes the loop for its I/O, so bound the wait as the pumps did (#419).
+      timeoutMs = min(timeoutMs, 5)
     if loop.bodyPausedConns > 0:
       # A streaming read is paused at the read-ahead high-water (recv loop stopped
       # pulling; fd still armed). The async consumer drains from its own queue on
@@ -2714,6 +2755,12 @@ proc run*(loop: Loop) =
       if key.fd == loop.udpFd:
         quicWork = true
         continue
+      if key.fd == loop.adapterFd:
+        # The adapter's dispatcher has I/O ready (#419): its pump, at the end
+        # of this iteration, polls it. Ahead of the conns guard below, which
+        # would read the fd as a connection slot.
+        loop.core.hooks.ioReadyHook()
+        continue
       if key.fd >= loop.core.conns.len:
         continue
       let c = loop.core.conns.at(key.fd)
@@ -2765,6 +2812,8 @@ proc run*(loop: Loop) =
         discard quicWork
         try: loop.h3Drive()
         except Exception: discard
+    if loop.adapterFd == -2:
+      loop.core.hooks.ioReadyHook()   # unwatchable dispatcher: poll it anyway
     if loop.core.hooks.pumpHook != nil:
       # Pump at the end of the iteration so callbacks scheduled while
       # handling this batch (e.g. an await that completed immediately)
@@ -2777,6 +2826,8 @@ proc run*(loop: Loop) =
       finally:
         loop.inPump = false
         loop.releaseBatchFlushes()
+    if loop.adapterFd == -1 and loop.core.hooks.ioFdHook != nil:
+      loop.registerAdapterFd()
     loop.tick()
     when not defined(plainHttp):
       # Anything that ran after this iteration's h3Drive (a continuation the
@@ -2819,6 +2870,13 @@ proc run*(loop: Loop) =
         loop.h3FreeSlot(i)
       ngEngineFree()              # frees the shim engine (all conns + TLS ctx)
       discard posix.close(cint(loop.udpFd))
+  if loop.adapterFd >= 0:
+    # Out of the loop's selector before teardownHook closes the dispatcher
+    # that owns the fd: a closed fd left registered could be reused by the next
+    # open and misread as the adapter's.
+    try: loop.selector.unregister(loop.adapterFd)
+    except CatchableError: discard
+    loop.adapterFd = -1
   loop.selector.close()
   loop.core.chunkPool.chunkPoolFree()    # free pooled sendFile buffers (workers joined)
   if loop.listenFd >= 0:                 # beginDrain may have closed it already

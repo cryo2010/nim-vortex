@@ -416,6 +416,17 @@ type
       ## pumping until this reads false. Not pumpHook's wake cap: that one also
       ## honours timers the app owns (a detached heartbeat), which must not hold
       ## a drained loop for the full async drain deadline.
+    ioFdHook*: proc (): int {.nimcall, gcsafe.}
+      ## Registered by an adapter alongside pumpHook: the file descriptor of
+      ## this loop thread's dispatcher selector (its kqueue or epoll fd), or -1
+      ## while there is none yet. The loop registers it with its own selector
+      ## for Read once it exists: a kqueue or epoll fd reads ready while it holds
+      ## pending events, so the dispatcher's I/O wakes the loop like any socket
+      ## (#419). Unregistered before teardownHook closes the dispatcher.
+    ioReadyHook*: proc () {.nimcall, gcsafe.}
+      ## Registered with ioFdHook: the loop's selector found the dispatcher's fd
+      ## readable, so the pump at the end of this iteration must poll the
+      ## dispatcher's I/O even though no timer or callback asks for it.
     kick*: proc (loopPtr: pointer, fd: int32, gen: uint32,
                  stream: uint32, serial: uint32) {.nimcall, gcsafe.}
       ## Flush/resume after a deferred same-thread respond (async
