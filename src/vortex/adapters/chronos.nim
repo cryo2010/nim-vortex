@@ -75,6 +75,24 @@ var parkedOps {.threadvar.}: int
 
 proc noop(arg: pointer) {.gcsafe, raises: [].} = discard
 
+# This loop thread's chronos dispatcher is in use (#422). chronos has no
+# "exists" query: getThreadDispatcher() creates one on first use, kqueue/epoll
+# fd and all, and the pump's idle check used to call it on every pass. Set where
+# vortex first hands chronos work (noteDispatcher: ensurePump, the pending-op
+# tally, completeSoon); until then the pump, the loop's fd registration and the
+# teardown leave the dispatcher alone. ensurePump runs for every watched handler,
+# including one that completed without suspending: it may have detached a task
+# onto chronos that nothing else will drive (#412), and whether it did cannot be
+# asked without creating the dispatcher, so such a thread gets one too (and its
+# teardown releases it).
+var dispatcherLive {.threadvar.}: bool
+
+proc noteDispatcher() {.inline.} =
+  ## Contract shared with the asyncdispatch backend: vortex is about to hand
+  ## the dispatcher work (a watched future, a detached task's completion), so
+  ## the pump must drive it from here on.
+  dispatcherLive = true
+
 # How many entries an idle chronos dispatcher keeps in its callback queue
 # between polls: the one sentinel poll() re-queues, unless strict reentrancy is
 # on (`-d:chronosStrictReentrancy`, implied by `-d:chronosPreviewV5`), where
@@ -90,7 +108,8 @@ const idleCallbacks =
 proc unwatchedReady(): bool =
   ## chronos holds work that is runnable now: a queued callback (beyond the
   ## sentinel an idle dispatcher may keep in its queue between polls, see
-  ## idleCallbacks) or a timer that has expired.
+  ## idleCallbacks) or a timer that has expired. Never creates the dispatcher.
+  if not dispatcherLive: return false
   let d = getThreadDispatcher()
   d.callbacks.len > idleCallbacks or
     (d.timers.len > 0 and d.timers[0].finishAt <= Moment.now())
@@ -116,7 +135,9 @@ var ioReady {.threadvar.}: bool
 proc ioFd(): int {.nimcall, gcsafe.} =
   ## LoopCore.hooks.ioFdHook: this thread's dispatcher selector fd.
   when nestedSelector:
-    {.gcsafe.}: int(getFd(getIoHandler(getThreadDispatcher())))
+    {.gcsafe.}:
+      if not dispatcherLive: return -1   # register it once it exists
+      int(getFd(getIoHandler(getThreadDispatcher())))
   else: -1
 
 proc onIoReady() {.nimcall, gcsafe.} =
@@ -157,6 +178,7 @@ proc idleCap(): int =
   ## with none). I/O needs no cap: it wakes the loop through the dispatcher's
   ## fd. Without such an fd (the poll engine) registered I/O caps the wait at
   ## 5 ms instead.
+  if not dispatcherLive: return -1
   if unwatchedReady(): return 1
   let d = getThreadDispatcher()
   if d.timers.len == 0:
@@ -189,7 +211,9 @@ proc pumpIdle(): int =
   ## selector fd for it (ioFdHook), whose readiness sets ioReady, so the task
   ## runs in the pass its I/O is ready in (#419). Without that fd (chronos's
   ## poll engine) the pump polls on every pass while chronos watches any fd,
-  ## under idleCap's 5 ms cap.
+  ## under idleCap's 5 ms cap. A thread that has not handed chronos any work
+  ## has nothing to drive, and no dispatcher to create (#422).
+  if not dispatcherLive: return -1
   when nestedSelector:
     let io = ioReady
   else:
@@ -238,30 +262,48 @@ proc pump(): int {.nimcall, gcsafe.} =
     # I/O half keeps the bounded 5 ms cap it always had (idleCap).
     idleCap()
 
+proc releaseDispatcher() =
+  ## Close this thread's dispatcher's selector fd and drop the dispatcher, in a
+  ## proc of its own so no local ref outlives the drop.
+  let d = getThreadDispatcher()
+  try: chronosSelectors.close(getIoHandler(d))
+  except CatchableError, Defect: discard
+  # setThreadDispatcher doAsserts that the dispatcher it replaces has an empty
+  # callback queue, and a dispatcher outside strict reentrancy always keeps the
+  # sentinel poll() re-queues there (idleCallbacks). So dropping it raised an
+  # AssertionDefect, the teardown swallowed it, and the dispatcher stayed rooted
+  # in chronos's threadvar, which nothing frees when the thread exits: one
+  # ~15 KB dispatcher leaked per loop thread that ever used chronos (#422).
+  # Whatever is still queued is work this exiting thread will never run.
+  d.callbacks.clear()
+  try: setThreadDispatcher(nil)
+  except CatchableError, Defect: discard
+
 proc teardown() {.nimcall, gcsafe.} =
   ## Release this loop thread's chronos dispatcher on exit. Without it the
   ## dispatcher's epoll fd leaks, and every server restart on a fresh loop thread
   ## leaks another. Drain ready callbacks so completed futures are released, then
   ## close the selector fd and drop the dispatcher; the post-run GC_fullCollect in
   ## runLoopThread (once the Loop is out of scope) collects any remaining cycles.
+  ## A thread that never handed chronos work has no dispatcher to release, and
+  ## must not create one just to close it.
   {.gcsafe.}:
+    if not dispatcherLive: return
     var spins = 0
     while pendingOps > 0 and spins < 64:
-      callSoon(noop)
-      poll()
+      pollOnce()
       inc spins
-    try:
-      chronosSelectors.close(getIoHandler(getThreadDispatcher()))
-      # Drop the dispatcher so anything it still roots becomes unreachable.
-      setThreadDispatcher(nil)
-    except CatchableError, Defect: discard
+    releaseDispatcher()
+    dispatcherLive = false
     GC_fullCollect()
 
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
-proc trackPending() {.inline.} = inc pendingOps
+proc trackPending() {.inline.} =
   ## Count one future as outstanding so the pump keeps spinning chronos each pass
   ## until it completes. Paired with untrackPending.
+  noteDispatcher()
+  inc pendingOps
 proc untrackPending() {.inline.} = dec pendingOps
   ## The completion half of trackPending.
 
@@ -300,6 +342,7 @@ proc completeSoon(fut: Future[void]) =
   ## `drained()` on an ended response, #408). chronos runs a callback queued
   ## while it is processing callbacks on its next poll, and the vortex pump
   ## polls a bounded number of times per loop iteration.
+  noteDispatcher()
   callSoon(proc (arg: pointer) {.gcsafe, raises: [].} =
     if not fut.finished: fut.complete())
 

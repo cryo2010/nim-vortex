@@ -29,6 +29,17 @@ else:
   const suiteName = "asyncdispatch adapter"
   template sleepMs(n: int): untyped = sleepAsync(n)
 
+when defined(macosx):
+  # tests/leakcheck.sh runs this suite under `leaks --atExit` with
+  # MallocStackLogging set (leaks adds more Malloc* variables), and every child
+  # inheriting them prints malloc's notices on stderr: keep those out of the
+  # curl output the h2/h3 cases read.
+  block:
+    var mallocVars: seq[string]
+    for k, _ in envPairs():
+      if k.startsWith("Malloc"): mallocVars.add k
+    for k in mallocVars: delEnv(k)
+
 proc hRoot(req: Request, res: Response) {.async.} =
   # No await at all: completes synchronously through the async path.
   res.send(Http200, "sync-in-async")

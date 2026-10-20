@@ -237,6 +237,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async adapters: a loop thread's exit now frees the adapter's dispatcher and
+  thread-local tables instead of leaking them. On chronos every loop thread
+  that ever used the adapter leaked its whole dispatcher (about 15 KB with its
+  timer heap, callback queue and selector tables) when it exited, so every
+  server stop or restart leaked one per loop thread. The teardown closed the
+  dispatcher's selector fd and called `setThreadDispatcher(nil)`, but chronos
+  asserts there that the dispatcher it replaces has an empty callback queue,
+  and outside `-d:chronosStrictReentrancy` an idle dispatcher always keeps the
+  sentinel entry `poll()` re-queues: the assertion fired, the teardown
+  swallowed it, and the dispatcher stayed in chronos's threadvar, which nothing
+  frees when the thread exits. The teardown now empties the queue first. The
+  pump's idle check, since #412, also created a dispatcher itself
+  (`getThreadDispatcher()` creates one on first use); the pump, the loop's
+  dispatcher-fd registration and the teardown now leave the dispatcher alone
+  until the adapter has handed it work, on both adapters; on asyncdispatch
+  that now means once the dispatcher exists, so a dispatcher that could not be
+  created (the accept had taken the process's last descriptor, and opening its
+  kqueue or epoll fd failed with EMFILE) no longer ends the loop thread, where
+  the pump's next request for it raised `Too many open files` out of the loop:
+  the request whose handler hit it is answered 500, and the loop serves the
+  next one once a descriptor is free. A loop thread that
+  has run an adapter handler still gets one, even if every handler completed
+  without suspending, since such a handler may have detached a task onto it
+  that only the pump will drive and neither runtime can say whether it did
+  without creating the dispatcher; its teardown now releases it.
+  Both adapters also leaked the storage of their thread-local reader tables
+  (2.5 KB each once a loop thread had streamed a request body or read a
+  WebSocket through the adapter); the teardown now frees them. A worker
+  thread of the `blocking:` pool also leaked its ORC cycle-root buffer (20 KB)
+  when it exited with a released cycle still queued there; it now collects
+  before it exits, as a loop thread already did. Measured with
+  `leaks --atExit` over the adapter suite: chronos went from 5 leaked
+  dispatcher roots to none, asyncdispatch from two 2.5 KB table roots to
+  none; what the suite still leaks is its own `SSL_CTX`, a few objects its
+  failing handlers raise, and the detached tasks its #423 cases let fail (about
+  4 KB each on asyncdispatch, see #423). `nimble leakcheck`
+  (`tests/leakcheck.sh`) runs that check, and CI's sanitize job runs it under
+  LeakSanitizer on Linux: it fails on any leaked block allocated by a
+  dispatcher or an adapter table, and on a suite that did not run to its end
+  (judged by the suite's final success line under `leaks` on macOS, which
+  reports on any exit, and by the suite's exit status under LeakSanitizer).
+  (#422)
 - A Future completed by a write-buffer drain that the loop's held flushes
   fire no longer waits up to a second to resume. Since #412 the loop holds the
   flushes the async pump makes and sends them once the pump returns, but the

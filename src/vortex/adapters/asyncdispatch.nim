@@ -54,6 +54,33 @@ import ../settings
 
 export asyncdispatch
 
+# This loop thread's asyncdispatch dispatcher is in use (#422).
+# getGlobalDispatcher() creates one on first use, so nothing here may call it
+# before vortex has handed the dispatcher work: set by noteDispatcher (from
+# ensurePump and completeSoon), and until then the pump, the loop's fd
+# registration and the teardown leave the dispatcher alone. See chronos.nim's
+# dispatcherLive for why a handler that never suspended still counts.
+var dispatcherLive {.threadvar.}: bool
+
+proc noteDispatcher() =
+  ## Contract shared with the chronos backend: vortex is about to hand the
+  ## dispatcher work, so the pump must drive it from here on.
+  ##
+  ## Only once the dispatcher exists: creating it opens its selector,
+  ## which fails under fd exhaustion (EMFILE when the accept took the last fd).
+  ## Set regardless, the flag sent the pump to getGlobalDispatcher(), which
+  ## tried again outside any guard, and the OSError ended the loop thread. A
+  ## failed creation leaves the flag clear, so the pump keeps leaving the
+  ## dispatcher alone, and the next handler that hands it work tries again
+  ## (the handler's own sleepAsync or socket call met the same OSError and
+  ## failed only that request).
+  if dispatcherLive: return
+  try:
+    discard getGlobalDispatcher()
+    dispatcherLive = true
+  except CatchableError, Defect:
+    discard
+
 proc readyNow(d: PDispatcher): bool =
   ## The dispatcher holds work that is runnable now: a queued callback or a
   ## timer that has expired.
@@ -81,7 +108,9 @@ var ioReady {.threadvar.}: bool
 proc ioFd(): int {.nimcall, gcsafe.} =
   ## LoopCore.hooks.ioFdHook: this thread's dispatcher selector fd.
   when nestedSelector:
-    {.gcsafe.}: getIoHandler(getGlobalDispatcher()).getFd
+    {.gcsafe.}:
+      if not dispatcherLive: return -1   # register it once it exists
+      getIoHandler(getGlobalDispatcher()).getFd
   else: -1
 
 proc onIoReady() {.nimcall, gcsafe.} =
@@ -110,7 +139,12 @@ proc pump(): int {.nimcall, gcsafe.} =
   ## (not nestedSelector) the pump polls registered I/O on every pass under that
   ## 5 ms cap, as before.
   {.gcsafe.}:
-    let d = getGlobalDispatcher()
+    if not dispatcherLive: return -1     # nothing handed to it yet (#422)
+    # dispatcherLive means it exists, so this does not create it; guarded like
+    # the poll all the same, since a raise here would end the loop thread.
+    var d: PDispatcher
+    try: d = getGlobalDispatcher()
+    except CatchableError, Defect: return -1
     when nestedSelector:
       let io = ioReady
     else:
@@ -140,16 +174,26 @@ proc teardown() {.nimcall, gcsafe.} =
   ## leaks another. Drain ready callbacks so completed futures are released, then
   ## close the selector fd and drop the dispatcher; the post-run GC_fullCollect in
   ## runLoopThread (once the Loop is out of scope) collects any remaining cycles.
+  ## A thread that never handed asyncdispatch work has no dispatcher to release,
+  ## and must not create one just to close it.
   {.gcsafe.}:
+    if not dispatcherLive: return
     var spins = 0
     while hasPendingOperations() and spins < 64:
       poll(0)
       inc spins
     try:
-      selectors.close(getIoHandler(getGlobalDispatcher()))
+      let d = getGlobalDispatcher()
+      selectors.close(getIoHandler(d))
+      # setGlobalDispatcher asserts the dispatcher it replaces has an empty
+      # callback queue; a callback re-queued past the drain above would trip it,
+      # and the swallowed AssertionDefect would leave the dispatcher rooted in
+      # the threadvar for good (the chronos teardown's leak, #422).
+      d.callbacks.clear()
       # Drop the dispatcher so anything it still roots becomes unreachable.
       setGlobalDispatcher(nil)
     except CatchableError, Defect: discard
+    dispatcherLive = false
     GC_fullCollect()
 
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
@@ -194,6 +238,7 @@ proc completeSoon(fut: Future[void]) =
   ## forever. A zero timer fires on the next poll() (processTimers only pops
   ## timers due when it started), and the vortex pump polls a bounded number of
   ## times per loop iteration.
+  noteDispatcher()
   sleepAsync(0).addCallback proc () {.gcsafe.} =
     if not fut.finished: complete(fut)
 
