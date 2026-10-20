@@ -75,7 +75,10 @@ task testchronos, "Test the chronos async adapter (needs chronos)":
   ensureNimblePath()
   # The shared adapter suite (tests/test_adapter.nim) built against the
   # chronos backend via -d:vortexChronos; a distinct output name so it never
-  # clobbers the default (asyncdispatch) build of the same file.
+  # clobbers the default (asyncdispatch) build of the same file. The adapter
+  # also reads chronos's dispatcher state, which differs under
+  # -d:chronosStrictReentrancy (implied by -d:chronosPreviewV5); TESTING.md has
+  # the command for that variant of this suite.
   exec "nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos -p:src " &
        "-o:tests/test_adapter_chronos tests/test_adapter.nim"
 

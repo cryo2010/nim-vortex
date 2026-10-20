@@ -159,13 +159,16 @@ type
     stopFlag: ptr Atomic[bool]
     lastWallSec: int64
     pumpCap: int                 # adapter-suggested selector timeout cap
+    inPump: bool                 # the adapter's pump is running: loop-thread
+                                 # flushes are held to its end (pumpHold)
     outboxScratch: seq[OutMsg]   # reused drain buffer
     pendingFlush: seq[(int32, uint32)]
                                  # connections holding a flush for the outbox
                                  # batch being applied (one entry per hold taken,
                                  # so the counts always balance); drained at the
                                  # end of processOutbox, which flushes each
-                                 # connection once (#333)
+                                 # connection once (#333); the async pump holds
+                                 # its flushes the same way (pumpHold)
     readyStreams: seq[uint32]    # reused h2 dispatch buffer
     unpackCt: string             # reused worker-response unpack buffers, so
     unpackHeaders: seq[(string, string)]  # draining the outbox allocates no
@@ -1248,15 +1251,35 @@ proc processInput(loop: Loop, c: ptr Connection) =
         return
       # Loop again: pipelined request already buffered.
 
+proc pumpHold(loop: Loop, c: ptr Connection): bool =
+  ## While the async pump runs, hold `c`'s flush to the pump's end and say
+  ## whether the caller may skip its own: true while the buffer is under
+  ## respHighWater (past it the bytes must meet the socket now, as with the
+  ## outbox hold). The first hold per connection per pump is recorded in
+  ## pendingFlush and released by releaseBatchFlushes after the pump returns,
+  ## which flushes each connection once. N responses resumed in one pump pass
+  ## (fifty handlers woken by one timer, each answering on the same h2
+  ## connection) then cost one send() rather than one per response (#412: a
+  ## loop-thread send flushes at once, so a detached task's answer is not left
+  ## in the buffer, and without this hold that turned into one send() per
+  ## response). Outside the pump it is a no-op returning false.
+  if not loop.inPump: return false
+  if c.flushHold == 0:
+    loop.pendingFlush.add (c.fd, c.gen)
+    holdFlush(c)
+  c.pendingOut < respHighWater
+
 proc resumeAfterRespond(loop: Loop, c: ptr Connection, stream: uint32) =
   ## Flush a response that was produced outside the dispatch call
   ## (worker outbox or same-thread async completion) and, for HTTP/1,
   ## resume the paused pipeline.
   if stream != 0:
-    loop.flushOut(c)
+    # An h2 completion kick from the pump leaves its flush to the pump's end
+    # (pumpHold), so the kicks of N streams answered in one pass share a send().
+    if not loop.pumpHold(c): loop.flushOut(c)
     if c.state != csFree and c.inputPausePins == 0:
       loop.processInput(c)       # resume input paused during pinning
-      if c.state != csFree and c.pendingOut > 0:
+      if c.state != csFree and c.pendingOut > 0 and not loop.pumpHold(c):
         loop.flushOut(c)
   elif c.closeAfterFlush:
     c.state = csClosing
@@ -1341,7 +1364,11 @@ proc kickImpl(loopPtr: pointer, fd: int32, gen: uint32,
     # closeRequested: the connection is being torn down (a teardown callback in
     # closeConn resumed a producer that called finish), or its close is deferred
     # behind a worker pin. Either way there is no pipeline left to resume.
-    if c == nil or c.closeRequested: return
+    # csDraining: an earlier kick for this request already flushed it and began
+    # the linger close (a send or finish kicks at once, and the handler's
+    # completion kick follows with the same serial, #412); resuming again
+    # would flip the state back to csClosing and half-close a second time.
+    if c == nil or c.closeRequested or c.state == csDraining: return
     if stream == 0 and c.reqSerial != serial: return   # stale h1 handle (#407)
     if stream == 0 and not (c.awaitingResponse and c.rs.responded):
       return                     # nothing deferred is pending
@@ -1371,6 +1398,10 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
     # dead socket, re-register it with the selector after closeConn dropped it,
     # or re-enter closeConn from flushOut's error path (#403).
     if c.closeRequested: return
+    # A flush from the async pump (a resumed handler's send or write, a
+    # detached task's answer) is held to the pump's end, so everything the pass
+    # produced on this connection goes out in one send() (pumpHold).
+    discard loop.pumpHold(c)
     if c.flushHold > 0 and c.pendingOut < respHighWater:
       # A batch is dispatching on this connection (a WebSocket read batch, an
       # outbox drain): the frames this send produced are already in wbuf and the
@@ -1379,6 +1410,24 @@ proc flushImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
       # hold is ignored: a handler that emits megabytes inside a single dispatch
       # must still meet the socket (and its EAGAIN -> wsBackpressure/onDrain
       # signal) rather than buffering the whole burst in wbuf.
+      return
+    loop.flushOut(c)
+
+proc flushNowImpl(loopPtr: pointer, fd: int32, gen: uint32) {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.flushNowHook: write a connection's pending output now, past
+  ## any flush hold, the pump's included (a direct flushOut is always allowed,
+  ## see Connection.flushHold). `res.drained()` calls it before it decides
+  ## whether to wait: with the pump hold a streamed write leaves its bytes in
+  ## wbuf, and a `write` then `await res.drained()` loop would otherwise park on
+  ## the drain kick and pay a full loop iteration per chunk (about 4 to 15
+  ## times slower than flushing at once). The held entry in pendingFlush
+  ## stays and finds nothing left to flush when the pump returns.
+  {.gcsafe.}:
+    if fd < 0: return
+    let loop = cast[Loop](loopPtr)
+    let c = conn(addr loop.core, fd, gen)
+    if c == nil or c.pendingOut <= 0 or c.closeRequested or
+        c.state == csDraining:
       return
     loop.flushOut(c)
 
@@ -2165,12 +2214,32 @@ proc releaseBatchFlushes(loop: Loop) =
   ## goes with the slot -- clear() scrubs the counter before it is reused. Runs
   ## even if applying a message raised, so a hold is never leaked onto a live
   ## connection (which would mute its flush hook until the next batch).
-  for (fd, gen) in loop.pendingFlush:
-    let c = conn(addr loop.core, fd, gen)
-    if c == nil: continue
-    if releaseFlushHold(c) and (c.pendingOut > 0 or c.closeAfterFlush):
-      loop.flushOut(c)
-  loop.pendingFlush.setLen(0)
+  ## A connection that reached its linger close inside the batch (an HTTP/1
+  ## Connection: close response resumed there) has already flushed and
+  ## half-closed: flushing it again would run beginLingerClose a second time.
+  ## Nor is one whose close is deferred behind a worker pin (closeRequested):
+  ## closeConn unregistered its fd, and flushOut could arm write interest on
+  ## it again (#403); its output goes with the slot, as in flushImpl.
+  ##
+  ## flushOut runs user code (an HTTP/1 onDrain callback, a WebSocket or HTTP/2
+  ## drain resume), and the pump's release runs from run() itself, outside any
+  ## per-connection guard: a callback that raises closes its own connection,
+  ## as a dispatch error does, rather than ending the loop thread. The list is
+  ## cleared even then, so no later connection inherits a stale entry.
+  try:
+    for (fd, gen) in loop.pendingFlush:
+      let c = conn(addr loop.core, fd, gen)
+      if c == nil: continue
+      try:
+        if releaseFlushHold(c) and c.state != csDraining and
+            not c.closeRequested and (c.pendingOut > 0 or c.closeAfterFlush):
+          loop.flushOut(c)
+      except Exception:
+        # A per-connection bug must never take down the loop thread.
+        if c.state != csFree:
+          loop.closeConn(c)
+  finally:
+    loop.pendingFlush.setLen(0)
 
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing. Each
@@ -2527,8 +2596,16 @@ proc drainComplete(loop: Loop): bool =
   ## dispatcher and runs on a later pump. If we exited on connCount alone, that
   ## in-flight continuation (and the future + blocking box it holds) would be
   ## orphaned at teardown instead of released -- a shutdown-time leak. So keep
-  ## pumping until the adapter drains (pumpCap < 0), bounded by a short deadline
-  ## so a never-completing future can't wedge shutdown.
+  ## pumping until the adapter's watched work drains (its pendingHook reads
+  ## false), bounded by a short deadline so a never-completing future can't
+  ## wedge shutdown.
+  ##
+  ## Not the pump's wake cap (pumpCap >= 0): that one also honours timers the
+  ## app owns outright, such as a detached heartbeat loop sleeping 10 s, which
+  ## no request waits on. Reading the cap held every such server's shutdown for
+  ## the whole 3 s deadline (on asyncdispatch, whose pump caps on any timer,
+  ## since the adapter existed; on chronos once its pump honoured app timers,
+  ## #412).
   ##
   ## `pendingBlockingResults` covers the earlier window too: a void async
   ## `req.blocking` body's `res.send` releases the connection pin one outbox
@@ -2537,7 +2614,9 @@ proc drainComplete(loop: Loop): bool =
   ## the worker's `onDone` runs -- completing the awaiting future -- before exit,
   ## instead of orphaning the future and its suspended continuation.
   if not loop.drainDone(): return false
-  if loop.pumpCap < 0 and loop.core.pendingBlockingResults == 0: return true
+  let watched = loop.core.hooks.pendingHook != nil and
+                loop.core.hooks.pendingHook()
+  if not watched and loop.core.pendingBlockingResults == 0: return true
   if loop.asyncDrainDeadline == 0:
     loop.asyncDrainDeadline = loop.core.nowSec + 3
     return false
@@ -2547,6 +2626,7 @@ proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.hooks.kick = kickImpl
   loop.core.hooks.flushHook = flushImpl
+  loop.core.hooks.flushNowHook = flushNowImpl
   loop.core.hooks.resumeBodyHook = resumeBodyImpl
   installWsHooks(addr loop.core)   # h2 WebSocket (RFC 8441) stream lookup
   when not defined(plainHttp):
@@ -2674,8 +2754,15 @@ proc run*(loop: Loop) =
     if loop.core.hooks.pumpHook != nil:
       # Pump at the end of the iteration so callbacks scheduled while
       # handling this batch (e.g. an await that completed immediately)
-      # finish in the same pass instead of after a selector timeout.
-      loop.pumpCap = loop.core.hooks.pumpHook()
+      # finish in the same pass instead of after a selector timeout. Flushes
+      # are held for the pump and released once it returns, one send() per
+      # connection for everything it produced (pumpHold).
+      loop.inPump = true
+      try:
+        loop.pumpCap = loop.core.hooks.pumpHook()
+      finally:
+        loop.inPump = false
+        loop.releaseBatchFlushes()
     loop.tick()
     when not defined(plainHttp):
       # Anything that ran after this iteration's h3Drive (a continuation the

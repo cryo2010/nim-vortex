@@ -25,11 +25,22 @@
 when not declared(onCompleted):
   {.error: "adapterimpl.nim must be included by a backend adapter (vortex/adapters/asyncdispatch or vortex/adapters/chronos), not compiled or imported directly".}
 
+proc watchedPending(): bool {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.pendingHook: a watched future is outstanding and at least
+  ## one of them waits on something the adapter's dispatcher drives (not all
+  ## are parked on a loop wakeup, which a drained loop never delivers). A
+  ## graceful shutdown waits on this, not on the pump's wake cap, so a timer the
+  ## app owns (a detached heartbeat loop) does not hold it for the full drain
+  ## deadline.
+  {.gcsafe.}:
+    pendingOps > 0 and parkedOps < pendingOps
+
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
   ## Idempotent; called automatically by the entry points below.
   if core.hooks.pumpHook == nil:
     core.hooks.pumpHook = pump
     core.hooks.teardownHook = teardown
+    core.hooks.pendingHook = watchedPending
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
@@ -43,14 +54,19 @@ proc complete(req: Request, failed: bool) {.gcsafe.} =
 proc watch(req: Request, fut: Future[void]) =
   ## Attach completion handling to a running future: 500 on failure,
   ## then flush/resume the connection.
+  # Install the pump even when the future completed without suspending: the
+  # handler may have detached a task (an asyncCheck'ed or asyncSpawn'ed
+  # producer) that suspends on the adapter's dispatcher and answers later. With
+  # no pump on this loop thread nothing would ever poll that task, and the
+  # request was never answered. Idempotent, and an idle pump costs nothing.
+  ensurePump(req.core)
   if fut.finished:
     # Completed without suspending (httpbeast's nil-future case): any
     # send already ran inline during dispatch, so skip the callback
-    # queue, the pump, and the kick entirely.
+    # queue and the kick.
     if fut.failed:
       response(req).send(Http500, "500 Internal Server Error")
     return
-  ensurePump(req.core)               # pump only once something suspends
   let watched = fut
   let target = req
   onCompleted(watched):
@@ -65,10 +81,10 @@ proc watchWs(ws: WebSocket, fut: Future[void]) =
   ## Fire-and-forget for a WebSocket: drive the future to completion on the
   ## loop; an uncaught exception closes the socket with 1011 (there is no
   ## HTTP response to answer with a 500).
+  ensurePump(ws.core)                # before the fast path, as in watch
   if fut.finished:
     if fut.failed and ws.isAlive: ws.close(1011)
     return
-  ensurePump(ws.core)
   let watched = fut
   let target = ws
   onCompleted(watched):
@@ -106,13 +122,16 @@ proc drained*(res: Response): Future[void] =
   ##   res.finish()
   ##
   ## Safe to await at any other time too, after a write that returned true or
-  ## from a timer: with nothing queued it completes at once, and with a backlog
-  ## left it completes once that drains (#403: on HTTP/2 a wait registered
-  ## without a preceding false used to park forever). On HTTP/2 "drained" is
-  ## the under-the-mark rule, so it can complete with `bufferedAmount > 0`
-  ## still; a flush-before-finish loop (`while res.bufferedAmount > 0: await
-  ## res.drained()`) then waits for the next WINDOW_UPDATE or socket drain on
-  ## each turn, and parks (without spinning) while the peer reads nothing.
+  ## from a timer: it first writes what is queued (an HTTP/1.1 or HTTP/2
+  ## write made from an async continuation is otherwise held to the end of the
+  ## loop's async pass), then with nothing left it completes at once, and with
+  ## a backlog left it completes once that drains (#403: on HTTP/2 a wait
+  ## registered without a preceding false used to park forever). On HTTP/2
+  ## "drained" is the under-the-mark rule, so it can complete with
+  ## `bufferedAmount > 0` still; a flush-before-finish loop (`while
+  ## res.bufferedAmount > 0: await res.drained()`) then waits for the next
+  ## WINDOW_UPDATE or socket drain on each turn, and parks (without spinning)
+  ## while the peer reads nothing.
   ##
   ## It also completes when the response ends (#408): a wait parked here while
   ## another task calls `res.finish()` or `res.abort()`, a buffered `res.send`
@@ -132,6 +151,18 @@ proc drained*(res: Response): Future[void] =
   if res.ended:
     completeSoon(result)
     return
+  if res.bufferedAmount > 0 and res.fd >= 0 and
+      res.core.hooks.flushNowHook != nil:
+    # A write made while the async pump runs is held to the pump's end (#412),
+    # so its bytes are still queued here. Put them on the socket now and
+    # re-check: a `write` then `await res.drained()` loop otherwise parks on
+    # every chunk and pays a full loop iteration for it. The flush can run a
+    # drain callback; one that raises must not escape into the producer.
+    try: res.core.hooks.flushNowHook(res.core.loopPtr, res.fd, res.gen)
+    except Exception: discard
+    if res.ended:
+      completeSoon(result)
+      return
   if res.bufferedAmount == 0:
     complete(result)
     return

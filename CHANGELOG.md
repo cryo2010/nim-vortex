@@ -233,6 +233,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A buffered `res.send` from a task the handler detached (an `asyncCheck`ed
+  or `asyncSpawn`ed producer, a timer) that runs after the handler's own
+  future has completed now answers the request at once, on every protocol. On
+  HTTP/1.1 the response only filled the connection's write buffer: the
+  adapter's completion kick had already run and found nothing to resume, so
+  the response left when the client's next request arrived, and that request
+  was never answered (a request pipelined behind it, already buffered, waited
+  for good). On HTTP/2 the frames sat in the write buffer the same way until
+  some other socket event, and on HTTP/3 the response waited in the QUIC send
+  buffer for the loop's next wakeup, up to its 1 s idle wait. A loop-thread
+  `send` that answers a deferred HTTP/1.1 request now flushes and resumes the
+  connection itself, as `finish` does for a streamed body: it closes on
+  `Connection: close`, otherwise it serves the next request. A send made
+  before the handler's future completes is answered at send time the same
+  way, so a handler that keeps running after it (logging, cleanup awaits) no
+  longer holds a pipelined request back; its later calls on the answered
+  request are no-ops and its reads of `req` come back empty, like those of any
+  kept handle (#407) and as on HTTP/2 and HTTP/3 once the stream has closed,
+  so read what you need before answering. An HTTP/2 send flushes
+  (inside a read batch the batch's single flush still carries it) and an
+  HTTP/3 send has the loop drive QUIC egress before it sleeps. On the chronos
+  adapter such a task did not run at all once the handler finished: the pump
+  polled chronos only while a watched future was outstanding, so the
+  detached task's timer never fired until another request suspended. The
+  pump now also runs work chronos holds on its own (an expired timer, a
+  queued callback) and caps the loop's wait at chronos's next timer, so an
+  idle server with no timers still sleeps its full wait; this holds under
+  `-d:chronosStrictReentrancy` (and `-d:chronosPreviewV5`) too, where chronos
+  keeps no idle sentinel in its callback queue. A handler that detaches such a
+  task and returns without ever suspending is answered too: on a loop thread
+  where no earlier handler had suspended, nothing had installed the adapter's
+  pump, so the task never ran and the request was never answered (both
+  adapters). On HTTP/3 the same wait hit any streamed response produced after
+  an `await`, detached or not: `sendHead`, `write`, `finish` and `abort` from
+  the async pump left their bytes in the QUIC send buffer for the loop's 1 s
+  idle wait, so the last write and the end of the body arrived about a second
+  late; they now have the loop drive egress before it sleeps. A detached
+  `sendFile` refused by a saturated worker pool (`maxBlockingQueue`) answered
+  its 503 the same broken way as the buffered send and now answers it at once.
+  Loop-thread flushes made while the async pump runs are held to the pump's
+  end, so N responses resumed in one pass (fifty handlers woken by one timer,
+  answering on one HTTP/2 connection) still cost one `send()` rather than one
+  each. `res.drained()` puts a held write on the socket before it decides to
+  wait, so a `res.write` then `await res.drained()` loop keeps the throughput
+  it had (parked on the drain instead, it paid a loop iteration per chunk). A
+  `res.onDrain` callback that raises when the held flush runs closes its own
+  connection, as a handler error does, instead of ending the loop thread. A
+  graceful shutdown no longer waits out its 3 s async drain deadline
+  for a timer the application owns (a detached heartbeat loop): it waits for
+  the handlers and `doAsync` bodies the adapter watches, not for every timer in
+  the dispatcher, on both adapters (asyncdispatch had always waited the full
+  deadline in that case). (#412)
 - HTTP/1.1: a `HEAD` request routed to a streamed handler that calls
   `res.sendHead(code, contentType)` without a `contentLength` now gets its
   head. `sendHead` marked the request answered before falling back to a
@@ -1464,6 +1516,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An async handler's loop-thread `res.send` that answers a request after the
+  handler has suspended now ends the request at the `send`, not when the
+  handler returns: the connection moves on to the next request at once, the
+  handler's later reads of `req` come back empty and its later calls on `res`
+  are no-ops. Read what you need from `req` before answering. (#412)
 - WebSocket: frames sent from an `onMessage` handler, or by a worker's burst
   through the outbox, are written to the socket once per batch instead of once
   per message (`Connection.flushHold`), and HTTP/1 frames are serialized

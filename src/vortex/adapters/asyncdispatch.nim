@@ -80,24 +80,34 @@ proc teardown() {.nimcall, gcsafe.} =
 
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
-proc trackParked() {.inline.} = discard
+# Futures the adapter watches (handlers, doAsync bodies) that are still
+# outstanding, and how many of those are parked on a wakeup only the vortex loop
+# delivers, per loop thread. The pump does not need them (the dispatcher's
+# hasPendingOperations tells it when to run); a graceful shutdown does: it waits
+# for watched work through LoopCore.hooks.pendingHook (adapterimpl's
+# watchedPending), not for every timer the dispatcher holds, so an app's
+# detached heartbeat timer does not hold a drained loop open.
+var pendingOps {.threadvar.}: int
+var parkedOps {.threadvar.}: int
+
+proc trackParked() {.inline.} = inc parkedOps
   ## Contract shared with the chronos backend: one outstanding future has parked
-  ## on a wakeup that only the vortex loop delivers. This backend needs no tally
-  ## -- a bare parked Future registers no fd, timer or callback with the
+  ## on a wakeup that only the vortex loop delivers. The pump needs no tally --
+  ## a bare parked Future registers no fd, timer or callback with the
   ## dispatcher, so hasPendingOperations already reads false and the pump below
-  ## already returns -1 (loop may sleep) on its own. See chronos.nim's
-  ## trackParked, whose pump keeps its own count of outstanding futures and so
-  ## cannot tell the difference without being told.
-proc untrackParked() {.inline.} = discard
+  ## already returns -1 (loop may sleep) on its own -- but the shutdown's
+  ## watchedPending must not wait on such a future either.
+proc untrackParked() {.inline.} = dec parkedOps
   ## The unpark half of trackParked.
 
 template onCompleted(fut, body: untyped) =
   ## Contract shared with the chronos backend: run `body` when `fut` completes
-  ## (asyncdispatch callback signature: a plain nullary closure). Unlike chronos,
-  ## this backend does NO pending-op accounting -- the asyncdispatch dispatcher's
-  ## hasPendingOperations already tells the pump when to run, so there is no
-  ## per-future trackPending/untrackPending to keep. See chronos.nim's onCompleted.
+  ## (asyncdispatch callback signature: a plain nullary closure), counting the
+  ## future as watched until then (see pendingOps). The pump itself still runs
+  ## on the dispatcher's hasPendingOperations; see chronos.nim's onCompleted.
+  inc pendingOps
   fut.addCallback proc () {.gcsafe.} =
+    dec pendingOps
     body
 
 proc completeSoon(fut: Future[void]) =

@@ -10,6 +10,7 @@ import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics]
 import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
+import vortex/staticfiles                    # res.sendFile (fresh-server suite)
 import ./helper                              # macro would clash with the async
 import ./h2client
 import ./wsclient
@@ -349,6 +350,84 @@ proc hPing(req: Request, res: Response) {.async.} =
   pingAtIter.store(runawayIter.load())
   res.send(Http200, "pong")
 
+# --- a buffered send from a detached task (#412) ------------------------------
+#
+# The handler starts a producer it does not await and returns, so the handler's
+# future (and with it the adapter's completion kick) completes before the
+# producer's buffered `res.send`. That send filled the write buffer and nothing
+# flushed it or resumed the pipeline: the response left only when the client's
+# next request arrived, and that request was never answered.
+
+template detach(f: untyped) =
+  when defined(vortexChronos): asyncSpawn f
+  else: asyncCheck f
+
+proc producerBuffered(res: Response) {.async.} =
+  await sleepMs(100)
+  res.send(Http200, "detached buffered")
+
+proc hDetachedBuf(req: Request, res: Response) {.async.} =
+  await sleepMs(10)
+  detach producerBuffered(res)          # the handler future completes first
+
+proc hSendThenLinger(req: Request, res: Response) {.async.} =
+  # The other order: a buffered send after an await, then the handler keeps
+  # running. The send answers the request (and serves a pipelined one) at
+  # once; the completion kick that follows holds a stale serial (#407).
+  await sleepMs(10)
+  res.send(Http200, "answered early")
+  await sleepMs(300)
+
+proc hStreamLate(req: Request, res: Response) {.async.} =
+  # A streamed body produced after awaits, so sendHead, both writes and finish
+  # run from the async pump, after the loop's h3Drive for that iteration.
+  await sleepMs(30)
+  res.sendHead(Http200, "text/plain")
+  discard res.write("late-".toOpenArray(0, 4))
+  await sleepMs(30)
+  discard res.write("stream".toOpenArray(0, 5))
+  res.finish()
+
+proc hBatch(req: Request, res: Response) {.async.} =
+  # Many of these on one h2 connection wake in the same pump pass (#412).
+  await sleepMs(80)
+  res.send(Http200, "batched")
+
+proc hCloseLinger(req: Request, res: Response) {.async.} =
+  # Answer, then keep running well past the send: the handler's completion
+  # kick lands on a connection the send already moved into its linger close.
+  await sleepMs(10)
+  res.send(Http200, "linger-close")
+  await sleepMs(2500)
+
+proc drainBoom(r: Response) {.gcsafe.} =
+  raise newException(ValueError, "drain boom")
+
+proc hRaiseDrain(req: Request, res: Response) {.async.} =
+  # The write's flush is held to the pump's end, so the raising callback runs
+  # from the loop's release of that hold rather than inside `res.write`.
+  await sleepMs(5)
+  res.sendHead(Http200, "text/plain")
+  res.onDrain drainBoom
+  discard res.write("abc".toOpenArray(0, 2))
+  await sleepMs(300)
+  res.finish()
+
+var drainedAtOnce: Atomic[int]           # 1 = drained() was complete on return
+
+proc hDrainedNow(req: Request, res: Response) {.async.} =
+  # A small write on an idle socket, then drained(): the write's flush is held
+  # to the pump's end, and drained() must put the bytes out itself rather than
+  # park on the drain kick (a loop iteration per chunk).
+  await sleepMs(5)
+  res.sendHead(Http200, "text/plain")
+  let chunk = "d".repeat(1024)
+  discard res.write(chunk.toOpenArray(0, chunk.len - 1))
+  let f = res.drained()
+  drainedAtOnce.store(if f.finished: 1 else: 0)
+  await f
+  res.finish()
+
 var appRouter = newRouter()
 appRouter.get("/pre-big", hPreBig)
 appRouter.get("/pre-parked", hPreParked)
@@ -372,10 +451,150 @@ appRouter.get("/stream", hStream)
 appRouter.get("/streamraw", hStreamRaw)
 appRouter.get("/streamemit", hStreamEmit)
 appRouter.get("/headlate/:n", hHeadLate)
+appRouter.get("/detached-buf", hDetachedBuf)
+appRouter.get("/send-linger", hSendThenLinger)
+appRouter.get("/streamlate", hStreamLate)
+appRouter.get("/batch", hBatch)
+appRouter.get("/close-linger", hCloseLinger)
+appRouter.get("/raise-drain", hRaiseDrain)
+appRouter.get("/drained-now", hDrainedNow)
 appRouter.post("/upload", hUpload, streaming = true)
 appRouter.post("/upload-reject", hUploadReject, streaming = true)
 appRouter.post("/upload-boom", hUploadBoom, streaming = true)
 appRouter.post("/upload-read", hUploadRead, streaming = true)
+
+# --- a fresh server: a detach with no await, a saturated pool, shutdown ------
+#
+# Its own server, so the first request it serves is one whose handler never
+# suspends (no earlier handler has installed the adapter's pump on its loop
+# thread), with one worker and a one-deep queue so a `blocking:` dispatch can be
+# refused, and so the last test can time its shutdown.
+
+proc hNoAwait(req: Request, res: Response) {.async.} =
+  # Detach and return without ever suspending: the handler's future is already
+  # complete when the adapter sees it (the watch fast path).
+  detach producerBuffered(res)
+
+var hogsRunning: Atomic[int]             # bumped by a hog body once dequeued
+
+proc hHog(req: Request, res: Response) {.async.} =
+  req.blocking:                          # occupies the single worker (or queues)
+    discard hogsRunning.fetchAdd(1)
+    sleep(1500)
+    res.send(Http200, "hog")
+
+var detFile: string                      # set before the server starts
+
+proc producerFile(res: Response) {.async.} =
+  await sleepMs(50)
+  {.gcsafe.}:
+    res.sendFile(detFile)                # refused by the saturated pool: 503
+
+proc hDetFile(req: Request, res: Response) {.async.} =
+  detach producerFile(res)
+
+proc heartbeat() {.async.} =
+  while true:
+    await sleepMs(10_000)                # an app-owned timer no request waits on
+
+var beatStarted {.threadvar.}: bool
+
+proc hBeat(req: Request, res: Response) {.async.} =
+  if not beatStarted:
+    beatStarted = true
+    detach heartbeat()
+  res.send(Http200, "beating")
+
+block:
+  let freshRouter = newRouter()
+  freshRouter.get("/noawait", hNoAwait)
+  freshRouter.get("/hog", hHog)
+  freshRouter.get("/det-file", hDetFile)
+  freshRouter.get("/beat", hBeat)
+  detFile = getTempDir() / ("vortex_adapter_det_" & $getCurrentProcessId())
+  writeFile(detFile, "file body")
+  var fresh = newVortex(freshRouter.toHandler, initVortexConfig(
+    numThreads = 1, workerThreads = 1, maxBlockingQueue = 1)).start(0)
+  var closed = false
+  defer:
+    if not closed: fresh.close()
+    removeFile(detFile)
+
+  suite suiteName & " (fresh server)":
+    test "a detach from a handler that never suspends is answered (#412)":
+      # First request on this server: nothing has installed the pump yet, and
+      # the handler's future is complete on return, so the producer's timer was
+      # never polled and the request was never answered.
+      let s = connectTimeout(fresh.port, 3000)
+      defer: s.close()
+      let t0 = epochTime()
+      s.send("GET /noawait HTTP/1.1\r\nHost: x\r\n\r\n")
+      let r = s.readHttpResponse(2000)
+      check r.ok and r.body == "detached buffered"
+      check epochTime() - t0 < 1.0
+
+    test "a detached sendFile refused by a saturated pool answers 503 at once (#412)":
+      # One hog runs, one queues: the pool is at maxBlockingQueue. The 503 for
+      # the refused sendFile used to sit in the write buffer: it left with the
+      # client's next request, which was never answered.
+      # Saturate deterministically. The cap counts tasks not yet started, so
+      # three hogs sent at once can see TWO refusals on a loaded runner (the
+      # worker has not dequeued the first when the next two arrive) and leave
+      # the queue empty. So: one hog, wait until its body is running (queue
+      # empty), then two more: one queues, the other is refused at once (its
+      # awaitable blocking: body fails with PoolSaturatedError, a 500). From
+      # that refusal on, the pool stays full until the running hog finishes.
+      var hogs: seq[Socket]
+      template sendHog() =
+        let h = connectTimeout(fresh.port, 3000)
+        h.send("GET /hog HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        hogs.add h
+      let before = hogsRunning.load
+      sendHog()
+      var deadline = epochTime() + 5.0
+      while hogsRunning.load == before and epochTime() < deadline: sleep(5)
+      check hogsRunning.load == before + 1
+      sendHog()
+      sendHog()
+      var refused = -1
+      deadline = epochTime() + 5.0
+      while refused < 0 and epochTime() < deadline:
+        for i in 1 ..< hogs.len:
+          let hr = hogs[i].readHttpResponse(100)
+          if hr.ok:
+            check hr.head.startsWith("HTTP/1.1 5")
+            refused = i
+            break
+      check refused >= 0
+      let s = connectTimeout(fresh.port, 3000)
+      defer: s.close()
+      s.send("GET /det-file HTTP/1.1\r\nHost: x\r\n\r\n")
+      let r = s.readHttpResponse(1500)
+      # A 503 means the refusal was answered while the pool was still full
+      # (the running hog holds it for 1.5 s); a 200 would mean the sendFile was
+      # dispatched after all, and no response is the bug (the 503 waits in the
+      # write buffer for the client's next request).
+      check r.ok
+      check r.head.startsWith("HTTP/1.1 503")
+      s.send("GET /noawait HTTP/1.1\r\nHost: x\r\n\r\n")
+      let b = s.readHttpResponse(2000)   # the connection moved on
+      check b.ok and b.body == "detached buffered"
+      for h in hogs:
+        discard h.recvUntilClose(4000)
+        h.close()
+
+    test "a live app timer does not hold a graceful shutdown (#412)":
+      # A detached heartbeat keeps a 10 s timer in the dispatcher for good. The
+      # drain used to read the pump's wake cap as pending work and wait out its
+      # whole 3 s deadline; nothing the server watches is pending here.
+      let s = connectTimeout(fresh.port, 3000)
+      s.send("GET /beat HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      check s.recvUntilClose(2000).endsWith("beating")
+      s.close()
+      let t0 = epochTime()
+      fresh.close()
+      closed = true
+      check epochTime() - t0 < 1.5        # a stuck drain takes 2 s or more
 
 withServer(appRouter.toHandler,
            initVortexConfig(numThreads = 1, workerThreads = 2),
@@ -480,6 +699,187 @@ withServer(appRouter.toHandler,
       check r.ok
       check "Transfer-Encoding: chunked" in r.head
       check r.body == "tick".repeat(3)
+
+    test "a buffered send from a detached task is flushed at once (#412)":
+      # The response used to sit in the write buffer until the client sent
+      # something else, and the request after it was never answered.
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      let t0 = epochTime()
+      s.send("GET /detached-buf HTTP/1.1\r\nHost: x\r\n\r\n")
+      let a = s.readHttpResponse(2000)  # nothing else is sent meanwhile
+      check a.ok and a.body == "detached buffered"
+      check "Content-Length: 17" in a.head
+      check epochTime() - t0 < 1.0
+      s.send("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+      let b = s.readHttpResponse(2000)
+      check b.ok and b.body == "pong"
+
+    proc readPipelined(s: Socket, want: int, timeoutMs = 2000): seq[string] =
+      ## The bodies of `want` Content-Length responses read off one socket,
+      ## fewer if it goes quiet for `timeoutMs` first.
+      s.setRecvTimeout(timeoutMs)
+      var raw = ""
+      var tmp = newString(8192)
+      while true:
+        var pos = 0
+        result.setLen(0)
+        while true:
+          let he = raw.find("\r\n\r\n", pos)
+          if he < 0: break
+          var clen = 0
+          for line in raw[pos ..< he].split("\r\n"):
+            if line.toLowerAscii.startsWith("content-length:"):
+              clen = parseInt(line.split(':', 1)[1].strip)
+          if he + 4 + clen > raw.len: break
+          result.add raw[he + 4 ..< he + 4 + clen]
+          pos = he + 4 + clen
+        if result.len >= want: return
+        let n = recv(s.getFd, addr tmp[0], tmp.len, cint(0))
+        if n <= 0: return
+        raw.add tmp.substr(0, n - 1)
+
+    test "a detached buffered send answers, then serves the pipelined request (#412)":
+      # /ping is already buffered behind /detached-buf, so no later read event
+      # could have brought either response out.
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      s.send("GET /detached-buf HTTP/1.1\r\nHost: x\r\n\r\n" &
+             "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+      check s.readPipelined(2) == @["detached buffered", "pong"]
+
+    test "a detached buffered send answers a HEAD at once (#412)":
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      s.send("HEAD /detached-buf HTTP/1.1\r\nHost: x\r\n\r\n")
+      let head = s.recvAvailable(2000)
+      check head.startsWith("HTTP/1.1 200")
+      check "Content-Length: 17" in head
+      check head.endsWith("\r\n\r\n")       # head only, no body
+      s.send("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+      let b = s.readHttpResponse(2000)
+      check b.ok and b.body == "pong"
+
+    test "a detached buffered send on Connection: close answers and closes (#412)":
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      let t0 = epochTime()
+      s.send("GET /detached-buf HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      let raw = s.recvUntilClose(2000)
+      check raw.startsWith("HTTP/1.1 200")
+      check raw.endsWith("\r\n\r\ndetached buffered")
+      check epochTime() - t0 < 1.0       # closed by the server, not a timeout
+
+    test "a buffered send before the handler returns serves the next request at once (#412)":
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      let t0 = epochTime()
+      s.send("GET /send-linger HTTP/1.1\r\nHost: x\r\n\r\n" &
+             "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+      check s.readPipelined(2) == @["answered early", "pong"]
+      check epochTime() - t0 < 0.25      # not after the handler's 300 ms linger
+      sleep(350)                         # its completion kick finds a stale serial
+      s.send("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+      let c = s.readHttpResponse(2000)
+      check c.ok and c.body == "sync-in-async"
+
+    test "h2: a buffered send from a detached task is flushed at once (#412)":
+      var c = newH2TestConn(srv.port)
+      defer: c.close()
+      var req = ""
+      req.addRequest(1, {":method": "GET", ":scheme": "http",
+                         ":path": "/detached-buf", ":authority": "localhost"})
+      c.sendRaw(req)
+      let t0 = epochTime()
+      let frames = c.readFrames(2000, until = proc(f: seq[Frame]): bool =
+        for x in f:
+          if x.streamId == 1 and (x.flags and flagEndStream) != 0: return true
+        false)
+      check epochTime() - t0 < 1.0
+      var body = ""
+      var ended = false
+      for f in frames:
+        if f.streamId != 1: continue
+        if f.typ == uint8(ftData): body.add f.payload
+        if (f.flags and flagEndStream) != 0: ended = true
+      check ended
+      check body == "detached buffered"
+
+    test "h2: fifty streams answered in one pump pass all arrive (#412)":
+      # Every handler wakes on the same timer tick, so their sends land in one
+      # pump pass; the loop holds their flushes to the pump's end and writes
+      # them in one send() rather than one per stream.
+      const n = 50
+      var c = newH2TestConn(srv.port)
+      defer: c.close()
+      var req = ""
+      for i in 0 ..< n:
+        req.addRequest(uint32(1 + 2 * i), {":method": "GET", ":scheme": "http",
+                       ":path": "/batch", ":authority": "localhost"})
+      c.sendRaw(req)
+      let t0 = epochTime()
+      let frames = c.readFrames(3000, until = proc(f: seq[Frame]): bool =
+        var done = 0
+        for x in f:
+          if (x.flags and flagEndStream) != 0 and x.streamId != 0: inc done
+        done >= n)
+      check epochTime() - t0 < 1.0
+      var bodies = newSeq[string](n)
+      var ended = 0
+      for f in frames:
+        if f.streamId == 0: continue
+        let i = int(f.streamId - 1) div 2
+        if f.typ == uint8(ftData): bodies[i].add f.payload
+        if (f.flags and flagEndStream) != 0: inc ended
+      check ended == n
+      for b in bodies: check b == "batched"
+
+    test "drained() after a write held by the pump flushes it at once (#412)":
+      # Count-free check of the write-then-drained() throughput fix: with the
+      # bytes on the socket the wait completes inside the call. Parked on the
+      # drain kick instead, it cost a loop iteration per chunk.
+      drainedAtOnce.store(-1)
+      let s = connectTimeout(srv.port, 3000)
+      defer: s.close()
+      s.send("GET /drained-now HTTP/1.1\r\nHost: x\r\n\r\n")
+      let r = s.readHttpResponse(2000)
+      check r.ok and r.body == "d".repeat(1024)
+      check drainedAtOnce.load == 1
+
+    test "h2: drained() after a write held by the pump flushes it at once (#412)":
+      drainedAtOnce.store(-1)
+      var c = newH2TestConn(srv.port)
+      defer: c.close()
+      var req = ""
+      req.addRequest(1, {":method": "GET", ":scheme": "http",
+                         ":path": "/drained-now", ":authority": "localhost"})
+      c.sendRaw(req)
+      let frames = c.readFrames(2000, until = proc(f: seq[Frame]): bool =
+        for x in f:
+          if x.streamId == 1 and (x.flags and flagEndStream) != 0: return true
+        false)
+      var body = ""
+      for f in frames:
+        if f.streamId == 1 and f.typ == uint8(ftData): body.add f.payload
+      check body == "d".repeat(1024)
+      check drainedAtOnce.load == 1
+
+    test "a raising onDrain from a held flush does not end the loop thread (#412)":
+      # The pump's release of its flush hold ran the HTTP/1 drain callback
+      # outside any guard: the exception escaped run(), the loop thread exited
+      # and closed its listener, so a new connection was refused. The callback's
+      # own connection is closed instead, as for a dispatch error.
+      block:
+        let s = connectTimeout(srv.port, 3000)
+        defer: s.close()
+        s.send("GET /raise-drain HTTP/1.1\r\nHost: x\r\n\r\n")
+        let raw = s.recvUntilClose(2000)
+        check raw.startsWith("HTTP/1.1 200")
+      let s2 = connectTimeout(srv.port, 3000)
+      defer: s2.close()
+      s2.send("GET /ping HTTP/1.1\r\nHost: x\r\n\r\n")
+      let b = s2.readHttpResponse(2000)
+      check b.ok and b.body == "pong"
 
     test "await req.read() streams a request body":
       let body = "z".repeat(200 * 1024)
@@ -801,6 +1201,64 @@ withServer(appRouter.toHandler,
       defer: client.close()
       check client.getContent("http://127.0.0.1:" & $s.port & "/") == "bare-async"
 
+# A Connection: close request answered by a send while its handler keeps
+# running, over TLS. The send kicks the connection at once: it flushes, queues
+# close_notify, half-closes and arms the drain deadline (the linger close). The
+# handler's completion kick follows 2.5 s later with the same request serial and
+# must find nothing to do: resuming again flipped the connection back to
+# csClosing and ran the linger close a second time (another close_notify and
+# SHUT_WR, and a drain deadline re-armed from the late kick), so a client that
+# keeps its socket open was held about 2.5 s past the drain timeout.
+block:
+  let (tlsCert, tlsKey) = makeCertPair("vortex_adapter_tls_")
+  withServer(appRouter.toHandler,
+             initVortexConfig(numThreads = 1, workerThreads = 2,
+                              certFile = tlsCert, keyFile = tlsKey),
+             appRouter.streamPredicate, srvT):
+    suite suiteName & " over TLS (#412)":
+      test "a late completion kick does not restart the linger close":
+        let ctx = newContext(verifyMode = CVerifyNone)
+        let s = newSocket(buffered = false)
+        defer: s.close()
+        s.connect("127.0.0.1", srvT.port)
+        ctx.wrapConnectedSocket(s, handshakeAsClient, "localhost")
+        s.send("GET /close-linger HTTP/1.1\r\nHost: x\r\n" &
+               "Connection: close\r\n\r\n")
+        let t0 = epochTime()
+        s.setRecvTimeout(2000)
+        var resp = ""
+        var buf = newString(4096)
+        while not resp.endsWith("linger-close"):
+          var n = 0
+          try: n = s.recv(addr buf[0], buf.len)
+          except CatchableError: break
+          if n <= 0: break
+          resp.add buf[0 ..< n]
+        check resp.startsWith("HTTP/1.1 200")
+        check resp.endsWith("\r\n\r\nlinger-close")
+        check epochTime() - t0 < 1.0
+        # Keep the socket open and poke it with raw bytes below the TLS layer:
+        # a draining server reads and discards them, a closed one answers with
+        # a reset, which the next send or read reports.
+        const noSig = when defined(linux): MSG_NOSIGNAL else: cint(0)
+        let probe = "x"
+        s.setRecvTimeout(20)             # each read below waits at most 20 ms
+        var closedAfter = -1.0
+        while epochTime() - t0 < 9.0:
+          sleep(100)
+          let w = posix.send(s.getFd, unsafeAddr probe[0], 1, noSig)
+          var b: array[64, char]
+          let r = posix.recv(s.getFd, addr b[0], b.len, cint(0))
+          let err = errno
+          if w < 0 or (r < 0 and err != EAGAIN and err != EWOULDBLOCK):
+            closedAfter = epochTime() - t0
+            break
+        # The drain deadline is 5 s on a whole-second clock, armed at the send:
+        # closed 4 to 5 s in. Re-armed by the late kick it was 6.5 s or more.
+        check closedAfter > 0
+        check closedAfter < 6.0
+  removeDir(tlsCert.parentDir)
+
 # The same #408 scenario over HTTP/3, against curl reading at a trickle so QUIC
 # flow control holds the stream's backlog. Skipped without an HTTP/3 curl. The
 # peer-side check is the reset curl reports on abort (and on the short finish);
@@ -827,6 +1285,42 @@ else:
       if kill: p.terminate()
       result = p.waitForExit(15000)
       p.close()
+
+    suite suiteName & " over HTTP/3 (#412)":
+      test "h3: a buffered send from a detached task is flushed at once":
+        # It used to wait in the QUIC send buffer for the loop's next wakeup:
+        # the selector's idle wait, about 1 s after the send. First on this
+        # server, so no earlier test's QUIC connection (a killed curl's
+        # retransmit timers) wakes the loop early and hides the stall.
+        for i in 0 ..< 3:
+          let (output, rc) = execCmdEx(h3curlBin & " -sk --http3-only -m 5 " &
+            "-w '|%{time_appconnect}|%{time_starttransfer}' " &
+            "https://localhost:" & $srv3.port & "/detached-buf")
+          check rc == 0
+          let parts = output.strip.split('|')
+          check parts.len == 3
+          if parts.len == 3:
+            check parts[0] == "detached buffered"
+            # From the handshake to the first response byte: the producer's
+            # 110 ms plus a loopback round trip, not the idle wait.
+            let waitS = parseFloat(parts[2]) - parseFloat(parts[1])
+            check waitS < 0.6
+
+      test "h3: a body streamed after an await is driven out at once":
+        # sendHead, write and finish from the async pump left their bytes in
+        # the QUIC send buffer for the selector's idle wait: about 1.1 s per
+        # response instead of the handler's 60 ms.
+        for i in 0 ..< 3:
+          let (output, rc) = execCmdEx(h3curlBin & " -sk --http3-only -m 5 " &
+            "-w '|%{time_appconnect}|%{time_total}' " &
+            "https://localhost:" & $srv3.port & "/streamlate")
+          check rc == 0
+          let parts = output.strip.split('|')
+          check parts.len == 3
+          if parts.len == 3:
+            check parts[0] == "late-stream"
+            let waitS = parseFloat(parts[2]) - parseFloat(parts[1])
+            check waitS < 0.6
 
     suite suiteName & " over HTTP/3 (#408)":
       for how in ["drained", "write"]:
