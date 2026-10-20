@@ -224,7 +224,7 @@ Vortex supports gzip, brotli and zstd compression for requests and responses whe
 
 An eligible response is compressed with the best encoding `Accept-Encoding` offers, 
 adding `Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out);
-on a tie the server prefers **br**, then **zstd**, then **gzip**. 
+on a tie the server prefers **br**, then **zstd**, then **gzip**. A `blocking:` body negotiates from its own request, but a kept `Response` answered from a worker or a thread your application owns has no request to read `Accept-Encoding` from, so it negotiates nothing and goes out as identity.
 
 The **inbound** direction is opt-in with `config.decompressRequest`: a request
 whose `Content-Encoding` is `gzip`, `br`, or `zstd` is transparently decoded into `req.body`. 
@@ -567,7 +567,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
 | `req.params` | `PathParams` | all router path parameters |
 | `req.param(name)` | `string` | one router path parameter; "" if absent |
-| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned) |
+| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned). The other accessors follow the same rule: off the loop thread and outside the `blocking:` body that owns the request (a kept handle answered later, or a thread your application owns) there is no request snapshot to read, so they return their defaults rather than race the loop: "" for `req.header`/`req.path`/`req.body`, 0 for `req.contentLength`, and `HttpGet` for `req.method`, so the method reads as GET there |
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |

@@ -233,6 +233,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Compression: a buffered `res.send` from a worker thread no longer answers
+  `500` when its body is eligible for compression. On a compression build with
+  `compress = true`, a `blocking:` body sending at least 1400 bytes of a
+  compressible type, or `staticHandler` / `sendFile` serving a file at or below
+  the stream threshold (a `.txt`, say), failed with or without an
+  `Accept-Encoding` header: negotiation read that header through a Request
+  built from the Response with no request snapshot, so the lookup fell through
+  to the loop-owned connection table and tripped its loop-thread assertion
+  (#343), which the worker turned into a 500. Under `-d:danger` (the bench and
+  `PROFILE=bench` stress builds) the assertion is compiled out and the worker
+  read that table unsynchronised instead. A worker task's own `res` now
+  negotiates through the task's request snapshot, so it is compressed exactly
+  as a loop-thread send is. Any other off-loop handle (a kept `Response` a
+  worker body answers, or a send from a thread the application owns) has no
+  snapshot to read (on an app-owned thread the same assertion went uncaught
+  and ended the process), and the request accessors now fail closed off the
+  loop thread without one: they return their empty value instead of reaching
+  the connection table, so such a send goes out as identity. (#413)
+
 - A buffered `res.send` from a task the handler detached (an `asyncCheck`ed
   or `asyncSpawn`ed producer, a timer) that runs after the handler's own
   future has completed now answers the request at once, on every protocol. On

@@ -116,13 +116,6 @@ proc response*(req: Request): Response =
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
            serial: req.serial)
 
-proc request(res: Response): Request {.inline.} =
-  ## The Request half of a Response handle, same words (serial included), for
-  ## the read-side helpers the response paths call (encoding negotiation, file
-  ## serving, SSE liveness).
-  Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream,
-          serial: res.serial)
-
 proc requestFor*(core: ptr LoopCore, fd: int32, gen: uint32,
                  stream: uint32): Request =
   ## A Request for the request currently in flight on (fd, gen, stream), for
@@ -258,8 +251,22 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
   ## caller-supplied identifiers (like withConn's `c`): onH2/onH1 see the resolved
   ## non-nil Connection `c`, onH3 the resolved non-nil H3Conn `h3c`, onSnap uses
   ## req.snap. The h3 branch is compiled out under -d:plainHttp.
+  ##
+  ## Off the loop thread with no snapshot (a kept handle answered from a worker
+  ## task it does not belong to, or any handle on a thread the application
+  ## owns) it fails closed: no branch runs, so the accessor returns its
+  ## empty/default value (#413): "" for `header`/`path`/`body`/
+  ## `remoteAddress`, 0 for `contentLength`, and `HttpGet` for `method`, which
+  ## reads as a plausible GET there rather than an obviously empty value. The h2/h1 branches resolve through
+  ## `liveConn`/`conn()`, whose loop-thread assertion (#343) would otherwise
+  ## fire there, and under -d:danger, where the assertion is compiled out, read
+  ## the loop's connection table unsynchronised; the h3 branch has no assertion
+  ## at all. On the loop thread nothing changes: the same branches run and
+  ## `conn()` keeps its assertion as the backstop for every other caller.
   if req.snap != nil:
     onSnap
+  elif currentThreadId() != req.core.threadId:
+    discard
   elif req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -1167,6 +1174,28 @@ proc isWorkerTaskHandle(res: Response): bool {.inline.} =
   workerTaskSet and
     workerTaskKey == reqKey(res.fd, res.gen, res.stream, res.serial)
 
+proc request(res: Response): Request =
+  ## The Request half of a Response handle, same words (serial included), for
+  ## the read-side helpers the response paths call (encoding negotiation, file
+  ## serving, SSE liveness).
+  ##
+  ## Off the loop thread it carries the running worker task's request snapshot
+  ## when `res` is that task's OWN handle (#413), so a buffered `send` from a
+  ## `blocking:` body (or the worker half of static-file serving) negotiates
+  ## compression from the request's real Accept-Encoding. The snapshot lives in
+  ## the WorkerTask and is valid only while that task runs, so it is attached
+  ## only to the handle the task was dispatched for: a kept handle a worker
+  ## body answers, or any handle on a thread the application owns, gets no
+  ## snapshot and its read-side helpers return their empty/default values (see
+  ## withCarrier). Invariant: nothing reachable from a worker or app-owned
+  ## thread through this Request touches `liveConn`/`conn()`, which are
+  ## loop-thread only.
+  result = Request(core: res.core, fd: res.fd, gen: res.gen,
+                   stream: res.stream, serial: res.serial)
+  if currentThreadId() != res.core.threadId and res.isWorkerTaskHandle and
+      workerSnapshot != nil and workerSnapshot.present:
+    result.snap = workerSnapshot
+
 proc markWorkerAnswered(res: Response) {.inline.} =
   ## Record an outbox answer for `res`; only the task's own handle latches.
   if res.isWorkerTaskHandle: workerTaskAnswered = true
@@ -1295,6 +1324,10 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     ## acceptsCharset), with the offer list limited to encoders this build can
     ## produce. No Accept-Encoding header -> identity (unlike accepts(), which
     ## falls back to the first offer, an encoding is only added on explicit ask).
+    ## Off the loop thread `req` is `res.request`: the worker task's snapshot
+    ## for its own handle, otherwise no snapshot, where `header` fails closed
+    ## to "" and the body goes out as identity rather than reading the loop's
+    ## connection table (#413).
     let ae = req.header("accept-encoding")
     if ae.strip.len == 0: return ""
     var offered: seq[string]                       # server-preference order,
@@ -2735,7 +2768,11 @@ proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
 proc alive*(s: SseStream): bool =
   ## False once the client disconnects; the producer loop should stop. Use this
   ## rather than `send` returning false, which is ambiguous (backpressure *or*
-  ## a dead connection). Loop-thread only: false from any other thread.
+  ## a dead connection). Loop-thread only: false from any other thread,
+  ## including a `blocking:` body, where `request(res)` carries the worker
+  ## task's snapshot and `isAlive` would report the pinned connection as live
+  ## even after the client went away (#413).
+  if currentThreadId() != s.res.core.threadId: return false
   s.res.request.isAlive
 
 proc close*(s: SseStream) {.raises: [].} = s.res.finish()

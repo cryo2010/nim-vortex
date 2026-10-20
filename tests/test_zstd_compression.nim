@@ -27,6 +27,11 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   case req.path
   of "/buf":
     res.send(Http200, bufText)
+  of "/worker":
+    # A buffered send from a worker thread negotiates through the task's
+    # request snapshot (#413).
+    req.blocking:
+      res.send(Http200, bufText)
   of "/stream":
     res.sendHead(Http200, "text/plain")
     for _ in 0 ..< nChunks: discard res.write(chunkText)
@@ -34,7 +39,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   else:
     res.send(Http404)
 
-var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, compress = true)).start(0)
+var srv = newVortex(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2, compress = true)).start(0)
 let base = "http://127.0.0.1:" & $srv.port
 let tmp = getTempDir() / "vortex_zstd_" & $getCurrentProcessId()
 createDir(tmp)
@@ -92,6 +97,12 @@ suite "zstd response compression":
   test "negotiation: q-value can pick zstd over br":
     let (hdrs, _) = fetch("/buf", false, "br;q=0.5, zstd;q=1.0")
     check "content-encoding: zstd" in hdrs
+
+  test "blocking: body, Accept-Encoding: zstd -> 200 zstd, round-trips (#413)":
+    let (hdrs, body) = fetch("/worker", false, "zstd")
+    check hdrs.startsWith("http/1.1 200")
+    check "content-encoding: zstd" in hdrs
+    check body == bufText
 
 srv.close()
 removeDir(tmp)
