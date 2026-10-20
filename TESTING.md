@@ -28,6 +28,12 @@ nimble testzstd        # zstd response compression + negotiation (needs zstd+bro
 nimble testdeflate     # WebSocket permessage-deflate (needs zlib)
 nimble testrace        # cross-thread race regressions (ThreadSanitizer)
 nimble testchronos     # chronos async adapter (needs chronos)
+# the chronos suite again under strict reentrancy (implied by
+# -d:chronosPreviewV5), where chronos keeps no idle sentinel in its queue:
+nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos \
+  -d:chronosStrictReentrancy=true -p:src \
+  --nimcache:nimcache/test_adapter_chronos_strict \
+  -o:tests/test_adapter_chronos_strict tests/test_adapter.nim
 
 # Docker conformance / load (each builds images and exits non-zero on failure):
 nimble h1spec h2spec h3spec h3websocket autobahn redbot \

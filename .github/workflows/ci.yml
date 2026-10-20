@@ -205,6 +205,17 @@ jobs:
           nimble install -y "chronos@>= 4.0.0"
           nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos -p:src \
             -o:tests/test_adapter_chronos tests/test_adapter.nim
+      - name: Test the chronos adapter under strict reentrancy
+        # The same suite with -d:chronosStrictReentrancy (implied by
+        # -d:chronosPreviewV5), where chronos keeps no idle sentinel in its
+        # callback queue and the adapter's pump reads that queue differently
+        # (#412). Its own output and nimcache, so it neither reuses nor clobbers
+        # the build above.
+        run: |
+          nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos \
+            -d:chronosStrictReentrancy=true -p:src \
+            --nimcache:nimcache/test_adapter_chronos_strict \
+            -o:tests/test_adapter_chronos_strict tests/test_adapter.nim
 
   testdeflate:
     runs-on: ubuntu-latest

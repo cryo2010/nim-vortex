@@ -224,7 +224,7 @@ Vortex supports gzip, brotli and zstd compression for requests and responses whe
 
 An eligible response is compressed with the best encoding `Accept-Encoding` offers, 
 adding `Content-Encoding` + `Vary: Accept-Encoding`. Negotiation honors q-values (`gzip;q=0` opts out);
-on a tie the server prefers **br**, then **zstd**, then **gzip**. 
+on a tie the server prefers **br**, then **zstd**, then **gzip**. A `blocking:` body negotiates from its own request, but a kept `Response` answered from a worker or a thread your application owns has no request to read `Accept-Encoding` from, so it negotiates nothing and goes out as identity.
 
 The **inbound** direction is opt-in with `config.decompressRequest`: a request
 whose `Content-Encoding` is `gzip`, `br`, or `zstd` is transparently decoded into `req.body`. 
@@ -505,6 +505,33 @@ proc report(req: Request, res: Response) {.async.} =
 Returning a value is async-only: a pure sync handler can't suspend, so there
 `req.blocking` is terminal (the block sends the response itself).
 
+An async handler does not have to answer before its future completes. It can
+hand `res` to a task it does not await (an `asyncCheck`ed or `asyncSpawn`ed
+producer, a timer) and return; that task's `res.send` answers the request
+whenever it runs, flushes it at once and moves the connection on to the next
+request. A loop-thread `send` that answers a request after the handler
+suspended does this wherever it runs, so the request is over at the `send`,
+not when the handler returns: read what you still need from `req` before
+answering, since its reads come back empty after that, and the handler's
+later calls on `res` are no-ops. This works even when the handler returns
+without ever suspending.
+
+A detached task is not watched by the server, so nothing answers for it if it
+fails: an exception that escapes an `asyncCheck`ed (or `asyncSpawn`ed)
+producer is unhandled, and it takes the loop thread down (`vortex: event-loop
+thread exited on error`). That thread closes its listener as it exits, so it
+takes no new connections (a server with one loop thread refuses them), and the
+keep-alive connections it already holds hang without an answer. Catch
+errors inside the producer and answer them yourself:
+
+```nim
+proc producer(res: Response) {.async.} =
+  try:
+    res.send(Http200, await fetchReport())
+  except CatchableError:
+    res.send(Http500, "report failed")
+```
+
 #### Requests
 
 The `Request` object passed into the handler contains the content and metadata related to each request.
@@ -540,7 +567,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
 | `req.params` | `PathParams` | all router path parameters |
 | `req.param(name)` | `string` | one router path parameter; "" if absent |
-| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned) |
+| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned). The other accessors follow the same rule: off the loop thread and outside the `blocking:` body that owns the request (a kept handle answered later, or a thread your application owns) there is no request snapshot to read, so they return their defaults rather than race the loop: "" for `req.header`/`req.path`/`req.body`, 0 for `req.contentLength`, and `HttpGet` for `req.method`, so the method reads as GET there |
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |

@@ -407,6 +407,13 @@ type
       ## thread exits, to release the adapter's thread-local dispatcher (its
       ## selector fd and any lingering futures). Without it, a loop thread that
       ## used async leaks the dispatcher on exit (each server restart leaks one).
+    pendingHook*: proc (): bool {.nimcall, gcsafe.}
+      ## Registered by an adapter alongside pumpHook: true while a future the
+      ## adapter watches (a handler, a `doAsync` body) is still outstanding and
+      ## not parked on a wakeup only the loop delivers. A graceful shutdown keeps
+      ## pumping until this reads false. Not pumpHook's wake cap: that one also
+      ## honours timers the app owns (a detached heartbeat), which must not hold
+      ## a drained loop for the full async drain deadline.
     kick*: proc (loopPtr: pointer, fd: int32, gen: uint32,
                  stream: uint32, serial: uint32) {.nimcall, gcsafe.}
       ## Flush/resume after a deferred same-thread respond (async
@@ -417,6 +424,13 @@ type
                       gen: uint32) {.nimcall, gcsafe.}
       ## Flush a connection's write buffer now. Used by a loop-thread
       ## WebSocket send outside the read path. Set by the event loop.
+    flushNowHook*: proc (loopPtr: pointer, fd: int32,
+                         gen: uint32) {.nimcall, gcsafe.}
+      ## Flush an h1/h2 connection's write buffer now, past any flush hold
+      ## (the async pump's included). For a caller about to wait on the drain
+      ## (`res.drained()`): the bytes must meet the socket for the wait to mean
+      ## anything, and a held flush would cost it a loop iteration per call.
+      ## A no-op for an h3 handle (fd < 0). Set by the event loop.
     resumeBodyHook*: proc (loopPtr: pointer, fd: int32, gen: uint32,
                            n: int) {.nimcall, gcsafe.}
       ## HTTP/1 flow-control credit (req.ackBody) for a manualAck streaming

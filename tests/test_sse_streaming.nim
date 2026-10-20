@@ -81,6 +81,16 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
     discard s.send("off " & $probeAlive & " " & $probeBuffered)
     discard s.send("on " & $s.alive)
     s.close()
+  of "/blocking-alive":
+    # #413: a `blocking:` body's own handle carries the worker task's request
+    # snapshot, for which `isAlive` reports the pinned connection as live. The
+    # SSE `alive` is loop-thread only, so it must still read false here, or a
+    # producer polling it on a worker never sees the client leave.
+    req.blocking:
+      let s = res.sse()
+      var n = 0
+      while s.alive and n < 50: inc n
+      res.send(Http200, "alive-polls=" & $n)
   of "/empty":
     # #266: a payload-free typed event must still dispatch on the client.
     let s = res.sse()
@@ -109,7 +119,7 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
 
 # streamPaths (router-free) opts /upload into inbound streaming; /events is a
 # plain buffered handler that happens to stream its *response*.
-withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
+withServer(RequestHandler(handler), initVortexConfig(numThreads = 1, workerThreads = 2),
            streamPaths("/upload"), srv):
   let port = srv.port
 
@@ -203,6 +213,12 @@ withServer(RequestHandler(handler), initVortexConfig(numThreads = 1),
       check dechunk(body) ==
         "data: off false 0\n\n" &
         "data: on true\n\n"
+
+    test "alive is false inside a blocking: body (#413)":
+      let (head, body) = splitHeadBody(rawGet("/blocking-alive"))
+      checkpoint head
+      check "HTTP/1.1 200" in head
+      check body.endsWith("alive-polls=0")
 
     test "send from another thread asserts instead of returning false":
       # False is the producer's "pause and wait for onDrain", so an off-thread

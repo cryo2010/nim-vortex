@@ -116,13 +116,6 @@ proc response*(req: Request): Response =
   Response(core: req.core, fd: req.fd, gen: req.gen, stream: req.stream,
            serial: req.serial)
 
-proc request(res: Response): Request {.inline.} =
-  ## The Request half of a Response handle, same words (serial included), for
-  ## the read-side helpers the response paths call (encoding negotiation, file
-  ## serving, SSE liveness).
-  Request(core: res.core, fd: res.fd, gen: res.gen, stream: res.stream,
-          serial: res.serial)
-
 proc requestFor*(core: ptr LoopCore, fd: int32, gen: uint32,
                  stream: uint32): Request =
   ## A Request for the request currently in flight on (fd, gen, stream), for
@@ -258,8 +251,22 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
   ## caller-supplied identifiers (like withConn's `c`): onH2/onH1 see the resolved
   ## non-nil Connection `c`, onH3 the resolved non-nil H3Conn `h3c`, onSnap uses
   ## req.snap. The h3 branch is compiled out under -d:plainHttp.
+  ##
+  ## Off the loop thread with no snapshot (a kept handle answered from a worker
+  ## task it does not belong to, or any handle on a thread the application
+  ## owns) it fails closed: no branch runs, so the accessor returns its
+  ## empty/default value (#413): "" for `header`/`path`/`body`/
+  ## `remoteAddress`, 0 for `contentLength`, and `HttpGet` for `method`, which
+  ## reads as a plausible GET there rather than an obviously empty value. The h2/h1 branches resolve through
+  ## `liveConn`/`conn()`, whose loop-thread assertion (#343) would otherwise
+  ## fire there, and under -d:danger, where the assertion is compiled out, read
+  ## the loop's connection table unsynchronised; the h3 branch has no assertion
+  ## at all. On the loop thread nothing changes: the same branches run and
+  ## `conn()` keeps its assertion as the backstop for every other caller.
   if req.snap != nil:
     onSnap
+  elif currentThreadId() != req.core.threadId:
+    discard
   elif req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -1167,9 +1174,105 @@ proc isWorkerTaskHandle(res: Response): bool {.inline.} =
   workerTaskSet and
     workerTaskKey == reqKey(res.fd, res.gen, res.stream, res.serial)
 
+proc request(res: Response): Request =
+  ## The Request half of a Response handle, same words (serial included), for
+  ## the read-side helpers the response paths call (encoding negotiation, file
+  ## serving, SSE liveness).
+  ##
+  ## Off the loop thread it carries the running worker task's request snapshot
+  ## when `res` is that task's OWN handle (#413), so a buffered `send` from a
+  ## `blocking:` body (or the worker half of static-file serving) negotiates
+  ## compression from the request's real Accept-Encoding. The snapshot lives in
+  ## the WorkerTask and is valid only while that task runs, so it is attached
+  ## only to the handle the task was dispatched for: a kept handle a worker
+  ## body answers, or any handle on a thread the application owns, gets no
+  ## snapshot and its read-side helpers return their empty/default values (see
+  ## withCarrier). Invariant: nothing reachable from a worker or app-owned
+  ## thread through this Request touches `liveConn`/`conn()`, which are
+  ## loop-thread only.
+  result = Request(core: res.core, fd: res.fd, gen: res.gen,
+                   stream: res.stream, serial: res.serial)
+  if currentThreadId() != res.core.threadId and res.isWorkerTaskHandle and
+      workerSnapshot != nil and workerSnapshot.present:
+    result.snap = workerSnapshot
+
 proc markWorkerAnswered(res: Response) {.inline.} =
   ## Record an outbox answer for `res`; only the task's own handle latches.
   if res.isWorkerTaskHandle: workerTaskAnswered = true
+
+proc flushConn(res: Response) {.raises: [].} =
+  ## Call the loop's flush hook: write an h1/h2 connection's buffered output
+  ## (held to the end of an outbox batch, a read batch or the async pump, so a
+  ## pass costs one send() per connection), or flag the loop to drive QUIC
+  ## egress for an h3 handle before it sleeps. Backs the streaming API
+  ## (sendHead, write, finish, abort) and a loop-thread buffered send on h2 and
+  ## h3 (applyOnLoop), so output made outside the dispatch call (an async
+  ## continuation, a detached task, a timer) does not wait for an unrelated
+  ## event. Contains the hook's untyped effect so these stay callable from a
+  ## strict-effect async body (chronos infers the hook as raising Exception,
+  ## which `{.async.}` forbids).
+  try: res.core.hooks.flushHook(res.core.loopPtr, res.fd, res.gen)
+  except Exception: discard
+
+proc kickConn(res: Response) {.raises: [].} =
+  try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0, res.serial)
+  except Exception: discard
+
+proc applyOnLoop(res: Response, code: int, contentType: string,
+                 headers: openArray[(string, string)], body: openArray[char]) =
+  ## Apply a buffered response on the loop thread and put it on its way: the
+  ## shared tail of sendRaw's loop-thread path and of any other loop-thread
+  ## answer made outside the outbox (emitPoolSaturated's 503). The worker outbox
+  ## and an h2 read batch's 500 apply through applyResponse directly, each with
+  ## its own resume or flush.
+  if res.fd < 0:
+    h3Apply(res.core, res.fd, res.gen, res.stream, code, contentType,
+            headers, body)
+    # The response sits in the QUIC stream's send buffer. A send from the
+    # dispatch is driven out by the h3Drive it runs under, but one from the
+    # async pump, a timer or a detached task runs after this iteration's
+    # h3Drive, and the adapter's kick is a no-op for h3, so it waited for the
+    # next datagram or the selector's idle wait (up to 1 s, #412). The flush
+    # hook only flags the loop to drive egress again before it sleeps, which
+    # is safe inside an nghttp3 callback and free when nothing is pending.
+    flushConn(res)
+    return
+  let c = liveConn(res)
+  if c == nil: return
+  # Whether this call is what answers a deferred HTTP/1.1 request: the dispatch
+  # returned without a response (awaitingResponse) and none has landed since.
+  let answersDeferred = res.stream == 0 and c.awaitingResponse and
+                        not c.rs.responded
+  applyResponse(res.core, c, res.stream, code, contentType,
+                headers, body)
+  if res.stream != 0:
+    # h2: the frames are in the connection's write buffer, and a send from a
+    # task detached from the handler lands after the adapter's completion kick
+    # has already run, so nothing else would write them until the next socket
+    # event (#412). Inside an h2 read batch the flush hold defers this to the
+    # batch's single send (#334), so an inline response costs nothing extra;
+    # inside the async pump the loop holds it to the pump's end the same way,
+    # so N streams answered in one pass share one send().
+    flushConn(res)
+  elif answersDeferred:
+    # A buffered send that answers a deferred HTTP/1.1 request resumes the
+    # connection now (#412), as finish() does for a streamed body and the
+    # no-length HEAD path in sendHead does (#410). The adapter's completion
+    # kick only acts once a response exists, so a send from a task the handler
+    # detached (an asyncCheck'ed producer, a timer, an upstream callback) that
+    # lands after the handler's future completed used to only fill the write
+    # buffer: the response left when the client's next request arrived, and
+    # that request was never answered. The kick runs resumeAfterRespond, which
+    # flushes, then closes on closeAfterFlush or resets for the next request
+    # and serves a pipelined one. A send made before the handler's future
+    # completes is answered the same way, at send time rather than at
+    # completion, so the handler's later calls hold a stale serial and are
+    # no-ops (#407), its own completion kick included. An inline send leaves
+    # awaitingResponse false, and the dispatch return resets or closes as
+    # before; a duplicate send finds `responded` already set and kicks
+    # nothing. The worker outbox applies responses through applyResponse
+    # directly, with its own resume, so it never reaches this.
+    kickConn(res)
 
 proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
              contentType: string, headers: openArray[(string, string)]) =
@@ -1194,14 +1297,7 @@ proc sendRaw(res: Response, code: HttpCode, body: openArray[char],
       release: res.relKind))
     res.markWorkerAnswered()
     return
-  if res.fd < 0:
-    h3Apply(res.core, res.fd, res.gen, res.stream, int(code), contentType,
-            headers, body)
-    return
-  let c = liveConn(res)
-  if c != nil:
-    applyResponse(res.core, c, res.stream, int(code), contentType,
-                  headers, body)
+  applyOnLoop(res, int(code), contentType, headers, body)
 
 when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
   const compressMinSize = 1400   # not worth compressing below ~one MTU
@@ -1228,6 +1324,10 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     ## acceptsCharset), with the offer list limited to encoders this build can
     ## produce. No Accept-Encoding header -> identity (unlike accepts(), which
     ## falls back to the first offer, an encoding is only added on explicit ask).
+    ## Off the loop thread `req` is `res.request`: the worker task's snapshot
+    ## for its own handle, otherwise no snapshot, where `header` fails closed
+    ## to "" and the body goes out as identity rather than reading the loop's
+    ## connection table (#413).
     let ae = req.header("accept-encoding")
     if ae.strip.len == 0: return ""
     var offered: seq[string]                       # server-preference order,
@@ -1759,17 +1859,6 @@ proc ackBody*(req: Request, n: int) =
 
 # --- streaming responses ----------------------------------------------------
 
-proc flushConn(res: Response) {.raises: [].} =
-  ## Call the loop's flush hook, containing its untyped effect so the streaming
-  ## API stays callable from a strict-effect async body (chronos infers the
-  ## hook as raising Exception, which `{.async.}` forbids).
-  try: res.core.hooks.flushHook(res.core.loopPtr, res.fd, res.gen)
-  except Exception: discard
-
-proc kickConn(res: Response) {.raises: [].} =
-  try: res.core.hooks.kick(res.core.loopPtr, res.fd, res.gen, 0, res.serial)
-  except Exception: discard
-
 proc ended*(res: Response): bool {.raises: [].} =
   ## True once this response can carry no more body: `finish` or `abort` ran
   ## (including the internal abort of a body that missed its declared
@@ -1946,6 +2035,13 @@ proc sendHead*(res: Response, code: HttpCode, contentType = "",
           when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
             if enc.len > 0:
               h3SetRespComp(h3c, uint64(res.stream), makeStreamComp(enc), enc)
+          # The head sits in the QUIC send buffer. From the async pump (any
+          # handler streaming after an await, a detached task) this runs after
+          # the iteration's h3Drive, so without the flag the loop slept its
+          # idle wait (about 1 s) before driving egress. The hook only sets
+          # the flag, so it is safe inside an nghttp3 callback, as in
+          # applyOnLoop; write, finish and abort below do the same.
+          flushConn(res)
       return
     let c = liveConn(res)
     if c == nil: return
@@ -2083,8 +2179,12 @@ proc write*(res: Response, data: openArray[char]): bool {.discardable,
             if comp != nil:
               let z = compChunk(comp, data, false)
               if z.len == 0: return true      # buffered; still writable
-              return h3StreamWrite(h3c, uint64(res.stream), z) < respHighWater
-          return h3StreamWrite(h3c, uint64(res.stream), data) < respHighWater
+              let left = h3StreamWrite(h3c, uint64(res.stream), z)
+              flushConn(res)                  # drive egress before sleeping
+              return left < respHighWater
+          let left = h3StreamWrite(h3c, uint64(res.stream), data)
+          flushConn(res)                      # as in sendHead
+          return left < respHighWater
       return false
     var c = liveConn(res)
     if c == nil: return false
@@ -2173,6 +2273,7 @@ proc finish*(res: Response) {.raises: [].} =
               h3SetRespComp(h3c, uint64(res.stream), nil, "")
           h3StreamFinish(h3c, uint64(res.stream), trailers)
           if ended(res): dropEndedFields(res)
+          flushConn(res)                      # as in sendHead
       return
     let c = liveConn(res)
     if c == nil: return
@@ -2433,6 +2534,7 @@ proc abort*(res: Response) {.raises: [].} =
         if h3c != nil:
           h3StreamAbort(h3c, uint64(res.stream))   # fires a parked drain
           if ended(res): dropEndedFields(res)
+          flushConn(res)                      # the reset, as in sendHead
       return
     let c = liveConn(res)
     if c == nil: return
@@ -2666,7 +2768,11 @@ proc onDrain*(s: SseStream, cb: proc(s: SseStream) {.gcsafe.}) =
 proc alive*(s: SseStream): bool =
   ## False once the client disconnects; the producer loop should stop. Use this
   ## rather than `send` returning false, which is ambiguous (backpressure *or*
-  ## a dead connection). Loop-thread only: false from any other thread.
+  ## a dead connection). Loop-thread only: false from any other thread,
+  ## including a `blocking:` body, where `request(res)` carries the worker
+  ## task's snapshot and `isAlive` would report the pinned connection as live
+  ## even after the client went away (#413).
+  if currentThreadId() != s.res.core.threadId: return false
   s.res.request.isAlive
 
 proc close*(s: SseStream) {.raises: [].} = s.res.finish()
@@ -2782,14 +2888,11 @@ proc emitPoolSaturated(req: Request) =
   ## saturated pool refused, without pinning or running any body.
   const body = "503 Service Unavailable"
   const hdrs = [("Retry-After", "1")]
-  if req.fd < 0:
-    when not defined(plainHttp):
-      h3Apply(req.core, req.fd, req.gen, req.stream, 503, "text/plain", hdrs,
-              body)
-  else:
-    let c = liveConn(req)
-    if c != nil:
-      applyResponse(req.core, c, req.stream, 503, "text/plain", hdrs, body)
+  # Through applyOnLoop, as a buffered send would: a `sendFile` from a task the
+  # handler detached reaches this after the handler's completion kick, and a
+  # bare applyResponse only filled the write buffer, so the 503 left with the
+  # client's next request, which was never answered (#412).
+  applyOnLoop(response(req), 503, "text/plain", hdrs, body)
 
 proc undoPin(req: Request, k: PinKind) =
   ## Release a pin taken on this loop thread for a dispatch the pool then refused

@@ -50,7 +50,8 @@
 
 import pkg/chronos
 import pkg/chronos/selectors2 as chronosSelectors   # close(Selector) for teardown
-import std/[httpcore, tables, deques, macros]
+import pkg/chronos/config as chronosConfig          # chronosStrictReentrancy
+import std/[httpcore, tables, deques, macros, heapqueue]
 import ../connection
 import ../request
 import ../routing
@@ -70,9 +71,57 @@ var parkedOps {.threadvar.}: int
 
 proc noop(arg: pointer) {.gcsafe, raises: [].} = discard
 
+# How many entries an idle chronos dispatcher keeps in its callback queue
+# between polls: the one sentinel poll() re-queues, unless strict reentrancy is
+# on (`-d:chronosStrictReentrancy`, implied by `-d:chronosPreviewV5`), where
+# poll() never adds it. Reading the queue against a hardcoded 1 under strict
+# reentrancy took a single queued continuation for an idle queue, so a detached
+# task's resumed continuation was never polled. chronos releases from before the
+# flag existed always keep the sentinel.
+const idleCallbacks =
+  when declared(chronosConfig.chronosStrictReentrancy):
+    (if chronosConfig.chronosStrictReentrancy: 0 else: 1)
+  else: 1
+
+proc unwatchedReady(): bool =
+  ## chronos holds work that is runnable now: a queued callback (beyond the
+  ## sentinel an idle dispatcher may keep in its queue between polls, see
+  ## idleCallbacks) or a timer that has expired.
+  let d = getThreadDispatcher()
+  d.callbacks.len > idleCallbacks or
+    (d.timers.len > 0 and d.timers[0].finishAt <= Moment.now())
+
+proc pumpIdle(): int =
+  ## The pump's exit once no watched future needs it: drive the work chronos
+  ## holds on its own, then cap the loop's wait at its next timer (-1, the
+  ## loop's full wait, with none).
+  ##
+  ## pendingOps counts only the futures the adapter watches (a handler, a
+  ## `doAsync` body), so a task the handler detached with `asyncSpawn` (a
+  ## producer that sleeps, then answers with `res.send`) is invisible to it:
+  ## once the handler's future completed the pump stopped polling, and the
+  ## task never ran again until some unrelated request suspended (#412). Every
+  ## chronos sleep and timeout is a timer, so honouring the earliest one drives
+  ## such a task at its own pace without spinning, and an idle server with no
+  ## timers still sleeps the loop's full wait. The bounded spin covers the
+  ## chain a fired timer starts (the timer completes a future, whose
+  ## continuation runs as a callback on the next poll). A detached task parked
+  ## on chronos I/O alone owns no timer and still waits for the loop's next
+  ## pass.
+  var spins = 0
+  while spins < 8 and unwatchedReady():
+    callSoon(noop)               # forces a zero-timeout poll
+    poll()
+    inc spins
+  if unwatchedReady(): return 1  # more ready work: come straight back
+  let d = getThreadDispatcher()
+  if d.timers.len == 0: return -1
+  let left = (d.timers[0].finishAt - Moment.now()).milliseconds
+  int(clamp(left, 1'i64, 1000'i64))
+
 proc pump(): int {.nimcall, gcsafe.} =
   {.gcsafe.}:
-    if pendingOps <= 0: return -1
+    if pendingOps <= 0: return pumpIdle()
     # Bounded spin: completing one future can resume work that
     # immediately suspends again (chained awaits); each such link needs
     # another poll pass. chronos derives its backend-poll timeout from
@@ -84,7 +133,7 @@ proc pump(): int {.nimcall, gcsafe.} =
       callSoon(noop)
       poll()
       inc spins
-      if pendingOps <= 0: return -1
+      if pendingOps <= 0: return pumpIdle()
       # Every future still outstanding is parked on a wakeup that only this
       # loop can deliver, so chronos has nothing of its own left to drive:
       # stop spinning and let the loop block on its selector until that wakeup
@@ -105,7 +154,7 @@ proc pump(): int {.nimcall, gcsafe.} =
       # long as any such connection is open and whether or not it carries
       # traffic, so it scales with the countProcessors() loop threads a default
       # server starts -- and the 5 ms cap kept every one of them from sleeping.
-      if parkedOps >= pendingOps: return -1
+      if parkedOps >= pendingOps: return pumpIdle()
     5
 
 proc teardown() {.nimcall, gcsafe.} =
