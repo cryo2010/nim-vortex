@@ -22,8 +22,24 @@
 ## its answer, that Z's pin counter is back to zero (the `totalPins` hook, read
 ## on the loop thread by `/pins`), and that every connection still serves a
 ## follow-up request.
+##
+## The last suites (#420) read a kept handle's request and response accessors
+## from a worker task it does not belong to and from the app-owned thread.
+## Neither has a snapshot of that request, and the accessors outside
+## `withCarrier` (clientCertSubject, isSecure, url, query, json, params,
+## param, res.responded, res.headers, res.trailers, setParams, onBody, ...)
+## reached the loop-owned connection table there: its loop-thread assertion
+## (#343) fired (a 500 from the worker, the process ended on the app thread),
+## and under -d:danger they read it unsynchronised. Each now returns its
+## empty/default value. A `blocking:` body over an HTTP/2 Extended CONNECT
+## also reads the `:protocol` pseudo-header from its snapshot now, instead of
+## the live stream. The last suite checks a `blocking:` body's OWN handle:
+## `res.responded` reads the task's latch (false, then true after its send),
+## and a write through its own `res.headers` / `res.trailers` asserts with
+## assertions on (the default, -d:release included: a 500) and is dropped
+## silently with assertions off (-d:danger or --assertions:off).
 
-import std/[unittest, net, posix, strutils, httpcore, atomics]
+import std/[unittest, net, posix, strutils, httpcore, atomics, json, tables]
 from std/os import sleep
 import vortex/[settings, request, server]
 import vortex/http2/frames
@@ -61,6 +77,51 @@ proc answerOwnThenKept(res: Response, variant: int) {.gcsafe.} =
   elif variant == 2:
     raise newException(ValueError, "after both answers")
 
+var keptReqs: array[2, Request]  # #420: kept handles by HTTP version (1, 2)
+var keptResps: array[2, Response]
+var keptReqReady: array[2, Atomic[bool]]
+var probeSlot: Atomic[int]       # the slot the app thread probes (-1: none)
+var appProbeRes: Response        # the handle the app thread answers with
+var ownAfter: Atomic[int]        # res.responded after a body's own send (1/0)
+
+proc probeAccessors(q: Request, r: Response): string {.gcsafe.} =
+  ## Read every accessor that resolved live loop state outside withCarrier,
+  ## from a thread holding no snapshot of `q`'s request (#420). Each one is
+  ## reported on its own, so a build without the guard names every accessor
+  ## that tripped the loop-thread assertion (#343) instead of stopping at the
+  ## first.
+  template field(name: string, expr: untyped) =
+    try:
+      result.add name & "=" & $(expr) & ";"
+    except Exception:
+      result.add name & "=TRIP;"
+  field("cert", q.clientCertSubject)
+  field("secure", q.isSecure)
+  field("scheme", q.scheme)
+  field("fwdProto", q.forwardedProto)
+  field("fwdHost", q.forwardedHost)
+  field("clientIp", q.clientIp)
+  field("url", q.url.path & "?" & q.url.query)
+  field("query", q.query.len)
+  field("json", $q.json)
+  field("params", q.params.len)
+  field("param", q.param("id"))
+  field("setParams", (q.setParams(@[("id", "overwritten")]); "ok"))
+  field("onBody", (q.onBody(proc(c: openArray[char], last: bool) {.gcsafe.} =
+    discard); "ok"))
+  # isWebSocketUpgrade / isWebSocketIntent / acceptWebSocket are not probed
+  # here: off the loop with no snapshot `method` reads HttpGet, which
+  # short-circuits them before any `:protocol` read, so they would pass with
+  # the guard reverted. Their snapshot path is the /ws-blocking case below.
+  field("responded", r.responded)
+  # A write goes to a discarding sink: the next hand-out is empty again.
+  field("headers", (r.headers["X-Off-Loop"] = "leaked"; r.headers.len))
+  field("trailers", (r.trailers["X-Off-Loop"] = "leaked"; r.trailers.len))
+
+const probeExpected = "cert=;secure=false;scheme=http;fwdProto=;fwdHost=;" &
+  "clientIp=;url=?;query=0;json={};params=0;param=;setParams=ok;onBody=ok;" &
+  "responded=true;headers=0;trailers=0;"
+
 proc noteX(req: Request) =
   xFd.store(req.fd); xGen.store(req.gen)
 
@@ -69,6 +130,17 @@ proc pinsOf(res: Response, fd: int32, gen: uint32): string =
   if c == nil: "gone" else: $c.totalPins
 
 proc handler(req: Request, res: Response) {.gcsafe.} =
+  if req.path.startsWith("/keep-req"):
+    # #420: keep both halves, unanswered. On the loop thread the accessors
+    # see the real request, so the off-loop defaults below are not the
+    # request's own values.
+    req.setParams(@[("id", "7")])
+    let slot = req.httpVersion - 1
+    {.cast(gcsafe).}:
+      keptReqs[slot] = req
+      keptResps[slot] = res
+    keptReqReady[slot].store(true)
+    return
   case req.path
   of "/keep":
     {.cast(gcsafe).}:
@@ -97,6 +169,72 @@ proc handler(req: Request, res: Response) {.gcsafe.} =
   of "/again":
     req.blocking:
       res.send(Http200, "again")
+  of "/loop-view-1", "/loop-view-2":
+    # The kept request read on the loop thread: its live values.
+    let slot = (if req.path.endsWith("1"): 0 else: 1)
+    {.cast(gcsafe).}:
+      let q = keptReqs[slot]
+    res.send(Http200, q.url.path & "?" & q.url.query & ";" &
+                      $q.query.len & ";" & $q.json & ";" & q.param("id"))
+  of "/probe-kept-1", "/probe-kept-2":
+    # A worker task reading a kept handle that is not its own.
+    if req.path.endsWith("1"):
+      req.blocking:
+        {.cast(gcsafe).}:
+          let q = keptReqs[0]
+          let r = keptResps[0]
+        res.send(Http200, probeAccessors(q, r))
+    else:
+      req.blocking:
+        {.cast(gcsafe).}:
+          let q = keptReqs[1]
+          let r = keptResps[1]
+        res.send(Http200, probeAccessors(q, r))
+  of "/probe-app-1", "/probe-app-2":
+    # The app-owned thread reads the kept handle and answers this one.
+    {.cast(gcsafe).}:
+      appProbeRes = res
+    probeSlot.store(if req.path.endsWith("1"): 0 else: 1)
+  of "/release-1", "/release-2":
+    # Answer the kept handle on the loop: none of the off-loop writes (headers,
+    # trailers, params) reached it.
+    let slot = (if req.path.endsWith("1"): 0 else: 1)
+    {.cast(gcsafe).}:
+      let q = keptReqs[slot]
+      let r = keptResps[slot]
+    r.send(Http200, "kept-done param=" & q.param("id"))
+    res.send(Http200, "released")
+  of "/ws-blocking":
+    # An Extended CONNECT read from its own `blocking:` body: the snapshot
+    # answers it; the live h2 stream is loop-only.
+    req.blocking:
+      let up = req.isWebSocketUpgrade
+      let intent = req.isWebSocketIntent
+      let ws = req.acceptWebSocket()
+      res.send(Http200, $up & "," & $intent & "," & $ws.isAlive)
+  of "/own-responded":
+    # A `blocking:` body asking whether it has answered its OWN request yet:
+    # off the loop that reads the task's first-send latch (#420 review), so
+    # it is false before the send and true after, on every build. A blanket
+    # `true` there turned this guarded send into the fallback 500.
+    ownAfter.store(-1)
+    req.blocking:
+      if not res.responded: res.send(Http200, "answered")
+      ownAfter.store(if res.responded: 1 else: 0)
+  of "/own-after":
+    res.send(Http200, $ownAfter.load)
+  of "/own-headers":
+    # res.headers from a `blocking:` body's own handle: with assertions on
+    # (the default, -d:release included) it asserts and the Defect answers
+    # 500; with assertions off (-d:danger, --assertions:off) the write is
+    # discarded.
+    req.blocking:
+      res.headers["X-Own"] = "set-in-blocking"
+      res.send(Http200, "sent")
+  of "/own-trailers":
+    req.blocking:
+      res.trailers["X-Own"] = "set-in-blocking"
+      res.send(Http200, "sent")
   of "/pins":
     res.send(Http200, pinsOf(res, zFd.load, zGen.load) & "," &
                       pinsOf(res, xFd.load, xGen.load))
@@ -115,6 +253,15 @@ proc appMain() {.thread.} =
   ## twice (the loop must drop the second response).
   var done = 0
   while not stopApp.load:
+    let slot = probeSlot.load
+    if slot >= 0:
+      probeSlot.store(-1)
+      {.cast(gcsafe).}:
+        let q = keptReqs[slot]
+        let r = keptResps[slot]
+        let a = appProbeRes
+      a.send(Http200, probeAccessors(q, r))
+      continue
     let t = target.load
     if t > done and stashed.load >= t:
       for i in done ..< t:
@@ -237,6 +384,7 @@ template ownThenKept(port: Port, useH2: bool, path: string) =
   a.get("/ping")
   check a.readAll(3000, 100).endsWith("pong")
 
+probeSlot.store(-1)
 createThread(appThread, appMain)
 
 withServer(RequestHandler(handler),
@@ -314,6 +462,141 @@ withServer(RequestHandler(handler),
         ownThenKept(port, useH2, "/work-own-kept-own")
       test proto & ": own, kept, then raises":
         ownThenKept(port, useH2, "/work-own-kept-raise")
+
+  suite "request accessors off the loop with no snapshot (#420)":
+    test "HTTP/1.1: a kept handle read from a foreign worker task and the app thread":
+      keptReqReady[0].store(false)
+      let k = connectTimeout(port)
+      defer: k.close()
+      const body = "{\"k\":1}"
+      k.send("POST /keep-req/h1?a=1&b=2 HTTP/1.1\r\nHost: offloop.test\r\n" &
+             "Content-Type: application/json\r\nContent-Length: " &
+             $body.len & "\r\n\r\n" & body)
+      for i in 0 ..< 200:
+        if keptReqReady[0].load: break
+        sleep(10)
+      check keptReqReady[0].load
+      let o = connectTimeout(port)
+      defer: o.close()
+      o.get("/loop-view-1")
+      let lv = o.readAll(3000, 100)
+      checkpoint "loop view: " & lv.escape
+      check lv.endsWith("/keep-req/h1?a=1&b=2;2;{\"k\":1};7")
+      o.get("/probe-kept-1")
+      let wr = o.readAll(3000, 100)
+      checkpoint "worker probe: " & wr.escape
+      check wr.startsWith("HTTP/1.1 200")
+      check wr.endsWith(probeExpected)
+      o.get("/probe-app-1")
+      let ar = o.readAll(3000, 100)
+      checkpoint "app-thread probe: " & ar.escape
+      check ar.startsWith("HTTP/1.1 200")
+      check ar.endsWith(probeExpected)
+      o.get("/release-1")
+      check o.readAll(3000, 100).endsWith("released")
+      let kr = k.readAll(3000, 100)
+      checkpoint "kept: " & kr.escape
+      check kr.startsWith("HTTP/1.1 200")
+      check kr.endsWith("kept-done param=7")
+      check "x-off-loop" notin kr.toLowerAscii
+      k.get("/ping")
+      check k.readAll(3000, 100).endsWith("pong")
+
+    test "HTTP/2: a kept stream read from a foreign worker task and the app thread":
+      keptReqReady[1].store(false)
+      var k = newH2TestConn(port)
+      defer: k.close()
+      var buf = ""
+      buf.addRequest(1, [(":method", "GET"), (":scheme", "http"),
+                         (":path", "/keep-req/h2?a=1&b=2"),
+                         (":authority", "localhost")])
+      k.sendAll(buf)
+      for i in 0 ..< 200:
+        if keptReqReady[1].load: break
+        sleep(10)
+      check keptReqReady[1].load
+      let o = connectTimeout(port)
+      defer: o.close()
+      o.get("/loop-view-2")
+      let lv = o.readAll(3000, 100)
+      checkpoint "loop view: " & lv.escape
+      check lv.endsWith("/keep-req/h2?a=1&b=2;2;{};7")
+      o.get("/probe-kept-2")
+      let wr = o.readAll(3000, 100)
+      checkpoint "worker probe: " & wr.escape
+      check wr.startsWith("HTTP/1.1 200")
+      check wr.endsWith(probeExpected)
+      o.get("/probe-app-2")
+      let ar = o.readAll(3000, 100)
+      checkpoint "app-thread probe: " & ar.escape
+      check ar.startsWith("HTTP/1.1 200")
+      check ar.endsWith(probeExpected)
+      o.get("/release-2")
+      check o.readAll(3000, 100).endsWith("released")
+      let fr = k.readFrames(3000, until = proc(fs: seq[Frame]): bool =
+        fs.bodyOf(1) == "kept-done param=7")
+      check fr.headersOn(1) == 1
+      check fr.bodyOf(1) == "kept-done param=7"
+      for f in fr:
+        if f.typ == uint8(ftHeaders) and f.streamId == 1:
+          for (n, v) in decodeHeaders(f.payload):
+            check n != "x-off-loop"
+      check fr.goawayError() == -1
+
+    test "HTTP/2: a blocking: body reads its Extended CONNECT from the snapshot":
+      var c = newH2TestConn(port)
+      defer: c.close()
+      let status = c.extendedConnect(1, "/ws-blocking")
+      check status == "200"
+      let data = c.streamData(1, proc(acc: string): bool = acc.len >= 15)
+      checkpoint "body: " & data.escape
+      # Upgrade and intent read true from the snapshot; nothing is accepted
+      # off the loop thread.
+      check data == "true,true,false"
+
+  suite "a blocking: body's own handle off the loop (#420 review)":
+    test "res.responded reads the task's own latch: false, then true":
+      let o = connectTimeout(port)
+      defer: o.close()
+      o.get("/own-responded")
+      let r = o.readAll(3000, 100)
+      checkpoint "own: " & r.escape
+      check r.startsWith("HTTP/1.1 200")
+      check r.endsWith("answered")
+      # The worker stores ownAfter after its send is pushed, so the client
+      # can read the response first; poll (bounded, about 2 s) past -1.
+      var after = ""
+      for _ in 0 ..< 14:           # ~150 ms a round (100 ms quiet + 50)
+        o.get("/own-after")
+        after = o.readAll(3000, 100)
+        if not after.endsWith("\r\n\r\n-1"): break
+        sleep(50)
+      checkpoint "after: " & after.escape
+      check after.endsWith("\r\n\r\n1")
+
+    for path in ["/own-headers", "/own-trailers"]:
+      test "a write through " & path[5 .. ^1] & " from its own blocking: body":
+        let o = connectTimeout(port)
+        defer: o.close()
+        o.get(path)
+        let r = o.readAll(3000, 100)
+        checkpoint "got: " & r.escape
+        when compileOption("assertions"):
+          # With assertions on (the default, -d:release included) the
+          # developer signal: the assertion fails the body. This is the only
+          # branch with teeth for trailers.
+          check r.startsWith("HTTP/1.1 500")
+        else:
+          # Assertions off (-d:danger, --assertions:off): the sink drops the
+          # write silently, the send goes out.
+          check r.startsWith("HTTP/1.1 200")
+          check r.endsWith("sent")
+          # A buffered send never emits trailers, so only the header case can
+          # tell the sink from the live table here.
+          if path == "/own-headers":
+            check "x-own" notin r.toLowerAscii
+        o.get("/ping")
+        check o.readAll(3000, 100).endsWith("pong")
 
   stopApp.store(true)
   joinThread(appThread)

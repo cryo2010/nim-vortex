@@ -237,6 +237,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reading a kept `Request` or `Response` from a thread that holds no snapshot
+  of its request (a worker task it does not belong to, or a thread the
+  application owns) no longer reaches the loop's connection table through
+  `req.clientCertSubject`, `req.isSecure`, `req.scheme`, `req.url`,
+  `req.query`, `req.json`, `req.params`, `req.param` or `res.responded`.
+  #413 made the `header`, `path`, `body` and other carrier accessors fail
+  closed there, but these still took the live path: with assertions on (the
+  default, `-d:release` included) they tripped its loop-thread assertion
+  (#343), so a worker task answered `500` and an app-owned thread ended the
+  process, and with assertions off (`-d:danger` or `--assertions:off`, where
+  the assertion is compiled out) they read loop-owned tables unsynchronised.
+  Each now returns its documented default there, the same rule `req.isAlive`
+  states: "" for the string readers, false for `isSecure`, an empty `url`,
+  `query` and `params`, `{}` for `json`, and true for `responded`, like
+  `res.ended`. A `blocking:` body asking `res.responded` of its own `res`
+  reads whether it has answered yet, so `if not res.responded: res.send(...)`
+  still sends there. The calls that write loop-owned state do nothing on any
+  thread but the loop's, a `blocking:` body included: `req.setParams`,
+  `req.onBody`, `req.acceptWebSocket` and `req.decodeRequestBody` are no-ops,
+  and `res.headers` and `res.trailers` hand back a thread-local scratch table
+  whose writes are discarded (before, they asserted with assertions on, and
+  with assertions off they wrote into the loop's pending-header table from the
+  foreign thread). A `blocking:` body writing its own `res.headers` or
+  `res.trailers` is always a bug (pass headers to `send` there), so that case
+  still asserts with assertions on (the default, `-d:release` included), which
+  fails the body (a `500` in the `blocking:` form, a `BlockingDefectError` at
+  the await in the awaitable one); with assertions off (`-d:danger` or
+  `--assertions:off`) the write is discarded silently. A `blocking:` body
+  over an HTTP/2 or HTTP/3 Extended CONNECT also reads `:protocol` from its
+  request snapshot now, so `req.isWebSocketUpgrade` and `isWebSocketIntent`
+  answer there instead of reading the loop-owned stream (which asserted on
+  HTTP/2 and raced the loop on HTTP/3). (#420)
 - Async adapters: a task waiting only on the adapter's own I/O now resumes as
   soon as that I/O is ready, instead of when the loop next wakes for some other
   reason. A detached task (`asyncSpawn`/`asyncCheck` from a handler that has

@@ -207,11 +207,71 @@ template reqState(req: Request): ptr RequestState =
 template reqState(res: Response): ptr RequestState =
   reqStateOf(res.core, res.fd, res.gen, res.stream, res.serial)
 
+template offLoopNoSnap(req: Request): bool =
+  ## The fail-closed rule of `withCarrier` (#413), for the accessors that read
+  ## live loop state outside it (#420): off the loop thread with no request
+  ## snapshot (a kept handle read from a worker task it does not belong to, or
+  ## any handle on a thread the application owns) there is nothing safe to
+  ## read. `reqState` / `liveConn` / `conn()` would trip the loop-thread
+  ## assertion (#343), or under -d:danger read the loop's tables
+  ## unsynchronised, so the accessor returns its empty/default value instead.
+  req.snap == nil and currentThreadId() != req.core.threadId
+
+var workerTaskKey {.threadvar.}: ReqKey
+var workerTaskSet {.threadvar.}: bool
+var workerTaskAnswered {.threadvar.}: bool
+  ## The off-loop first-send latch, scoped to the worker task's OWN handle
+  ## (#409): the ReqKey of the request the task running on this thread
+  ## answers, whether a task is running at all, and whether that handle has
+  ## been answered yet. A worker trampoline opens it at task start
+  ## (`beginWorkerTask`), reads it at the end to tell whether the `blocking:`
+  ## body produced a response, and closes it (`endWorkerTask`). A body that
+  ## finishes without one (a bug, or a misuse of the loop-thread-only
+  ## streaming API from a worker) must still get a default response emitted,
+  ## otherwise the outbox push that releases the connection's pin never
+  ## happens and it hangs forever; a body that answered must not get a second
+  ## push, which would release that pin twice.
+  ##
+  ## Only the task's own handle is latched. Its Response carries the task's
+  ## pin release (relKind), so it must reach the outbox at most once from the
+  ## task: that is the pin-release invariant. Any OTHER handle (a kept
+  ## Response a worker body answers, or any send from a thread the
+  ## application owns, where no task is running) always pushes: such handles
+  ## carry prNone, so a duplicate never touches a pin, and the loop drops a
+  ## duplicate response (the responded guard, the HTTP/1 request serial, h2/h3
+  ## closed-stream handling). Before #409 this was one thread-wide bool, so an
+  ## app-owned thread (which no trampoline resets) answered only its first
+  ## kept handle and every later send from it was dropped. Latching only the
+  ## task's own handle (rather than whichever handle was answered last) is
+  ## also what keeps a body that answers its own request and then a kept one
+  ## from looking unanswered and getting a second, pin-releasing 500.
+
+proc beginWorkerTask(res: Response) {.inline.} =
+  ## Worker task start: latch `res` (the task's own handle) as unanswered.
+  workerTaskKey = reqKey(res.fd, res.gen, res.stream, res.serial)
+  workerTaskSet = true
+  workerTaskAnswered = false
+
+proc endWorkerTask() {.inline.} =
+  ## Worker task end: later sends from this thread latch nothing.
+  workerTaskSet = false
+
+proc isWorkerTaskHandle(res: Response): bool {.inline.} =
+  ## Whether `res` is the own handle of the worker task running on this thread.
+  workerTaskSet and
+    workerTaskKey == reqKey(res.fd, res.gen, res.stream, res.serial)
+
 proc responded*(res: Response): bool =
   ## True once a response has been sent (or a streamed response started) for this
   ## request, on any protocol. Used by the async `req.stream` sugar to auto-ack
   ## with 200 only when the handler hasn't answered itself. A dead connection
-  ## reads as `true` (nothing left to answer).
+  ## reads as `true` (nothing left to answer). Off the loop thread it reads the
+  ## running worker task's own first-send latch when `res` is that task's
+  ## handle (a `blocking:` body asking whether it has answered yet: exact, and
+  ## thread-local), and is `true` for any other handle there, like `res.ended`
+  ## (#420).
+  if currentThreadId() != res.core.threadId:
+    return (if res.isWorkerTaskHandle: workerTaskAnswered else: true)
   let rs = reqState(res)
   rs == nil or rs.responded
 
@@ -223,15 +283,10 @@ when not defined(plainHttp):
       if st != nil:
         body
 
-  proc h3FieldOf(req: Request, name: string): string =
-    withH3(req, st):
-      for (n, v) in st.headers:
-        if n == name: return v
-
   proc h3FieldIn(h3c: H3Conn, stream: uint32, name: string): string =
     ## A single request field from an already-resolved H3Conn + stream ("" if the
-    ## stream is gone or the field is absent). The by-carrier twin of h3FieldOf,
-    ## for use inside withCarrier's onH3 (which has already resolved h3c).
+    ## stream is gone or the field is absent), for use inside withCarrier's
+    ## onH3 (which has already resolved h3c).
     let st = h3StreamPtr(h3c, uint64(stream))
     if st != nil:
       for (n, v) in st.headers:
@@ -262,7 +317,9 @@ template withCarrier(req: Request; c, h3c, onSnap, onH3, onH2, onH1: untyped) =
   ## fire there, and under -d:danger, where the assertion is compiled out, read
   ## the loop's connection table unsynchronised; the h3 branch has no assertion
   ## at all. On the loop thread nothing changes: the same branches run and
-  ## `conn()` keeps its assertion as the backstop for every other caller.
+  ## `conn()` keeps its assertion as the backstop for every other caller. The
+  ## accessors that read loop state outside this template apply the same rule
+  ## through `offLoopNoSnap` (#420).
   if req.snap != nil:
     onSnap
   elif currentThreadId() != req.core.threadId:
@@ -302,10 +359,21 @@ proc headers*(res: Response): var ResponseHeaders =
   ## `res.headers.add("Set-Cookie", c)`; the `send` call's own `headers`
   ## argument overrides these per name. Buffered `send` only (not `sendHead`
   ## streaming). Loop-thread only: do not touch from inside `req.blocking`
-  ## (pass headers to `send` there instead).
-  assert currentThreadId() == res.core.threadId,
-    "res.headers is loop-thread only; set headers before req.blocking, or " &
-    "pass them to send() from the worker"
+  ## (pass headers to `send` there instead). Off the loop thread it fails
+  ## closed (#420): it hands back a thread-local scratch table, cleared on
+  ## every call, so what is written there is discarded and never reaches the
+  ## response, and the loop's pending-header table is never touched from a
+  ## foreign thread. The one case that is always a bug, a `blocking:` body
+  ## touching its own `res.headers`, asserts with assertions on (the default,
+  ## `-d:release` included), and the Defect fails the body (a 500 in the
+  ## `blocking:` form, a `BlockingDefectError` at the await in the awaitable
+  ## one); with assertions off (`-d:danger` or `--assertions:off`) the write
+  ## is silently discarded there too.
+  if currentThreadId() != res.core.threadId:
+    assert not res.isWorkerTaskHandle,
+      "res.headers is loop-thread only; pass headers to send() from a " &
+      "blocking: body"
+    return staleScratch()             # off the loop: a sink (#420)
   if res.fd >= 0 and res.stream == 0 and liveConn(res) == nil:
     return staleScratch()             # finished h1 request: a sink (#407)
   res.core.respHeaders.mgetOrPut(reqKey(res.fd, res.gen, res.stream, res.serial),
@@ -317,9 +385,14 @@ proc trailers*(res: Response): var ResponseHeaders =
   ## shape as `res.headers`, e.g. `res.trailers["X-Checksum"] = digest` or
   ## `res.trailers.add("Server-Timing", t)`. Set them any time before
   ## `res.finish`, which emits them. Streamed responses only
-  ## (`res.sendHead`/`write`/`finish`); loop-thread only, like `res.headers`.
-  assert currentThreadId() == res.core.threadId,
-    "res.trailers is loop-thread only; set it before res.finish on the loop"
+  ## (`res.sendHead`/`write`/`finish`); loop-thread only, like `res.headers`
+  ## (off the loop thread it is the same discarding sink, #420, and from a
+  ## `blocking:` body's own handle it asserts with assertions on, the default
+  ## and `-d:release` included, and is discarded with them off).
+  if currentThreadId() != res.core.threadId:
+    assert not res.isWorkerTaskHandle,
+      "res.trailers is loop-thread only; set it before res.finish on the loop"
+    return staleScratch()             # off the loop: a sink (#420)
   if res.fd >= 0 and res.stream == 0 and liveConn(res) == nil:
     return staleScratch()             # finished h1 request: a sink (#407)
   res.core.respTrailers.mgetOrPut(reqKey(res.fd, res.gen, res.stream, res.serial),
@@ -545,6 +618,7 @@ proc clientCertSubject*(req: Request): string =
   ## HTTP/1.1, HTTP/2 and HTTP/3 (#351). Always "" over plaintext (or a
   ## -d:plainHttp build).
   if req.snap != nil: return req.snap.clientSubject
+  if req.offLoopNoSnap: return ""     # fail closed off the loop (#420)
   when not defined(plainHttp):
     if req.fd < 0:
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -598,7 +672,10 @@ proc forwardedElems(req: Request): seq[ForwardedElem] =
   ## handler reading several of forwardedProto / forwardedHost / clientIp /
   ## scheme / isSecure parses the header only once. On the worker path there is
   ## no live cache to reuse (the same rule as url/query), so parse directly.
-  if req.snap != nil: return parseForwarded(req.header("forwarded"))
+  ## Off the loop with no snapshot `header` reads "" (#413), so this is empty
+  ## without touching the loop's request state (#420).
+  if req.snap != nil or req.offLoopNoSnap:
+    return parseForwarded(req.header("forwarded"))
   let rs = reqState(req)
   if rs == nil: return parseForwarded(req.header("forwarded"))
   if not rs.fwdCached:
@@ -662,10 +739,12 @@ proc isSecure*(req: Request): bool =
   ## (HTTP/3 is always encrypted). Use it to gate Secure cookies, HSTS, and a
   ## plaintext->HTTPS redirect. Behind a trusted proxy it reflects the forwarded
   ## proto (X-Forwarded-Proto / Forwarded), so termination at the proxy is seen
-  ## as secure.
+  ## as secure. Off the loop thread with no request snapshot it is false
+  ## (#420), like the other accessors.
   let fp = req.forwardedProto
   if fp.len > 0: return fp == "https"
   if req.snap != nil: return req.snap.secure
+  if req.offLoopNoSnap: return false
   if req.fd < 0: return true            # HTTP/3 over QUIC is always TLS
   let c = liveConn(req)
   c != nil and c.ssl != nil
@@ -769,6 +848,7 @@ proc url*(req: Request): Uri =
   ## The request target parsed as a Uri (so `req.url.path` excludes the
   ## query string). Parsed lazily on first access, cached per request.
   if req.snap != nil: return parseUri(req.snap.target)  # no live cache to reuse
+  if req.offLoopNoSnap: return        # fail closed off the loop (#420)
   let rs = reqState(req)
   if rs == nil: return
   lazyUrl(rs[], req.path)
@@ -780,6 +860,7 @@ proc query*(req: Request): Table[string, string] =
   if req.snap != nil:
     for (k, v) in decodeQuery(parseUri(req.snap.target).query): result[k] = v
     return
+  if req.offLoopNoSnap: return        # fail closed off the loop (#420)
   let rs = reqState(req)
   if rs == nil: return
   lazyQuery(rs[], lazyUrl(rs[], req.path).query)
@@ -795,9 +876,11 @@ proc json*(req: Request): JsonNode =
   ## access (`req.json["a"]`, `req.json["b"]`) parses once. An empty body is
   ## treated as `{}`. Raises `JsonParsingError` on a malformed body (catch it
   ## to answer 400; a future middleware can do this globally). Call it on the
-  ## loop thread, not inside `blocking:`.
+  ## loop thread, not inside `blocking:`. Off the loop thread with no request
+  ## snapshot the body reads "" (#413), so this is `{}` (#420).
   if req.snap != nil:
     return (if req.snap.body.len == 0: newJObject() else: parseJson(req.snap.body))
+  if req.offLoopNoSnap: return newJObject()
   let raw = req.body
   let rs = reqState(req)
   if rs == nil: return
@@ -941,21 +1024,25 @@ proc param*(params: PathParams, name: string): string =
 proc setParams*(req: Request, params: sink PathParams) =
   ## Store route parameters for req.params. Called by the router on the
   ## loop thread at match time; params are computed by matching anyway,
-  ## so they are stored eagerly (a move) rather than lazily.
+  ## so they are stored eagerly (a move) rather than lazily. A no-op off the
+  ## loop thread (#420).
+  if currentThreadId() != req.core.threadId: return
   let rs = reqState(req)
   if rs != nil: rs.pathParams = params
 
 proc params*(req: Request): PathParams =
   ## Route parameters captured by the router ("/users/:id" etc.); empty
   ## when no router matched. Valid from any thread holding the handle,
-  ## same as req.body.
+  ## same as req.body (so empty off the loop thread without a snapshot, #420).
   if req.snap != nil: return req.snap.params
+  if req.offLoopNoSnap: return
   let rs = reqState(req)
   if rs != nil: result = rs.pathParams
 
 proc param*(req: Request, name: string): string =
   ## Single path-parameter lookup; "" when absent.
   if req.snap != nil: return req.snap.params.param(name)
+  if req.offLoopNoSnap: return
   let rs = reqState(req)
   if rs != nil: result = rs.pathParams.param(name)
 
@@ -1129,50 +1216,6 @@ proc h3Apply*(core: ptr LoopCore, fd: int32, gen: uint32, stream: uint32,
       else:
         h3Respond(core, h3c, uint64(stream), code, contentType, headers, body,
                   core.secHeaders)
-
-var workerTaskKey {.threadvar.}: ReqKey
-var workerTaskSet {.threadvar.}: bool
-var workerTaskAnswered {.threadvar.}: bool
-  ## The off-loop first-send latch, scoped to the worker task's OWN handle
-  ## (#409): the ReqKey of the request the task running on this thread
-  ## answers, whether a task is running at all, and whether that handle has
-  ## been answered yet. A worker trampoline opens it at task start
-  ## (`beginWorkerTask`), reads it at the end to tell whether the `blocking:`
-  ## body produced a response, and closes it (`endWorkerTask`). A body that
-  ## finishes without one (a bug, or a misuse of the loop-thread-only
-  ## streaming API from a worker) must still get a default response emitted,
-  ## otherwise the outbox push that releases the connection's pin never
-  ## happens and it hangs forever; a body that answered must not get a second
-  ## push, which would release that pin twice.
-  ##
-  ## Only the task's own handle is latched. Its Response carries the task's
-  ## pin release (relKind), so it must reach the outbox at most once from the
-  ## task: that is the pin-release invariant. Any OTHER handle (a kept
-  ## Response a worker body answers, or any send from a thread the
-  ## application owns, where no task is running) always pushes: such handles
-  ## carry prNone, so a duplicate never touches a pin, and the loop drops a
-  ## duplicate response (the responded guard, the HTTP/1 request serial, h2/h3
-  ## closed-stream handling). Before #409 this was one thread-wide bool, so an
-  ## app-owned thread (which no trampoline resets) answered only its first
-  ## kept handle and every later send from it was dropped. Latching only the
-  ## task's own handle (rather than whichever handle was answered last) is
-  ## also what keeps a body that answers its own request and then a kept one
-  ## from looking unanswered and getting a second, pin-releasing 500.
-
-proc beginWorkerTask(res: Response) {.inline.} =
-  ## Worker task start: latch `res` (the task's own handle) as unanswered.
-  workerTaskKey = reqKey(res.fd, res.gen, res.stream, res.serial)
-  workerTaskSet = true
-  workerTaskAnswered = false
-
-proc endWorkerTask() {.inline.} =
-  ## Worker task end: later sends from this thread latch nothing.
-  workerTaskSet = false
-
-proc isWorkerTaskHandle(res: Response): bool {.inline.} =
-  ## Whether `res` is the own handle of the worker task running on this thread.
-  workerTaskSet and
-    workerTaskKey == reqKey(res.fd, res.gen, res.stream, res.serial)
 
 proc request(res: Response): Request =
   ## The Request half of a Response handle, same words (serial included), for
@@ -1498,8 +1541,10 @@ when defined(httpGzip) or defined(httpBrotli) or defined(httpZstd):
     ## decompression bomb can't exhaust memory. Returns false (having sent 413
     ## for an over-cap body or 400 for a corrupt one) to skip the handler; true
     ## otherwise (including the no-op cases: feature off, no/other encoding,
-    ## empty body). Called once at dispatch (loop thread) before the handler.
+    ## empty body). Called once at dispatch (loop thread) before the handler;
+    ## a no-op (true) from any other thread (#420).
     if not req.core.config.decompressRequest: return true
+    if currentThreadId() != req.core.threadId: return true
     let enc = req.header("content-encoding").strip.toLowerAscii
     var isGzip, isBr, isZstd = false
     when defined(httpGzip):
@@ -1800,7 +1845,9 @@ proc onBody*(req: Request, cb: proc(chunk: openArray[char], last: bool)
   ## reads) are only replenished on ack, so a slow consumer throttles the peer.
   ## The default auto-acks each chunk once the callback returns (a synchronous
   ## consumer is already throttled by holding the loop thread). The async
-  ## adapters use `manualAck` and ack on `read()`.
+  ## adapters use `manualAck` and ack on `read()`. Loop-thread only: a no-op
+  ## from any other thread (#420).
+  if currentThreadId() != req.core.threadId: return
   if req.fd < 0:
     when not defined(plainHttp):
       let h3c = h3ConnOf(req.core, req.fd, req.gen)
@@ -3598,15 +3645,16 @@ proc isWebSocketUpgrade*(req: Request): bool =
     # validated scheme/path/authority for a ws-connect stream).
     when not defined(plainHttp):
       return req.method == HttpConnect and
-        h3FieldOf(req, ":protocol") == "websocket" and
+        req.header(":protocol") == "websocket" and
         req.header("sec-websocket-version") == "13"
     else:
       return false
   if req.httpVersion == 2:
     # HTTP/2: :method CONNECT + :protocol websocket (validated by the codec).
+    # `header` reads the pseudo-header from the stream, or the snapshot, and
+    # fails closed off the loop (#420).
     return req.method == HttpConnect and
-      h2Field(liveConn(req), req.stream, ":protocol") ==
-        "websocket" and
+      req.header(":protocol") == "websocket" and
       req.header("sec-websocket-version") == "13"
   req.httpVersion == 1 and req.method == HttpGet and
   "websocket" in req.header("upgrade").toLowerAscii and
@@ -3631,13 +3679,12 @@ proc isWebSocketIntent*(req: Request): bool =
   if req.fd < 0:
     when not defined(plainHttp):
       return req.method == HttpConnect and
-        h3FieldOf(req, ":protocol") == "websocket"
+        req.header(":protocol") == "websocket"
     else:
       return false
   if req.httpVersion == 2:
     return req.method == HttpConnect and
-      h2Field(liveConn(req), req.stream, ":protocol") ==
-        "websocket"
+      req.header(":protocol") == "websocket"
   req.httpVersion == 1 and
   "websocket" in req.header("upgrade").toLowerAscii
 
@@ -3662,6 +3709,9 @@ proc acceptWebSocket*(req: Request,
   # `Sec-WebSocket-Accept` computed over an empty key off a plain GET, and the
   # h2/h3 codecs classify an Extended CONNECT on `:protocol` alone, so a
   # handshake with no `Sec-WebSocket-Version` reached their 200 as well (#400).
+  # Off the loop thread (a `blocking:` body included, whose snapshot would let
+  # isWebSocketUpgrade answer true) nothing is upgraded either (#420).
+  if currentThreadId() != req.core.threadId: return
   if not req.isWebSocketUpgrade: return
   if req.fd < 0:
     # HTTP/3 (RFC 9220): reply 200 on the QUIC stream and attach a WsConn.

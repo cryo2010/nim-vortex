@@ -575,7 +575,7 @@ The `Request` object passed into the handler contains the content and metadata r
 | `req.httpVersion` | `int` | `1`, `2`, or `3` |
 | `req.params` | `PathParams` | all router path parameters |
 | `req.param(name)` | `string` | one router path parameter; "" if absent |
-| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned). The other accessors follow the same rule: off the loop thread and outside the `blocking:` body that owns the request (a kept handle answered later, or a thread your application owns) there is no request snapshot to read, so they return their defaults rather than race the loop: "" for `req.header`/`req.path`/`req.body`, 0 for `req.contentLength`, and `HttpGet` for `req.method`, so the method reads as GET there |
+| `req.isAlive` | `bool` | connection/stream still open; loop-thread only (false from another thread, except inside `blocking:`, where the connection is pinned). The other accessors follow the same rule: off the loop thread and outside the `blocking:` body that owns the request (a kept handle answered later, or a thread your application owns) there is no request snapshot to read, so they return their defaults rather than race the loop: "" for `req.header`/`req.path`/`req.body`/`req.param`/`req.clientCertSubject`, 0 for `req.contentLength`, `HttpGet` for `req.method` (so the method reads as GET there), false for `req.isSecure`/`req.isWebSocketUpgrade`, an empty `req.url`/`req.query`/`req.params`, `{}` for `req.json`, and true for `res.responded` (inside the `blocking:` body, its own `res.responded` reads whether the body has answered yet). The calls that write loop-owned state do nothing on any thread but the loop's, the `blocking:` body included: `req.setParams`/`req.onBody`/`req.acceptWebSocket`/`req.decodeRequestBody` are no-ops, and `res.headers`/`res.trailers` hand back a scratch table whose writes are discarded (from the `blocking:` body's own `res` it asserts with assertions on, the default and `-d:release` included, which fails the body: a 500 in the `blocking:` form, a `BlockingDefectError` at the await in the awaitable one; with assertions off, `-d:danger` or `--assertions:off`, the write is dropped; pass headers to `send` there) |
 | `req.response` | `Response` | the paired write half |
 | `req.lastEventId` | `string` | `Last-Event-ID` (SSE reconnect) |
 | `req.sendContinue()` | `void` | send `100 Continue` (h1 streaming routes) |
@@ -779,7 +779,16 @@ proc requestId(next: RequestHandler): RequestHandler =
 `res.headers["Name"] = v` overwrites by name; `res.headers.add("Set-Cookie", c)`
 keeps duplicates. The `send` call's own `headers` still win per name. `res.headers`
 is loop-thread only (buffered `send`, not `sendHead` streaming): set it before a
-`req.blocking:` section, or pass headers to `send` from inside the worker.
+`req.blocking:` section, or pass headers to `send` from inside the worker. From
+any other thread it returns a scratch table, so what is written there never
+reaches the response; inside a `blocking:` body, writing the body's own
+`res.headers` is always a mistake, so it asserts there with assertions on (the
+default, `-d:release` included), which fails the body (a 500 in the
+`blocking:` form, a `BlockingDefectError` at the await in the awaitable one),
+and only a build with assertions off (`-d:danger` or `--assertions:off`) drops
+the write silently. Under `--panics:on` (with assertions on) that assertion
+aborts the process instead of answering 500, the same as the SSE stream's
+loop-thread check.
 
 #### CORS
 
