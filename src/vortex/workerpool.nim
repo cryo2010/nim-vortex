@@ -102,7 +102,13 @@ proc start*(pool: ptr WorkerPool, n: int, maxQueue = 0,
   pool.alive = alive
   pool.threads = newSeq[Thread[ptr WorkerPool]](n)
   for i in 0 ..< n:
-    createThread(pool.threads[i], workerLoop, pool)
+    try:
+      createThread(pool.threads[i], workerLoop, pool)
+    except CatchableError:
+      # Keep only the workers that exist, so the caller's unwind (shutdown)
+      # joins those and never a Thread that was not created.
+      pool.threads.setLen(i)
+      raise
 
 proc enqueue*(pool: ptr WorkerPool, task: WorkerTask) =
   acquire pool.lock

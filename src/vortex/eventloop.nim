@@ -161,6 +161,8 @@ type
     pumpCap: int                 # adapter-suggested selector timeout cap
     inPump: bool                 # the adapter's pump is running: loop-thread
                                  # flushes are held to its end (pumpHold)
+    wakeFd: int                  # the outbox's wakeup read end, registered
+                                 # for Read (#418); -1 = no outbox
     outboxScratch: seq[OutMsg]   # reused drain buffer
     pendingFlush: seq[(int32, uint32)]
                                  # connections holding a flush for the outbox
@@ -439,8 +441,14 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
   result.core.conns = initConnTable()
   result.refreshDate()
   result.selector.registerHandle(int(listenFd), {Event.Read}, fkListen)
+  # The outbox's wakeup is a plain descriptor vortex owns (an eventfd on Linux,
+  # a pipe's read end elsewhere; see connection.newOutbox), watched for Read
+  # and emptied by run()'s wakeup branch: the stop fan-out writes to it too,
+  # with the same bare write() a worker's push makes (#418).
+  result.wakeFd = -1
   if outbox != nil:
-    result.selector.registerEvent(outbox.ev, fkWakeup)
+    result.selector.registerHandle(int(outbox.wakeRead), {Event.Read}, fkWakeup)
+    result.wakeFd = int(outbox.wakeRead)
   when not defined(plainHttp):
     if udpFd != osInvalidSocket:
       # A valid udpFd means the server enabled h3 and validated the TLS cert.
@@ -2634,7 +2642,7 @@ proc run*(loop: Loop) =
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
   while true:
-    if loop.stopFlag[].load(moRelaxed) and not loop.draining:
+    if loop.stopFlag[].load(moAcquire) and not loop.draining:
       loop.tick()                     # refresh nowSec before arming the deadline
       loop.beginDrain()
     if loop.draining and loop.drainComplete():
@@ -2686,7 +2694,13 @@ proc run*(loop: Loop) =
     var quicWork = false
     for i in 0 ..< n:
       let key = keys[i]
-      if Event.User in key.events:
+      if key.fd == loop.wakeFd:
+        # A worker's push or a stop request (#418) wrote the outbox's wakeup
+        # descriptor. Empty it first (it is level-triggered and would read
+        # ready forever), then the queue: see drainWake for why in that order.
+        # A stop request finds the queue empty, and the stop flag is read at
+        # the top of the next iteration.
+        drainWake(loop.core.outbox)
         # Guard like the per-connection block below: a raise while applying a
         # worker response or accepting a connection must never take down the
         # whole loop thread (R11).

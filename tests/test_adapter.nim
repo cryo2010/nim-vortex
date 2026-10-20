@@ -593,10 +593,17 @@ block:
       s.send("GET /beat HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       check s.recvUntilClose(2000).endsWith("beating")
       s.close()
+      sleep(300)                          # let the loop settle into its wait
       let t0 = epochTime()
       fresh.close()
       closed = true
-      check epochTime() - t0 < 1.5        # a stuck drain takes 2 s or more
+      # A stuck drain takes 2 s or more. Under 0.2 s also needs the stop to
+      # wake the loop (#418): chronos's pump caps the wait at the heartbeat's
+      # 10 s timer, so the loop sat out its 1 s idle wait before it saw the
+      # flag (measured 0.7 s); asyncdispatch's 5 ms cap hid it.
+      let took = epochTime() - t0
+      echo "    close() with a live heartbeat took ", int(took * 1000), " ms"
+      check took < 0.2
 
 # --- an awaitable blocking body that raises a Defect (#416) ----------------
 #

@@ -237,6 +237,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `close()` (and `serve()` after SIGINT/SIGTERM) on an idle server no longer
+  waits out the event loops' idle wait. A stop request only set the server's
+  stop flag, and a loop thread asleep in its selector wait read it when it next
+  woke on its own, up to its 1 s idle timeout, so stopping an idle server took
+  up to a second, set by whichever loop was furthest from its wakeup. Measured
+  with a detached heartbeat timer, `close()` took 0.7 s on the chronos adapter
+  (whose pump caps the wait at the app's 10 s timer, so the loop slept its full
+  second); asyncdispatch's 5 ms pump cap hid it (0.01 s), and an idle server
+  with no async adapter took 0.8 s with eight loop threads. That time was this
+  wait, not drain work. `requestShutdown(server)` now stores the flag and then
+  wakes each of the server's loops through its worker outbox's wakeup
+  descriptor, and the no-argument `requestShutdown()` the signal handler calls
+  does the same for every live server: the process-wide registry records each
+  loop's wakeup descriptor beside the flag. That descriptor is now vortex's own
+  (an `eventfd` on Linux, a non-blocking pipe elsewhere) instead of a
+  std/selectors `SelectEvent`, whose `trigger` raises on a full pipe and whose
+  descriptors are private: a worker's push and a stop request both wake the
+  loop with one bare `write()`, so the signal path stays async-signal-safe (no
+  lock, no allocation, no exception, errno preserved), and the loop empties the
+  descriptor itself. Both forms read a server's registry entry only under a
+  reader count that teardown waits out before it frees the entry and closes
+  the outboxes' descriptors, and `requestShutdown(server)` finds its entry by
+  slot and registration tag, so a request racing the owner's `waitFor` from
+  another thread, or made after the server is gone, never reads freed memory
+  or writes to a closed or reused descriptor. `close()` on an idle server now
+  takes about 10 ms on both adapters. A start that fails after the server's
+  entry is registered (a bad certificate or key, a taken port, descriptor
+  exhaustion) now releases that entry along with the worker pool and its
+  threads: the registration used to happen ahead of the worker pool and the TLS
+  setup, outside the unwind that frees it, so every start that failed on a bad
+  certificate kept one of the registry's 256 entries, and once they were gone a
+  later server was out of reach of the signal path. (#418)
 - asyncdispatch adapter: a live timer that no request waits on no longer wakes
   its loop thread every 5 ms. The adapter's pump capped the loop's selector
   wait at 5 ms whenever the dispatcher's `hasPendingOperations()` was true, and

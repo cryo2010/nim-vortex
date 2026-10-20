@@ -20,33 +20,105 @@ when not defined(plainHttp):
 
 # Each Server owns its own stop flag (shared memory, one per instance) so that
 # stopping or starting one server never disturbs another in the same process.
-# A small lock-free registry of the live flags lets a signal handler (and the
+# A small lock-free registry of the live servers lets a signal handler (and the
 # no-arg requestShutdown) fan a stop out to every server without a lock or
 # allocation, which a signal handler must avoid.
-const maxRegisteredServers = 256
-var serverFlags: array[maxRegisteredServers, Atomic[pointer]]  # ptr Atomic[bool]
+#
+# Setting the flag alone is not enough: a loop thread asleep in its selector
+# wait reads it only when it next wakes, up to its 1 s idle wait, so close() on
+# an idle server took up to a second (#418). Each entry is therefore a
+# ShutdownRecord holding the flag AND the descriptor that wakes each of the
+# server's loops (its outbox's wakeup descriptor, see connection.newOutbox), so
+# both paths store the flag and then wake every loop with one bare write()
+# apiece.
+#
+# Every path that reads a record does so under a reader count that lives in
+# static memory, never in the record: the no-arg fan-out under its slot's
+# count, requestShutdown(server) under its slot's count too (by the slot index
+# and generation the Server kept, so a record freed and its slot reused by
+# another server is recognised, not fired), and an unregistered server's
+# per-server request under overflowUsers. Teardown unpublishes the record,
+# waits for its count to reach 0, and only then frees the record and closes the
+# outboxes' descriptors, so no request, from a signal or from an application
+# thread racing the owner's waitFor, reads a freed record or writes to a closed
+# (or reused) descriptor.
+type
+  ShutdownRecord = object
+    flag: ptr Atomic[bool]
+    gen: uint                           ## registration tag (ABA guard)
+    nWake: int                          ## loops; fixed at allocation
+    wake: UncheckedArray[Atomic[cint]]  ## per loop, -1 until its outbox exists
 
-proc registerServerFlag(flag: ptr Atomic[bool]) =
+const maxRegisteredServers = 256
+var serverRecords: array[maxRegisteredServers, Atomic[pointer]]  # ptr ShutdownRecord
+var serverRecordUsers: array[maxRegisteredServers, Atomic[int]]
+  ## Requests currently reading slot i. unregisterServer clears the slot and
+  ## waits for this to reach 0 before the record is freed and the outboxes'
+  ## descriptors closed, so a request that loaded the record just before the
+  ## clear never writes to a closed (or reused) descriptor. A request never
+  ## waits, so a signal landing on the thread that is waiting here cannot
+  ## deadlock it.
+var overflowUsers: Atomic[int]
+  ## The same count for requestShutdown(server) on a server the full registry
+  ## could not take (no slot): it reads the Server's own record pointer, which
+  ## teardown clears before waiting this out.
+var registrations: Atomic[uint]
+  ## Source of ShutdownRecord.gen. Starts the first tag at 1, so a Server that
+  ## was never started (gen 0) never matches a live record.
+
+proc newShutdownRecord(flag: ptr Atomic[bool], loops: int): ptr ShutdownRecord =
+  result = cast[ptr ShutdownRecord](allocShared0(
+    sizeof(ShutdownRecord) + loops * sizeof(Atomic[cint])))
+  result.flag = flag
+  result.gen = registrations.fetchAdd(1) + 1
+  result.nWake = loops
+  for i in 0 ..< loops: result.wake[i].store(-1)
+
+proc fire(rec: ptr ShutdownRecord) {.raises: [], gcsafe.} =
+  ## Store the stop flag, then wake each loop so it reads it now instead of at
+  ## the end of its selector wait. Async-signal-safe: atomics and write() only.
+  ## The loop's wakeup branch drains an empty outbox (harmless) and the flag is
+  ## read, with acquire, at the top of its next iteration. The caller must hold
+  ## a reader count that covers `rec` (or own it, as startServer's unwind does).
+  rec.flag[].store(true, moRelease)
+  for i in 0 ..< rec.nWake:
+    wakeLoopFd(rec.wake[i].load(moAcquire))
+
+proc registerServer(rec: ptr ShutdownRecord): int =
+  ## The slot `rec` took, or -1 when the registry is full (>256 live servers):
+  ## the global/signal fan-out won't reach that one, but close(server) still
+  ## stops and wakes it through the overflow path of requestShutdown(server).
   for i in 0 ..< maxRegisteredServers:
     var expected: pointer = nil
-    if serverFlags[i].compareExchange(expected, cast[pointer](flag)):
-      return
-  # Registry full (>256 live servers): the global/signal fan-out won't reach
-  # this one, but close(server) still stops it via its own flag.
+    if serverRecords[i].compareExchange(expected, cast[pointer](rec)):
+      return i
+  -1
 
-proc unregisterServerFlag(flag: ptr Atomic[bool]) =
-  for i in 0 ..< maxRegisteredServers:
-    var expected = cast[pointer](flag)
-    if serverFlags[i].compareExchange(expected, pointer(nil)):
-      return
+proc unregisterServer(rec: ptr ShutdownRecord, slot: int) =
+  ## Unpublish `rec` and wait out every request still reading it; `rec` may be
+  ## freed once this returns. `slot` is registerServer's result.
+  if slot >= 0:
+    var expected = cast[pointer](rec)
+    if serverRecords[slot].compareExchange(expected, pointer(nil)):
+      while serverRecordUsers[slot].load() != 0:
+        cpuRelax()
+  else:
+    # The overflow path read the record through the Server's own field (the
+    # caller has cleared it); a request that loaded it before the clear holds
+    # overflowUsers.
+    while overflowUsers.load() != 0:
+      cpuRelax()
 
 proc requestShutdown*() =
-  ## Ask every running server's event loops to stop after their current tick.
-  ## Async-signal-safe (only atomic loads/stores, no lock or allocation).
+  ## Ask every running server's event loops to stop after their current tick,
+  ## waking any that are asleep in their selector wait.
+  ## Async-signal-safe (only atomics and write(), no lock or allocation).
   for i in 0 ..< maxRegisteredServers:
-    let p = serverFlags[i].load(moRelaxed)
+    discard serverRecordUsers[i].fetchAdd(1)
+    let p = serverRecords[i].load()
     if p != nil:
-      cast[ptr Atomic[bool]](p)[].store(true, moRelaxed)
+      fire(cast[ptr ShutdownRecord](p))
+    discard serverRecordUsers[i].fetchSub(1)
 
 proc installSignalHandlers() =
   proc onSignal(sig: cint) {.noconv.} =
@@ -61,6 +133,17 @@ type
     outboxes: seq[ptr Outbox]
     pool: ptr WorkerPool
     stopFlag: ptr Atomic[bool]  ## this server's own stop signal (shared memory)
+    shutdown: ptr ShutdownRecord  ## the flag plus each loop's wake fd (#418);
+                                  ## read atomically by the overflow path
+    shutdownSlot: int           ## registry slot of `shutdown`, -1 = none (full
+                                ## registry); with shutdownGen, set once at
+                                ## start and never cleared, so a request racing
+                                ## teardown finds the slot cleared or reused
+                                ## instead of reading a freed record. A
+                                ## never-started Server holds 0 here, which is
+                                ## harmless: its gen 0 never matches a record
+    shutdownGen: uint           ## `shutdown.gen`; 0 = never started (no live
+                                ## record has gen 0)
     alive: ptr Atomic[int]      ## live loop + worker threads (shared memory); each
                                 ## decrements on exit so waitFor can bound its wait
                                 ## and detach a thread stuck in a never-returning
@@ -74,9 +157,45 @@ export AcceptDrops, AcceptDropCause
 export eventloop.acceptDrops   ## the no-argument, process-wide form (see below)
 
 proc requestShutdown*(server: var Server) =
-  ## Ask just this server's event loops to stop after their current tick.
-  if server.stopFlag != nil:
-    server.stopFlag[].store(true, moRelaxed)
+  ## Ask just this server's event loops to stop after their current tick,
+  ## waking any that are asleep in their selector wait (#418). Safe from any
+  ## thread while the owner blocks in `serve()` / `waitFor` and tears the
+  ## server down: the record is read only under a reader count teardown waits
+  ## out (see the registry above), so a request that loses that race does
+  ## nothing rather than touch freed memory. A no-op on a server that was never
+  ## started or is already torn down. Lock- and allocation-free.
+  let slot = server.shutdownSlot
+  if slot >= 0:
+    discard serverRecordUsers[slot].fetchAdd(1)
+    let p = cast[ptr ShutdownRecord](serverRecords[slot].load())
+    # Covered by the count from here: unregisterServer clears the slot first
+    # and then waits for it, so `p` cannot be freed under us. The tag tells a
+    # record another server registered in the slot since (at an address the
+    # allocator may well have reused) from ours.
+    if p != nil and p.gen == server.shutdownGen:
+      fire(p)
+    discard serverRecordUsers[slot].fetchSub(1)
+  else:
+    # Registry was full at start: no slot, so read the Server's own pointer,
+    # which teardown clears (atomically) before waiting out overflowUsers.
+    discard overflowUsers.fetchAdd(1)
+    let p = atomicLoadN(addr server.shutdown, ATOMIC_SEQ_CST)
+    if p != nil:
+      fire(p)
+    discard overflowUsers.fetchSub(1)
+
+proc retireShutdownRecord(server: var Server) =
+  ## Unpublish and free this server's ShutdownRecord. Once this returns no stop
+  ## request (signal, no-arg fan-out, or requestShutdown(server) from another
+  ## thread) can still be reading it or writing to the outboxes' wakeup
+  ## descriptors, so those may be closed. The loops never touch the record
+  ## (they read the stop flag and their outbox), so this is safe with loop or
+  ## worker threads still running.
+  let rec = server.shutdown
+  if rec == nil: return
+  atomicStoreN(addr server.shutdown, nil, ATOMIC_SEQ_CST)
+  unregisterServer(rec, server.shutdownSlot)
+  deallocShared rec
 
 proc acceptDrops*(server: Server): AcceptDrops =
   ## Connections this process accepted and then dropped, per cause: the
@@ -151,6 +270,9 @@ proc teardownResources(server: var Server) =
   ## and close those on exit). Used by both the startServer unwind path and the
   ## clean waitFor path so the resource list lives once.
   server.threads.setLen(0)
+  # Before the outboxes go: once the record is retired no stop request can
+  # still be writing to their wakeup descriptors.
+  server.retireShutdownRecord()
   # Order matters: shut the worker pool down (joining the worker threads) BEFORE
   # freeing the outboxes, because workers post blocking: results into the outboxes
   # and hold their locks -- freeing an outbox lock under a live worker is a race
@@ -174,7 +296,6 @@ proc teardownResources(server: var Server) =
       deallocShared server.quicReload
       server.quicReload = nil
   if server.stopFlag != nil:
-    unregisterServerFlag(server.stopFlag)
     deallocShared server.stopFlag
     server.stopFlag = nil
 
@@ -187,12 +308,14 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
   signal(SIGPIPE, SIG_IGN)   # a mid-response client reset must not kill us
                              # (OpenSSL's raw write on Linux has no MSG_NOSIGNAL)
   result.stopFlag = createShared(Atomic[bool])   # zero-init == false
-  registerServerFlag(result.stopFlag)
   var numLoops =
     if settings.numThreads > 0: settings.numThreads
     else: max(1, countProcessors())
   if not settings.reusePort:
     numLoops = 1               # per-thread listeners require SO_REUSEPORT
+  result.shutdown = newShutdownRecord(result.stopFlag, numLoops)
+  result.shutdownSlot = registerServer(result.shutdown)
+  result.shutdownGen = result.shutdown.gen
   let numWorkers =
     if settings.workerThreads > 0: settings.workerThreads
     else: numLoops * 2
@@ -206,45 +329,47 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
     if settings.shutdownHardTimeout > 0: settings.shutdownHardTimeout
     else: max(1, settings.shutdownGrace) + 5    # loop grace + margin
 
-  result.pool = createShared(WorkerPool)
-  result.pool.start(numWorkers, maxQueue = settings.maxBlockingQueue,
-                    alive = result.alive)
-
-  when not defined(plainHttp):
-    if settings.hasTls:
-      let minVer = case settings.minTlsVersion
-                   of TlsVersion.None, TlsVersion.V12: TLS1_2_VERSION  # None: secure default floor
-                   of TlsVersion.V13: TLS1_3_VERSION
-      result.tls = cast[pointer](
-        newTlsConfig(settings.certFile, settings.keyFile, enableH2 = true,
-                     minProtoVersion = minVer,
-                     cipherList = settings.tlsCipherList,
-                     cipherSuites = settings.tlsCipherSuites,
-                     certPem = settings.certPem, keyPem = settings.keyPem,
-                     keyPassword = settings.keyPassword,
-                     pkcs12File = settings.pkcs12File, pkcs12 = settings.pkcs12,
-                     verify = tlsVerifyMode(settings.verifyClient),
-                     clientCaFile = settings.clientCaFile,
-                     clientCaPem = settings.clientCaPem,
-                     sni = toSniCerts(settings),
-                     maxProtoVersion = tlsMaxVer(settings.maxTlsVersion),
-                     ocsp = ocspBytes(settings),
-                     ocspFile = ocspSourceFile(settings)))
-  else:
-    if settings.hasTls:
-      raise newException(CatchableError,
-        "TLS requested but built with -d:plainHttp")
-
   var fds = newSeq[SocketHandle](numLoops)
   var udpFds = newSeq[SocketHandle](numLoops)
   for i in 0 ..< numLoops:
     fds[i] = osInvalidSocket
     udpFds[i] = osInvalidSocket
   var madeThreads = 0
-  # Anything past the worker pool can fail (a taken port, fd exhaustion, a cert
-  # that changed since the probe, createThread). Unwind everything acquired so
-  # far so a caught-and-retried start() does not leak threads, fds, or memory.
+  # Anything past the shutdown record's registration can fail (the worker
+  # pool's createThread, a bad certificate or key in newTlsConfig, a taken port,
+  # fd exhaustion, createThread). Unwind everything acquired so far, the
+  # registration included, so a caught-and-retried start() does not leak
+  # threads, fds, memory, or one of the registry's 256 slots for good (#418).
   try:
+    result.pool = createShared(WorkerPool)
+    result.pool.start(numWorkers, maxQueue = settings.maxBlockingQueue,
+                      alive = result.alive)
+
+    when not defined(plainHttp):
+      if settings.hasTls:
+        let minVer = case settings.minTlsVersion
+                     of TlsVersion.None, TlsVersion.V12: TLS1_2_VERSION  # None: secure default floor
+                     of TlsVersion.V13: TLS1_3_VERSION
+        result.tls = cast[pointer](
+          newTlsConfig(settings.certFile, settings.keyFile, enableH2 = true,
+                       minProtoVersion = minVer,
+                       cipherList = settings.tlsCipherList,
+                       cipherSuites = settings.tlsCipherSuites,
+                       certPem = settings.certPem, keyPem = settings.keyPem,
+                       keyPassword = settings.keyPassword,
+                       pkcs12File = settings.pkcs12File, pkcs12 = settings.pkcs12,
+                       verify = tlsVerifyMode(settings.verifyClient),
+                       clientCaFile = settings.clientCaFile,
+                       clientCaPem = settings.clientCaPem,
+                       sni = toSniCerts(settings),
+                       maxProtoVersion = tlsMaxVer(settings.maxTlsVersion),
+                       ocsp = ocspBytes(settings),
+                       ocspFile = ocspSourceFile(settings)))
+    else:
+      if settings.hasTls:
+        raise newException(CatchableError,
+          "TLS requested but built with -d:plainHttp")
+
     fds[0] = newListenSocket(settings)
     result.port = boundPort(fds[0])
     var cfg = settings
@@ -267,6 +392,7 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
     result.outboxes = newSeq[ptr Outbox](numLoops)
     for i in 0 ..< numLoops:
       result.outboxes[i] = newOutbox()
+      result.shutdown.wake[i].store(result.outboxes[i].wakeWrite, moRelease)
       createThread(result.threads[i], runLoopThread,
                    (settings: cfg, handler: handler,
                     stopFlag: result.stopFlag, listenFd: fds[i],
@@ -279,7 +405,7 @@ proc startServer(handler: RequestHandler, settings: VortexConfig,
   except CatchableError:
     # Stop and join any loops already started (they own their listen/udp fds and
     # close them on exit), then free everything else and re-raise.
-    result.stopFlag[].store(true, moRelaxed)
+    fire(result.shutdown)      # wake the started loops, do not wait out their idle wait
     for i in 0 ..< madeThreads: joinThread result.threads[i]
     for i in madeThreads ..< numLoops:      # fds of loops that never started
       if fds[i] != osInvalidSocket: discard posix.close(cint(fds[i]))
@@ -322,6 +448,19 @@ proc waitFor*(server: var Server) =
     opLog($live & " thread(s) still in a blocking: handler after " &
       $server.hardShutdownSec & "s; detaching and leaking their resources so " &
       "shutdown returns (the handler never returned)")
+    #
+    # The shutdown record is the exception: retire it (unregister, wait out
+    # any request reading it, free it) even here. No loop or worker thread
+    # touches it, only stop requests do, and a stuck server's flag is already
+    # set. Left registered, every later no-arg requestShutdown() (each signal)
+    # would write a wakeup into the leaked outboxes' descriptors, which no
+    # exited loop drains: a pipe fills after a few thousand, and from then a
+    # stuck worker's push to that outbox would find its wakeup write failing.
+    # That is harmless (the write is a bare write() whose failure is ignored,
+    # and a full pipe already reads ready) but pointless; retired, the leaked
+    # descriptors see only the stuck threads' own pushes. They stay open, with
+    # the outboxes, for those threads.
+    server.retireShutdownRecord()
     server.threads.setLen(0)
     server.outboxes.setLen(0)
     server.pool = nil
