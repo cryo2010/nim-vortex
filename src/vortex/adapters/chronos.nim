@@ -36,17 +36,34 @@
 ## still works inside an async body for synchronous libraries.
 ##
 ## Mechanics: the loop calls the registered pump once per iteration to
-## drive chronos, capping its selector timeout at a few ms while async
-## operations are pending (chronos's own fds cannot wake our selector;
-## this bounds completion latency instead). chronos's `poll()` would
-## otherwise block until its next timer, so the pump keeps a pending
-## callback queued to force a zero-timeout backend poll. The cap is
-## dropped again as soon as every outstanding future is parked on a
-## wakeup only this loop delivers (an inbound WebSocket message, a
-## request-body chunk): chronos has nothing to poll for then, so the loop
-## is free to sleep on its own selector. When the future finishes, the
-## deferred respond is flushed via LoopCore.hooks.kick. An uncaught
-## exception in the body responds 500.
+## drive chronos. chronos's `poll()` would otherwise block until its next
+## timer, so the pump queues a callback before each poll to force a
+## zero-timeout backend poll. The pump caps the loop's selector timeout at
+## chronos's next timer, and the dispatcher's own selector fd (its kqueue
+## or epoll fd) is registered with the loop's selector, so I/O completing
+## on any fd chronos watches wakes the loop like one of its own
+## connections and the pump polls chronos then: a future waiting on
+## chronos I/O alone, watched or detached, resumes as soon as that I/O is
+## ready, and an idle server sleeps the loop's full wait. While every
+## outstanding future is parked on a wakeup only this loop delivers (an
+## inbound WebSocket message, a request-body chunk), the pump stops
+## spinning: chronos has nothing to poll for then. When the future
+## finishes, the deferred respond is flushed via LoopCore.hooks.kick. An
+## uncaught exception in the body responds 500; a detached (`asyncSpawn`ed)
+## task that fails is logged and the loop carries on (#423).
+##
+## Defects: chronos's async transform does not turn a Defect into a failed
+## future, not even under `-d:chronosHandleException` or
+## `{.async: (handleException: true).}` (both cover `Exception`, and chronos
+## re-raises a Defect ahead of that). A Defect raised after an `await` leaves
+## the continuation inside the pump's poll, and that future never completes. In
+## a `doAsync:` body the adapter catches it and answers 500 (1011 on a
+## WebSocket). In a router-registered `{.async.}` handler, which is the app's
+## own proc, it cannot: the loop logs it (`vortex: async adapter: an async body
+## raised a Defect past an await ...`) and carries on, but that request gets no
+## response until its timeout, and a graceful shutdown waits out its 3 s async
+## drain for it. Catch a Defect you can expect (an IndexDefect from a bounds
+## check) in the handler, or run that code in a `doAsync:` block.
 
 import pkg/chronos
 import pkg/chronos/selectors2 as chronosSelectors   # close(Selector) for teardown
@@ -57,12 +74,14 @@ import ../request
 import ../routing
 import ../server
 import ../settings
+import ./detachedfailure
 
 export chronos
 
 # Futures we are still waiting on, per loop thread. chronos futures never
 # cross threads, so a plain threadvar (no atomics) is correct and lets
-# the pump know when to run and when to keep capping the loop timeout.
+# the pump know when to keep spinning chronos (a watched future may resume
+# this pass).
 var pendingOps {.threadvar.}: int
 # How many of those are parked on a wakeup only the vortex loop can deliver
 # (an inbound WebSocket message, a request-body chunk) rather than on anything
@@ -70,6 +89,24 @@ var pendingOps {.threadvar.}: int
 var parkedOps {.threadvar.}: int
 
 proc noop(arg: pointer) {.gcsafe, raises: [].} = discard
+
+# This loop thread's chronos dispatcher is in use (#422). chronos has no
+# "exists" query: getThreadDispatcher() creates one on first use, kqueue/epoll
+# fd and all, and the pump's idle check used to call it on every pass. Set where
+# vortex first hands chronos work (noteDispatcher: ensurePump, the pending-op
+# tally, completeSoon); until then the pump, the loop's fd registration and the
+# teardown leave the dispatcher alone. ensurePump runs for every watched handler,
+# including one that completed without suspending: it may have detached a task
+# onto chronos that nothing else will drive (#412), and whether it did cannot be
+# asked without creating the dispatcher, so such a thread gets one too (and its
+# teardown releases it).
+var dispatcherLive {.threadvar.}: bool
+
+proc noteDispatcher() {.inline.} =
+  ## Contract shared with the asyncdispatch backend: vortex is about to hand
+  ## the dispatcher work (a watched future, a detached task's completion), so
+  ## the pump must drive it from here on.
+  dispatcherLive = true
 
 # How many entries an idle chronos dispatcher keeps in its callback queue
 # between polls: the one sentinel poll() re-queues, unless strict reentrancy is
@@ -86,10 +123,110 @@ const idleCallbacks =
 proc unwatchedReady(): bool =
   ## chronos holds work that is runnable now: a queued callback (beyond the
   ## sentinel an idle dispatcher may keep in its queue between polls, see
-  ## idleCallbacks) or a timer that has expired.
+  ## idleCallbacks) or a timer that has expired. Never creates the dispatcher.
+  if not dispatcherLive: return false
   let d = getThreadDispatcher()
   d.callbacks.len > idleCallbacks or
     (d.timers.len > 0 and d.timers[0].finishAt <= Moment.now())
+
+# The dispatcher's selector is a kqueue (BSD, macOS) or epoll (Linux) fd, which
+# reads ready while it holds pending events, so the loop can watch it (#419).
+# chronos's poll engine has no such fd (its getFd is -1).
+const nestedSelector =
+  when declared(chronosConfig.chronosEventEngine):
+    chronosConfig.chronosEventEngine in ["epoll", "kqueue"]
+  else:
+    defined(linux) or defined(macosx) or defined(freebsd) or
+      defined(netbsd) or defined(openbsd) or defined(dragonfly)
+
+when not nestedSelector:
+  import std/importutils                    # ioRegistered: the poll engine's fds
+  import std/tables                         # ... and that table's len
+
+# The loop's selector found the dispatcher's fd readable this iteration (set by
+# ioReadyHook): the pump polls chronos even with no timer or callback due.
+var ioReady {.threadvar.}: bool
+
+proc ioFd(): int {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.ioFdHook: this thread's dispatcher selector fd.
+  when nestedSelector:
+    {.gcsafe.}:
+      if not dispatcherLive: return -1   # register it once it exists
+      int(getFd(getIoHandler(getThreadDispatcher())))
+  else: -1
+
+proc onIoReady() {.nimcall, gcsafe.} =
+  ## LoopCore.hooks.ioReadyHook.
+  {.gcsafe.}: ioReady = true
+
+proc pollOnce() =
+  ## One non-blocking chronos pass. chronos derives its backend-poll timeout
+  ## from the next timer, so queue a callback first: a pending callback forces
+  ## a zero-timeout poll that runs ready work and checks ready I/O without ever
+  ## blocking the loop.
+  ##
+  ## A detached task's failure cannot escape it (#423): chronos raises a
+  ## FutureDefect from the callback asyncSpawn registered when the task fails,
+  ## inside this poll, and uncaught it left the pump and ended the loop
+  ## thread. A raise leaves the rest of chronos's queue in place, and the next
+  ## poll runs it (its leading pass drains to the sentinel). Exception, since
+  ## asyncSpawn's is a Defect. Under --panics:on no Defect is catchable, so a
+  ## failing detached task still aborts the process there.
+  ##
+  ## Any other raise is a Defect an `{.async.}` body raised after an await:
+  ## chronos's async transform re-raises a Defect instead of failing the
+  ## future (with or without `handleException`), so it leaves the
+  ## continuation's callback here and that future never completes. It is
+  ## logged as what it is (noteAsyncDefect); a router-registered `{.async.}`
+  ## handler is the app's own proc, so the adapter cannot turn it into a 500
+  ## as it does for a doAsync: body (runAsyncBody).
+  ioReady = false
+  callSoon(noop)
+  try:
+    poll()
+  except FutureDefect as e:
+    noteDetachedFailure(e)
+  except Exception as e:
+    noteAsyncDefect(e)
+
+proc ioRegistered(): bool =
+  ## Without a pollable selector fd (not nestedSelector): the dispatcher watches
+  ## at least one fd, so nothing but a bounded wait gets its I/O polled. The
+  ## poll engine's selector keeps its fds in a private table and exports no
+  ## count, hence the privateAccess; a selector without that table counts as
+  ## watching (the bounded wait is the safe side).
+  when nestedSelector: false
+  else:
+    let s = getIoHandler(getThreadDispatcher())
+    privateAccess(typeof(s[]))
+    when compiles(s.fds.len): s.fds.len > 0
+    else:
+      # A fallback of `true` would silently pin every loop thread at the 5 ms
+      # cap for good, so fail the build instead.
+      {.error: "vortex/chronos: the chronos poll engine's selector has no " &
+        "private `fds` table (a Table[int32, SelectorKey], checked on chronos " &
+        "4.0.4, 4.2.2 and 4.4.0); ioRegistered needs another way to ask " &
+        "whether it watches an fd".}
+
+proc idleCap(): int =
+  ## The loop's wait once the pump has polled: come straight back (1) while
+  ## chronos holds ready work, else its next timer (-1, the loop's full wait,
+  ## with none). I/O needs no cap: it wakes the loop through the dispatcher's
+  ## fd. Without such an fd (the poll engine) registered I/O caps the wait at
+  ## 5 ms instead.
+  if not dispatcherLive: return -1
+  if unwatchedReady(): return 1
+  let d = getThreadDispatcher()
+  if d.timers.len == 0:
+    result = -1
+  else:
+    # Rounded up, as asyncdispatch's processTimers does, so the loop does not
+    # wake a hair early and pay a second pass for the same timer.
+    let left = (d.timers[0].finishAt - Moment.now()).milliseconds + 1
+    result = int(clamp(left, 1'i64, 1000'i64))
+  when not nestedSelector:
+    if ioRegistered():
+      result = if result < 0: 5 else: min(result, 5)
 
 proc pumpIdle(): int =
   ## The pump's exit once no watched future needs it: drive the work chronos
@@ -106,32 +243,32 @@ proc pumpIdle(): int =
   ## timers still sleeps the loop's full wait. The bounded spin covers the
   ## chain a fired timer starts (the timer completes a future, whose
   ## continuation runs as a callback on the next poll). A detached task parked
-  ## on chronos I/O alone owns no timer and still waits for the loop's next
-  ## pass.
+  ## on chronos I/O alone owns no timer: the loop watches the dispatcher's
+  ## selector fd for it (ioFdHook), whose readiness sets ioReady, so the task
+  ## runs in the pass its I/O is ready in (#419). Without that fd (chronos's
+  ## poll engine) the pump polls on every pass while chronos watches any fd,
+  ## under idleCap's 5 ms cap. A thread that has not handed chronos any work
+  ## has nothing to drive, and no dispatcher to create (#422).
+  if not dispatcherLive: return -1
+  when nestedSelector:
+    let io = ioReady
+  else:
+    let io = ioReady or ioRegistered()
   var spins = 0
-  while spins < 8 and unwatchedReady():
-    callSoon(noop)               # forces a zero-timeout poll
-    poll()
+  while spins < 8 and (unwatchedReady() or (io and spins == 0)):
+    pollOnce()
     inc spins
-  if unwatchedReady(): return 1  # more ready work: come straight back
-  let d = getThreadDispatcher()
-  if d.timers.len == 0: return -1
-  let left = (d.timers[0].finishAt - Moment.now()).milliseconds
-  int(clamp(left, 1'i64, 1000'i64))
+  idleCap()
 
 proc pump(): int {.nimcall, gcsafe.} =
   {.gcsafe.}:
     if pendingOps <= 0: return pumpIdle()
     # Bounded spin: completing one future can resume work that
     # immediately suspends again (chained awaits); each such link needs
-    # another poll pass. chronos derives its backend-poll timeout from
-    # the next timer, so queue a callback first: a pending callback
-    # forces a zero-timeout poll that runs ready work and checks ready
-    # IO without ever blocking the loop.
+    # another poll pass (pollOnce never blocks the loop).
     var spins = 0
     while spins < 8:
-      callSoon(noop)
-      poll()
+      pollOnce()
       inc spins
       if pendingOps <= 0: return pumpIdle()
       # Every future still outstanding is parked on a wakeup that only this
@@ -155,7 +292,28 @@ proc pump(): int {.nimcall, gcsafe.} =
       # traffic, so it scales with the countProcessors() loop threads a default
       # server starts -- and the 5 ms cap kept every one of them from sleeping.
       if parkedOps >= pendingOps: return pumpIdle()
-    5
+    # Watched futures are still waiting on chronos: on a timer (capped below),
+    # on I/O (the dispatcher's fd wakes the loop, #419), or on a callback
+    # (unwatchedReady: come straight back). Without a pollable selector fd the
+    # I/O half keeps the bounded 5 ms cap it always had (idleCap).
+    idleCap()
+
+proc releaseDispatcher() =
+  ## Close this thread's dispatcher's selector fd and drop the dispatcher, in a
+  ## proc of its own so no local ref outlives the drop.
+  let d = getThreadDispatcher()
+  try: chronosSelectors.close(getIoHandler(d))
+  except CatchableError, Defect: discard
+  # setThreadDispatcher doAsserts that the dispatcher it replaces has an empty
+  # callback queue, and a dispatcher outside strict reentrancy always keeps the
+  # sentinel poll() re-queues there (idleCallbacks). So dropping it raised an
+  # AssertionDefect, the teardown swallowed it, and the dispatcher stayed rooted
+  # in chronos's threadvar, which nothing frees when the thread exits: one
+  # ~15 KB dispatcher leaked per loop thread that ever used chronos (#422).
+  # Whatever is still queued is work this exiting thread will never run.
+  d.callbacks.clear()
+  try: setThreadDispatcher(nil)
+  except CatchableError, Defect: discard
 
 proc teardown() {.nimcall, gcsafe.} =
   ## Release this loop thread's chronos dispatcher on exit. Without it the
@@ -163,24 +321,25 @@ proc teardown() {.nimcall, gcsafe.} =
   ## leaks another. Drain ready callbacks so completed futures are released, then
   ## close the selector fd and drop the dispatcher; the post-run GC_fullCollect in
   ## runLoopThread (once the Loop is out of scope) collects any remaining cycles.
+  ## A thread that never handed chronos work has no dispatcher to release, and
+  ## must not create one just to close it.
   {.gcsafe.}:
+    if not dispatcherLive: return
     var spins = 0
     while pendingOps > 0 and spins < 64:
-      callSoon(noop)
-      poll()
+      pollOnce()
       inc spins
-    try:
-      chronosSelectors.close(getIoHandler(getThreadDispatcher()))
-      # Drop the dispatcher so anything it still roots becomes unreachable.
-      setThreadDispatcher(nil)
-    except CatchableError, Defect: discard
+    releaseDispatcher()
+    dispatcherLive = false
     GC_fullCollect()
 
 # --- backend primitives for the shared adapter body (adapterimpl.nim) --------
 
-proc trackPending() {.inline.} = inc pendingOps
-  ## Count one future as outstanding so the pump keeps running (and keeps capping
-  ## the loop timeout) until it completes. Paired with untrackPending.
+proc trackPending() {.inline.} =
+  ## Count one future as outstanding so the pump keeps spinning chronos each pass
+  ## until it completes. Paired with untrackPending.
+  noteDispatcher()
+  inc pendingOps
 proc untrackPending() {.inline.} = dec pendingOps
   ## The completion half of trackPending.
 
@@ -189,8 +348,8 @@ proc trackParked() {.inline.} = inc parkedOps
   ## parked on a wakeup that only the vortex loop delivers, so chronos has
   ## nothing to poll for on its behalf. Once every outstanding future is parked
   ## this way the pump stops spinning and lets the loop sleep (see pump). The
-  ## asyncdispatch backend needs no tally -- a bare parked Future registers no
-  ## fd, timer or callback, so its hasPendingOperations already reads false.
+  ## asyncdispatch pump needs no tally -- a bare parked Future registers no
+  ## fd, timer or callback, so that pump has nothing to poll for it anyway.
 proc untrackParked() {.inline.} = dec parkedOps
   ## The unpark half of trackParked.
 
@@ -198,12 +357,12 @@ template onCompleted(fut, body: untyped) =
   ## Contract shared with the asyncdispatch backend: run `body` when `fut`
   ## completes (absorbing chronos's callback signature: pointer argument,
   ## `raises: []`). This backend ADDITIONALLY owns the pump's pending-op
-  ## accounting -- chronos's own fds cannot wake our selector, so it tracks each
-  ## awaited future as outstanding (trackPending) until completion
-  ## (untrackPending) to tell the pump when to run. asyncdispatch needs none of
-  ## this (its dispatcher's hasPendingOperations already reports pending work), so
-  ## its onCompleted only runs body. Callers in adapterimpl rely only on the
-  ## "run body on completion" half; this pump-scheduling side is the backend's.
+  ## accounting -- it tracks each awaited future as outstanding (trackPending)
+  ## until completion (untrackPending), so the pump spins chronos while a
+  ## watched future may resume. asyncdispatch keeps the same tally only for the
+  ## shutdown's watchedPending (its pump reads the dispatcher's own state).
+  ## Callers in adapterimpl rely only on the "run body on completion" half;
+  ## this pump-scheduling side is the backend's.
   trackPending()
   fut.addCallback proc (arg: pointer) {.gcsafe, raises: [].} =
     untrackPending()
@@ -219,12 +378,35 @@ proc completeSoon(fut: Future[void]) =
   ## `drained()` on an ended response, #408). chronos runs a callback queued
   ## while it is processing callbacks on its next poll, and the vortex pump
   ## polls a bounded number of times per loop iteration.
+  noteDispatcher()
   callSoon(proc (arg: pointer) {.gcsafe, raises: [].} =
     if not fut.finished: fut.complete())
+
+type AsyncBodyDefect* = object of CatchableError
+  ## A Defect a doAsync: body raised, as the failure of that body's future
+  ## (`parent` holds the Defect). See runAsyncBody.
+
+proc asyncBodyDefect(e: ref Defect): ref AsyncBodyDefect =
+  (ref AsyncBodyDefect)(msg: $e.name & ": " & e.msg, parent: e)
 
 template runAsyncBody(body: untyped): untyped =
   ## Immediately-invoked async closure (chronos's `{.async.}` procs are
   ## closures already; no extra pragma needed).
-  (proc () {.async.} = body)()
+  ##
+  ## chronos's async transform does not catch a Defect: it re-raises it from
+  ## the continuation, in the pump's poll, and the future never completes, so a
+  ## doAsync: body that raised one after an await left its request unanswered
+  ## until the request timeout (#423). `handleException` does not change that
+  ## on any chronos release (checked on 4.0.4, 4.2.2 and 4.4.0: its Defect
+  ## branch re-raises ahead of the Exception one). Catching it inside the body
+  ## does, on all of them: the body's future fails with an AsyncBodyDefect, and
+  ## the uncaught-exception path answers 500 (closes a WebSocket with 1011), as
+  ## the asyncdispatch adapter, whose transform does catch Defects, already
+  ## did. Under --panics:on a Defect is not catchable and aborts the process.
+  (proc () {.async.} =
+    try:
+      body
+    except Defect as vortexBodyDefect:
+      raise asyncBodyDefect(vortexBodyDefect))()
 
 include ./adapterimpl

@@ -184,6 +184,27 @@ jobs:
         # fails the job. Direct via tests/run.sh (not `nimble test`) so a failure
         # is not masked by nim-lang/nimble#1802.
         run: bash tests/run.sh
+      - name: Install chronos
+        if: ${{ !cancelled() }}
+        # For the leak gate's chronos build. Retry: nimble fetches chronos's deps
+        # from several git remotes, which occasionally hit a transient error.
+        run: |
+          ok=
+          for i in 1 2 3; do
+            if nimble install -y "chronos@>= 4.0.0"; then ok=1; break; fi
+            echo "chronos install attempt $i failed; retrying in 5s"; sleep 5
+          done
+          [ -n "$ok" ] || { echo "chronos install failed after retries"; exit 1; }
+      - name: Leak gate for the async adapters' per-thread state (LeakSanitizer)
+        # The suite above runs with LeakSanitizer off (detect_leaks=0 in the job
+        # env: the whole-suite report has leaks unrelated to any one change).
+        # This step turns it on for the shared adapter suite, built against
+        # asyncdispatch and chronos, and fails on any leaked root allocated by a
+        # dispatcher or by the adapters' thread-local tables: a loop thread's
+        # teardown must release those, and each leaked once per loop thread
+        # that used the adapter (#422). The script sets its own ASAN_OPTIONS.
+        if: ${{ !cancelled() }}
+        run: bash tests/leakcheck.sh asyncdispatch chronos
 
   testchronos:
     runs-on: ubuntu-latest

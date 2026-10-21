@@ -530,9 +530,11 @@ proc teardownStream(h2: H2Conn, c: ptr Connection, sid: uint32) {.gcsafe, raises
     except Exception: discard
   if bodyCb != nil:
     var empty: string
+    noteDrainFire(h2.core)                # a teardown callback runs (#421)
     try: bodyCb(toOpenArray(empty, 0, -1), true)
     except Exception: discard
   if drainCb != nil:
+    noteDrainFire(h2.core)
     try: drainCb(h2.core, c.fd, c.gen, sid)
     except Exception: discard
 
@@ -906,6 +908,7 @@ proc h2WsAfterEmit(h2: H2Conn, c: ptr Connection, sid: uint32) =
     elif w.backedUp:
       w.backedUp = false
       if w.onDrain != nil:
+        noteDrainFire(h2.core)          # #421
         try: w.onDrain(WebSocket(core: h2.core, fd: c.fd, gen: c.gen, stream: sid))
         except Exception: discard
   else:
@@ -947,6 +950,7 @@ proc h2ResumeProducers(h2: H2Conn, c: ptr Connection) =
     # backs up again (res.write -> enqueue+schedule). Contain a raising producer
     # so the effect stays `raises: []`: the scheduler is reachable from a
     # strict-effect async handler (res.send -> h2Respond -> h2Schedule).
+    noteDrainFire(h2.core)             # #421
     try: cb(h2.core, c.fd, c.gen, sid)
     except Exception: discard
   h2.resuming = false
@@ -1258,6 +1262,7 @@ proc fireEndedDrain(h2: H2Conn, c: ptr Connection, sid: uint32,
   ## from inside a close notification, and firing it would re-enter a producer
   ## from its own finish/abort.
   if cb == nil or c.closeInProgress: return
+  noteDrainFire(h2.core)                 # #421
   try: cb(h2.core, c.fd, c.gen, sid)
   except Exception: discard
 
@@ -1376,12 +1381,14 @@ proc h2NotifyClosed*(c: ptr Connection) =
       st.rs.onRespDrain = nil
   var empty: string
   for (sid, cb) in bodyCbs:
+    noteDrainFire(h2.core)               # a teardown callback runs (#421)
     try: cb(toOpenArray(empty, 0, -1), true)
     except CatchableError: discard
   for (sid, cb) in drainCbs:
     # onRespDrain wraps an unannotated user producer (raises: [Exception]); catch
     # Exception so the connection-close path stays raises:[] under strict-effect
     # async (as teardownStream / h2ResumeProducers do).
+    noteDrainFire(h2.core)
     try: cb(h2.core, c.fd, c.gen, sid)
     except Exception: discard
 

@@ -10,6 +10,13 @@
 # - the runtime import/export itself (Future[T], newFuture, complete,
 #   fail, addCallback, the `{.async.}` macro, `await`)
 # - `pump` / `teardown` procs (the loop hooks wired by `ensurePump`)
+# - `ioFd` / `onIoReady` procs: the dispatcher's selector fd (-1 while there is
+#   none) and its readiness callback, which the loop registers and calls so the
+#   dispatcher's I/O wakes it (#419)
+# - `noteDispatcher()`: vortex is handing this thread's dispatcher work, so the
+#   pump, the fd registration and the teardown may use (and create) it from now
+#   on; neither runtime can say whether a thread already has a dispatcher
+#   without creating one (#422)
 # - `template onCompleted(fut, body)`: run `body` when `fut` completes,
 #   absorbing the backend's addCallback callback signature (and, for
 #   chronos, the pendingOps bookkeeping that drives its pump)
@@ -35,12 +42,23 @@ proc watchedPending(): bool {.nimcall, gcsafe.} =
   {.gcsafe.}:
     pendingOps > 0 and parkedOps < pendingOps
 
+proc teardownAdapter() {.nimcall, gcsafe.}
+  ## LoopCore.hooks.teardownHook: the backend's teardown, then this file's own
+  ## thread-local state (defined at the end, after the tables it clears).
+
 proc ensurePump*(core: ptr LoopCore) {.inline.} =
-  ## Idempotent; called automatically by the entry points below.
+  ## Idempotent; called automatically by the entry points below, each of which
+  ## is about to hand the dispatcher work: a watched future, or a handler that
+  ## may have detached a task onto it (#412). That is where this loop thread's
+  ## dispatcher starts to count as live (noteDispatcher, #422); before it no
+  ## adapter hook creates one.
+  noteDispatcher()
   if core.hooks.pumpHook == nil:
     core.hooks.pumpHook = pump
-    core.hooks.teardownHook = teardown
+    core.hooks.teardownHook = teardownAdapter
     core.hooks.pendingHook = watchedPending
+    core.hooks.ioFdHook = ioFd          # the loop watches the dispatcher (#419)
+    core.hooks.ioReadyHook = onIoReady
 
 proc complete(req: Request, failed: bool) {.gcsafe.} =
   ## 500 on failure, then flush/resume the connection (send is a no-op
@@ -688,3 +706,14 @@ template blocking*(socket: WebSocket, message: string, body: untyped) =
     proc (ws {.inject.}: WebSocket, msg {.inject.}: string)
         {.nimcall, gcsafe.} =
       body)
+
+proc teardownAdapter() {.nimcall, gcsafe.} =
+  teardown()
+  {.gcsafe.}:
+    # The reader tables are threadvars, which nothing destroys when the thread
+    # exits: their slot storage (2.5 KB once a table has held an entry) leaked
+    # with every loop thread that ever streamed a body or read a WebSocket
+    # through the adapter (#422). Any reader still in them belongs to a
+    # connection that is gone.
+    reset(bodyReaders)
+    reset(wsReaders)

@@ -28,6 +28,7 @@ nimble testzstd        # zstd response compression + negotiation (needs zstd+bro
 nimble testdeflate     # WebSocket permessage-deflate (needs zlib)
 nimble testrace        # cross-thread race regressions (ThreadSanitizer)
 nimble testchronos     # chronos async adapter (needs chronos)
+nimble leakcheck       # adapter suite under leaks(1) / LeakSanitizer: no leaked dispatcher (needs chronos)
 # the chronos suite again under strict reentrancy (implied by
 # -d:chronosPreviewV5), where chronos keeps no idle sentinel in its queue:
 nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos \
@@ -229,6 +230,7 @@ Separate `nimble` tasks because they need a build flag or an extra dependency.
 | `nimble testdeflate` | **yes** (`testdeflate`) | WebSocket permessage-deflate (RFC 7692, `-d:wsDeflate`, links zlib) over a live server, plus the h2 (RFC 8441) deflate case. |
 | `nimble testrace` | **yes** (`testrace`) | Four ThreadSanitizer regression suites: `test_thread_race` (the handler/stream-route closure refcount race across loop threads at `start()`/shutdown), `test_blocking_race` (C3/IMP2 -- a `req.blocking:` worker reading a request snapshot rather than live h2 state, under concurrent h2c blocking requests -- plus the awaitable-emit double-release race: many concurrent h2 streams whose awaitable `req.blocking` bodies emit their response inside the body, so the prNone response and the prAwait omBlockingDone must not double-release the pkAwait pin), `test_blocking_args` (the `req.blocking(a, b, ...)` box refcount touched on one thread only), and `test_router_race` (concurrent route-trie traversal on a multi-threaded server). TSan aborts on any data race. |
 | `nimble testchronos` | **yes** (`testchronos`) | The chronos async adapter: the shared `test_adapter.nim` suite rebuilt with `-d:vortexChronos`; chronos is opt-in so this build is kept out of the default suite. |
+| `nimble leakcheck` | **yes** (`sanitize`, LeakSanitizer) | `tests/leakcheck.sh`: the shared `test_adapter.nim` suite built against asyncdispatch and chronos (`strict` adds the `-d:chronosStrictReentrancy` build) and run under a leak checker, `leaks --atExit --list` over a `-d:useMalloc` build on macOS, LeakSanitizer over the `NIM_SANITIZE=1` build on Linux. Fails when any leaked block (a root or a block only another leak reaches, each by its own allocation stack) was allocated by a dispatcher (`newDispatcher`) or by the adapters' thread-local reader tables, which a loop thread's teardown must release (#422), or when the suite did not run to its end (on macOS its final success line, since `leaks` reports on any exit and does not pass the suite's exit status on; on Linux the suite's exit status); the suite's other leaks are counted but do not fail it. On macOS export `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib` first. |
 
 ---
 

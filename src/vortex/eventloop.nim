@@ -107,7 +107,7 @@ else:
   const sendFlags = cint(0)
 
 type
-  FdKind = enum fkListen, fkClient, fkWakeup, fkQuic
+  FdKind = enum fkListen, fkClient, fkWakeup, fkQuic, fkAdapter
 
   AcceptDropCause* = enum
     ## Why the accept path gave up on a connection. The first three are
@@ -159,8 +159,17 @@ type
     stopFlag: ptr Atomic[bool]
     lastWallSec: int64
     pumpCap: int                 # adapter-suggested selector timeout cap
+    adapterFd: int               # the async adapter's dispatcher selector fd,
+                                 # registered for Read once it exists (#419);
+                                 # -1 = not yet, -2 = registration failed
     inPump: bool                 # the adapter's pump is running: loop-thread
                                  # flushes are held to its end (pumpHold)
+    pumpOwed: bool               # the pump's held-flush release ran code that
+                                 # may have queued async work after pumpCap was
+                                 # computed: do not sleep before the next pump
+                                 # (#421)
+    wakeFd: int                  # the outbox's wakeup read end, registered
+                                 # for Read (#418); -1 = no outbox
     outboxScratch: seq[OutMsg]   # reused drain buffer
     pendingFlush: seq[(int32, uint32)]
                                  # connections holding a flush for the outbox
@@ -402,7 +411,8 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
     handlerRaw: cast[RawClosure](handler),   # raw pair: no cross-thread refcount
     stopFlag: stopFlag,
     tls: tls,
-    udpFd: -1)
+    udpFd: -1,
+    adapterFd: -1)
   result.core.streamRouteRaw = cast[RawClosure](streamRoute)
   result.core.serverHeader = settings.serverHeader
   if settings.securityHeaders:
@@ -439,8 +449,14 @@ proc newLoop*(settings: VortexConfig, handler: RequestHandler,
   result.core.conns = initConnTable()
   result.refreshDate()
   result.selector.registerHandle(int(listenFd), {Event.Read}, fkListen)
+  # The outbox's wakeup is a plain descriptor vortex owns (an eventfd on Linux,
+  # a pipe's read end elsewhere; see connection.newOutbox), watched for Read
+  # and emptied by run()'s wakeup branch: the stop fan-out writes to it too,
+  # with the same bare write() a worker's push makes (#418).
+  result.wakeFd = -1
   if outbox != nil:
-    result.selector.registerEvent(outbox.ev, fkWakeup)
+    result.selector.registerHandle(int(outbox.wakeRead), {Event.Read}, fkWakeup)
+    result.wakeFd = int(outbox.wakeRead)
   when not defined(plainHttp):
     if udpFd != osInvalidSocket:
       # A valid udpFd means the server enabled h3 and validated the TLS cert.
@@ -589,6 +605,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     let cb = c.rs.onBodyCb
     c.rs.onBodyCb = nil
     var empty: string
+    noteDrainFire(addr loop.core)     # a teardown callback runs (#421)
     try: cb(toOpenArray(empty, 0, -1), true)
     except CatchableError: discard
   if c.h2 == nil and c.rs.onRespDrain != nil:
@@ -605,6 +622,7 @@ proc closeConn(loop: Loop, c: ptr Connection) =
     let cb = c.rs.onRespDrain
     c.rs.onRespDrain = nil
     c.respBackedUp = false
+    noteDrainFire(addr loop.core)
     try: cb(addr loop.core, c.fd, c.gen, 0)
     except Exception: discard    # unannotated user producer (raises: [Exception])
     # Drop a registration the producer made from inside the callback: nothing
@@ -866,6 +884,7 @@ proc flushOut(loop: Loop, c: ptr Connection) =
         # re-fire spuriously on the next full drain (issue #273).
         let cb = c.rs.onRespDrain
         c.rs.onRespDrain = nil
+        noteDrainFire(addr loop.core)       # #421
         cb(addr loop.core, c.fd, c.gen, 0)  # resume a streamed body
       return
     else:
@@ -2206,7 +2225,7 @@ proc applyOutboxConn(loop: Loop, m: OutMsg) =
                 m.data.toOpenArray(bodyStart, m.data.len - 1))
   loop.resumeAfterRespond(c, m.stream)
 
-proc releaseBatchFlushes(loop: Loop) =
+proc releaseBatchFlushes(loop: Loop): bool {.discardable.} =
   ## One socket write per connection for the whole outbox batch (#333). Each entry
   ## is the one hold deferBatchFlush took for that connection, so dropping it
   ## flushes everything the batch produced there. A connection that died while the
@@ -2226,6 +2245,20 @@ proc releaseBatchFlushes(loop: Loop) =
   ## per-connection guard: a callback that raises closes its own connection,
   ## as a dispatch error does, rather than ending the loop thread. The list is
   ## cleared even then, so no later connection inherits a stale entry.
+  ##
+  ## Returns true when a flush ran such user code, which can complete a Future
+  ## (a sync onDrain the app turns into one, a resumed h2 producer, a teardown
+  ## callback) whose continuation the adapter only queues. The pump's caller
+  ## must then not sleep on the wake cap it read before this ran (#421). Exact,
+  ## not inferred from the connection's stall state: every site that runs a
+  ## drain or teardown callback bumps LoopCore.drainFires (noteDrainFire), and
+  ## this compares it across the release. A plain response flushed into a
+  ## socket with room, or a flush that only meets EAGAIN again under a client
+  ## that is not reading, fires nothing, so the pass keeps its wait. A flush
+  ## that raised counts too: the user code it ran may have completed a Future
+  ## before the raise.
+  let fires = loop.core.drainFires
+  var raised = false
   try:
     for (fd, gen) in loop.pendingFlush:
       let c = conn(addr loop.core, fd, gen)
@@ -2236,10 +2269,12 @@ proc releaseBatchFlushes(loop: Loop) =
           loop.flushOut(c)
       except Exception:
         # A per-connection bug must never take down the loop thread.
+        raised = true
         if c.state != csFree:
           loop.closeConn(c)
   finally:
     loop.pendingFlush.setLen(0)
+  raised or loop.core.drainFires != fires
 
 proc processOutbox(loop: Loop) =
   ## Apply worker-produced responses: unpin, write out, resume parsing. Each
@@ -2261,6 +2296,9 @@ proc processOutbox(loop: Loop) =
       else:
         loop.applyOutboxConn(m)
   finally:
+    # A flush here that completes a Future needs no pumpOwed: processOutbox runs
+    # from the selector's event branch, ahead of this iteration's pump, which
+    # runs the continuation and computes a fresh wake cap (#421).
     loop.releaseBatchFlushes()
   # Recycle every sendFile read buffer from this batch back to the pool -- once,
   # here, so a buffer is returned exactly once whether its stream was alive (the
@@ -2622,6 +2660,77 @@ proc drainComplete(loop: Loop): bool =
     return false
   loop.core.nowSec >= loop.asyncDrainDeadline
 
+proc registerAdapterFd(loop: Loop) =
+  ## Register the async adapter's dispatcher selector fd (a kqueue or epoll fd)
+  ## with the loop's selector for Read, once the dispatcher exists (#419). The
+  ## dispatcher's own fds are invisible to this selector, so without it a task
+  ## parked on the adapter's I/O alone (a detached task reading its own socket,
+  ## no timer) ran only when the loop woke for some other reason, up to the 1 s
+  ## idle wait later. A kqueue or epoll fd reads ready, level-triggered, while it
+  ## holds pending events (nested kqueue checked on macOS), so its readiness
+  ## wakes the selector and ioReadyHook has the pump poll it. Polled after each
+  ## pump: the dispatcher is created lazily, possibly by this iteration's
+  ## handlers, and the hook returns -1 until then.
+  var fd = -1
+  try:
+    # Inside the try: the hook may create the dispatcher, and creating one
+    # opens its selector, which raises OSError under fd exhaustion. Ask again
+    # next pass then; a loop thread must not end on it. That retry costs one
+    # hook call per loop pass, and only while it keeps failing (the adapters'
+    # hooks return -1 without creating anything until the dispatcher exists).
+    fd = loop.core.hooks.ioFdHook()
+  except CatchableError, Defect:
+    return
+  if fd < 0: return
+  try:
+    loop.selector.registerHandle(fd, {Event.Read}, fkAdapter)
+    loop.adapterFd = fd
+  except CatchableError, Defect:
+    # Stop asking (-2): an unregistrable fd will not register next pass either.
+    # The pump then polls the dispatcher's I/O on every pass and run caps the
+    # loop's wait at 5 ms (see run), so that I/O is served within 5 ms, as the
+    # pumps' own I/O cap did before #419, rather than on the loop's next
+    # unrelated wakeup. The cost is permanent for this loop thread (it never
+    # asks again), but it is paid only on this failure path: an idle loop
+    # wakes every 5 ms instead of sleeping its full wait.
+    loop.adapterFd = -2
+
+proc releaseOnAbort(loop: Loop) =
+  ## run's exception exit (#423): release what its normal tail and the drain
+  ## would have, each step contained so the exception in flight is the one
+  ## runLoopThread reports.
+  ##
+  ## The adapter's teardown runs first, while the selector is still open: its
+  ## drain can resume continuations that write a response or re-arm a
+  ## connection through it. Then every live connection's fd is closed, so its
+  ## client sees a FIN (or a reset) instead of hanging on a socket no thread
+  ## serves; the Connection memory is left alone, since a blocking: worker may
+  ## still hold a pin on it and post to the outbox, which the server frees only
+  ## after it joins the workers. The listeners close here too, and are set to -1
+  ## like beginDrain does, so runLoopThread closes only the ones a loop never
+  ## took over (newLoop failed) and never a number this loop already closed and
+  ## another thread may have reused.
+  if loop.adapterFd >= 0:
+    try: loop.selector.unregister(loop.adapterFd)
+    except CatchableError, Defect: discard
+    loop.adapterFd = -1
+  if loop.core.hooks.teardownHook != nil:      # release the async adapter's dispatcher
+    try: loop.core.hooks.teardownHook()
+    except CatchableError, Defect: discard
+  try:
+    for c in loop.core.conns.slots:
+      if c.state != csFree and c.fd >= 0:
+        discard posix.close(cint(c.fd))
+  except CatchableError, Defect: discard
+  try: loop.selector.close()
+  except CatchableError, Defect: discard
+  if loop.listenFd >= 0:
+    discard posix.close(cint(loop.listenFd))
+    loop.listenFd = -1
+  if loop.udpFd >= 0:
+    discard posix.close(cint(loop.udpFd))
+    loop.udpFd = -1
+
 proc run*(loop: Loop) =
   loop.core.threadId = getThreadId()
   loop.core.hooks.kick = kickImpl
@@ -2633,8 +2742,17 @@ proc run*(loop: Loop) =
     installH3WsHooks(addr loop.core)   # h3 WebSocket (RFC 9220) stream lookup
   loop.pumpCap = -1
   var keys: array[256, ReadyKey]
+  var tailRan = false
+  defer:
+    if not tailRan:
+      # run is leaving on an exception (runLoopThread logs it): still release
+      # what the tail and the drain release, or the dispatcher and its tables
+      # leak as on any exit before #422, the adapter fd stays registered with a
+      # selector nothing closes, and every client of this loop hangs on a
+      # socket nothing serves (#423).
+      loop.releaseOnAbort()
   while true:
-    if loop.stopFlag[].load(moRelaxed) and not loop.draining:
+    if loop.stopFlag[].load(moAcquire) and not loop.draining:
       loop.tick()                     # refresh nowSec before arming the deadline
       loop.beginDrain()
     if loop.draining and loop.drainComplete():
@@ -2646,6 +2764,10 @@ proc run*(loop: Loop) =
       # An adapter has pending async operations: bound the wait so
       # timer/IO completions from its dispatcher aren't starved.
       timeoutMs = min(timeoutMs, max(1, loop.pumpCap))
+    if loop.adapterFd == -2:
+      # The dispatcher's fd could not be watched (registerAdapterFd): nothing
+      # wakes the loop for its I/O, so bound the wait as the pumps did (#419).
+      timeoutMs = min(timeoutMs, 5)
     if loop.bodyPausedConns > 0:
       # A streaming read is paused at the read-ahead high-water (recv loop stopped
       # pulling; fd still armed). The async consumer drains from its own queue on
@@ -2664,6 +2786,13 @@ proc run*(loop: Loop) =
       # socket is drained: there is no event to wait for, so do not wait. Without
       # this a body that paused and then resumed stalls until some unrelated
       # event happens to wake the loop (#366).
+      timeoutMs = 0
+    if loop.pumpOwed:
+      # The last pump's held flushes ran after it computed pumpCap, and one of
+      # them may have completed a Future (a WebSocket onDrain turned into one, an
+      # h2 producer's drain resume): its continuation is queued with nothing to
+      # wake the selector for it, so pump again at once instead of waiting out
+      # a cap that predates it, up to the 1 s idle wait (#421).
       timeoutMs = 0
     if loop.core.drainKicks.len > 0:
       # A res.onDrain registration (from the async pump, a timer, an onDrain
@@ -2686,7 +2815,13 @@ proc run*(loop: Loop) =
     var quicWork = false
     for i in 0 ..< n:
       let key = keys[i]
-      if Event.User in key.events:
+      if key.fd == loop.wakeFd:
+        # A worker's push or a stop request (#418) wrote the outbox's wakeup
+        # descriptor. Empty it first (it is level-triggered and would read
+        # ready forever), then the queue: see drainWake for why in that order.
+        # A stop request finds the queue empty, and the stop flag is read at
+        # the top of the next iteration.
+        drainWake(loop.core.outbox)
         # Guard like the per-connection block below: a raise while applying a
         # worker response or accepting a connection must never take down the
         # whole loop thread (R11).
@@ -2699,6 +2834,12 @@ proc run*(loop: Loop) =
         continue
       if key.fd == loop.udpFd:
         quicWork = true
+        continue
+      if key.fd == loop.adapterFd:
+        # The adapter's dispatcher has I/O ready (#419): its pump, at the end
+        # of this iteration, polls it. Ahead of the conns guard below, which
+        # would read the fd as a connection slot.
+        loop.core.hooks.ioReadyHook()
         continue
       if key.fd >= loop.core.conns.len:
         continue
@@ -2751,6 +2892,8 @@ proc run*(loop: Loop) =
         discard quicWork
         try: loop.h3Drive()
         except Exception: discard
+    if loop.adapterFd == -2:
+      loop.core.hooks.ioReadyHook()   # unwatchable dispatcher: poll it anyway
     if loop.core.hooks.pumpHook != nil:
       # Pump at the end of the iteration so callbacks scheduled while
       # handling this batch (e.g. an await that completed immediately)
@@ -2758,11 +2901,24 @@ proc run*(loop: Loop) =
       # are held for the pump and released once it returns, one send() per
       # connection for everything it produced (pumpHold).
       loop.inPump = true
+      loop.pumpOwed = false
       try:
         loop.pumpCap = loop.core.hooks.pumpHook()
       finally:
         loop.inPump = false
-        loop.releaseBatchFlushes()
+        if loop.releaseBatchFlushes():
+          loop.pumpOwed = true         # pumpCap predates what it ran (#421)
+    # Everything below runs after the pump computed pumpCap too: tick()'s
+    # timeout sweeps close connections (closeConn fires onClose, a final
+    # onBody, a parked onRespDrain) and the tail h3Drive runs the HTTP/3
+    # backend's fire sites. A Future one of them completes has its continuation
+    # only queued, so compare the drain-fire count across them the way the
+    # release does, or the handler waits out the cap (up to the 1 s idle wait)
+    # before it resumes. The sweeps run at most once a second, so this adds no
+    # spin.
+    let firesAfterPump = loop.core.drainFires
+    if loop.adapterFd == -1 and loop.core.hooks.ioFdHook != nil:
+      loop.registerAdapterFd()
     loop.tick()
     when not defined(plainHttp):
       # Anything that ran after this iteration's h3Drive (a continuation the
@@ -2774,6 +2930,9 @@ proc run*(loop: Loop) =
       if loop.h3FlushPending and loop.udpFd >= 0:
         try: loop.h3Drive()
         except Exception: discard
+    if loop.core.drainFires != firesAfterPump and
+        loop.core.hooks.pumpHook != nil:
+      loop.pumpOwed = true             # see firesAfterPump (#421)
     if loop.draining:
       loop.drainSweep()               # close connections that just finished
       if loop.drainComplete():
@@ -2798,6 +2957,7 @@ proc run*(loop: Loop) =
             " connection(s) held by a still-running blocking: handler; the " &
             "loop cannot exit until they return (a handler that never returns " &
             "will block shutdown -- blocking: bodies must finish)")
+  tailRan = true
   when not defined(plainHttp):
     if loop.udpFd >= 0:
       for i in 0 ..< loop.core.h3slots.len:
@@ -2805,6 +2965,13 @@ proc run*(loop: Loop) =
         loop.h3FreeSlot(i)
       ngEngineFree()              # frees the shim engine (all conns + TLS ctx)
       discard posix.close(cint(loop.udpFd))
+  if loop.adapterFd >= 0:
+    # Out of the loop's selector before teardownHook closes the dispatcher
+    # that owns the fd: a closed fd left registered could be reused by the next
+    # open and misread as the adapter's.
+    try: loop.selector.unregister(loop.adapterFd)
+    except CatchableError: discard
+    loop.adapterFd = -1
   loop.selector.close()
   loop.core.chunkPool.chunkPoolFree()    # free pooled sendFile buffers (workers joined)
   if loop.listenFd >= 0:                 # beginDrain may have closed it already
@@ -2837,11 +3004,13 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
   # and run() is defended per-connection but not absolutely; contain both so one
   # loop failing degrades the server instead of killing it. Close this loop's
   # listeners so its share of connections isn't blackholed by a dead listener.
+  var loopOwnsFds = false     # the Loop took over the listeners (see except)
   try:
     block:
       let loop = newLoop(arg.settings, arg.handler, arg.stopFlag, arg.listenFd,
                          arg.pool, arg.outbox, arg.tls, arg.udpFd,
                          arg.streamRoute, arg.quicReload)
+      loopOwnsFds = true
       loop.run()
     # The Loop (and any async-dispatcher state) is now out of scope. Under ORC,
     # a cyclic object decref'd here is only queued in this thread's cycle-root
@@ -2852,10 +3021,15 @@ proc runLoopThread*(arg: LoopThreadArg) {.thread, gcsafe.} =
     when defined(gcOrc): GC_fullCollect()
   except CatchableError, Defect:
     opLog("event-loop thread exited on error: " & getCurrentExceptionMsg())
-    if arg.listenFd != osInvalidSocket:
-      discard posix.close(cint(arg.listenFd))
-    if arg.udpFd != osInvalidSocket:
-      discard posix.close(cint(arg.udpFd))
+    # Once the Loop exists it owns the listeners: run's exit (releaseOnAbort,
+    # or beginDrain before it) closes whichever it still holds, and closing
+    # arg's numbers again here could close a descriptor another thread has
+    # since been handed under the same number (#423).
+    if not loopOwnsFds:
+      if arg.listenFd != osInvalidSocket:
+        discard posix.close(cint(arg.listenFd))
+      if arg.udpFd != osInvalidSocket:
+        discard posix.close(cint(arg.udpFd))
   # The WebSocket pump's reused frame buffer is a thread-local; free it here on
   # both paths, since nothing destroys a thread-local when the thread exits.
   wsReleasePumpBuffer()

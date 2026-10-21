@@ -6,7 +6,8 @@
 # src/vortex/adapters/adapterimpl.nim, but the backend primitives
 # (onCompleted, pump, pendingOps) differ, so the full scenario matrix runs
 # against each backend.
-import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics]
+import std/[unittest, net, httpcore, strutils, os, osproc, posix, atomics,
+            monotimes, selectors]
 import std/httpclient except Response
 import std/times except milliseconds        # chronos exports its own
 import vortex/[settings, server, routing]   # not `request`: its (sync) blocking
@@ -15,15 +16,30 @@ import ./helper                              # macro would clash with the async
 import ./h2client
 import ./wsclient
 import vortex/http2/frames
+from vortex/connection import conn, totalPins
+from vortex/adapters/detachedfailure import failureSummary   # #423 log line
 when defined(vortexChronos):
   import vortex/chronos as nhsasync          # adapter's; Request/Response via facade
+  import pkg/chronos/config as chronosCfg    # chronosEventEngine (#419 CPU check)
   const suiteName = "chronos adapter"
   # chronos's sleepAsync takes a Duration; asyncdispatch's takes plain ms.
   template sleepMs(n: int): untyped = sleepAsync(n.milliseconds)
 else:
   import vortex/asyncdispatch as nhsasync    # adapter's; Request/Response via facade
+  import std/asyncnet                        # AsyncSocket (#419 I/O wait)
   const suiteName = "asyncdispatch adapter"
   template sleepMs(n: int): untyped = sleepAsync(n)
+
+when defined(macosx):
+  # tests/leakcheck.sh runs this suite under `leaks --atExit` with
+  # MallocStackLogging set (leaks adds more Malloc* variables), and every child
+  # inheriting them prints malloc's notices on stderr: keep those out of the
+  # curl output the h2/h3 cases read.
+  block:
+    var mallocVars: seq[string]
+    for k, _ in envPairs():
+      if k.startsWith("Malloc"): mallocVars.add k
+    for k in mallocVars: delEnv(k)
 
 proc hRoot(req: Request, res: Response) {.async.} =
   # No await at all: completes synchronously through the async path.
@@ -591,10 +607,650 @@ block:
       s.send("GET /beat HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
       check s.recvUntilClose(2000).endsWith("beating")
       s.close()
+      sleep(300)                          # let the loop settle into its wait
       let t0 = epochTime()
       fresh.close()
       closed = true
-      check epochTime() - t0 < 1.5        # a stuck drain takes 2 s or more
+      # A stuck drain takes 2 s or more. Under 0.2 s also needs the stop to
+      # wake the loop (#418): chronos's pump caps the wait at the heartbeat's
+      # 10 s timer, so the loop sat out its 1 s idle wait before it saw the
+      # flag (measured 0.7 s); asyncdispatch's 5 ms cap hid it.
+      let took = epochTime() - t0
+      echo "    close() with a live heartbeat took ", int(took * 1000), " ms"
+      check took < 0.2
+
+# --- an awaitable blocking body that raises a Defect (#416) ----------------
+#
+# Its own server, so the last test can time its shutdown. The awaitable
+# trampoline caught only CatchableError: a Defect escaped it, skipping the
+# omBlockingDone push, so the awaiting future never completed (no response
+# at all), the task's pkAwait pin stayed held, and close() waited out the
+# async drain deadline (3 s) for the outstanding result.
+
+proc hDefectValue(req: Request, res: Response) {.async.} =
+  let n = 7
+  let v = req.blocking(n):
+    doAssert n < 0, "defect in a blocking body"
+    n
+  res.send(Http200, $v)                   # never reached: the await raises
+
+proc hDefectVoid(req: Request, res: Response) {.async.} =
+  let n = 1
+  req.blocking(n):
+    # Raised outright: an out-of-range `s[n]` is undefined under -d:danger
+    # (no bounds checks), so it would not raise there.
+    if n > 0: raise newException(IndexDefect, "index " & $n & " out of bounds")
+    res.send(Http200, "unreachable")
+
+proc hCatchDefect(req: Request, res: Response) {.async.} =
+  let n = 7
+  try:
+    let v = req.blocking(n):
+      doAssert n < 0, "caught by the handler"
+      n
+    res.send(Http200, "no error " & $v)
+  except BlockingDefectError as e:
+    res.send(Http200, e.msg)
+
+proc hOwnPins(req: Request, res: Response) {.async.} =
+  # Loop thread: this connection's pin count once the defect request is done.
+  let c = conn(req.core, req.fd, req.gen)
+  res.send(Http200, if c == nil: "gone" else: $c.totalPins)
+
+block:
+  let defRouter = newRouter()
+  defRouter.get("/defect-value", hDefectValue)
+  defRouter.get("/defect-void", hDefectVoid)
+  defRouter.get("/defect-caught", hCatchDefect)
+  defRouter.get("/pins", hOwnPins)
+  var dsrv = newVortex(defRouter.toHandler, initVortexConfig(
+    numThreads = 1, workerThreads = 1)).start(0)
+  var closed = false
+  defer:
+    if not closed: dsrv.close()
+
+  suite suiteName & " (blocking body Defect, #416)":
+    for path in ["/defect-value", "/defect-void"]:
+      test "a Defect in an awaitable blocking body answers 500 and unpins (" &
+          path & ")":
+        let s = connectTimeout(dsrv.port, 3000)
+        defer: s.close()
+        s.send("GET " & path & " HTTP/1.1\r\nHost: x\r\n\r\n")
+        let r = s.readHttpResponse(2000)
+        check r.ok
+        check r.head.startsWith("HTTP/1.1 500")
+        # Same connection: it moved on, and the task's pin is released.
+        s.send("GET /pins HTTP/1.1\r\nHost: x\r\n\r\n")
+        let p = s.readHttpResponse(2000)
+        check p.ok and p.body == "0"
+
+    test "the Defect reaches the handler as a BlockingDefectError":
+      let s = connectTimeout(dsrv.port, 3000)
+      defer: s.close()
+      s.send("GET /defect-caught HTTP/1.1\r\nHost: x\r\n\r\n")
+      let r = s.readHttpResponse(2000)
+      check r.ok
+      check r.body.startsWith("AssertionDefect: ")
+      check "caught by the handler" in r.body
+      # The trace sits under a "Stack trace:" header, so a one-line log
+      # summary (#423) stops before it instead of flattening it.
+      check "\nStack trace:\n" in r.body
+
+    test "close() after a Defect in a blocking body does not wait out the drain":
+      let s = connectTimeout(dsrv.port, 3000)
+      s.send("GET /defect-value HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      discard s.recvUntilClose(2000)
+      s.close()
+      let t0 = getMonoTime()
+      dsrv.close()
+      closed = true
+      # The drain deadline is 3 s and the unfixed case took about 18 s; the
+      # bound leaves headroom for a loaded host.
+      check (getMonoTime() - t0).inMilliseconds < 2500
+
+# --- an idle loop thread with live long timers (#417) -------------------------
+#
+# A timer nobody waits on (a detached heartbeat, the leftover timer of a
+# `withTimeout` whose operation finished early) must cost the loop thread one
+# wakeup when it is due, not one every few ms for as long as it lives. The
+# asyncdispatch pump answered any such timer with a 5 ms wake cap.
+
+proc loopThreadCpuNs(): int64 =
+  var ts: Timespec
+  discard clock_gettime(CLOCK_THREAD_CPUTIME_ID, ts)
+  int64(ts.tv_sec) * 1_000_000_000 + int64(ts.tv_nsec)
+
+proc hArmTimers(req: Request, res: Response) {.async.} =
+  detach heartbeat()                     # a 10 s timer, re-armed for good
+  # Finishes after 5 ms; its 30 s timeout timer stays in the dispatcher's heap.
+  when defined(vortexChronos):
+    discard await withTimeout(sleepMs(5), 30_000.milliseconds)
+  else:
+    discard await withTimeout(sleepMs(5), 30_000)
+  res.send(Http200, "armed")
+
+proc hLoopCpu(req: Request, res: Response) {.async.} =
+  res.send(Http200, $loopThreadCpuNs())  # runs on the (only) loop thread
+
+# The idle loop-CPU ceiling of the #417 and #419 checks below. A loop that
+# sleeps its full wait costs under a millisecond over their 2 s windows (0.0008
+# s measured), but a sanitizer build slows each wakeup: macOS ASan measured
+# 0.0019-0.0021 s on chronos, about 1.4x headroom under 0.003, and CI's Linux
+# sanitize job runs this suite under ASan+LSan (tests/leakcheck.sh; -d:useMalloc
+# is what NIM_SANITIZE=1 implies). The fallbacks the checks must still catch, a
+# 5 ms wake cap on a timer or on the dispatcher's I/O, cost 0.013 s and more, so
+# three times the limit still fails them.
+const idleCpuLimit = when defined(useMalloc): 0.009 else: 0.003
+
+# --- a detached task parked on the adapter's own I/O (#419) -------------------
+#
+# The task waits only on a socket of the adapter's dispatcher: no timer, no
+# callback, nothing the pump can see, and the loop's selector could not see the
+# dispatcher's fds, so the task ran only when the loop woke for some other
+# reason (the 1 s idle wait, or a timer cap).
+
+var ioPeerPort: Atomic[int]              # the test's plain listener
+
+# Whether the loop can watch the dispatcher's selector fd. chronos's poll
+# engine has none, so its pump keeps a 5 ms wake cap for registered I/O by
+# design, and the loop-CPU check below does not apply there.
+const pollableDispatcher =
+  when defined(vortexChronos):
+    chronosCfg.chronosEventEngine in ["epoll", "kqueue"]
+  else: true
+
+proc ioWaiter(res: Response, port: int) {.async.} =
+  try:
+    when defined(vortexChronos):
+      let t = await connect(initTAddress("127.0.0.1", Port(port)))
+      var buf = newString(5)
+      await t.readExactly(addr buf[0], 5)
+      await t.closeWait()
+    else:
+      let t = newAsyncSocket(buffered = false)
+      await t.connect("127.0.0.1", Port(port))
+      let buf = await t.recv(5)
+      t.close()
+    res.send(Http200, buf)
+  except CatchableError as e:
+    res.send(Http500, e.msg)
+
+proc hIoWait(req: Request, res: Response) {.async.} =
+  detach ioWaiter(res, ioPeerPort.load)  # the handler answers nothing itself
+
+proc hSlowPending(req: Request, res: Response) {.async.} =
+  await sleepMs(1500)                    # a watched future on a far timer
+  res.send(Http200, "slow")
+
+block:
+  let idleRouter = newRouter()
+  idleRouter.get("/arm", hArmTimers)
+  idleRouter.get("/cpu", hLoopCpu)
+  idleRouter.get("/iowait", hIoWait)
+  idleRouter.get("/slow", hSlowPending)
+  var idle = newVortex(idleRouter.toHandler,
+                       initVortexConfig(numThreads = 1)).start(0)
+  defer: idle.close()
+
+  proc idleGet(path: string): string =
+    let s = connectTimeout(idle.port, 3000)
+    defer: s.close()
+    s.send("GET " & path & " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    let r = s.readHttpResponse(3000)
+    doAssert r.ok, path
+    r.body
+
+  suite suiteName & " (idle loop)":
+    test "live long timers do not wake an idle loop thread (#417)":
+      check idleGet("/arm") == "armed"
+      sleep(50)
+      let c0 = parseBiggestInt(idleGet("/cpu"))
+      sleep(2000)                        # idle: only the two long timers live
+      let c1 = parseBiggestInt(idleGet("/cpu"))
+      let cpu = float(c1 - c0) / 1e9
+      # A 5 ms wake cap costs 0.019 to 0.036 s of loop CPU over this window,
+      # depending on the host (0.094 s per 5 s measured); one wakeup per second
+      # of idle wait costs under a millisecond (0.0008 s measured).
+      echo "    loop thread CPU over 2 s idle: ", formatFloat(cpu, ffDecimal, 4),
+        " s"
+      check cpu < idleCpuLimit
+
+    # Accept the detached task's connection, let the loop settle into its idle
+    # wait, then write: the response must follow the write, not the loop's
+    # next unrelated wakeup (up to ~1 s later). With `cpuWindowMs` > 0 it also
+    # measures the loop thread's CPU over that long an idle window while the
+    # task is parked, before the write: a pump that keeps a wake cap for the
+    # dispatcher's I/O (the 5 ms cap asyncdispatch had before #419, which also
+    # answered the write in time) spins the loop through it.
+    proc ioWaitRoundTrip(lis: Socket, client: Socket,
+                         cpuWindowMs = 0): tuple[took, cpu: float] =
+      var sel = newSelector[int]()
+      defer: sel.close()
+      sel.registerHandle(lis.getFd, {Event.Read}, 0)
+      doAssert sel.select(3000).len > 0, "the detached task never connected"
+      var peer: Socket
+      lis.accept(peer)
+      defer: peer.close()
+      if cpuWindowMs > 0:
+        sleep(20)                        # the task reaches its read
+        let c0 = parseBiggestInt(idleGet("/cpu"))
+        sleep(cpuWindowMs)
+        let c1 = parseBiggestInt(idleGet("/cpu"))
+        result.cpu = float(c1 - c0) / 1e9
+      sleep(200)                         # the loop is asleep on its selector
+      let t0 = epochTime()
+      peer.send("hello")
+      let r = client.readHttpResponse(3000)
+      result.took = epochTime() - t0
+      check r.ok and r.body == "hello"
+
+    proc ioListener(): Socket =
+      result = newSocket()
+      result.setSockOpt(OptReuseAddr, true)
+      result.bindAddr(Port(0), "127.0.0.1")
+      result.listen()
+      ioPeerPort.store(int(result.getLocalAddr()[1]))
+
+    test "a detached task parked on adapter I/O alone resumes on that I/O (#419)":
+      let lis = ioListener()
+      defer: lis.close()
+      let c = connectTimeout(idle.port, 3000)
+      defer: c.close()
+      c.send("GET /iowait HTTP/1.1\r\nHost: x\r\n\r\n")
+      let (took, cpu) = ioWaitRoundTrip(lis, c, cpuWindowMs = 2000)
+      checkpoint "write to response: " & $took & " s"
+      echo "    loop thread CPU over 2 s parked on I/O: ",
+        formatFloat(cpu, ffDecimal, 4), " s"
+      check took < 0.3
+      # The 5 ms I/O wake cap asyncdispatch kept until #419 costs 0.013 s over
+      # this window (and answers the write within 7 ms, so `took` alone cannot
+      # tell); sleeping on the dispatcher's fd costs 0.0007 s.
+      when pollableDispatcher:
+        check cpu < idleCpuLimit
+
+    test "a detached task resumes on adapter I/O while another request is in flight (#419)":
+      let lis = ioListener()
+      defer: lis.close()
+      let slow = connectTimeout(idle.port, 3000)
+      defer: slow.close()
+      slow.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n")
+      sleep(20)                          # its handler is parked on the timer
+      let c = connectTimeout(idle.port, 3000)
+      defer: c.close()
+      c.send("GET /iowait HTTP/1.1\r\nHost: x\r\n\r\n")
+      let took = ioWaitRoundTrip(lis, c).took
+      checkpoint "write to response: " & $took & " s"
+      check took < 0.3
+      let r = slow.readHttpResponse(3000)
+      check r.ok and r.body == "slow"
+
+# --- the dispatcher cannot be created (#422) ----------------------------------
+#
+# The accept takes the process's last descriptor, so the handler's first use of
+# the dispatcher, which opens its kqueue/epoll fd, fails with EMFILE. The
+# asyncdispatch adapter marked the dispatcher live anyway, its pump then asked
+# for it outside any guard, and the OSError ended the loop thread ("Too many
+# open files"): every later connection to that loop was refused. asyncdispatch
+# only: chronos raises an OSDefect from newDispatcher there, which its adapter
+# already survived, but that Defect object stays referenced and its
+# newDispatcher allocation stack would trip tests/leakcheck.sh.
+
+proc hFirstAwait(req: Request, res: Response) {.async.} =
+  await sleepMs(1)
+  res.send(Http200, "ok")
+
+when not defined(vortexChronos):
+  block:
+    let emRouter = newRouter()
+    emRouter.get("/", hFirstAwait)
+    var emSrv = newVortex(emRouter.toHandler,
+                          initVortexConfig(numThreads = 1, workerThreads = 1)).start(0)
+    defer: emSrv.close()
+
+    proc emGet(): HttpResp =
+      try:
+        let s = connectTimeout(emSrv.port, 1000)
+        defer: s.close()
+        s.send("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        s.readHttpResponse(2000)
+      except CatchableError: (false, "", "", "")
+
+    suite suiteName & " (no descriptor for the dispatcher, #422)":
+      test "a loop thread survives a dispatcher it cannot create (#422)":
+        sleep(50)                          # the loop is up and idle
+        var openFds: seq[int]
+        for fd in 0 ..< 4096:
+          if fcntl(cint(fd), F_GETFD) != -1: openFds.add fd
+        var lim, saved: RLimit
+        doAssert getrlimit(RLIMIT_NOFILE, lim) == 0
+        saved = lim
+        # The smallest limit with two free descriptor numbers under it: one for
+        # this client's socket, one for the connection the server accepts.
+        var limit = 0
+        var free = 0
+        while free < 2:
+          if limit notin openFds: inc free
+          inc limit
+        lim.rlim_cur = limit
+        doAssert setrlimit(RLIMIT_NOFILE, lim) == 0
+        var first: HttpResp
+        try:
+          first = emGet()
+        finally:
+          doAssert setrlimit(RLIMIT_NOFILE, saved) == 0
+        # The handler's own sleepAsync met the EMFILE and failed its request.
+        check first.ok and first.head.startsWith("HTTP/1.1 500")
+        sleep(50)
+        let second = emGet()
+        check second.ok and second.body == "ok"
+
+# --- a detached task that fails (#423) ----------------------------------------
+#
+# A task the handler detached (asyncCheck / asyncSpawn) whose future fails has
+# its error raised by the dispatcher's own callback, inside the pump's poll:
+# asyncCheck re-raises the error, and chronos's asyncSpawn raises a
+# FutureDefect. Nothing between the pump and the loop thread's entry caught it,
+# so the loop thread exited ("event-loop thread exited on error"), its listener
+# closed, and a one-thread server refused every connection after one failing
+# detached task. Its own one-thread server, so a dead loop takes nothing else
+# down.
+
+proc failingTask() {.async.} =
+  await sleepMs(10)
+  raise newException(ValueError, "detached boom (#423)")
+
+proc hDetachFail(req: Request, res: Response) {.async.} =
+  detach failingTask()
+  res.send(Http200, "detached")
+
+proc hAlive(req: Request, res: Response) {.async.} =
+  await sleepMs(1)                       # through the pump, after the failure
+  res.send(Http200, "alive")
+
+block:
+  let failRouter = newRouter()
+  failRouter.get("/fail", hDetachFail)
+  failRouter.get("/alive", hAlive)
+  var failSrv = newVortex(failRouter.toHandler,
+                          initVortexConfig(numThreads = 1)).start(0)
+  var closed = false
+  defer:
+    if not closed: failSrv.close()
+
+  proc failGet(path: string): string =
+    ## The body, or "" when the request was refused or went unanswered.
+    try:
+      let s = connectTimeout(failSrv.port, 1000)
+      defer: s.close()
+      s.send("GET " & path &
+             " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      let r = s.readHttpResponse(2000)
+      if r.ok: r.body else: ""
+    except CatchableError: ""
+
+  suite suiteName & " (failing detached task, #423)":
+    test "a detached task that fails does not end the loop thread (#423)":
+      for i in 0 ..< 3:
+        check failGet("/fail") == "detached"
+        sleep(50)                        # the task fails 10 ms in
+        check failGet("/alive") == "alive"
+
+    test "close() after a failed detached task is prompt (#423)":
+      check failGet("/fail") == "detached"
+      sleep(50)
+      let t0 = epochTime()
+      failSrv.close()
+      closed = true
+      let took = epochTime() - t0
+      echo "    close() after a failed detached task took ", int(took * 1000),
+        " ms"
+      check took < 0.2
+
+# --- a Defect past an await (#423) -------------------------------------------
+#
+# chronos's async transform does not catch a Defect (not even under
+# handleException): one raised after an await leaves the continuation inside
+# the pump's poll and the body's future never completes. The pump catches it
+# like a detached task's failure, but must say what it is, since the request it
+# was answering gets nothing until its timeout. A doAsync: body is the
+# adapter's own closure, which turns the Defect into a failed future and so a
+# 500, as the asyncdispatch transform does for any async body.
+
+proc hDefectAfterAwait(req: Request, res: Response) {.async.} =
+  await sleepMs(1)
+  raise newException(IndexDefect, "handler defect (#423)")
+
+proc hDoAsyncDefect(req: Request, res: Response) {.gcsafe.} =
+  req.doAsync:
+    await sleepMs(1)
+    raise newException(IndexDefect, "doAsync defect (#423)")
+
+template captureStderr(body: untyped): string =
+  ## What the process wrote to fd 2 while `body` ran (opLog's sink).
+  let capPath = getTempDir() / ("vortex_adapter_stderr_" &
+                                $getCurrentProcessId() & ".log")
+  let capFd = posix.open(capPath.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o600)
+  let savedFd = dup(2)
+  discard dup2(capFd, 2)
+  try:
+    body
+  finally:
+    discard dup2(savedFd, 2)
+    discard posix.close(savedFd)
+    discard posix.close(capFd)
+  let captured = readFile(capPath)
+  removeFile(capPath)
+  captured
+
+block:
+  let defRouter = newRouter()
+  defRouter.get("/defect", hDefectAfterAwait)
+  defRouter.get("/doasync", hDoAsyncDefect)
+  defRouter.get("/alive", hAlive)
+  var defSrv = newVortex(defRouter.toHandler,
+                         initVortexConfig(numThreads = 1)).start(0)
+  defer: defSrv.close()   # chronos: waits out the 3 s drain for the lost future
+
+  proc defGet(path: string, ms = 2000): HttpResp =
+    try:
+      let s = connectTimeout(defSrv.port, 1000)
+      defer: s.close()
+      s.send("GET " & path &
+             " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+      s.readHttpResponse(ms)
+    except CatchableError: (false, "", "", "")
+
+  suite suiteName & " (Defect past an await, #423)":
+    test "a doAsync: body's Defect after an await answers 500 (#423)":
+      let r = defGet("/doasync")
+      check r.ok and r.head.startsWith("HTTP/1.1 500")
+      check defGet("/alive").body == "alive"
+
+    test "a handler's Defect after an await is reported and the loop serves on (#423)":
+      var r: HttpResp
+      let log = captureStderr:
+        r = defGet("/defect", 300)
+        sleep(50)
+      when defined(vortexChronos):
+        # The handler's future never completes: no response, but the loop says
+        # why, under its own line rather than as a detached task's failure.
+        check not r.ok
+        check "async adapter: an async body raised a Defect past an await" in log
+        check "IndexDefect: handler defect (#423)" in log
+        check "a detached task failed" notin log
+      else:
+        check r.ok and r.head.startsWith("HTTP/1.1 500")
+      check defGet("/alive").body == "alive"
+
+suite suiteName & " (failure summary, #423)":
+  test "the log line stops at the runtime's traceback and is capped":
+    check failureSummary(newException(ValueError,
+      "boom\nStack trace:\nfoo.nim(1) bar\nbaz.nim(2) qux")) == "boom"
+    check failureSummary(newException(ValueError,
+      "two\nlines\nAsync traceback:\n  frame")) == "two lines"
+    check failureSummary(newException(ValueError, "")) == "ValueError"
+    let long = failureSummary(newException(ValueError, repeat('x', 5000)))
+    check long.len <= 503 and long.endsWith("...")
+
+# --- a Future completed by the pump's held-flush release (#421) ---------------
+#
+# Since #412 the loop holds the flushes the async pump makes and releases them
+# after the pump returns, but the pump computed the loop's wake cap before that.
+# A release flush that empties a backed-up WebSocket fires its onDrain; an app
+# that turns that sync callback into a Future completes it there, and the
+# adapter only queues the continuation. With the pump's cap saying "nothing
+# pending" (-1) the selector then slept its full 1 s idle wait before the
+# producer resumed.
+#
+# The window needs a connection that is backed up (it hit EAGAIN and has not
+# drained to zero since) with less than respHighWater buffered (a bigger buffer
+# is flushed at send time, inside the pump, where the continuation runs in the
+# same pass), a pump write to it, and room in the socket by the time the pump
+# returns although the pass saw no writability. The client builds it, one step
+# per message, without depending on how the kernel sizes its socket buffers:
+#  * "s" (client not reading): the server sends three 16 KiB frames from the
+#    pump, held and released together; "q", read on a later pass, publishes
+#    ws.bufferedAmount. The client repeats both until the release hit EAGAIN:
+#    the socket is full and up to 48 KiB stay buffered, backed up.
+#  * "w": a waiter parks on a drain Future made from the sync ws.onDrain.
+#  * "x", then the client starts reading 5 ms later: the reply spins 30 ms in
+#    the pump (the pass that read "x" saw a full socket) and sends "e" behind
+#    the backlog; by the time the pump returns the client has emptied the
+#    kernel buffers, so the release writes everything and fires onDrain.
+# Nothing else wakes the loop then (no timer, the client sends nothing), so
+# before the fix the waiter's "r" arrived ~1 s after "e".
+
+const drainFrame = 16 * 1024
+var drainQ, drainQSeq, drainSent: Atomic[int]
+
+proc wsDrainedFut(ws: WebSocket): Future[void] =
+  ## A sync `ws.onDrain` turned into a Future, the way an app awaits a drain.
+  let f = newFuture[void]("wsDrainedFut")
+  proc cb(ws: WebSocket) {.gcsafe.} =
+    if not f.finished: f.complete()
+  try: ws.onDrain = cb
+  except Exception: discard
+  f
+
+proc wsSafeSend(ws: WebSocket, data: string) {.raises: [], gcsafe.} =
+  try: ws.send(data, WsKind.Binary)
+  except Exception: discard
+
+proc wsPublishBuffered(ws: WebSocket) {.raises: [], gcsafe.} =
+  try: drainQ.store(ws.bufferedAmount)
+  except Exception: drainQ.store(-1)
+  drainQSeq.atomicInc
+
+proc wsDrainWaiter(ws: WebSocket) {.async.} =
+  await wsDrainedFut(ws)
+  wsSafeSend(ws, "r")
+
+proc hWsDrain(req: Request, res: Response) {.async.} =
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):
+    case msg
+    of "s":
+      for i in 0 ..< 3: wsSafeSend(ws, repeat('x', drainFrame))
+      drainSent.atomicInc
+    of "q":
+      wsPublishBuffered(ws)
+    of "w":
+      detach wsDrainWaiter(ws)
+    of "x":
+      let t0 = epochTime()
+      while epochTime() - t0 < 0.03: discard   # hold the pump: see above
+      wsSafeSend(ws, "e")
+
+block:
+  let drainRouter = newRouter()
+  drainRouter.ws("/wsdrain", hWsDrain)
+  var dsrv = newVortex(drainRouter.toHandler,
+    initVortexConfig(numThreads = 1, workerThreads = 1)).start(0)
+  defer: dsrv.close()
+
+  suite suiteName & " (held-flush release)":
+    test "a WebSocket onDrain Future completed by a held flush resumes at once (#421)":
+      let s = openWs(dsrv.port, "/wsdrain", timeoutMs = 5000).sock
+      defer: s.close()
+      var gaps: seq[int]
+      for cycle in 0 ..< 3:
+        # Fill the socket without reading until a release hits EAGAIN.
+        var buffered = 0
+        var rounds = 0
+        while buffered == 0 and rounds < 2000:
+          inc rounds
+          let sent = drainSent.load
+          s.sendBin("s")
+          var deadline = epochTime() + 3.0
+          while drainSent.load == sent and epochTime() < deadline: sleep(0)
+          # "q" must be read on a later pass than "s", after the release:
+          # in the same batch it would see the frames still held.
+          sleep(2)
+          let before = drainQSeq.load
+          s.sendBin("q")
+          deadline = epochTime() + 3.0
+          while drainQSeq.load == before and epochTime() < deadline: sleep(0)
+          buffered = drainQ.load
+        check buffered > 0 and buffered < 64 * 1024
+        s.sendBin("w")
+        sleep(20)                    # the waiter parks
+        s.sendBin("x")
+        sleep(5)                     # read only once the pump is spinning
+        var tE = 0.0
+        while true:
+          let f = s.recvFrame()
+          if f.payload == "e": tE = epochTime()
+          elif f.payload == "r": break
+        gaps.add int((epochTime() - tE) * 1000)
+      echo "    drain-to-resume gap per cycle (ms): ", gaps
+      check max(gaps) < 300
+
+# The same window, opened by the loop's timeout sweeps instead of a held flush:
+# tick() runs after the pump, and a WebSocket whose client never answers the
+# keepalive ping is closed there (an h1 WebSocket rides the deadline sweep:
+# sweepTimeouts -> closeConn -> onClose), which
+# completes the handler's `ws.messages` Future. Its continuation was queued
+# under the pump's stale cap, so the handler resumed ~1 s after the close.
+
+var sweepDoneNs: Atomic[int64]
+
+proc hWsSweep(req: Request, res: Response) {.async.} =
+  let ws = req.acceptWebSocket()
+  ws.messages(msg):
+    discard msg
+  sweepDoneNs.store(getMonoTime().ticks)
+
+block:
+  let sweepRouter = newRouter()
+  sweepRouter.ws("/wssweep", hWsSweep)
+  var sweepCfg = initVortexConfig(numThreads = 1, workerThreads = 1)
+  sweepCfg.wsPingInterval = 1          # ping after 1 s idle,
+  sweepCfg.wsPongTimeout = 1           # close 1 s later without a reply
+  var ssrv = newVortex(sweepRouter.toHandler, sweepCfg).start(0)
+  defer: ssrv.close()
+
+  suite suiteName & " (timeout sweep close)":
+    test "a handler resumes at once when a timeout sweep closes its WebSocket (#421)":
+      sweepDoneNs.store(0)
+      let s = openWs(ssrv.port, "/wssweep", timeoutMs = 8000).sock
+      defer: s.close()
+      # Never answer the ping: read (and drop) until the server closes.
+      var buf = newString(256)
+      var eofNs = 0'i64
+      while eofNs == 0:
+        var n = -1
+        try: n = s.recv(addr buf[0], buf.len)
+        except CatchableError: n = -1
+        if n <= 0: eofNs = getMonoTime().ticks
+      var waited = 0
+      while sweepDoneNs.load == 0 and waited < 3000:
+        sleep(1)
+        inc waited
+      let done = sweepDoneNs.load
+      check done != 0
+      let gapMs = (done - eofNs) div 1_000_000
+      echo "    sweep close to handler resume: ", gapMs, " ms"
+      check gapMs < 300
 
 withServer(appRouter.toHandler,
            initVortexConfig(numThreads = 1, workerThreads = 2),

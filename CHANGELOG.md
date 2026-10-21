@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `BlockingDefectError` is new public API: the exported `CatchableError` an
+  awaitable `req.blocking(...)` future fails with when its body raised a
+  `Defect`; its message is `<DefectName>: <msg>` followed by the stack trace.
+  (#416)
 - Stress harness: `VORTEX_CLIENT=python|navi|all`, which makes the **load
   client** an axis of the soak matrix beside `VORTEX_PROTO` and `VORTEX_SERVER`.
   The Python canary (httpx + websockets + aioquic) stays the default and the
@@ -233,6 +237,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Async adapters: a detached task that fails no longer ends its loop thread.
+  A task a handler started with `asyncCheck` (asyncdispatch) or `asyncSpawn`
+  (chronos) and never awaited has its error raised by the dispatcher's own
+  callback when it fails: asyncCheck re-raises the error, asyncSpawn raises a
+  `FutureDefect`. That raise surfaced inside the adapter pump's poll, and
+  nothing between the pump and the loop thread's entry caught it, so the loop
+  thread exited (`vortex: event-loop thread exited on error: ...`), its
+  listener closed, and the next connection to that loop was refused: a
+  one-thread server was dead after one failing detached task. The pump (and
+  the adapter's shutdown drain) now catch each poll's raise, log it once per
+  loop thread at most every 5 s with a running count (`vortex: async adapter:
+  a detached task failed (the loop carries on): ...`), and carry on, the way a
+  failing handler costs only its own connection. A Defect is caught too,
+  except under `--panics:on`, where it aborts the process as anywhere else; on
+  chronos every detached failure arrives as a `FutureDefect`, so under
+  `--panics:on` none of this applies there and a failing detached task still
+  aborts the process. The runtimes still leak the failed task itself on that
+  path (about 4 KB per failure on asyncdispatch, whose callback loop in Nim
+  2.2.10 skips the raising callback's destructor, and about 200 bytes on
+  chronos), so a detached task should still catch its own errors. chronos's
+  async transform also lets a Defect out of any async body that raises it
+  after an `await` (it re-raises Defects instead of failing the future, even
+  under `-d:chronosHandleException` or `{.async: (handleException: true).}`),
+  and the future never completes. The pump now tells that apart from a
+  detached task's `FutureDefect` and logs it as what it is (`vortex: async
+  adapter: an async body raised a Defect past an await ...`). In a `doAsync:`
+  body, which is the adapter's own closure, the Defect now fails the body's
+  future, so the request is answered 500 (a WebSocket closed with 1011) as on
+  asyncdispatch; before, it got no response until its timeout. A
+  router-registered `{.async.}` handler is the application's own proc, which
+  the adapter cannot wrap: on chronos its request still gets no response until
+  the timeout, and a graceful shutdown waits out the 3 s async drain for it,
+  so catch the Defects you can expect in the handler or move that code into a
+  `doAsync:` block. The event loop also releases its adapter state when it
+  does leave on an exception: that exit skipped the adapter fd unregister, the
+  selector close and the adapter's teardown, so the dispatcher and reader
+  tables #422 frees on a clean exit leaked there. That exit now also closes the
+  loop's live connections, whose clients hung on sockets nothing served, and no
+  longer closes a listener a shutdown drain had already closed (a descriptor
+  number another thread may have been handed since). (#423)
+- Async adapters: a loop thread's exit now frees the adapter's dispatcher and
+  thread-local tables instead of leaking them. On chronos every loop thread
+  that ever used the adapter leaked its whole dispatcher (about 15 KB with its
+  timer heap, callback queue and selector tables) when it exited, so every
+  server stop or restart leaked one per loop thread. The teardown closed the
+  dispatcher's selector fd and called `setThreadDispatcher(nil)`, but chronos
+  asserts there that the dispatcher it replaces has an empty callback queue,
+  and outside `-d:chronosStrictReentrancy` an idle dispatcher always keeps the
+  sentinel entry `poll()` re-queues: the assertion fired, the teardown
+  swallowed it, and the dispatcher stayed in chronos's threadvar, which nothing
+  frees when the thread exits. The teardown now empties the queue first. The
+  pump's idle check, since #412, also created a dispatcher itself
+  (`getThreadDispatcher()` creates one on first use); the pump, the loop's
+  dispatcher-fd registration and the teardown now leave the dispatcher alone
+  until the adapter has handed it work, on both adapters; on asyncdispatch
+  that now means once the dispatcher exists, so a dispatcher that could not be
+  created (the accept had taken the process's last descriptor, and opening its
+  kqueue or epoll fd failed with EMFILE) no longer ends the loop thread, where
+  the pump's next request for it raised `Too many open files` out of the loop:
+  the request whose handler hit it is answered 500, and the loop serves the
+  next one once a descriptor is free. A loop thread that
+  has run an adapter handler still gets one, even if every handler completed
+  without suspending, since such a handler may have detached a task onto it
+  that only the pump will drive and neither runtime can say whether it did
+  without creating the dispatcher; its teardown now releases it.
+  Both adapters also leaked the storage of their thread-local reader tables
+  (2.5 KB each once a loop thread had streamed a request body or read a
+  WebSocket through the adapter); the teardown now frees them. A worker
+  thread of the `blocking:` pool also leaked its ORC cycle-root buffer (20 KB)
+  when it exited with a released cycle still queued there; it now collects
+  before it exits, as a loop thread already did. Measured with
+  `leaks --atExit` over the adapter suite: chronos went from 5 leaked
+  dispatcher roots to none, asyncdispatch from two 2.5 KB table roots to
+  none; what the suite still leaks is its own `SSL_CTX`, a few objects its
+  failing handlers raise, and the detached tasks its #423 cases let fail (about
+  4 KB each on asyncdispatch, see #423). `nimble leakcheck`
+  (`tests/leakcheck.sh`) runs that check, and CI's sanitize job runs it under
+  LeakSanitizer on Linux: it fails on any leaked block allocated by a
+  dispatcher or an adapter table, and on a suite that did not run to its end
+  (judged by the suite's final success line under `leaks` on macOS, which
+  reports on any exit, and by the suite's exit status under LeakSanitizer).
+  (#422)
+- A Future completed by a write-buffer drain that the loop's held flushes
+  fire no longer waits up to a second to resume. Since #412 the loop holds the
+  flushes the async pump makes and sends them once the pump returns, but the
+  pump computed the loop's next wait before that. When one of those flushes
+  emptied a backed-up connection it fired the drain callback there: a sync
+  `ws.onDrain` the app turns into a Future, an HTTP/1 `res.onDrain`, an HTTP/2
+  producer's drain resume. The adapter only queues the continuation of a
+  Future completed that way, and with the pump having reported nothing pending
+  the selector slept its full 1 s idle wait before running it, on both
+  adapters. Before #412 the completion happened inside the pump, whose bounded
+  poll ran the continuation in the same pass. The release now reports whether
+  a flush ran such a callback (every drain and teardown callback site bumps a
+  per-loop counter the release compares), and the loop then polls again at
+  once instead of sleeping. A plain response flushed into a socket with room,
+  or a flush that only meets a full socket again under a client that is not
+  reading, keeps the normal wait, and `res.drained()` was never affected (its
+  drain kick already forces a zero wait). The outbox batch's release needs no
+  such flag: it runs ahead of the same iteration's pump. Measured with a
+  WebSocket producer parked on such a Future under a slow reader: 1000 ms from
+  the drain to the next frame before, under 1 ms after. The same wait followed
+  a connection the loop's timeout sweeps closed (they also run after the pump):
+  a handler in `ws.messages` on a WebSocket closed for an unanswered keepalive
+  ping resumed 1000 ms after the close on both adapters, and now at once. The
+  HTTP/3 backend's drain, body and teardown callbacks are counted too, for the
+  extra HTTP/3 pass the loop makes after the pump. (#421)
+- Reading a kept `Request` or `Response` from a thread that holds no snapshot
+  of its request (a worker task it does not belong to, or a thread the
+  application owns) no longer reaches the loop's connection table through
+  `req.clientCertSubject`, `req.isSecure`, `req.scheme`, `req.url`,
+  `req.query`, `req.json`, `req.params`, `req.param` or `res.responded`.
+  #413 made the `header`, `path`, `body` and other carrier accessors fail
+  closed there, but these still took the live path: with assertions on (the
+  default, `-d:release` included) they tripped its loop-thread assertion
+  (#343), so a worker task answered `500` and an app-owned thread ended the
+  process, and with assertions off (`-d:danger` or `--assertions:off`, where
+  the assertion is compiled out) they read loop-owned tables unsynchronised.
+  Each now returns its documented default there, the same rule `req.isAlive`
+  states: "" for the string readers, false for `isSecure`, an empty `url`,
+  `query` and `params`, `{}` for `json`, and true for `responded`, like
+  `res.ended`. A `blocking:` body asking `res.responded` of its own `res`
+  reads whether it has answered yet, so `if not res.responded: res.send(...)`
+  still sends there. The calls that write loop-owned state do nothing on any
+  thread but the loop's, a `blocking:` body included: `req.setParams`,
+  `req.onBody`, `req.acceptWebSocket` and `req.decodeRequestBody` are no-ops,
+  and `res.headers` and `res.trailers` hand back a thread-local scratch table
+  whose writes are discarded (before, they asserted with assertions on, and
+  with assertions off they wrote into the loop's pending-header table from the
+  foreign thread). A `blocking:` body writing its own `res.headers` or
+  `res.trailers` is always a bug (pass headers to `send` there), so that case
+  still asserts with assertions on (the default, `-d:release` included), which
+  fails the body (a `500` in the `blocking:` form, a `BlockingDefectError` at
+  the await in the awaitable one); with assertions off (`-d:danger` or
+  `--assertions:off`) the write is discarded silently. A `blocking:` body
+  over an HTTP/2 or HTTP/3 Extended CONNECT also reads `:protocol` from its
+  request snapshot now, so `req.isWebSocketUpgrade` and `isWebSocketIntent`
+  answer there instead of reading the loop-owned stream (which asserted on
+  HTTP/2 and raced the loop on HTTP/3). (#420)
+- Async adapters: a task waiting only on the adapter's own I/O now resumes as
+  soon as that I/O is ready, instead of when the loop next wakes for some other
+  reason. A detached task (`asyncSpawn`/`asyncCheck` from a handler that has
+  already completed) that waits on nothing but its own socket (a chronos
+  `StreamTransport`, an asyncdispatch `AsyncSocket`; no timer, no callback)
+  owned nothing the adapter's pump could see, and the dispatcher's fds are
+  invisible to the loop's selector, so on chronos it ran only when a request
+  arrived or the loop's 1 s idle wait expired. A handler's own awaits on such
+  I/O were covered only by a 5 ms wake cap on both adapters, which kept the
+  loop thread spinning for as long as the wait lasted. The loop now registers
+  the adapter dispatcher's selector fd (its kqueue or epoll fd, which reads
+  ready while it holds pending events; nested kqueue checked on macOS) with its
+  own selector once the dispatcher exists, and that fd's readiness has the pump
+  poll the dispatcher in the same pass, so the dispatcher's I/O wakes the loop
+  like any connection. Both pumps drop their I/O wake caps: the wait is capped
+  only at the dispatcher's next timer, so a loop thread with an idle async
+  connection open sleeps its full wait. The fd is unregistered before the
+  adapter's teardown closes the dispatcher. Measured from the peer's write to
+  the response, on a one-thread server idle in its selector wait: under 1 ms on
+  both adapters, against 0.8 s on chronos before. On asyncdispatch the old 5 ms
+  cap answered within 7 ms but kept the loop thread polling through the whole
+  wait: 0.013 s of loop thread CPU over 2 s with a task parked on its socket
+  before, 0.0007 s after. If the fd cannot be registered the loop polls the
+  dispatcher on every pass and caps its wait at 5 ms. On chronos's poll engine,
+  which has no pollable selector fd, the pump polls on every pass while chronos
+  watches any fd, under the same 5 ms cap, so a detached task waiting only on
+  I/O is driven there too. (#419)
+- `close()` (and `serve()` after SIGINT/SIGTERM) on an idle server no longer
+  waits out the event loops' idle wait. A stop request only set the server's
+  stop flag, and a loop thread asleep in its selector wait read it when it next
+  woke on its own, up to its 1 s idle timeout, so stopping an idle server took
+  up to a second, set by whichever loop was furthest from its wakeup. Measured
+  with a detached heartbeat timer, `close()` took 0.7 s on the chronos adapter
+  (whose pump caps the wait at the app's 10 s timer, so the loop slept its full
+  second); asyncdispatch's 5 ms pump cap hid it (0.01 s), and an idle server
+  with no async adapter took 0.8 s with eight loop threads. That time was this
+  wait, not drain work. `requestShutdown(server)` now stores the flag and then
+  wakes each of the server's loops through its worker outbox's wakeup
+  descriptor, and the no-argument `requestShutdown()` the signal handler calls
+  does the same for every live server: the process-wide registry records each
+  loop's wakeup descriptor beside the flag. That descriptor is now vortex's own
+  (an `eventfd` on Linux, a non-blocking pipe elsewhere) instead of a
+  std/selectors `SelectEvent`, whose `trigger` raises on a full pipe and whose
+  descriptors are private: a worker's push and a stop request both wake the
+  loop with one bare `write()`, so the signal path stays async-signal-safe (no
+  lock, no allocation, no exception, errno preserved), and the loop empties the
+  descriptor itself. Both forms read a server's registry entry only under a
+  reader count that teardown waits out before it frees the entry and closes
+  the outboxes' descriptors, and `requestShutdown(server)` finds its entry by
+  slot and registration tag, so a request racing the owner's `waitFor` from
+  another thread, or made after the server is gone, never reads freed memory
+  or writes to a closed or reused descriptor. `close()` on an idle server now
+  takes about 10 ms on both adapters. A start that fails after the server's
+  entry is registered (a bad certificate or key, a taken port, descriptor
+  exhaustion) now releases that entry along with the worker pool and its
+  threads: the registration used to happen ahead of the worker pool and the TLS
+  setup, outside the unwind that frees it, so every start that failed on a bad
+  certificate kept one of the registry's 256 entries, and once they were gone a
+  later server was out of reach of the signal path. (#418)
+- asyncdispatch adapter: a live timer that no request waits on no longer wakes
+  its loop thread every 5 ms. The adapter's pump capped the loop's selector
+  wait at 5 ms whenever the dispatcher's `hasPendingOperations()` was true, and
+  that predicate counts every timer the dispatcher holds: a detached heartbeat
+  (an `asyncCheck`ed loop around `sleepAsync(10_000)`), or the timer of a
+  `withTimeout` whose operation finished early, which stays in the heap until
+  it expires. Any such timer kept the loop thread spinning through a poll pass
+  every 5 ms for as long as it lived, on every loop thread that held one. The
+  pump now runs the dispatcher's ready callbacks and expired timers and caps
+  the wait at its next timer, the way the chronos pump's idle exit already did,
+  so a 30 s timer costs a wakeup when it is due and an idle server otherwise
+  sleeps its full 1 s wait. While the dispatcher has an fd registered the pump
+  still polls it on every pass under the 5 ms cap, since the dispatcher's
+  selector is invisible to the loop's own (dropped again by #419). Measured
+  with a 10 s heartbeat and a finished `withTimeout(30 s)` live on a
+  one-thread server: 0.036 s of loop thread CPU over 2 s of idle before,
+  0.0008 s after (0.0007 s on chronos).
+  (#417)
+- An awaitable `req.blocking(...)` whose body raises a `Defect` (a failed
+  `doAssert`, an `IndexDefect`; catchable under the default `--panics:off`) now
+  fails the awaited call, so the handler answers `500`, instead of leaving the
+  request hanging. The worker side of the awaitable form caught only
+  `CatchableError`; a Defect escaped it past the completion it posts back to
+  the loop, so the awaiting future never completed and the client got no
+  response at all, the task's connection pin was never released (on HTTP/1.1
+  that connection served nothing more), and a graceful shutdown waited for the
+  outstanding result until its deadlines ran out (about 18 s in the test). The
+  worker thread itself survived, but kept a stale record of the finished task.
+  The completion now always runs, and a Defect reaches the handler as a
+  `BlockingDefectError` (a new exported `CatchableError` type) carrying the
+  Defect's name, message and, after a `Stack trace:` line, its trace (a full
+  trace on a debug build, the raise site only with stack traces off), which
+  the handler can catch or leave to the usual `500`. The synchronous `blocking:`
+  form already answered `500` for a Defect; it now also clears its task record
+  if that fallback answer itself raises. (#416)
 - Compression: a buffered `res.send` from a worker thread no longer answers
   `500` when its body is eligible for compression. On a compression build with
   `compress = true`, a `blocking:` body sending at least 1400 bytes of a

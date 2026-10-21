@@ -363,6 +363,7 @@ proc deliverBody(h3c: H3Conn, usid: uint64, last: bool) =
     if last: st.rs.onBodyCb = nil   # single EOF: cbStreamClose must not re-fire (#256)
     var buf: string
     swap(buf, st.body)
+    noteDrainFire(h3c.core)   # may complete a req.read() Future (#421)
     cb(buf.toOpenArray(0, buf.len - 1), last)
     if not manualAck and buf.len > 0 and h3c.vq != nil and usid in h3c.streams:
       # nghttp3_conn_read_stream does not credit DATA-frame payload to QUIC
@@ -568,9 +569,11 @@ proc cbStreamClose(user, connUd: pointer, sid: int64, appErr: uint64) {.cdecl.} 
     except Exception: discard
   if bodyCb != nil:
     var empty: string
+    noteDrainFire(h3c.core)                 # a teardown callback runs (#421)
     try: bodyCb(toOpenArray(empty, 0, -1), true)
     except Exception: discard
   if drainCb != nil:
+    noteDrainFire(h3c.core)
     try: drainCb(h3c.core, h3SlotFd(h3c.slot),
                  h3c.core.h3slots[h3c.slot].gen, uint32(usid))
     except Exception: discard
@@ -589,6 +592,7 @@ proc cbStreamWritable(user, connUd: pointer, sid: int64) {.cdecl.} =
       # drain re-registers itself per chunk (res.onDrain in applyFileChunk).
       let cb = st.rs.onRespDrain
       st.rs.onRespDrain = nil
+      noteDrainFire(h3c.core)               # #421
       cb(h3c.core, h3SlotFd(h3c.slot),
          h3c.core.h3slots[h3c.slot].gen, uint32(usid))
 
@@ -978,6 +982,7 @@ proc fireEndedDrain(conn: H3Conn, sid: uint64, cb: RespDrainCb) =
   ## re-registration is rejected. Contain Exception: an unannotated user
   ## producer must not unwind into the engine (matches cbStreamClose).
   if cb == nil: return
+  noteDrainFire(conn.core)                  # #421
   try: cb(conn.core, h3SlotFd(conn.slot), conn.core.h3slots[conn.slot].gen,
           uint32(sid))
   except Exception: discard
@@ -1116,9 +1121,11 @@ proc h3Free*(conn: H3Conn) =
     try: wsStreamClosed(conn.core, nil, w)
     except Exception: discard
   for cb in bodyCbs:
+    noteDrainFire(conn.core)                # a teardown callback runs (#421)
     try: cb(toOpenArray(empty, 0, -1), true)
     except Exception: discard
   for (sid, cb) in drainCbs:
+    noteDrainFire(conn.core)
     try: cb(conn.core, h3SlotFd(conn.slot), conn.core.h3slots[conn.slot].gen, sid)
     except Exception: discard
   if conn.vq != nil:
@@ -1148,6 +1155,7 @@ proc wsFlushH3ng(core: ptr LoopCore, c: ptr Connection, w: WsConn) {.nimcall, gc
     elif w.backedUp:
       w.backedUp = false
       if w.onDrain != nil:
+        noteDrainFire(core)                 # #421
         w.onDrain(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream))
   else:
     w.backedUp = true

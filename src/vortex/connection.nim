@@ -4,7 +4,8 @@
 ## has since been closed and reused.
 
 import std/[locks, uri, tables, json]
-from std/selectors import SelectEvent, trigger, newSelectEvent, close
+from std/posix import nil
+from std/oserrors import raiseOSError, osLastError
 import ./http1/parser
 
 type
@@ -111,10 +112,11 @@ type
 
   Outbox* = object
     ## MPSC channel into an event loop: workers push, the loop drains on
-    ## its wakeup event. Lives in shared memory (createShared).
+    ## its wakeup descriptor. Lives in shared memory (createShared).
     lock*: Lock
     msgs*: seq[OutMsg]
-    ev*: SelectEvent
+    wakeRead*: cint   ## the loop watches this for Read; drainWake empties it
+    wakeWrite*: cint  ## wakeLoopFd writes here (the same fd for an eventfd)
 
   ConnState* = enum
     csFree,      ## slot unused
@@ -414,6 +416,17 @@ type
       ## pumping until this reads false. Not pumpHook's wake cap: that one also
       ## honours timers the app owns (a detached heartbeat), which must not hold
       ## a drained loop for the full async drain deadline.
+    ioFdHook*: proc (): int {.nimcall, gcsafe.}
+      ## Registered by an adapter alongside pumpHook: the file descriptor of
+      ## this loop thread's dispatcher selector (its kqueue or epoll fd), or -1
+      ## while there is none yet. The loop registers it with its own selector
+      ## for Read once it exists: a kqueue or epoll fd reads ready while it holds
+      ## pending events, so the dispatcher's I/O wakes the loop like any socket
+      ## (#419). Unregistered before teardownHook closes the dispatcher.
+    ioReadyHook*: proc () {.nimcall, gcsafe.}
+      ## Registered with ioFdHook: the loop's selector found the dispatcher's fd
+      ## readable, so the pump at the end of this iteration must poll the
+      ## dispatcher's I/O even though no timer or callback asks for it.
     kick*: proc (loopPtr: pointer, fd: int32, gen: uint32,
                  stream: uint32, serial: uint32) {.nimcall, gcsafe.}
       ## Flush/resume after a deferred same-thread respond (async
@@ -486,6 +499,19 @@ type
       ## non-empty the selector does not wait. fd+generation, so a recycled slot
       ## is skipped. At most one entry per carrier per pass
       ## (RequestState.drainKickQueued).
+    drainFires*: uint
+      ## Bumped (wrapping) each time the loop thread is about to run a user
+      ## drain or teardown callback that a socket flush can fire: an HTTP/1
+      ## `res.onDrain`, a WebSocket `onDrain` / `onClose`, an h2 producer's
+      ## drain resume, a final onBody(last=true), and finish/abort's detached
+      ## drain (`noteDrainFire`). Any of them can complete a Future whose
+      ## continuation the adapter only queues, so the loop compares it across
+      ## everything that runs after the pump computed its wake cap (the
+      ## held-flush release, tick()'s timeout sweeps, the tail h3Drive) and,
+      ## when it moved, does not sleep on that cap (#421). The HTTP/3
+      ## backend's fire sites (stream close, connection free, stream-writable
+      ## drain, ended-response drain, h3 WebSocket onDrain, request-body
+      ## delivery) count too, for the tail h3Drive. Loop-thread only.
     # Async-adapter integration (see adapters/). All loop-thread only.
     loopPtr*: pointer         ## the owning Loop, for kick
     hooks*: AdapterHooks      ## adapter/event-loop proc-pointer vtable (below)
@@ -591,17 +617,90 @@ proc callStreamRoute*(core: ptr LoopCore, fd: int32, gen: uint32,
              env: pointer): bool {.nimcall, gcsafe.}](
     core.streamRouteRaw.prc)(core, fd, gen, stream, core.streamRouteRaw.env)
 
+template noteDrainFire*(core: ptr LoopCore) =
+  ## A user drain or teardown callback is about to run (LoopCore.drainFires,
+  ## #421). Unsigned, so it wraps rather than overflows.
+  inc core.drainFires
+
+# The outbox's wakeup descriptor is vortex's own (#418): an eventfd on Linux, a
+# non-blocking pipe elsewhere. It used to be a std/selectors SelectEvent, but
+# `trigger` raises (and allocates the exception) on a failed write, which a
+# signal handler must not do, and its descriptors are private, so reaching them
+# meant mirroring a layout std/selectors does not promise. Owning the descriptor,
+# the worker push and the stop fan-out wake the loop with the same bare write()
+# (wakeLoopFd), and the loop registers the read end as a plain handle and
+# empties it itself (drainWake).
+when defined(linux):
+  var EFD_NONBLOCK {.importc, header: "<sys/eventfd.h>".}: cint
+  var EFD_CLOEXEC {.importc, header: "<sys/eventfd.h>".}: cint
+  proc eventfd(initval: cuint, flags: cint): cint
+    {.importc, header: "<sys/eventfd.h>".}
+
 proc newOutbox*(): ptr Outbox =
+  ## Raises OSError when the kernel refuses the wakeup descriptor (descriptor
+  ## exhaustion); nothing stays allocated then.
+  var r, w: cint
+  when defined(linux):
+    # An eventfd counter: a write adds to it, one 8-byte read returns it and
+    # resets it to 0, and it reads ready (level-triggered) while non-zero.
+    r = eventfd(0, EFD_NONBLOCK or EFD_CLOEXEC)
+    if r < 0: raiseOSError(osLastError(), "outbox wakeup eventfd")
+    w = r
+  else:
+    var fds: array[2, cint]
+    if posix.pipe(fds) != 0: raiseOSError(osLastError(), "outbox wakeup pipe")
+    r = fds[0]
+    w = fds[1]
+    for fd in fds:
+      # Both ends non-blocking: a write to a full pipe must fail (it already
+      # holds a pending wakeup) rather than block a worker or a signal handler,
+      # and drainWake reads until the pipe is empty. Close-on-exec so a child
+      # process does not inherit a loop's wakeup.
+      discard posix.fcntl(fd, posix.F_SETFL,
+        posix.fcntl(fd, posix.F_GETFL) or posix.O_NONBLOCK)
+      discard posix.fcntl(fd, posix.F_SETFD, posix.FD_CLOEXEC)
   result = createShared(Outbox)
   initLock result.lock
-  result.ev = newSelectEvent()
+  result.wakeRead = r
+  result.wakeWrite = w
 
 proc freeOutbox*(ob: ptr Outbox) =
-  ## Only after all loops and workers using it have stopped.
-  close(ob.ev)
+  ## Only after all loops and workers using it have stopped, and after the
+  ## server's shutdown record is unregistered (so no stop fan-out can still be
+  ## writing to the wakeup descriptor).
+  discard posix.close(ob.wakeRead)
+  if ob.wakeWrite != ob.wakeRead: discard posix.close(ob.wakeWrite)
   deinitLock ob.lock
   ob.msgs = @[]
   deallocShared ob
+
+proc wakeLoopFd*(fd: cint) {.raises: [], gcsafe.} =
+  ## Wake the loop whose outbox's `wakeWrite` is `fd`. Async-signal-safe: one
+  ## write(), errno restored for the interrupted code. A failed write loses
+  ## nothing: a full pipe (EAGAIN) already holds a wakeup the loop has not
+  ## consumed, and an eventfd write fails only on a counter overflow no run
+  ## reaches. 8 bytes is what an eventfd write must be; a pipe takes it whole or
+  ## not at all (it is under PIPE_BUF).
+  if fd < 0: return
+  let saved = posix.errno
+  var data: uint64 = 1
+  discard posix.write(fd, addr data, sizeof(data))
+  posix.errno = saved
+
+proc drainWake*(ob: ptr Outbox) {.raises: [], gcsafe.} =
+  ## Consume every pending wakeup (loop thread), so the level-triggered
+  ## registration stops reading ready. Call BEFORE `drain`: a push between the
+  ## two then lands in that drain (its wakeup is spurious, harmless), and one
+  ## after it finds the queue empty and wakes again. Emptying the descriptor
+  ## after the queue instead could swallow the wakeup of a push the queue
+  ## drain missed, and the loop would sleep holding its message.
+  when defined(linux):
+    var v: uint64
+    discard posix.read(ob.wakeRead, addr v, sizeof(v))   # resets the counter
+  else:
+    var buf: array[256, byte]
+    while posix.read(ob.wakeRead, addr buf[0], buf.len) == buf.len:
+      discard     # a short read, or -1 with EAGAIN, means the pipe is empty
 
 proc push*(ob: ptr Outbox, msg: sink OutMsg) =
   ## Queue a message for the owning loop, waking it only on the empty ->
@@ -623,7 +722,7 @@ proc push*(ob: ptr Outbox, msg: sink OutMsg) =
   let wasEmpty = ob.msgs.len == 0
   ob.msgs.add msg
   release ob.lock
-  if wasEmpty: trigger ob.ev
+  if wasEmpty: wakeLoopFd(ob.wakeWrite)
 
 proc drain*(ob: ptr Outbox, into: var seq[OutMsg]) =
   ## Swap out all pending messages; `into` should be empty. Must take ALL of them

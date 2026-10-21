@@ -308,6 +308,7 @@ proc notifyClose(core: ptr LoopCore, c: ptr Connection, w: WsConn,
   if w.closeNotified: return
   w.closeNotified = true
   if w.onClose != nil:
+    noteDrainFire(core)           # a teardown callback runs (#421)
     w.onClose(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream),
               code, reason)
 
@@ -692,6 +693,7 @@ proc wsDrained*(core: ptr LoopCore, c: ptr Connection) =
   if w.backedUp:
     w.backedUp = false
     if w.onDrain != nil:
+      noteDrainFire(core)         # #421
       w.onDrain(WebSocket(core: core, fd: w.fd, gen: w.gen, stream: w.stream))
 
 # --- public send/close API --------------------------------------------------

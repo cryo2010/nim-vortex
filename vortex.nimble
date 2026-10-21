@@ -82,6 +82,18 @@ task testchronos, "Test the chronos async adapter (needs chronos)":
   exec "nim c -r --mm:orc --threads:on -d:ssl -d:vortexChronos -p:src " &
        "-o:tests/test_adapter_chronos tests/test_adapter.nim"
 
+taskRequires "leakcheck", "chronos >= 4.0.0"
+
+task leakcheck, "Leak gate for the async adapters' per-thread state (needs chronos)":
+  ensureNimblePath()
+  # tests/test_adapter.nim built against asyncdispatch and chronos, run under
+  # `leaks --atExit` on macOS (LeakSanitizer on Linux); fails on a leaked
+  # dispatcher or adapter table (#422). CI runs the script directly in the
+  # sanitize job (a failure here would be masked by nim-lang/nimble#1802). On
+  # macOS the TLS/QUIC build needs Homebrew's headers:
+  # CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib.
+  exec "bash tests/leakcheck.sh asyncdispatch chronos"
+
 proc runCodecTest(test, flags: string) =
   ## Compile-and-run one opt-in codec test: the shared orc/threads/ssl prefix,
   ## the per-task defines + linker libs, binary written next to the source.
